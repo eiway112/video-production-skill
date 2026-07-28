@@ -1,0 +1,29 @@
+{
+  "engine": "openmontage",
+  "pipeline": "animated-explainer",
+  "input": {
+    "type": "markdown",
+    "path": ""
+  },
+  "output": {
+    "video_name": "",
+    "subtitle_name": "",
+    "resolution": "1920x1080",
+    "fps": 30,
+    "codec": "libx264",
+    "crf": 23
+  },
+  "budget": {
+    "cap_usd": 10.0,
+    "mode": "warn"
+  },
+  "runtime": {
+    "compose_engine": "remotion",
+    "tts_provider": "edge-tts",
+    "image_provider": "builtin"
+  },
+  "paths": {
+    "temp_subdir": "",
+    "video_name": ""
+  }
+}

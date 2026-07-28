@@ -1,0 +1,54 @@
+# ===== 过程产物（保留目录结构，忽略内容）=====
+过程产物/**
+!过程产物/临时产物/
+过程产物/临时产物/*
+!过程产物/临时产物/.gitkeep
+
+# ===== 成果产物（本地生成，不入库）=====
+成果文件/视频/*
+!成果文件/视频/.gitkeep
+成果文件/字幕/*
+!成果文件/字幕/.gitkeep
+
+# ===== 素材（用户自备，不入库）=====
+素材文件/图片/*
+!素材文件/图片/.gitkeep
+
+# ===== 运行环境 =====
+程序文件/运行环境/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 备份与中间产物（*.bak* 同时覆盖 .bak/.bak.json 等派生后缀）
+*.bak*
+*.hash
+_backup_*/
+*.noaudio.mp4
+
+# HyperFrames render work dirs
+work-*
+
+# ImageGen 输出必须移入 素材文件/图片/，禁止留在项目根
+vibe_images/
+
+# 本地密钥 / 环境变量覆盖（openmontage.env.local 等）——切勿将真实 API Key 提交
+*.env.local
+.env.local

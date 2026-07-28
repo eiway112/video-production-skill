@@ -1,0 +1,16 @@
+{
+  "video_duration": 43.0,
+  "cover_duration": 3.0,
+  "bgm_enabled": false,
+  "tts_engine": "edge",
+  "voice": "zh-CN-YunxiNeural",
+  "rate": "+5%",
+  "pitch": "+0Hz",
+  "narration_source": "./narration.json",
+  "paths": {
+    "video_name": "quickstart-demo.mp4",
+    "subtitle_name": "quickstart-demo.srt",
+    "temp_subdir": "quickstart-demo_audio",
+    "html_project": "quickstart-demo"
+  }
+}

@@ -1,0 +1,205 @@
+# ============================================================================
+# 统一验证规则配置（首版 v1.0）
+# ============================================================================
+# 提取来源（只收录在 ≥2 个验证脚本中真实复用的规则，宁缺毋滥）：
+#   - 脚本/preflight_check.py          （渲染前门禁）
+#   - 脚本/verify_tts_product.py (_v2) （TTS 产物验证）
+#   - 脚本/regression_test.py          （最小回归测试集）
+#   - 过程产物/architecture_self_check.py（架构自检）
+#
+# 执行引擎：脚本/unified_validator.py
+#   python unified_validator.py --list-rules
+#   python unified_validator.py --context config_path=... html_path=...
+#
+# 上下文变量（CLI 用 --context key=value 注入，未解析的规则自动 skip）：
+#   {project_dir}   HyperFrames 项目目录
+#   {config_path}   渲染配置 JSON
+#   {html_path}     项目 index.html
+#   {manifest_path} tts_manifest.json
+#   {image_path}    单张图片（逐文件检查时注入）
+#   {audio_path}    单个 TTS 音频（逐文件检查时注入）
+#   {srt_path}      字幕文件
+#   {result_json_path} Result 对象 JSON 文件
+#
+# severity: error = 阻断级；warn = 提示级（不影响退出码）
+# ============================================================================
+
+version: "1.0"
+
+rules:
+  # ── 类别 1：文件存在性 file_exists ─────────────────────────────
+  - id: project_dir_exists
+    category: file_exists
+    check: path_exists
+    severity: error
+    params: { path: "{project_dir}", kind: dir }
+    message: "项目目录不存在"
+    sources: [preflight_check.check_production_readiness, architecture_self_check.selfcheck_05]
+
+  - id: html_index_exists
+    category: file_exists
+    check: path_exists
+    severity: error
+    params: { path: "{html_path}", kind: file }
+    message: "index.html 不存在"
+    sources: [preflight_check.check_production_readiness, architecture_self_check.selfcheck_05]
+
+  - id: config_file_exists
+    category: file_exists
+    check: path_exists
+    severity: error
+    params: { path: "{config_path}", kind: file }
+    message: "配置文件不存在"
+    sources: [preflight_check.check_json_config, regression_test]
+
+  - id: tts_manifest_exists
+    category: file_exists
+    check: path_exists
+    severity: error
+    params: { path: "{manifest_path}", kind: file }
+    message: "tts_manifest.json 不存在"
+    sources: [verify_tts_product, regression_test.test_tts_empty_scenes]
+
+  - id: asset_inventory_exists
+    category: file_exists
+    check: path_exists
+    severity: warn
+    params: { path: "{project_dir}/asset_inventory.json", kind: file }
+    message: "缺少 asset_inventory.json（建议运行 asset_scanner.py 生成）"
+    sources: [preflight_check.check_production_readiness]
+
+  # ── 类别 2：编码 encoding ─────────────────────────────────────
+  - id: config_utf8_readable
+    category: encoding
+    check: utf8_readable
+    severity: error
+    params: { path: "{config_path}" }
+    message: "配置文件无法按 UTF-8 读取"
+    sources: [preflight_check, verify_tts_product, regression_test]
+
+  - id: html_utf8_readable
+    category: encoding
+    check: utf8_readable
+    severity: error
+    params: { path: "{html_path}" }
+    message: "HTML 文件无法按 UTF-8 读取"
+    sources: [preflight_check, regression_test]
+
+  # ── 类别 3：JSON 结构 json_structure ──────────────────────────
+  - id: config_json_valid
+    category: json_structure
+    check: json_valid
+    severity: error
+    params: { path: "{config_path}" }
+    message: "配置 JSON 语法错误"
+    sources: [preflight_check.check_json_config, architecture_self_check]
+
+  - id: config_required_fields
+    category: json_structure
+    check: json_required_fields
+    severity: error
+    params:
+      path: "{config_path}"
+      fields: [video_duration, scenes]
+    message: "配置缺少必填字段"
+    sources: [preflight_check.check_json_config, regression_test.test_scene_compile_basic]
+
+  - id: scene_bounds_valid
+    category: json_structure
+    check: scene_bounds
+    severity: error
+    params:
+      path: "{config_path}"
+      continuity_tolerance: 0.01
+    message: "场景边界非法（start/end 缺失、倒置或不连续）"
+    sources: [preflight_check.check_json_config, regression_test.test_scene_compile_basic]
+
+  - id: photo_registry_json_valid
+    category: json_structure
+    check: json_valid
+    severity: error
+    params:
+      path: "{project_dir}/photo-registry.json"
+      skip_if_missing: true
+    message: "photo-registry.json 存在但 JSON 解析失败"
+    sources: [preflight_check.check_production_readiness, generate_photo_registry]
+
+  - id: manifest_json_valid
+    category: json_structure
+    check: json_valid
+    severity: error
+    params: { path: "{manifest_path}" }
+    message: "tts_manifest.json 解析失败"
+    sources: [verify_tts_product, regression_test.test_tts_empty_scenes]
+
+  # ── 类别 4：备份配对 backup_pairing ───────────────────────────
+  - id: config_backup_pair
+    category: backup_pairing
+    check: backup_pair
+    severity: warn
+    params:
+      path: "{config_path}"
+      validate: json          # 备份必须是合法 JSON
+    message: "配置备份（*.bak.json）缺失或语法错误"
+    sources: [preflight_check.check_json_config]
+
+  - id: html_backup_pair
+    category: backup_pairing
+    check: backup_pair
+    severity: warn
+    params:
+      path: "{html_path}"
+      bak_name: index.html.bak
+      validate: exists        # 仅要求存在
+    message: "index.html.bak 缺失（adjust_timeline.py 依赖该备份）"
+    sources: [preflight_check.check_bak_consistency]
+
+  # ── 类别 5：媒体参数 media_params ─────────────────────────────
+  - id: image_min_size
+    category: media_params
+    check: file_size_range
+    severity: warn
+    params:
+      path: "{image_path}"
+      min_bytes: 10240        # <10KB 疑似占位图
+    message: "图片过小，疑似占位图"
+    sources: [preflight_check.check_html_images]
+
+  - id: critical_image_size
+    category: media_params
+    check: file_size_range
+    severity: error
+    params:
+      path: "{image_path}"
+      min_bytes: 100000       # <100KB 关键图表可能不清晰
+      max_bytes: 5000000      # >5MB 过大
+    message: "关键图表尺寸超出合理区间（100KB~5MB）"
+    sources: [preflight_check.check_image_clarity]
+
+  - id: tts_audio_size
+    category: media_params
+    check: file_size_range
+    severity: error
+    params:
+      path: "{audio_path}"
+      min_bytes: 1024         # <1KB 视为假成功产物
+      max_bytes: 10485760     # >10MB 异常
+    message: "TTS 音频文件大小异常（1KB~10MB）"
+    sources: [verify_tts_product, regression_test]
+
+  - id: srt_format_valid
+    category: media_params
+    check: srt_valid
+    severity: error
+    params: { path: "{srt_path}" }
+    message: "SRT 字幕格式非法（编号/时间码/时序）"
+    sources: [media_qa_gate.parse_srt, regression_test.test_subtitle_format_validation]
+
+  # ── 类别 6：Result 接口 result_interface ──────────────────────
+  - id: result_object_shape
+    category: result_interface
+    check: result_shape
+    severity: error
+    params: { path: "{result_json_path}" }
+    message: "Result 对象缺少标准字段（status/code/message/data/metadata/diagnostics）"
+    sources: [script_interface.Result, regression_test.Result接口用例, verify_tts_product_v2]

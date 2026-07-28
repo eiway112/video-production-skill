@@ -1,0 +1,310 @@
+{
+  "meta": {
+    "version": "1.0",
+    "description": "Beat表五维诊断规则（法规层）",
+    "authority": "AGENTS.md > 本文件 > 阈值参数集",
+    "boundary": "只检查可客观度量的结构特征，不替代主观美学判断",
+    "action": "标记问题+提供建议，不阻断后续流程"
+  },
+
+  "profiles": {
+    "product_knowledge": {
+      "label": "产品介绍/知识讲解",
+      "max_static_interval_s": 7,
+      "max_density_ratio": 2.0,
+      "keyword_max_chars": 10,
+      "min_visual_modes": 4
+    },
+    "brand_emotion": {
+      "label": "品牌形象/情绪类",
+      "max_static_interval_s": 10,
+      "max_density_ratio": 3.0,
+      "keyword_max_chars": 15,
+      "min_visual_modes": 3
+    },
+    "tutorial_demo": {
+      "label": "教程/操作演示",
+      "max_static_interval_s": 5,
+      "max_density_ratio": 2.0,
+      "keyword_max_chars": 8,
+      "min_visual_modes": 5
+    }
+  },
+
+  "dimensions": [
+    {
+      "id": "rhythm",
+      "name": "节奏健康度",
+      "rules": [
+        {
+          "id": "1.1",
+          "name": "beat时长区间",
+          "check": "每个beat时长必须在[min_beat_s, max_static_interval]范围内",
+          "params": { "min_beat_s": 2.5, "max_static_interval_ref": "profile.max_static_interval_s" },
+          "severity": "warning",
+          "source": "办公隔墙视频scene1内15-20秒静止段"
+        },
+        {
+          "id": "1.2",
+          "name": "相邻场景密度差",
+          "check": "相邻场景平均beat时长比不超过max_density_ratio",
+          "params": { "max_density_ratio_ref": "profile.max_density_ratio" },
+          "severity": "warning",
+          "exception": "视觉喘息场景(≤4 beats)放宽至3倍",
+          "source": "多项目scene3密→scene4疏的落差"
+        },
+        {
+          "id": "1.3",
+          "name": "封面hook",
+          "check": "第一个beat必须在0:00-3:00，视觉响应必须是冲击力入场（非简单淡入）",
+          "severity": "critical",
+          "agents_md_ref": "封面场景规范",
+          "source": "AGENTS.md scene0规格"
+        },
+        {
+          "id": "1.4",
+          "name": "收尾不裸奔",
+          "check": "最后一个beat必须是专门的收尾设计（品牌/CTA），不允许仍是内容信息点",
+          "severity": "critical",
+          "agents_md_ref": "收尾场景规范",
+          "source": "办公隔墙视频scene8结束后直接黑屏"
+        },
+        {
+          "id": "1.6",
+          "name": "beat内元素stagger",
+          "check": "单个beat视觉响应包含≥2个元素时，必须标注stagger间隔",
+          "params": { "stagger_range_s": [0.2, 0.5] },
+          "severity": "warning",
+          "agents_md_ref": "动效时序规范-同屏元素入场时间差",
+          "source": "编译器anim_progressive_reveal固定stagger"
+        },
+        {
+          "id": "1.7",
+          "name": "动效类型标注",
+          "check": "beat视觉响应应标注动效类型，类型必须匹配AGENTS.md四类标准",
+          "params": {
+            "types": {
+              "entrance": { "duration_s": [0.5, 0.8], "ease": "ease-out" },
+              "exit": { "duration_s": [0.3, 0.5], "ease": "ease-in" },
+              "emphasis": { "duration_s": [0.4, 0.6], "ease": "power2.inOut" },
+              "transition": { "duration_s": [0.8, 1.2], "ease": "power1.inOut" }
+            }
+          },
+          "severity": "suggestion",
+          "agents_md_ref": "动效时序规范",
+          "source": "AGENTS.md动效时序四类标准"
+        }
+      ]
+    },
+    {
+      "id": "diversity",
+      "name": "视觉多样性",
+      "rules": [
+        {
+          "id": "2.1",
+          "name": "相邻场景视觉模式去重",
+          "check": "相邻场景不得标注为同一视觉模式标签",
+          "params": {
+            "mode_labels": [
+              "cards_reveal", "space_annotate", "layer_expand",
+              "cross_section", "comparison", "data_emphasis",
+              "concept_flow", "text_only", "image_focus"
+            ]
+          },
+          "severity": "warning",
+          "source": "办公隔墙beat表自检：场景4/5=layer_expand，场景2/6=space_annotate"
+        },
+        {
+          "id": "2.2",
+          "name": "全片模式丰富度",
+          "check": "全片视觉模式种类数 ≥ max(min_visual_modes, 场景数×0.5)",
+          "params": { "min_visual_modes_ref": "profile.min_visual_modes" },
+          "severity": "warning",
+          "source": "编译器v2虽有7种类型但实际只用了2-3种"
+        },
+        {
+          "id": "2.3",
+          "name": "跨场景入场方式多样",
+          "check": "相邻场景的主要入场方式不得相同",
+          "params": {
+            "directions": ["from_left", "from_right", "from_bottom", "fade_in", "scale_up", "highlight"]
+          },
+          "severity": "suggestion",
+          "scope": "跨场景（场景内同类元素仍遵循AGENTS.md统一入场规则）",
+          "source": "anim_progressive_reveal固定方向入场"
+        },
+        {
+          "id": "2.4",
+          "name": "纯文字场景上限",
+          "check": "连续2个场景不得都是纯文字+背景模式（无图片/图表/动画主体）",
+          "severity": "warning",
+          "source": "多项目scene1/2只有标题+卡片，无任何图片"
+        }
+      ]
+    },
+    {
+      "id": "sync",
+      "name": "旁白-画面同步性",
+      "rules": [
+        {
+          "id": "3.1",
+          "name": "旁白句零遗漏",
+          "check": "旁白中每个独立信息句（按句号/分号分割）必须有对应beat",
+          "severity": "critical",
+          "source": "SDL只描述组件不关心旁白句数"
+        },
+        {
+          "id": "3.2",
+          "name": "语义锚点对齐",
+          "check": "旁白中的锚点词必须在同一beat的视觉响应中有对应视觉元素",
+          "params": {
+            "anchors": {
+              "number": { "keywords": ["%", "dB", "mm", "kg", "数字"], "visual": "数字可视化" },
+              "product": { "keywords": ["WSI", "模块", "系统", "系列"], "visual": "产品图片或标识" },
+              "comparison": { "keywords": ["对比", "相比", "不同于", "传统vs"], "visual": "对比布局" },
+              "process": { "keywords": ["步骤", "路径", "从...到..."], "visual": "流程箭头或步骤图" },
+              "space": { "keywords": ["会议室", "走廊", "租区", "前台"], "visual": "空间标注或实景" }
+            }
+          },
+          "severity": "warning",
+          "source": "旁白说WSI 120时画面没有WSI 120视觉标识"
+        },
+        {
+          "id": "3.3",
+          "name": "屏幕关键词长度",
+          "check": "屏幕关键词字符数不超过keyword_max_chars",
+          "params": { "keyword_max_chars_ref": "profile.keyword_max_chars" },
+          "severity": "suggestion",
+          "source": "长屏幕文字与底部字幕视觉冲突"
+        },
+        {
+          "id": "3.4",
+          "name": "单beat信息负载",
+          "check": "单个beat旁白句子中独立概念（逗号/顿号分隔）不超过2个，超过则建议拆分",
+          "params": { "max_concepts_per_beat": 2 },
+          "severity": "warning",
+          "source": "一句旁白含3个产品名但只有1个beat"
+        },
+        {
+          "id": "3.5",
+          "name": "字幕安全区预留",
+          "check": "beat视觉响应中如包含'底部'、'全屏铺满'等词，标记字幕冲突风险",
+          "severity": "warning",
+          "agents_md_ref": "字幕防重叠机制-padding-bottom>=150px",
+          "source": "字幕烧录后与场景内容干涉"
+        },
+        {
+          "id": "3.6",
+          "name": "事实性断言追溯",
+          "check": "beat旁白中的具体数值/标准编号/政策法规应标注信息来源",
+          "severity": "suggestion",
+          "source": "AGENTS.md旁白事实性断言约束"
+        }
+      ]
+    },
+    {
+      "id": "assets",
+      "name": "资产完备性",
+      "rules": [
+        {
+          "id": "4.1",
+          "name": "真实空间必须有图",
+          "check": "旁白或视觉响应中出现空间关键词时，必须有ImageGen资产或已有实景照片",
+          "params": {
+            "trigger_words": ["办公室", "会议室", "走廊", "前台", "大堂", "施工现场", "医院", "酒店", "展厅", "工厂"]
+          },
+          "severity": "warning",
+          "agents_md_ref": "氛围背景素材生成-触发条件",
+          "source": "办公场景CSS渐变退化为单调背景"
+        },
+        {
+          "id": "4.2",
+          "name": "产品提及必须有图",
+          "check": "旁白提到具体产品名且该beat素材列为空时，标记关键缺失",
+          "severity": "warning",
+          "source": "WSI 82被多次提及但只有1张照片"
+        },
+        {
+          "id": "4.3",
+          "name": "资产过度复用",
+          "check": "同一张照片被≥3个beat引用时标记过度复用",
+          "params": { "max_reuse_count": 2 },
+          "severity": "suggestion",
+          "source": "项目6张照片在42个beat中反复使用"
+        },
+        {
+          "id": "4.4",
+          "name": "场景级视觉空洞",
+          "check": "场景内所有beat素材列均为空时标记为视觉空洞",
+          "severity": "warning",
+          "source": "多场景全程只有文字动画无图片支撑"
+        },
+        {
+          "id": "4.5",
+          "name": "ImageGen叠层合规",
+          "check": "使用ImageGen背景的beat必须在视觉响应中注明暗色叠层",
+          "severity": "warning",
+          "agents_md_ref": "氛围背景素材生成-暗色叠层强制",
+          "source": "ImageGen背景无叠层导致文字不可读"
+        }
+      ]
+    },
+    {
+      "id": "structure",
+      "name": "结构完整性",
+      "rules": [
+        {
+          "id": "5.1",
+          "name": "叙事弧线四段分布",
+          "check": "将beat按时间分四段(0-25%/25-50%/50-75%/75-100%)，密度应呈引入→展开→高潮→收束",
+          "severity": "suggestion",
+          "source": "多项目scene7/8信息密度反而高于scene3/4"
+        },
+        {
+          "id": "5.2",
+          "name": "高潮场景位置",
+          "check": "全片视觉冲击力最强的场景应出现在50%-75%的时间位置",
+          "severity": "suggestion",
+          "source": "办公隔墙场景7（对比+数据动画）在75%位置"
+        },
+        {
+          "id": "5.3",
+          "name": "视觉喘息",
+          "check": "连续3个高密度场景(≥6 beats)后必须有低密度场景(≤4 beats)",
+          "severity": "warning",
+          "source": "连续高密度场景导致信息疲劳"
+        },
+        {
+          "id": "5.4",
+          "name": "跨主题转场标注",
+          "check": "相邻场景主题完全不同时，beat表应标注转场方式",
+          "severity": "suggestion",
+          "agents_md_ref": "动效时序规范-转场切换",
+          "source": "Codex转场逻辑检查项"
+        },
+        {
+          "id": "5.5",
+          "name": "转场空白上限",
+          "check": "转场beat如描述为清空或全部退场，持续时间不得超过0.5秒",
+          "params": { "max_transition_blank_s": 0.5 },
+          "severity": "warning",
+          "agents_md_ref": "动效时序规范-转场时画面全空不超过0.5s",
+          "source": "AGENTS.md动效时序规范"
+        }
+      ]
+    }
+  ],
+
+  "report_format": {
+    "severity_levels": {
+      "critical": { "symbol": "🔴", "meaning": "会产生可见质量缺陷，强烈建议修复" },
+      "warning": { "symbol": "🟡", "meaning": "影响观感质量，建议修复" },
+      "suggestion": { "symbol": "🔵", "meaning": "可改善项，按优先级处理" }
+    },
+    "verdict_thresholds": {
+      "ready": "0 critical, ≤2 warning",
+      "fix_first": "any critical, or >3 warning",
+      "redesign": "any dimension has all rules failing"
+    }
+  }
+}

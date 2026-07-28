@@ -1,0 +1,143 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Compiled Scenes Contract",
+  "description": "规范化场景数据模型 - 所有消费者（TTS、Timeline、Render、Verify）的唯一权威源",
+  "type": "object",
+  "required": ["project_name", "total_duration", "scenes"],
+  "properties": {
+    "project_name": {
+      "type": "string",
+      "description": "项目名称"
+    },
+    "total_duration": {
+      "type": "number",
+      "description": "视频总时长（秒）",
+      "minimum": 0
+    },
+    "compiled_at": {
+      "type": "string",
+      "description": "编译时间戳（ISO 8601）"
+    },
+    "source_narration_hash": {
+      "type": "string",
+      "description": "源 narration.json 的 SHA256 哈希"
+    },
+    "compiler_version": {
+      "type": "string",
+      "description": "编译器版本（Git commit hash）"
+    },
+    "scenes": {
+      "type": "array",
+      "description": "场景列表（必须包含至少1个非封面场景）",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["scene_id", "type", "start", "end", "duration"],
+        "properties": {
+          "scene_id": {
+            "type": "string",
+            "description": "场景唯一标识（如 s0, s1, ...）",
+            "pattern": "^s[0-9]+$"
+          },
+          "type": {
+            "type": "string",
+            "description": "场景类型",
+            "enum": ["cover", "content", "transition", "static", "gsap", "animation"]
+          },
+          "title": {
+            "type": "string",
+            "description": "场景标题"
+          },
+          "start": {
+            "type": "number",
+            "description": "场景开始时间（秒）",
+            "minimum": 0
+          },
+          "end": {
+            "type": "number",
+            "description": "场景结束时间（秒）",
+            "minimum": 0
+          },
+          "duration": {
+            "type": "number",
+            "description": "场景时长（秒）= end - start",
+            "minimum": 0
+          },
+          "narration": {
+            "type": "string",
+            "description": "场景旁白文本"
+          },
+          "narration_required": {
+            "type": "boolean",
+            "description": "是否需要旁白（默认 true）",
+            "default": true
+          },
+          "subtitle_required": {
+            "type": "boolean",
+            "description": "是否需要字幕（默认 true）",
+            "default": true
+          },
+          "assets": {
+            "type": "array",
+            "description": "场景引用的素材文件列表",
+            "items": {
+              "type": "string"
+            }
+          },
+          "audio_file": {
+            "type": "string",
+            "description": "TTS 生成的音频文件相对路径（TTS 后填充）"
+          },
+          "audio_hash": {
+            "type": "string",
+            "description": "音频文件的 SHA256 哈希（验证后填充）"
+          },
+          "audio_duration": {
+            "type": "number",
+            "description": "实际音频时长（秒）（TTS 后填充）"
+          },
+          "validation_status": {
+            "type": "string",
+            "description": "验证状态",
+            "enum": ["pending", "valid", "failed", "degraded"],
+            "default": "pending"
+          },
+          "validation_error": {
+            "type": "string",
+            "description": "验证失败原因"
+          }
+        }
+      }
+    },
+    "validation_metadata": {
+      "type": "object",
+      "description": "全局验证元数据",
+      "properties": {
+        "total_scenes": {
+          "type": "integer",
+          "description": "场景总数"
+        },
+        "content_scenes": {
+          "type": "integer",
+          "description": "非封面场景数（需要旁白的）"
+        },
+        "tts_expected_count": {
+          "type": "integer",
+          "description": "预期 TTS 音频数"
+        },
+        "tts_actual_count": {
+          "type": "integer",
+          "description": "实际生成的 TTS 音频数"
+        },
+        "all_times_continuous": {
+          "type": "boolean",
+          "description": "场景时间是否连续无重叠"
+        },
+        "final_time_matches_duration": {
+          "type": "boolean",
+          "description": "最后场景的 end 时间是否等于 total_duration"
+        }
+      }
+    }
+  }
+}

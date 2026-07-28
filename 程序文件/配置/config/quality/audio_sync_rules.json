@@ -1,0 +1,30 @@
+{
+  "$schema": "Audio-sync validation rules for pipeline_runner + enhance_video_audio",
+  "$description": "See AGENTS.md → 渲染纪律 → 音画同步。任一场景 TTS 结束到窗口边界间的静音超过 max_seconds_per_scene → 阻断交付。",
+  "dead_air": {
+    "max_seconds_per_scene": 3.0,
+    "fail_on_violation": true,
+    "remediation": "运行 pipeline_runner.py --config <cfg>（默认已启用 --shrink）或收紧 config.json 中该场景的 end 时间。"
+  },
+  "shrink": {
+    "enabled_by_default": true,
+    "shrink_margin_seconds": 1.5,
+    "description": "pipeline_runner 传给 adjust_timeline.py 的 --shrink-margin：TTS 播完后为镜头预留的呼吸时间。需覆盖 GSAP 场景 pre-fade(0.5s) + 感官缓冲(1.0s)，避免音频尾音撞进画面淡出。"
+  },
+  "mix": {
+    "tts_volume": 1.5,
+    "bgm_volume": 0.08,
+    "loudnorm_I": -16,
+    "loudnorm_TP": -1.5,
+    "loudnorm_LRA": 11,
+    "description": "TTS 音量增益(1.5x) + BGM音量(0.08x) + EBU R128 响度标准化(-16 LUFS)。amix normalize=0 禁用按输入数衰减。"
+  },
+  "alignment": {
+    "p95_max_seconds": 0.6,
+    "min_onsets": 5,
+    "silence_db": -38,
+    "min_silence_seconds": 0.5,
+    "fail_on_violation": true,
+    "description": "字幕-语音对齐度门禁（media_qa_gate 检查12）：silencedetect 提取成片音轨语音起口，与最近字幕条目起点比对，偏差 p95 超过 p95_max_seconds 则拒收。起口数 < min_onsets（如含 BGM 无静音段）降级为警告。"
+  }
+}

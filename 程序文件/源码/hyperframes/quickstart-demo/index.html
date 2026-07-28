@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1920,height=1080">
+  <title>quickstart-demo</title>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    /* ── SAFE ZONE: 修改此变量即可全局调整字幕安全区高度 ── */
+    :root { --safe-zone-height: 325px; }
+    body { width:1920px; height:1080px; overflow:hidden;
+      background:#0c1222; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+    .scene { position:absolute; top:0; left:0; width:1920px; height:1080px; overflow:hidden; opacity:0; }
+    .sc { position:relative; width:100%; height:100%;
+      padding:60px 100px calc(var(--safe-zone-height) + 60px); overflow:hidden;
+      background:radial-gradient(ellipse at 30% 40%, #1a2744 0%, #0c1222 60%, #060a14 100%); display:flex; flex-direction:column; gap:16px; }
+    .subtitle-safe { position:absolute; bottom:0; left:0; width:100%;
+      height:var(--safe-zone-height); z-index:100; pointer-events:none;
+      background:linear-gradient(to bottom,rgba(10,15,30,0) 0%,rgba(10,15,30,0.88) 40%,rgba(10,15,30,0.96) 100%); }
+#scene0 .hero-title { font-size:96px; font-weight:700; color:#e8edf5;
+  text-align:center; line-height:1.15; letter-spacing:-2px;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; text-shadow:0 0 80px rgba(59,130,246,0.15); }
+#scene0 .hero-sub { font-size:44px; color:#8899b3; text-align:center;
+  margin-top:24px; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene0 .kw-row { display:flex; gap:16px; justify-content:center; margin-top:40px; flex-wrap:wrap; }
+#scene0 .kw-tag { padding:10px 28px; background:#1c2d4a; color:#06b6d4;
+  border-radius:30px; font-size:28px; font-weight:500; border:1px solid #3b82f640; }
+
+/* Scene 1: cards [feature] */
+#scene1 .sc { display:flex; flex-direction:column; align-items:center; padding-top:50px; padding-bottom:calc(var(--safe-zone-height) + 60px); }
+#scene1 .section-heading { font-size:56px; font-weight:700; color:#e8edf5;
+  margin-bottom:24px; opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene1 .cards-grid { display:grid; gap:18px; width:100%; max-width:1760px; }
+#scene1 .feat-card { background:#141e33; border:2px solid #3b82f620;
+  border-radius:16px; padding:32px 28px; display:flex; flex-direction:column;
+  gap:8px; box-shadow:0 8px 32px rgba(0,0,0,0.4); opacity:0; }
+#scene1 .feat-badge { display:inline-block; padding:6px 16px; background:#3b82f615;
+  color:#3b82f6; border-radius:20px; font-size:22px; font-weight:700; width:fit-content;
+  margin-bottom:8px; }
+#scene1 .feat-title { font-size:36px; font-weight:800; color:#3b82f6;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene1 .feat-desc { font-size:28px; color:#8899b3; line-height:1.5;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+
+/* Scene 2: stats [default] */
+#scene2 .sc { display:flex; flex-direction:column; align-items:center; padding-top:50px; padding-bottom:calc(var(--safe-zone-height) + 60px); }
+#scene2 .section-heading { font-size:56px; font-weight:700; color:#e8edf5;
+  margin-bottom:24px; opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene2 .stats-row { display:flex; gap:60px; justify-content:center; flex-wrap:wrap; }
+#scene2 .stat-item { text-align:center; opacity:0; }
+#scene2 .stat-ring { width:220px; height:220px; border-radius:50%;
+  border:6px solid #3b82f630; display:flex; align-items:center;
+  justify-content:center; background:#3b82f608; margin:0 auto; }
+#scene2 .stat-number { font-size:72px; font-weight:800; color:#3b82f6;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; line-height:1; }
+#scene2 .stat-label { font-size:32px; color:#8899b3; margin-top:20px;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; font-weight:600; }
+
+/* Scene 3: split [default] — 纯 CSS 流水线示意图，无外部素材 */
+#scene3 .sc { display:flex; align-items:center; justify-content:center; padding:60px 100px calc(var(--safe-zone-height) + 60px); }
+#scene3 .split-wrap { display:flex; gap:60px; align-items:center; width:100%; max-width:1700px; }
+#scene3 .split-media { flex:1; min-width:0; opacity:0; }
+#scene3 .pipe-diagram { display:flex; flex-direction:column; gap:20px;
+  background:#141e33; border:2px solid #3b82f620; border-radius:16px;
+  padding:48px 40px; box-shadow:0 8px 32px rgba(0,0,0,0.4); }
+#scene3 .pipe-node { display:flex; align-items:center; gap:20px;
+  background:#1c2d4a; border:1px solid #3b82f640; border-radius:12px;
+  padding:20px 28px; }
+#scene3 .pipe-dot { width:16px; height:16px; border-radius:50%;
+  background:linear-gradient(135deg,#3b82f6,#06b6d4); flex-shrink:0; }
+#scene3 .pipe-label { font-size:30px; font-weight:600; color:#e8edf5;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene3 .pipe-tag { margin-left:auto; font-size:22px; color:#06b6d4;
+  background:#06b6d415; padding:4px 16px; border-radius:16px; }
+#scene3 .pipe-arrow { text-align:center; font-size:28px; color:#3b82f680; line-height:0.6; }
+#scene3 .split-content { flex:1; min-width:0; }
+#scene3 .split-heading { font-size:56px; font-weight:700; color:#e8edf5;
+  margin-bottom:24px; opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene3 .split-text { font-size:34px; color:#8899b3; line-height:1.7;
+  opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+
+/* Scene 4: list [process] */
+#scene4 .sc { display:flex; flex-direction:column; align-items:center; padding-top:50px; padding-bottom:calc(var(--safe-zone-height) + 60px); }
+#scene4 .section-heading { font-size:56px; font-weight:700; color:#e8edf5;
+  margin-bottom:24px; opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene4 .process-row { display:flex; align-items:flex-start; gap:0; max-width:1700px; width:100%; }
+#scene4 .step-card { flex:1; background:#141e33; border:2px solid #3b82f615;
+  border-radius:16px; padding:28px 24px; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.4); opacity:0; }
+#scene4 .step-num { font-size:48px; font-weight:900; color:#3b82f6; line-height:1; margin-bottom:12px; }
+#scene4 .step-title { font-size:32px; font-weight:700; color:#e8edf5;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; margin-bottom:8px; }
+#scene4 .step-desc { font-size:26px; color:#8899b3; line-height:1.4;
+  font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene4 .step-connector { width:40px; height:4px; background:#3b82f640;
+  margin-top:60px; flex-shrink:0; border-radius:2px; }
+
+/* Scene 5: closing [default] */
+#scene5 .sc { display:flex; align-items:center; justify-content:center; padding-bottom:calc(var(--safe-zone-height) + 60px);
+  background:linear-gradient(135deg, #3b82f608 0%, #0c1222 50%, #06b6d408 100%); }
+#scene5 .closing-wrap { text-align:center; max-width:1500px; }
+#scene5 .closing-title { font-size:80px; font-weight:700; color:#e8edf5;
+  line-height:1.15; opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; text-shadow:0 0 80px rgba(59,130,246,0.15); }
+#scene5 .closing-sub { font-size:38px; color:#8899b3;
+  margin-top:20px; opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
+#scene5 .cta-btn { display:inline-block; margin-top:48px; padding:20px 60px;
+  background:linear-gradient(135deg, #3b82f6, #06b6d4);
+  color:#fff; font-size:32px; font-weight:600; border-radius:40px;
+  opacity:0; font-family:'Inter', 'Microsoft YaHei', sans-serif; box-shadow:0 8px 32px #3b82f650; }
+
+  </style>
+</head>
+<body>
+<div id="root" data-composition-id="main" data-start="0"
+     data-duration="43.0" data-cover-duration="3.0"
+     data-width="1920" data-height="1080">
+
+<!-- Scene 0: Cover (0s - 3s) -->
+<div id="scene0" class="scene" style="z-index:999; opacity:1;">
+  <div style="position:absolute;width:800px;height:800px;background:radial-gradient(circle,#3b82f615 0%,transparent 70%);top:-200px;right:-100px;border-radius:50%;pointer-events:none;"></div>
+  <div style="position:absolute;width:600px;height:600px;background:radial-gradient(circle,#06b6d410 0%,transparent 70%);bottom:-150px;left:-100px;border-radius:50%;pointer-events:none;"></div>
+  <div class="sc" style="display:flex;align-items:center;justify-content:center;">
+    <div class="hero-wrap">
+      <h1 class="hero-title">AI视频自动化工作流</h1>
+      <p class="hero-sub">从旁白脚本到成片·一条流水线搞定</p>
+      <div class="kw-row"><span class="kw-tag">自动化</span><span class="kw-tag">可验证</span><span class="kw-tag">可复现</span></div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<!-- Scene 1: Feature cards (3.0s - 9.5s) -->
+<div id="scene1" class="scene" style="z-index:1;">
+  <div class="sc">
+    <h2 class="section-heading">三大核心能力</h2>
+    <div class="cards-grid" style="grid-template-columns:repeat(3,1fr);">
+      <div class="feat-card" id="scene1-c0">
+        <span class="feat-badge">★</span>
+        <h3 class="feat-title">单一权威源</h3>
+        <p class="feat-desc">旁白只在1处定义，全链路统一消费</p>
+      </div>
+      <div class="feat-card" id="scene1-c1">
+        <span class="feat-badge">★</span>
+        <h3 class="feat-title">真实性门禁</h3>
+        <p class="feat-desc">每次"成功"都有真实测量数据背书</p>
+      </div>
+      <div class="feat-card" id="scene1-c2">
+        <span class="feat-badge">★</span>
+        <h3 class="feat-title">自动收敛</h3>
+        <p class="feat-desc">时间轴由语音时长驱动，杜绝空窗</p>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<!-- Scene 2: Stats (9.5s - 17.7s) -->
+<div id="scene2" class="scene" style="z-index:2;">
+  <div class="sc">
+    <h2 class="section-heading">质量保障数据</h2>
+    <div class="stats-row">
+      <div class="stat-item" id="scene2-s0">
+        <div class="stat-ring"><div class="stat-number" data-target="11">0项</div></div>
+        <div class="stat-label">媒体质量检查</div>
+      </div>
+      <div class="stat-item" id="scene2-s1">
+        <div class="stat-ring"><div class="stat-number" data-target="7">0层</div></div>
+        <div class="stat-label">语音产物验证</div>
+      </div>
+      <div class="stat-item" id="scene2-s2">
+        <div class="stat-ring"><div class="stat-number" data-target="18">0个</div></div>
+        <div class="stat-label">回归测试用例</div>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<!-- Scene 3: Split (17.7s - 24.9s) — 纯 CSS 流水线示意，无外部素材依赖 -->
+<div id="scene3" class="scene" style="z-index:3;">
+  <div class="sc">
+    <div class="split-wrap" style="flex-direction:row;">
+      <div class="split-media">
+        <div class="pipe-diagram">
+          <div class="pipe-node"><span class="pipe-dot"></span><span class="pipe-label">旁白脚本</span><span class="pipe-tag">narration.json</span></div>
+          <div class="pipe-arrow">▼</div>
+          <div class="pipe-node"><span class="pipe-dot"></span><span class="pipe-label">语音合成</span><span class="pipe-tag">TTS</span></div>
+          <div class="pipe-arrow">▼</div>
+          <div class="pipe-node"><span class="pipe-dot"></span><span class="pipe-label">时间轴收敛</span><span class="pipe-tag">auto</span></div>
+          <div class="pipe-arrow">▼</div>
+          <div class="pipe-node"><span class="pipe-dot"></span><span class="pipe-label">渲染成片</span><span class="pipe-tag">MP4</span></div>
+        </div>
+      </div>
+      <div class="split-content">
+        <h2 class="split-heading">全链路自动衔接</h2>
+        <p class="split-text">从旁白文本到成片，语音合成、时间轴收敛、渲染合成每个环节由流水线自动衔接，中间产物自动校验，无需手工干预。</p>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<!-- Scene 4: Process (24.9s - 33.3s) -->
+<div id="scene4" class="scene" style="z-index:4;">
+  <div class="sc">
+    <h2 class="section-heading">制作流程</h2>
+    <div class="process-row">
+      <div class="step-card" id="scene4-st0">
+        <div class="step-num">1</div>
+        <h3 class="step-title">编写旁白</h3>
+        <p class="step-desc">narration.json 唯一权威源</p>
+      </div>
+      <div class="step-connector"></div>
+      <div class="step-card" id="scene4-st1">
+        <div class="step-num">2</div>
+        <h3 class="step-title">生成语音</h3>
+        <p class="step-desc">TTS 合成+7层产物验证</p>
+      </div>
+      <div class="step-connector"></div>
+      <div class="step-card" id="scene4-st2">
+        <div class="step-num">3</div>
+        <h3 class="step-title">时间轴收敛</h3>
+        <p class="step-desc">按语音时长自动消除空窗</p>
+      </div>
+      <div class="step-connector"></div>
+      <div class="step-card" id="scene4-st3">
+        <div class="step-num">4</div>
+        <h3 class="step-title">渲染交付</h3>
+        <p class="step-desc">质量门禁通过后输出成片</p>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<!-- Scene 5: Closing (33.3s - 40.0s) -->
+<div id="scene5" class="scene" style="z-index:5;">
+  <div style="position:absolute;width:700px;height:700px;background:radial-gradient(circle,#3b82f612 0%,transparent 70%);top:-200px;left:50%;transform:translateX(-50%);border-radius:50%;pointer-events:none;"></div>
+  <div class="sc">
+    <div class="closing-wrap">
+      <h1 class="closing-title">让创意直达成片</h1>
+      <p class="closing-sub">AI视频自动化工作流·开箱即用</p>
+      <div class="cta-btn">开始使用 →</div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<!-- End fade overlay -->
+<div id="scene-end-fade" style="position:absolute;top:0;left:0;width:1920px;height:1080px;
+  background:#000;opacity:0;z-index:998;pointer-events:none;"></div>
+
+</div>
+
+<script>
+  window.__timelines = window.__timelines || {};
+  var tl = gsap.timeline({ paused: true });
+
+  // T-block: scene start times (structured — adjust_timeline.py rewrites this block)
+  var T = { s0: 0.0, s1: 3.0, s2: 9.5, s3: 17.7, s4: 24.9, s5: 33.3 };
+  // S-block: authoritative scene metadata (absolute video time, incl. cover)
+  var S = [{"start": 0, "end": 3, "dur": 3, "type": "cover", "cover": true, "title": "封面"},
+           {"start": 3.0, "end": 9.5, "dur": 6.5, "type": "gsap", "cover": false, "title": "核心能力"},
+           {"start": 9.5, "end": 17.7, "dur": 8.2, "type": "gsap", "cover": false, "title": "质量门禁"},
+           {"start": 17.7, "end": 24.9, "dur": 7.2, "type": "gsap", "cover": false, "title": "流水线衔接"},
+           {"start": 24.9, "end": 33.3, "dur": 8.4, "type": "gsap", "cover": false, "title": "四步流程"},
+           {"start": 33.3, "end": 43.0, "dur": 9.7, "type": "gsap", "cover": false, "title": "行动号召"}];
+
+  // Cover fade-out
+  tl.to("#scene0", { opacity: 0, duration: 0.3 }, T.s1 - 0.3);
+  tl.set("#scene0", { visibility: "hidden" }, T.s1);
+
+  // Scene 1 entrance and visibility
+  tl.set("#scene1", { opacity: 1 }, T.s1);
+  tl.fromTo("#scene1 .section-heading",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.8, ease: "power2.out" }, T.s1 + 0.2);
+  tl.fromTo("#scene1-c0",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s1 + 0.6);
+  tl.fromTo("#scene1-c1",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s1 + 1.0);
+  tl.fromTo("#scene1-c2",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s1 + 1.4);
+  // Scene 1 exit
+  tl.to("#scene1", { opacity: 0, duration: 0.5, ease: "power1.inOut" }, T.s2 - 0.5);
+  tl.set("#scene1", { visibility: "hidden" }, T.s2);
+
+  // Scene 2 entrance and visibility
+  tl.set("#scene2", { opacity: 1 }, T.s2);
+  tl.fromTo("#scene2 .section-heading",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.8, ease: "power2.out" }, T.s2 + 0.2);
+  gsap.utils.toArray("#scene2 .stat-item").forEach((el, i) => {
+    tl.fromTo(el,
+      { opacity: 0, y: 30, scale: 0.9 },
+      { opacity: 1, y: 0, scale: 1, duration: 0.7, ease: "power2.out" },
+      T.s2 + 0.6 + i * 0.3);
+  });
+  tl.to("#scene2-s0 .stat-number", {
+    innerText: 11, duration: 1.2, snap: { innerText: 1 }, ease: "power2.out",
+    onUpdate: function() {
+      this.targets()[0].textContent = Math.round(parseFloat(this.targets()[0].innerText)) + "项";
+    }
+  }, T.s2 + 1.2);
+  tl.to("#scene2-s1 .stat-number", {
+    innerText: 7, duration: 1.2, snap: { innerText: 1 }, ease: "power2.out",
+    onUpdate: function() {
+      this.targets()[0].textContent = Math.round(parseFloat(this.targets()[0].innerText)) + "层";
+    }
+  }, T.s2 + 1.5);
+  tl.to("#scene2-s2 .stat-number", {
+    innerText: 18, duration: 1.2, snap: { innerText: 1 }, ease: "power2.out",
+    onUpdate: function() {
+      this.targets()[0].textContent = Math.round(parseFloat(this.targets()[0].innerText)) + "个";
+    }
+  }, T.s2 + 1.8);
+  // Scene 2 exit
+  tl.to("#scene2", { opacity: 0, duration: 0.5, ease: "power1.inOut" }, T.s3 - 0.5);
+  tl.set("#scene2", { visibility: "hidden" }, T.s3);
+
+  // Scene 3 entrance and visibility
+  tl.set("#scene3", { opacity: 1 }, T.s3);
+  tl.fromTo("#scene3 .split-media",
+    { opacity: 0, x: -50, scale: 0.9 },
+    { opacity: 1, x: 0, scale: 1, duration: 0.8, ease: "power2.out" }, T.s3 + 0.2);
+  tl.fromTo("#scene3 .split-heading",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.8, ease: "power2.out" }, T.s3 + 0.6);
+  tl.fromTo("#scene3 .split-text",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.8, ease: "power2.out" }, T.s3 + 1.0);
+  // Scene 3 exit
+  tl.to("#scene3", { opacity: 0, duration: 0.5, ease: "power1.inOut" }, T.s4 - 0.5);
+  tl.set("#scene3", { visibility: "hidden" }, T.s4);
+
+  // Scene 4 entrance and visibility
+  tl.set("#scene4", { opacity: 1 }, T.s4);
+  tl.fromTo("#scene4 .section-heading",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.8, ease: "power2.out" }, T.s4 + 0.2);
+  tl.fromTo("#scene4-st0",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s4 + 0.6);
+  tl.fromTo("#scene4-st1",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s4 + 1.0);
+  tl.fromTo("#scene4-st2",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s4 + 1.4);
+  tl.fromTo("#scene4-st3",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, T.s4 + 1.8);
+  // Scene 4 exit
+  tl.to("#scene4", { opacity: 0, duration: 0.5, ease: "power1.inOut" }, T.s5 - 0.5);
+  tl.set("#scene4", { visibility: "hidden" }, T.s5);
+
+  // Scene 5 entrance and visibility
+  tl.set("#scene5", { opacity: 1 }, T.s5);
+  tl.fromTo("#scene5 .closing-title",
+    { opacity: 0, y: 40, scale: 0.9 },
+    { opacity: 1, y: 0, scale: 1, duration: 0.8, ease: "power2.out" }, T.s5 + 0.2);
+  tl.fromTo("#scene5 .closing-sub",
+    { opacity: 0, y: 30 },
+    { opacity: 1, y: 0, duration: 0.7, ease: "power2.out" }, T.s5 + 0.8);
+  tl.fromTo("#scene5 .cta-btn",
+    { opacity: 0, y: 30, scale: 0.9 },
+    { opacity: 1, y: 0, scale: 1, duration: 0.6, ease: "power2.out" }, T.s5 + 1.3);
+  // Scene 5 end fade (kept within the shrunk window: TTS 5.0s + margin)
+  tl.to("#scene-end-fade", { opacity: 1, duration: 0.5 }, T.s5 + 5.8);
+
+  window.__timelines["main"] = tl;
+</script>
+</body>
+</html>

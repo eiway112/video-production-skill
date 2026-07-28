@@ -1,0 +1,31 @@
+# 核心依赖
+pathlib2>=2.3.7
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# 视频处理
+Pillow>=10.0.0
+moviepy>=1.0.3
+
+# 预览引擎
+websocket-client>=1.5.0
+
+# TTS
+edge-tts>=6.0.0
+# Qwen / CosyVoice TTS via 阿里云百炼 DashScope（HyperFrames 默认引擎）
+dashscope>=1.25.17
+
+# 字幕-语音强制对齐（_forced_align.py，本地离线 ASR，P0-a）
+faster-whisper>=1.2.0
+
+# 中文处理
+jieba>=0.42.1
+
+# PPT处理（Doc2Video）
+python-pptx>=0.6.21
+
+# 文档处理
+python-docx>=0.8.11
+
+# 日志与追踪
+tqdm>=4.66.0
