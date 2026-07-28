@@ -521,11 +521,16 @@ def test_media_qa_gate_checks() -> RegressionTestCase:
     """用例10：媒体QA门禁检查项"""
     tc = RegressionTestCase(
         "media_qa_gate_checks",
-        "验证11项媒体质量检查都已实现"
+        "验证16项媒体质量检查都已实现（含黑场重叠/单字行/术语规范新门禁）"
     )
     
     try:
-        from media_qa_gate import MediaQAGate
+        from media_qa_gate import (
+            MediaQAGate,
+            ffmpeg_detect_black_intervals,
+            _load_black_frame_rules,
+            _load_term_lint_patterns,
+        )
         
         qa = MediaQAGate()
         
@@ -538,6 +543,26 @@ def test_media_qa_gate_checks() -> RegressionTestCase:
         sig = inspect.signature(qa.validate)
         tc.assert_true("video_path" in sig.parameters, "validate has video_path param")
         tc.assert_true("subtitle_path" in sig.parameters, "validate has subtitle_path param")
+        
+        # 新门禁（检查14/15/16）基础设施存在且规则可加载（单一权威源）
+        tc.assert_true(callable(ffmpeg_detect_black_intervals),
+                      "check14: ffmpeg_detect_black_intervals exists")
+        bf_rules = _load_black_frame_rules()
+        tc.assert_true("min_black_seconds" in bf_rules
+                      and "max_overlap_with_narration_seconds" in bf_rules,
+                      "check14: black_frame rules loadable with required keys")
+        term_patterns = _load_term_lint_patterns()
+        tc.assert_true(isinstance(term_patterns, list) and len(term_patterns) > 0,
+                      "check16: subtitle_term_rules lint_patterns loadable and non-empty")
+        
+        # 新门禁对带孤字行/术语违规的 SRT 文本真实拦截（不需要视频文件）
+        import re as _re
+        _cjk_single = _re.compile(r'^[\u4e00-\u9fff]$')
+        tc.assert_true(bool(_cjk_single.match('字')) and not _cjk_single.match('两字'),
+                      "check15: single-CJK-char line pattern effective")
+        _hit = any(_re.compile(p['pattern']).search('配置写在点Json文件里')
+                   for p in term_patterns)
+        tc.assert_true(_hit, "check16: lint pattern catches '点Json' leakage")
         
         tc.mark_passed()
         

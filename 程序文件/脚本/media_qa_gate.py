@@ -6,7 +6,7 @@
 功能：
   在交付前进行最后一层完整质量检查
   
-  检查项目（13项）：
+  检查项目（16项）：
   1. 视频/音频流存在性
   2. 音频非静音检测
   3. 音频响度检测
@@ -20,6 +20,9 @@
   11. 文件输出路径和命名正确性
   12. 字幕-语音对齐度（P0-b：silencedetect 语音起口 ↔ SRT 起点，p95 门禁）
   13. 配置声明-实测一致性（config 声明的 fps/resolution ↔ ffprobe 实测，防失效配置）
+  14. 黑场-字幕重叠（blackdetect 物理测量：黑场区间与字幕窗口重叠超阈值 = 画面空档但音频持续）
+  15. 字幕单字跨行（单个 CJK 汉字独占一行 = 排版孤字，破坏阅读体验）
+  16. 字幕术语规范（朗读层形态直通显示层，如『点Json』应为『.json』）
 
 用法：
   from media_qa_gate import MediaQAGate
@@ -186,6 +189,77 @@ def _load_alignment_rules() -> Dict[str, Any]:
         return defaults
     except (json.JSONDecodeError, OSError):
         return defaults
+
+
+def _load_black_frame_rules() -> Dict[str, Any]:
+    """读取 config/quality/audio_sync_rules.json 的 black_frame 节（带默认值）。
+
+    与 alignment 节同源，阈值只声明一处（单一权威源）。
+    """
+    defaults = {
+        "min_black_seconds": 1.0,
+        "pixel_threshold": 0.10,
+        "max_overlap_with_narration_seconds": 1.0,
+        "fail_on_violation": True,
+    }
+    rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                  / "quality" / "audio_sync_rules.json")
+    if not rules_path.exists():
+        return defaults
+    try:
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        section = loaded.get("black_frame", {})
+        for k, v in section.items():
+            if not k.startswith("$"):
+                defaults[k] = v
+        return defaults
+    except (json.JSONDecodeError, OSError):
+        return defaults
+
+
+def _load_term_lint_patterns() -> List[Dict[str, str]]:
+    """读取 config/quality/subtitle_term_rules.json 的 lint_patterns。
+
+    正常流程 step5 已按 replacements 规范化显示文本，此处是交付前
+    最后防线：仍命中说明有外部 SRT 导入或词典缺口。
+    """
+    rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                  / "quality" / "subtitle_term_rules.json")
+    if not rules_path.exists():
+        return []
+    try:
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        patterns = loaded.get("lint_patterns", [])
+        return [p for p in patterns if isinstance(p, dict) and p.get("pattern")]
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def ffmpeg_detect_black_intervals(video_path: str, min_black: float = 1.0,
+                                  pix_th: float = 0.10) -> List[Tuple[float, float]]:
+    """用 blackdetect 物理扫描成片，返回黑场区间列表 [(start, end), ...]。
+
+    这是对"观众实际看到什么"的直接测量，与声明层（T-block/S-block）
+    无关——即使时间轴声明自洽，渲染产物出现黑场也会被此检测捕获。
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-i', str(video_path), '-vf',
+             f'blackdetect=d={min_black}:pix_th={pix_th}',
+             '-an', '-f', 'null', '-'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=180
+        )
+    except Exception:
+        return []
+    intervals = []
+    for line in (result.stderr or '').splitlines():
+        m = re.search(r'black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)', line)
+        if m:
+            intervals.append((float(m.group(1)), float(m.group(2))))
+    return intervals
 
 
 def ffmpeg_detect_speech_onsets(video_path: str, duration: float,
@@ -443,6 +517,74 @@ class MediaQAGate:
                                 self.warnings.append(msg)
                         else:
                             self.checks['subtitle_audio_alignment'] = True
+
+                    # 检查14：黑场-字幕重叠（物理测量，直接回答"观众看到什么"）
+                    # 背景：曾出现 end-fade 声明与场景窗口脱钩，尾部 ~5s 黑场
+                    # 但音频/字幕持续播放。声明层门禁（step0）只能拦截已知
+                    # 形态，此处用 blackdetect 对渲染产物做无假设扫描。
+                    # 阈值单一权威源：audio_sync_rules.json → black_frame 节。
+                    if duration > 0 and len(video_streams) > 0:
+                        bf_rules = _load_black_frame_rules()
+                        black_intervals = ffmpeg_detect_black_intervals(
+                            str(video_path),
+                            min_black=bf_rules['min_black_seconds'],
+                            pix_th=bf_rules['pixel_threshold'])
+                        max_ov = bf_rules['max_overlap_with_narration_seconds']
+                        srt_spans = [(e['start_ms'] / 1000.0, e['end_ms'] / 1000.0)
+                                     for e in entries]
+                        violations = []
+                        for bs, be in black_intervals:
+                            for ss, se in srt_spans:
+                                overlap = min(be, se) - max(bs, ss)
+                                if overlap > max_ov:
+                                    violations.append((bs, be, ss, se, overlap))
+                        self.media_facts['black_intervals'] = [
+                            (round(bs, 2), round(be, 2))
+                            for bs, be in black_intervals]
+                        self.checks['no_black_frame_with_subtitle'] = not violations
+                        for bs, be, ss, se, overlap in violations:
+                            msg = (f"Black screen while subtitle showing: black "
+                                   f"{bs:.1f}-{be:.1f}s overlaps subtitle "
+                                   f"{ss:.1f}-{se:.1f}s by {overlap:.1f}s "
+                                   f"(threshold {max_ov}s) — 画面空档但音频/字幕持续")
+                            if bf_rules.get('fail_on_violation', True):
+                                self.errors.append(msg)
+                            else:
+                                self.warnings.append(msg)
+
+                    # 检查15：字幕单字跨行（排版孤字，严重破坏阅读体验）
+                    # step5 均衡分行算法已从源头消除，此处是交付前复查：
+                    # 拦截外部导入/手工编辑的 SRT。
+                    _cjk_re = re.compile(r'^[\u4e00-\u9fff]$')
+                    orphan_lines = []
+                    for e in entries:
+                        for ln in e['text'].split('\n'):
+                            if _cjk_re.match(ln.strip()):
+                                orphan_lines.append((e['index'], ln.strip()))
+                    self.checks['no_single_char_subtitle_line'] = not orphan_lines
+                    for idx, ch in orphan_lines:
+                        self.errors.append(
+                            f"Single-character subtitle line: entry #{idx} "
+                            f"has orphan char '{ch}' on its own line — 孤字跨行")
+
+                    # 检查16：字幕术语规范 lint（朗读层形态直通显示层）
+                    # 词典单一权威源：subtitle_term_rules.json → lint_patterns。
+                    term_hits = []
+                    for pat in _load_term_lint_patterns():
+                        try:
+                            regex = re.compile(pat['pattern'])
+                        except re.error:
+                            continue
+                        for e in entries:
+                            for m_hit in regex.findall(e['text']):
+                                term_hits.append(
+                                    (e['index'], m_hit,
+                                     pat.get('message', 'term lint hit')))
+                    self.checks['subtitle_terms_normalized'] = not term_hits
+                    for idx, hit, msg in term_hits:
+                        self.errors.append(
+                            f"Subtitle term violation: entry #{idx} contains "
+                            f"'{hit}' — {msg}（补充 subtitle_term_rules.json 词典后重跑 step5）")
         
         # 检查11：视觉边界检查
         self.checks['visual_check_passed'] = visual_check_passed

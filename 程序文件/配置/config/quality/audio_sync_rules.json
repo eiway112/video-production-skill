@@ -11,6 +11,20 @@
     "shrink_margin_seconds": 1.5,
     "description": "pipeline_runner 传给 adjust_timeline.py 的 --shrink-margin：TTS 播完后为镜头预留的呼吸时间。需覆盖 GSAP 场景 pre-fade(0.5s) + 感官缓冲(1.0s)，避免音频尾音撞进画面淡出。"
   },
+  "transition": {
+    "tts_fade_in_ms": 40,
+    "tts_fade_out_ms": 150,
+    "min_inter_narration_gap_seconds": 0.5,
+    "fail_on_violation": true,
+    "description": "音频过渡平滑规则：每段 TTS 混音前加微淡入(40ms防爆音)+尾部淡出(150ms自然收音)；相邻场景旁白间隔（上一场景 TTS 结束→下一场景开口）低于 min_inter_narration_gap_seconds → step7 拦截，防听感仓促。"
+  },
+  "black_frame": {
+    "min_black_seconds": 1.0,
+    "pixel_threshold": 0.10,
+    "max_overlap_with_narration_seconds": 1.0,
+    "fail_on_violation": true,
+    "description": "黑场-音频重叠门禁（media_qa_gate 检查14）：blackdetect 扫描成片，任一黑场区间与字幕展示窗口重叠超过 max_overlap_with_narration_seconds → 拒收（画面空档但音频持续播放）。测量对象是物理帧，不依赖任何声明值。"
+  },
   "mix": {
     "tts_volume": 1.5,
     "bgm_volume": 0.08,

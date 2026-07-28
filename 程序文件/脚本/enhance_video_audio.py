@@ -562,6 +562,18 @@ def step0_validate_html_template():
             if len(px_values) >= 3:
                 bottom_padding = int(px_values[2])  # 3-value: T R B; 4-value: T R B L
                 padding_ok = bottom_padding >= 150
+    if not padding_ok:
+        # 3. calc(var(--xxx) + NNpx) 形态（safe-zone 变量驱动的模板）：
+        #    从 :root 解析变量值后求和，避免对合规模板误报。
+        calc_match = _re.search(
+            r'\.sc\s*\{[^}]*padding(?:-bottom)?\s*:[^};]*calc\(\s*var\(\s*(--[\w-]+)\s*\)\s*\+\s*(\d+)px\s*\)',
+            content)
+        if calc_match:
+            var_name, extra_px = calc_match.group(1), int(calc_match.group(2))
+            var_def = _re.search(
+                _re.escape(var_name) + r'\s*:\s*(\d+)px', content)
+            if var_def:
+                padding_ok = int(var_def.group(1)) + extra_px >= 150
 
     issues = []
     if safe_count < scene_count:
@@ -656,6 +668,36 @@ def step0_validate_html_template():
                     f"  [TRANSITION] Opacity crossfade between scene{s_out} and scene{s_in} "
                     f"at T={t_out}s/{t_in}s — flickers in seek-and-capture. "
                     f"Use transform-based transition (Push Slide / Vertical Push)."
+                )
+
+    # Check 4: end-fade must not fire long before data-duration.
+    # quickstart-demo 事故：#scene-end-fade 按"收缩后窗口"手算写死 T.s5+5.8，
+    # 而 S-block 窗口未收缩 → 收尾 ~4s 黑场配音频。静态拦截声明脱钩：
+    # 淡出触发时刻距 data-duration 超过 dead-air 阈值 → 拒绝渲染。
+    dur_attr = _re.search(r'data-duration="([\d.]+)"', content)
+    if dur_attr:
+        _data_dur = float(dur_attr.group(1))
+        m_fade = _re.search(r'tl\.to\s*\(\s*"#scene-end-fade"[^\n]*', js_code)
+        if m_fade:
+            _fade_t = resolve_line_time(m_fade.group(0), t_map)
+            _max_dead = float(_load_audio_sync_rules().get("dead_air", {})
+                              .get("max_seconds_per_scene", 3.0))
+            # 尾部推导惯用形态：从权威 S-block 末场景 end 算触发时刻
+            # （adjust_timeline 重写 S-block 时自动同步，构造上不会脱钩）。
+            _tail_derived = bool(_re.search(
+                r'S\s*\[\s*S\.length\s*-\s*1\s*\]\s*\.\s*end', js_code))
+            if _fade_t is not None and _fade_t < _data_dur - _max_dead:
+                issues.append(
+                    f"  [END-FADE] #scene-end-fade fires at T={_fade_t:.1f}s but "
+                    f"data-duration={_data_dur}s — {_data_dur - _fade_t:.1f}s of black "
+                    f"screen while audio/subtitles may still play. Shrink the last "
+                    f"scene window (adjust_timeline --shrink) or move the fade to the tail."
+                )
+            elif _fade_t is None and not _tail_derived:
+                issues.append(
+                    "  [END-FADE] #scene-end-fade trigger time is not statically "
+                    "resolvable and not derived from the S-block tail — use "
+                    "`S[S.length - 1].end - fadeDur` so adjust_timeline keeps it in sync."
                 )
 
     if issues:
@@ -1091,6 +1133,12 @@ def step3_merge_all(video_path, temp_dir, output_path):
     loudnorm_target = mix_cfg.get("loudnorm_I", -16)
     loudnorm_tp = mix_cfg.get("loudnorm_TP", -1.5)
     loudnorm_lra = mix_cfg.get("loudnorm_LRA", 11)
+    # 音频过渡平滑（transition 节）：微淡入防爆音 + 尾部淡出自然收音。
+    # atrim 在波形非零点硬切会产生喳喎声，TTS 裸拼进混音听感突兀（用户反馈：
+    # 场景切换时音频衔接仓促）。参数单一权威源：audio_sync_rules.json。
+    trans_cfg = audio_rules.get("transition", {})
+    fade_in_s = float(trans_cfg.get("tts_fade_in_ms", 40)) / 1000.0
+    fade_out_s = float(trans_cfg.get("tts_fade_out_ms", 150)) / 1000.0
 
     tts_dir = temp_dir / "tts_44k"
     bgm_file = temp_dir / "bgm.wav"
@@ -1142,7 +1190,11 @@ def step3_merge_all(video_path, temp_dir, output_path):
             print(f"  Timeline is stale — run adjust_timeline.py (then re-render) before merging.")
             return False
         max_dur = min(audio_dur, window)  # ms-level safety only, guaranteed no-op above
-        filter_parts.append(f"[{input_idx}]atrim=0:{max_dur:.3f},asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms},apad,volume={tts_volume}[n{i}]")
+        fade_out_st = max(max_dur - fade_out_s, 0.0)
+        filter_parts.append(
+            f"[{input_idx}]atrim=0:{max_dur:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:d={fade_in_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_out_s:.3f},"
+            f"adelay={delay_ms}|{delay_ms},apad,volume={tts_volume}[n{i}]")
 
     # BGM input（可选：bgm_enabled=false 时纯旁白混音，无背景音）
     if BGM_ENABLED:
@@ -1321,17 +1373,20 @@ def _adaptive_punct_gap_segments(text, gaps, tts_dur, min_seg=1.5, max_dev_chars
     return segments, [t for _, t in chosen]
 
 
-def _wrap_subtitle_text(text, line_limit=22):
-    """SRT 显示层智能换行：优先在标点后断行，禁止拆散 ASCII 词组。
+def _wrap_subtitle_text(text, line_limit=22, min_tail=2):
+    """SRT 显示层智能换行：均衡分行 + 孤字控制（v2）。
 
-    libass 自动换行对 CJK 文本逐字硬断，会把 QU38、WSI 84、1200mm 等
-    完整名词拆到两行（用户反馈：QU38 被拆成 QU3/8）。改为在写 SRT 时
-    预先插入换行符：行长不超 line_limit（低于 libass 自动换行阈值，
-    确保不被二次换行），断点优先选标点之后，ASCII 字母数字连串
-    （含其间空格，如 WSI 84）内部绝不断开。
+    旧实现贪心装满每行再断，len=line_limit+1 时必然产出单字尾行
+    （用户反馈：单个汉字跨行显示）。现改为均衡分行——先按需要的
+    行数折算每行目标长度，在目标位置附近择优断点（标点后 > 普通
+    边界），行间字数均匀，从数学上消除孤字。保留两条硬规则：
+      - ASCII 字母数字连串（QU38 / WSI 84 / 1200mm）内部绝不断开
+      - 标点不悬挂行首
+    收尾保底：任何尾行短于 min_tail → 并回上行或向前借断点修复。
     """
     if len(text) <= line_limit:
         return text
+    import math
     ascii_re = re.compile(r'[A-Za-z0-9]')
 
     def can_break(s, i):
@@ -1342,28 +1397,90 @@ def _wrap_subtitle_text(text, line_limit=22):
             return False  # 避免标点悬挂行首
         return True
 
+    def pick_cut(rest):
+        # 均衡目标：剩余文本按最少行数平均分摊，断点尽量靠近目标位置
+        remaining = max(2, math.ceil(len(rest) / line_limit))
+        target = math.ceil(len(rest) / remaining)
+        lo = max(1, target - 6)
+        hi = min(line_limit, len(rest) - min_tail)
+        best_punct = None
+        best_any = None
+        for i in range(lo, hi + 1):
+            if not can_break(rest, i):
+                continue
+            d = abs(i - target)
+            if rest[i-1] in '，。；、：？！' and (best_punct is None or d < best_punct[0]):
+                best_punct = (d, i)
+            if best_any is None or d < best_any[0]:
+                best_any = (d, i)
+        if best_punct:
+            return best_punct[1]
+        if best_any:
+            return best_any[1]
+        return max(min(target, hi), 1)  # 无合法断点（超长 ASCII 连串）：硬切保底
+
     lines = []
     rest = text
     while len(rest) > line_limit:
-        cut = -1
-        # 优先：窗口内最靠右的标点后断点
-        for i in range(min(line_limit, len(rest) - 1), 0, -1):
-            if rest[i-1] in '，。；、：？！' and can_break(rest, i):
-                cut = i
-                break
-        if cut < int(line_limit * 0.4):
-            # 标点太靠前或没有 → 退而求其次找最靠右的合法断点
-            for i in range(min(line_limit, len(rest) - 1), 0, -1):
-                if can_break(rest, i):
-                    cut = i
-                    break
-        if cut <= 0:
-            cut = line_limit
+        cut = pick_cut(rest)
         lines.append(rest[:cut].rstrip())
         rest = rest[cut:].lstrip()
     if rest:
         lines.append(rest)
+
+    # 孤字修复保底：尾行短于 min_tail → 并回上行，装不下则向前借断点
+    while len(lines) > 1 and len(lines[-1]) < min_tail:
+        tail = lines.pop()
+        prev = lines.pop()
+        merged = prev + tail
+        if len(merged) <= line_limit:
+            lines.append(merged)
+            continue
+        cut = len(prev)
+        while cut > 1 and (len(merged) - cut < min_tail or not can_break(merged, cut)):
+            cut -= 1
+        lines.append(merged[:cut].rstrip())
+        lines.append(merged[cut:].lstrip())
+        break
     return '\n'.join(lines)
+
+
+_TERM_RULES_CACHE = None
+
+
+def _load_subtitle_term_rules():
+    """读取 config/quality/subtitle_term_rules.json（显示层术语词典，单一权威源）。
+
+    消费方：step5（生成时替换）、step7 与 media_qa_gate（lint 拦截）。
+    文件缺失/损坏时返回空规则，不阻断流水线（lint 层会提醒）。
+    """
+    global _TERM_RULES_CACHE
+    if _TERM_RULES_CACHE is not None:
+        return _TERM_RULES_CACHE
+    rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                  / "quality" / "subtitle_term_rules.json")
+    rules = {"replacements": [], "lint_patterns": []}
+    if rules_path.exists():
+        try:
+            with open(rules_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            for k in ("replacements", "lint_patterns"):
+                if isinstance(loaded.get(k), list):
+                    rules[k] = loaded[k]
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] subtitle_term_rules.json unreadable: {e}")
+    _TERM_RULES_CACHE = rules
+    return rules
+
+
+def _normalize_subtitle_terms(text):
+    """显示层术语规范化（点Json→.json / 毫米→mm 等）。仅改字幕，不影响 TTS 朗读。"""
+    for rule in _load_subtitle_term_rules().get("replacements", []):
+        try:
+            text = re.sub(rule.get("pattern", ""), rule.get("replace", ""), text)
+        except re.error:
+            continue
+    return text
 
 
 def _split_text_to_segments(text, group_limit=40):
@@ -1637,7 +1754,10 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
             # 显示层替换（如 毫米→mm）：仅改字幕文本，TTS 朗读文本不变
             for _k, _v in SUBTITLE_DISPLAY_REPLACEMENTS.items():
                 display_text = display_text.replace(_k, _v)
-            # 智能换行：标点优先断行，禁止拆散 QU38 / WSI 84 等 ASCII 词组
+            # 全局术语词典（subtitle_term_rules.json）：项目级替换之后应用，
+            # 点Json→.json 等朗读层写法不再直通显示层
+            display_text = _normalize_subtitle_terms(display_text)
+            # 智能换行：均衡分行，标点优先断行，禁拆 ASCII 词组，禁单字尾行
             display_text = _wrap_subtitle_text(display_text)
 
             entries.append((idx, start_t, end_t, display_text))
@@ -1981,6 +2101,36 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
             else:
                 warnings.append(msg)
 
+    # --- 1b. 场景间旁白停顿检查（transition 节，防听感仓促）---
+    # 上一场景 TTS 结束 → 下一场景开口的实际间隔低于阈值 → 拦截。
+    # shrink_margin(1.5s) 正常收敛时天然满足；这里拦的是 TTS 实测时长
+    # 漂移/未收敛时间轴导致的"嗘不上气"式衔接。
+    _trans_cfg = _load_audio_sync_rules().get("transition", {})
+    _min_gap = float(_trans_cfg.get("min_inter_narration_gap_seconds", 0.5))
+    _gap_fail = bool(_trans_cfg.get("fail_on_violation", True))
+    narr_spans = []  # (scene_id, narration_start, narration_end)
+    for scene_id, start, end, text in SCENES:
+        if not (text and text.strip()):
+            continue
+        h = _get_tts_hash_from_manifest(manifest, scene_id, text)
+        hq_file = tts_dir / f"tts_{h}_hq.wav"
+        if hq_file.exists():
+            _tts_d = min(get_duration(str(hq_file)), end - start)
+            narr_spans.append((scene_id, start, start + _tts_d))
+    narr_spans.sort(key=lambda x: x[1])
+    for (sid_a, _, end_a), (sid_b, start_b, _) in zip(narr_spans, narr_spans[1:]):
+        pause = start_b - end_a
+        if pause < _min_gap:
+            msg = (
+                f"Narration pause too short between scene {sid_a} and {sid_b}: "
+                f"{pause:.2f}s < {_min_gap}s — audio transition feels rushed; "
+                f"re-run adjust_timeline (shrink_margin 覆盖此阈值) 或延长 scene {sid_a} 窗口"
+            )
+            if _gap_fail:
+                errors.append(msg)
+            else:
+                warnings.append(msg)
+
     # --- 2. Subtitle Timing Validation ---
     if not subtitle_path.exists():
         errors.append(f"Subtitle file not found: {subtitle_path}")
@@ -2055,6 +2205,22 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
                         f"Subtitle #{idx}: trailing non-terminal punctuation — '{text[-10:]}'"
                     )
 
+            # 单字跨行检查（排版门禁）：任一显示行仅含 1 个 CJK 字符 → error。
+            # 正常流程下 _wrap_subtitle_text 均衡分行已消除孤字；仍命中说明
+            # 有外部 SRT 导入或算法回退，不得交付。
+            _cjk_re = re.compile(r'[\u4e00-\u9fff]')
+            for block in blocks:
+                _bl = block.strip().split('\n')
+                if len(_bl) < 3:
+                    continue
+                for _ln in _bl[2:]:
+                    _ln_s = _ln.strip()
+                    if len(_ln_s) == 1 and _cjk_re.match(_ln_s):
+                        errors.append(
+                            f"Subtitle #{_bl[0]}: single CJK char on its own line "
+                            f"('{_ln_s}') — orphan line break, rewrap required"
+                        )
+
     # --- 5. HTML Image Reference Integrity ---
     html_path = _html_override_path
     if html_path and html_path.exists():
@@ -2104,6 +2270,22 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
                 f"Subtitle contains Chinese numerals for quantitative values "
                 f"({len(_digit_findings)} hit(s)) — must be Arabic digits per AGENTS.md:\n{summary}"
             )
+
+    # --- 8. 术语规范化 lint（subtitle_term_rules.json → lint_patterns）---
+    # 正常流程下 step5 的 _normalize_subtitle_terms 已消除这些形态；
+    # 仍命中 = 外部 SRT 导入或词典缺口（如新扩展名），拒收并提示补词典。
+    if subtitle_path.exists():
+        _srt_text = subtitle_path.read_text(encoding='utf-8-sig')
+        for _rule in _load_subtitle_term_rules().get("lint_patterns", []):
+            try:
+                _hits = re.findall(_rule.get("pattern", ""), _srt_text)
+            except re.error:
+                continue
+            if _hits:
+                errors.append(
+                    f"Subtitle term lint: {_rule.get('message', 'term violation')} — "
+                    f"hits: {sorted(set(_hits))} — 补充 subtitle_term_rules.json 替换规则后重跑 step5"
+                )
 
     # --- Report ---
     if errors:

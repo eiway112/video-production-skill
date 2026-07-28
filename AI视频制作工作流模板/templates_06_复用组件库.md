@@ -111,8 +111,11 @@ CSS（浅色主题 / 深色主题二选一）：
 ```
 
 ```javascript
-tl.to("#scene-end-fade", { opacity: 1, duration: 1.5, ease: "power2.inOut" },
-    /* VIDEO_DURATION - 2 */);
+// 触发时刻必须从权威 S-block 尾场景推导，adjust_timeline 重写 S-block 时自动同步。
+// 禁止写死数值或场景内偏移（如 T.s5 + 5.8）：时间轴收敛后会声明脱钩，
+// 产生尾部黑场配音频（step0 [END-FADE] 门禁会拒绝渲染这类写法）。
+var endFadeAt = Math.max(S[S.length - 1].end - 1.5, 0);
+tl.to("#scene-end-fade", { opacity: 1, duration: 1.5, ease: "power2.inOut" }, endFadeAt);
 ```
 
 ---
