@@ -8,7 +8,7 @@
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     /* ── SAFE ZONE: 修改此变量即可全局调整字幕安全区高度 ── */
-    :root { --safe-zone-height: 325px; }
+    :root { --safe-zone-height: 140px; }
     body { width:1920px; height:1080px; overflow:hidden;
       background:#0c1222; font-family:'Inter', 'Microsoft YaHei', sans-serif; }
     .scene { position:absolute; top:0; left:0; width:1920px; height:1080px; overflow:hidden; opacity:0; }
@@ -17,7 +17,13 @@
       background:radial-gradient(ellipse at 30% 40%, #1a2744 0%, #0c1222 60%, #060a14 100%); display:flex; flex-direction:column; gap:16px; }
     .subtitle-safe { position:absolute; bottom:0; left:0; width:100%;
       height:var(--safe-zone-height); z-index:100; pointer-events:none;
-      background:linear-gradient(to bottom,rgba(10,15,30,0) 0%,rgba(10,15,30,0.88) 40%,rgba(10,15,30,0.96) 100%); }
+      background:linear-gradient(to bottom,rgba(10,15,30,0) 0%,rgba(10,15,30,0.85) 40%,rgba(10,15,30,0.95) 100%); }
+    /* 场景初始状态：scene0 封面可见，其余由 GSAP 驱动入场 */
+    #scene1 { opacity:0; }
+    #scene2 { opacity:0; }
+    #scene3 { opacity:0; }
+    #scene4 { opacity:0; }
+    #scene5 { opacity:0; }
 #scene0 .hero-title { font-size:96px; font-weight:700; color:#e8edf5;
   text-align:center; line-height:1.15; letter-spacing:-2px;
   font-family:'Inter', 'Microsoft YaHei', sans-serif; text-shadow:0 0 80px rgba(59,130,246,0.15); }
@@ -116,7 +122,7 @@
      data-width="1920" data-height="1080">
 
 <!-- Scene 0: Cover (0s - 3s) -->
-<div id="scene0" class="scene" style="z-index:999; opacity:1;">
+<div id="scene0" class="scene" data-scene-id="s0" data-scene-entry="cover" data-scene-subtitle-safe="true" style="z-index:999; opacity:1;">
   <div style="position:absolute;width:800px;height:800px;background:radial-gradient(circle,#3b82f615 0%,transparent 70%);top:-200px;right:-100px;border-radius:50%;pointer-events:none;"></div>
   <div style="position:absolute;width:600px;height:600px;background:radial-gradient(circle,#06b6d410 0%,transparent 70%);bottom:-150px;left:-100px;border-radius:50%;pointer-events:none;"></div>
   <div class="sc" style="display:flex;align-items:center;justify-content:center;">
@@ -130,7 +136,7 @@
 </div>
 
 <!-- Scene 1: Feature cards (3.0s - 9.5s) -->
-<div id="scene1" class="scene" style="z-index:1;">
+<div id="scene1" class="scene" data-scene-id="s1" data-scene-entry="gsap" data-scene-entry-at="3.0" data-scene-subtitle-safe="true" style="z-index:1;">
   <div class="sc">
     <h2 class="section-heading">三大核心能力</h2>
     <div class="cards-grid" style="grid-template-columns:repeat(3,1fr);">
@@ -155,7 +161,7 @@
 </div>
 
 <!-- Scene 2: Stats (9.5s - 17.7s) -->
-<div id="scene2" class="scene" style="z-index:2;">
+<div id="scene2" class="scene" data-scene-id="s2" data-scene-entry="gsap" data-scene-entry-at="11.6" data-scene-subtitle-safe="true" style="z-index:2;">
   <div class="sc">
     <h2 class="section-heading">质量保障数据</h2>
     <div class="stats-row">
@@ -177,7 +183,7 @@
 </div>
 
 <!-- Scene 3: Split (17.7s - 24.9s) — 纯 CSS 流水线示意，无外部素材依赖 -->
-<div id="scene3" class="scene" style="z-index:3;">
+<div id="scene3" class="scene" data-scene-id="s3" data-scene-entry="gsap" data-scene-entry-at="21.6" data-scene-subtitle-safe="true" style="z-index:3;">
   <div class="sc">
     <div class="split-wrap" style="flex-direction:row;">
       <div class="split-media">
@@ -201,7 +207,7 @@
 </div>
 
 <!-- Scene 4: Process (24.9s - 33.3s) -->
-<div id="scene4" class="scene" style="z-index:4;">
+<div id="scene4" class="scene" data-scene-id="s4" data-scene-entry="gsap" data-scene-entry-at="29.7" data-scene-subtitle-safe="true" style="z-index:4;">
   <div class="sc">
     <h2 class="section-heading">制作流程</h2>
     <div class="process-row">
@@ -234,7 +240,7 @@
 </div>
 
 <!-- Scene 5: Closing (33.3s - 40.0s) -->
-<div id="scene5" class="scene" style="z-index:5;">
+<div id="scene5" class="scene" data-scene-id="s5" data-scene-entry="gsap" data-scene-entry-at="39.4" data-scene-subtitle-safe="true" style="z-index:5;">
   <div style="position:absolute;width:700px;height:700px;background:radial-gradient(circle,#3b82f612 0%,transparent 70%);top:-200px;left:50%;transform:translateX(-50%);border-radius:50%;pointer-events:none;"></div>
   <div class="sc">
     <div class="closing-wrap">

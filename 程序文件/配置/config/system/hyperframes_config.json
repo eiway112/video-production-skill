@@ -2,7 +2,7 @@
   "browser_path": "",
   "ffmpeg_path": "",
   "default_resolution": "1920x1080",
-  "default_fps": 30,
+  "default_fps": 25,
   "default_format": "mp4",
   "encoding_notes": "中文Windows下使用ASCII junction处理FFmpeg中文路径编码",
   "render_timeout": 300,
