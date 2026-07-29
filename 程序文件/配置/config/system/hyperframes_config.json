@@ -6,5 +6,6 @@
   "default_format": "mp4",
   "encoding_notes": "中文Windows下使用ASCII junction处理FFmpeg中文路径编码",
   "render_timeout": 300,
-  "screenshot_retry": 3
+  "screenshot_retry": 3,
+  "tts_concurrency": 3
 }

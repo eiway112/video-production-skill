@@ -6,7 +6,7 @@
 功能：
   在交付前进行最后一层完整质量检查
   
-  检查项目（16项）：
+  检查项目（18项）：
   1. 视频/音频流存在性
   2. 音频非静音检测
   3. 音频响度检测
@@ -23,6 +23,9 @@
   14. 黑场-字幕重叠（blackdetect 物理测量：黑场区间与字幕窗口重叠超阈值 = 画面空档但音频持续）
   15. 字幕单字跨行（单个 CJK 汉字独占一行 = 排版孤字，破坏阅读体验）
   16. 字幕术语规范（朗读层形态直通显示层，如『点Json』应为『.json』）
+  17. 死区终检（silencedetect 物理扫描成品，连续静音超过 dead_air.max_seconds_per_scene → 拒收；
+      场景感知：narration_required=false 的封面/转场窗内静音属设计特征，不计入违规）
+  18. 视频码率下限（双档：实测 < min_video_bitrate_kbps_fail → 拒收；fail~warn 之间 → 低码率预警不阻断）
 
 用法：
   from media_qa_gate import MediaQAGate
@@ -101,11 +104,13 @@ def ffmpeg_detect_silence(audio_file: str, duration: float = None) -> float:
             if duration < 0:
                 return -1.0
         
+        # 静音阈值单一权威源：audio_sync_rules.json → alignment.silence_db
+        noise_db = _load_alignment_rules().get('silence_db', -40)
         result = subprocess.run(
             [
                 'ffmpeg',
                 '-i', audio_file,
-                '-af', 'silencedetect=n=-40dB:d=0.1',
+                '-af', f'silencedetect=n={noise_db:g}dB:d=0.1',
                 '-f', 'null',
                 '-'
             ],
@@ -162,22 +167,28 @@ def ffmpeg_get_loudness(audio_file: str) -> Tuple[float, float]:
         pass
     return None, None
 
-def _load_alignment_rules() -> Dict[str, Any]:
+def _load_alignment_rules(rules_path=None) -> Dict[str, Any]:
     """读取 config/quality/audio_sync_rules.json 的 alignment 节（带默认值）。
 
     与 enhance_video_audio / pipeline_runner 共用同一份规则文件，
-    阅阈值只声明一处（单一权威源）。
+    阅阈值只声明一处（单一权威源）。读不到 alignment.silence_db 时
+    回退默认 -40dB 并打印告警，与 verify_tts_product._load_silence_db 同口径。
+    显式传入 rules_path 时供回归测试验证回退路径。
     """
     defaults = {
         "p95_max_seconds": 0.6,
         "min_onsets": 5,
-        "silence_db": -38,
+        "silence_db": -40.0,
         "min_silence_seconds": 0.5,
         "fail_on_violation": True,
     }
-    rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
-                  / "quality" / "audio_sync_rules.json")
+    if rules_path is None:
+        rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                      / "quality" / "audio_sync_rules.json")
+    else:
+        rules_path = Path(rules_path)
     if not rules_path.exists():
+        print(f"  [WARN] 无法读取 {rules_path.name} 的 alignment.silence_db，回退默认 -40dB")
         return defaults
     try:
         with open(rules_path, 'r', encoding='utf-8') as f:
@@ -186,8 +197,11 @@ def _load_alignment_rules() -> Dict[str, Any]:
         for k, v in alignment.items():
             if not k.startswith("$"):
                 defaults[k] = v
+        if "silence_db" not in alignment:
+            print(f"  [WARN] {rules_path.name} 的 alignment 节缺少 silence_db，回退默认 -40dB")
         return defaults
     except (json.JSONDecodeError, OSError):
+        print(f"  [WARN] 无法读取 {rules_path.name} 的 alignment.silence_db，回退默认 -40dB")
         return defaults
 
 
@@ -216,6 +230,203 @@ def _load_black_frame_rules() -> Dict[str, Any]:
         return defaults
     except (json.JSONDecodeError, OSError):
         return defaults
+
+
+def _load_dead_air_rules() -> Dict[str, Any]:
+    """读取 config/quality/audio_sync_rules.json 的 dead_air 节（带默认值）。
+
+    与 enhance_video_audio / pipeline_runner 同源，阈值只声明一处（单一权威源）。
+    """
+    defaults = {
+        "max_seconds_per_scene": 3.0,
+        "fail_on_violation": True,
+    }
+    rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                  / "quality" / "audio_sync_rules.json")
+    if not rules_path.exists():
+        return defaults
+    try:
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        section = loaded.get("dead_air", {})
+        for k, v in section.items():
+            if not k.startswith("$"):
+                defaults[k] = v
+        return defaults
+    except (json.JSONDecodeError, OSError):
+        return defaults
+
+
+def _load_video_quality_rules() -> Dict[str, Any]:
+    """读取 config/quality/video_quality_rules.json（带默认值）。
+
+    与 enhance_video_audio._check_video_quality 同阈值同源（单一权威源），
+    读不到时回退默认双档 fail=300/warn=500 并打印告警。
+    文件声明按原样返回（不与默认双档键合并），保证旧单档键
+    min_video_bitrate_kbps 的兼容路径可被 _resolve_bitrate_thresholds 识别。
+    """
+    defaults = {"min_video_bitrate_kbps_fail": 300, "min_video_bitrate_kbps_warn": 500}
+    rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                  / "quality" / "video_quality_rules.json")
+    try:
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        declared = {k: v for k, v in loaded.items() if not k.startswith("$")}
+        return declared if declared else defaults
+    except (json.JSONDecodeError, OSError):
+        print(f"  [WARN] 无法读取 {rules_path.name}，视频码率阈值回退默认 fail=300/warn=500kbps")
+        return defaults
+
+
+def _resolve_bitrate_thresholds(rules: Dict[str, Any]) -> Tuple[int, int, bool]:
+    """解析码率双档阈值，返回 (fail_kbps, warn_kbps, legacy_single)。
+
+    双档键优先：实测 < fail 档 → 判定渲染失败/内容缺失（阻断）；
+    fail~warn 之间 → 低码率预警不阻断（纯文字动画码率天然偏低）。
+    仅存在旧单档键 min_video_bitrate_kbps 时按旧口径单档阻断
+    （legacy_single=True，调用方提示升级配置），不崩溃。
+    与 enhance_video_audio._resolve_bitrate_thresholds 保持同口径。
+    """
+    fail_k = rules.get("min_video_bitrate_kbps_fail")
+    warn_k = rules.get("min_video_bitrate_kbps_warn")
+    if fail_k is not None or warn_k is not None:
+        fail_v = int(fail_k) if fail_k is not None else 300
+        warn_v = int(warn_k) if warn_k is not None else 500
+        return fail_v, max(fail_v, warn_v), False
+    legacy = rules.get("min_video_bitrate_kbps")
+    if legacy is not None:
+        return int(legacy), int(legacy), True
+    return 300, 500, False
+
+
+def _classify_video_bitrate(v_br_kbps: int, rules: Dict[str, Any]) -> Tuple[str, int, int, bool]:
+    """按双档阈值归类实测码率，返回 (level, fail_kbps, warn_kbps, legacy_single)。
+
+    level ∈ 'fail'（阻断）/ 'warn'（预警不阻断）/ 'ok'。
+    """
+    fail_kbps, warn_kbps, legacy_single = _resolve_bitrate_thresholds(rules)
+    if v_br_kbps < fail_kbps:
+        return "fail", fail_kbps, warn_kbps, legacy_single
+    if v_br_kbps < warn_kbps:
+        return "warn", fail_kbps, warn_kbps, legacy_single
+    return "ok", fail_kbps, warn_kbps, legacy_single
+
+
+def _parse_bitrate_value(raw) -> Any:
+    """解析 ffprobe 的 bit_rate 字段为 int（bps），失败返回 None（码率未知）。
+
+    ffprobe 对部分容器/流返回 "N/A" 或缺失该键，直接 int() 会抛
+    ValueError 使门禁崩溃。返回 None 时调用方跳过码率门禁判定，
+    并追加 warning 保证可追溯（不判 FAIL/WARN 阻断，也不虚报）。
+    与 enhance_video_audio._parse_bitrate_value 保持同口径。
+    """
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _resolve_narration_from_config(config_path: str) -> Tuple[Any, float]:
+    """从 pipeline config 解析 narration.json 路径与 cover_duration。
+
+    路径解析口径与 enhance_video_audio.load_config 一致（P0-03）：相对
+    narration_source 优先按 HTML 项目目录（源码/hyperframes/<html_project>/）
+    解析，回退到配置文件所在目录。解析失败返回 (None, cover_duration)，不崩溃。
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None, 0.0
+    cover_duration = float(cfg.get('cover_duration', 0.0) or 0.0)
+    raw_source = cfg.get('narration_source')
+    if not raw_source:
+        return None, cover_duration
+    raw_source = str(raw_source)
+    candidates = []
+    if os.path.isabs(raw_source):
+        candidates.append(Path(raw_source))
+    else:
+        html_project = (cfg.get('paths') or {}).get('html_project', '')
+        if html_project:
+            candidates.append(Path(__file__).resolve().parents[1] / "源码"
+                              / "hyperframes" / html_project / raw_source)
+        candidates.append(Path(config_path).resolve().parent / raw_source)
+    for c in candidates:
+        if c.is_file():
+            return c, cover_duration
+    return None, cover_duration
+
+
+def _load_narration_scenes(narration_path: str, cover_duration: float = 0.0):
+    """读取项目 narration.json，返回死区终检用的场景窗列表（或 None）。
+
+    narration_required 判定与 compile_narration_to_scenes 同口径：
+    cover/transition 类型强制不需要旁白。legacy 相对时间约定（首个非封面
+    场景 start 落在 cover 窗内）自动平移 cover_duration 为绝对时间，与
+    enhance_video_audio._normalize_scenes_to_absolute 保持一致。
+    读取失败返回 None（调用方降级为全片扫描）。
+    """
+    try:
+        with open(narration_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        raw_scenes = data.get('scenes') or []
+    except (json.JSONDecodeError, OSError):
+        return None
+    scenes = []
+    for i, s in enumerate(raw_scenes):
+        stype = str(s.get('type', 'content')).lower()
+        required = bool(s.get('narration_required', True))
+        if stype in ('cover', 'transition'):
+            required = False
+        try:
+            start = float(s.get('start', 0))
+            end = float(s.get('end', 0))
+        except (TypeError, ValueError):
+            continue
+        scenes.append({'scene_id': s.get('scene_id', i), 'type': stype,
+                       'start': start, 'end': end,
+                       'narration_required': required})
+    if not scenes:
+        return None
+    non_cover = sorted((s for s in scenes if s['type'] != 'cover'),
+                       key=lambda s: s['start'])
+    if cover_duration > 0 and non_cover and non_cover[0]['start'] < cover_duration * 0.5:
+        for s in non_cover:
+            s['start'] += cover_duration
+            s['end'] += cover_duration
+    return scenes
+
+
+def filter_dead_air_violations(segments: List[Tuple[float, float, float]],
+                               scenes,
+                               max_dead: float) -> List[Tuple[float, float, float]]:
+    """场景感知的死区违规过滤（检查17核心逻辑，纯函数供回归测试）。
+
+    封面/转场（narration_required=false）场景窗内的静音属设计特征，
+    不计入死区违规；跨越边界的静音段只计入落在 narration_required=true
+    场景窗内的部分时长。scenes 为 None 时降级为全片口径（原样判定）。
+    返回 [(start, end, counted_dur), ...]，counted_dur 为计入的违规时长。
+    """
+    if scenes is None:
+        return list(segments)
+    windows = sorted((s['start'], s['end']) for s in scenes
+                     if s.get('narration_required', True))
+    violations = []
+    for st, en, _dur in segments:
+        counted = sum(max(0.0, min(en, we) - max(st, ws)) for ws, we in windows)
+        if counted > max_dead:
+            violations.append((st, en, counted))
+    return violations
+
+
+# 交付命名门禁（AGENTS.md → 文件与交付 → 命名）：技术词不得出现在交付文件名中，
+# 交付名应为业务描述性名称（如 quickstart-demo.mp4 / 墙体裂缝修补.mp4）。
+# 清单集中定义于此，检查11为唯一消费方。
+FORBIDDEN_NAME_TOKENS = ("final", "v01", "render", "raw", "tmp")
+_FORBIDDEN_NAME_RE = re.compile(
+    r'(?<![a-z0-9])(' + '|'.join(FORBIDDEN_NAME_TOKENS) + r')(?![a-z0-9])')
 
 
 def _load_term_lint_patterns() -> List[Dict[str, str]]:
@@ -260,6 +471,40 @@ def ffmpeg_detect_black_intervals(video_path: str, min_black: float = 1.0,
         if m:
             intervals.append((float(m.group(1)), float(m.group(2))))
     return intervals
+
+
+def ffmpeg_detect_long_silences(video_path: str, noise_db: float = -40,
+                                min_silence: float = 3.0,
+                                duration: float = None) -> List[Tuple[float, float, float]]:
+    """用 silencedetect 扫描成片，返回超过 min_silence 的连续静音段 [(start, end, dur), ...]。
+
+    d= 直接设为死区上限，ffmpeg 只报告超限段 —— 输出即违规清单。
+    尾部静音可能只有 silence_start 没有 silence_end，给定 duration 时补齐为收尾段。
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-i', str(video_path), '-af',
+             f'silencedetect=noise={noise_db:g}dB:d={min_silence:g}',
+             '-f', 'null', '-'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=120
+        )
+    except Exception:
+        return []
+    segments = []
+    start = None
+    for line in (result.stderr or '').splitlines():
+        m_s = re.search(r'silence_start:\s*(-?[\d.]+)', line)
+        if m_s:
+            start = max(float(m_s.group(1)), 0.0)
+            continue
+        m_e = re.search(r'silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)', line)
+        if m_e and start is not None:
+            segments.append((start, float(m_e.group(1)), float(m_e.group(2))))
+            start = None
+    if start is not None and duration and duration - start >= min_silence:
+        segments.append((start, duration, duration - start))
+    return segments
 
 
 def ffmpeg_detect_speech_onsets(video_path: str, duration: float,
@@ -351,14 +596,17 @@ class MediaQAGate:
                  video_path: str, 
                  subtitle_path: str = None,
                  visual_check_passed: bool = False,
-                 config_path: str = None) -> Tuple[bool, Dict[str, Any]]:
+                 config_path: str = None,
+                 narration_path: str = None) -> Tuple[bool, Dict[str, Any]]:
         """执行完整的媒体质量验收
         
         参数：
           video_path: 视频文件路径
           subtitle_path: 字幕文件路径（可选）
           visual_check_passed: 视觉边界检查是否通过
-          config_path: pipeline 配置文件路径（可选，提供后执行检查13：声明-实测一致性）
+          config_path: pipeline 配置文件路径（可选，提供后执行检查13：声明-实测一致性；
+                       同时用于解析 narration_source 供检查17场景感知排除）
+          narration_path: 项目 narration.json 路径（可选，显式指定优先于 config 指针解析）
         
         返回：
           (通过/失败, 详细检查结果)
@@ -391,6 +639,34 @@ class MediaQAGate:
         self.checks['audio_stream_exists'] = len(audio_streams) > 0
         if not self.checks['audio_stream_exists']:
             self.errors.append("No audio stream found")
+        
+        # 检查18：视频码率下限（阈值单一权威源：video_quality_rules.json，双档制）
+        # < fail 档 = 画面近乎空白（HTML 场景未渲染）阻断；fail~warn 之间 =
+        # 低码率预警不阻断（纯文字动画合法内容码率天然偏低）。与
+        # enhance_video_audio step7 同口径，此处是交付前最后防线。
+        if len(video_streams) > 0:
+            v_bitrate = _parse_bitrate_value(video_streams[0].get('bit_rate'))
+            if v_bitrate is not None:
+                vq_rules = _load_video_quality_rules()
+                v_br_kbps = v_bitrate // 1000
+                level, fail_kbps, warn_kbps, legacy_single = _classify_video_bitrate(
+                    v_br_kbps, vq_rules)
+                if legacy_single:
+                    self.warnings.append(
+                        f"video_quality_rules.json 仍为旧单档键 min_video_bitrate_kbps，"
+                        f"建议升级为双档 min_video_bitrate_kbps_fail/_warn")
+                self.checks['video_bitrate_ok'] = level != 'fail'
+                if level == 'fail':
+                    self.errors.append(
+                        f"Video bitrate too low: {v_br_kbps}kbps < {fail_kbps}kbps "
+                        f"(video_quality_rules.min_video_bitrate_kbps_fail) — 判定渲染失败或内容缺失")
+                elif level == 'warn':
+                    self.warnings.append(
+                        f"Video bitrate low: {v_br_kbps}kbps < {warn_kbps}kbps "
+                        f"(video_quality_rules.min_video_bitrate_kbps_warn) — 可能视觉内容不足，不阻断")
+            else:
+                self.warnings.append(
+                    "Video bitrate 无法解析（ffprobe 返回 N/A 或缺失），已跳过码率门禁")
         
         # 检查4：时长有效
         self.checks['duration_valid'] = duration > 0
@@ -586,7 +862,66 @@ class MediaQAGate:
                             f"Subtitle term violation: entry #{idx} contains "
                             f"'{hit}' — {msg}（补充 subtitle_term_rules.json 词典后重跑 step5）")
         
-        # 检查11：视觉边界检查
+        # 检查11：输出路径命名正确性（AGENTS.md 交付约束：禁止技术词命名）
+        # 被验收视频/字幕文件名命中 final/v01/render/raw/tmp → 拒收，
+        # 交付名须用业务描述性名称。清单集中定义：FORBIDDEN_NAME_TOKENS。
+        naming_violations = []
+        for label, p in (("视频", video_path), ("字幕", subtitle_path)):
+            if not p:
+                continue
+            hits = _FORBIDDEN_NAME_RE.findall(Path(p).stem.lower())
+            if hits:
+                naming_violations.append((label, Path(p).name, sorted(set(hits))))
+        self.checks['output_naming_valid'] = not naming_violations
+        for label, name, hits in naming_violations:
+            self.errors.append(
+                f"Delivery naming violation: {label}文件名 '{name}' 含技术词 "
+                f"{'/'.join(hits)} — 交付名须为业务描述性名称（AGENTS.md 交付约束）")
+        
+        # 检查17：死区终检（阈值单一权威源：audio_sync_rules.json → dead_air 节）
+        # step7 的死区检查基于声明的场景窗口；此处对最终成品做物理测量兜底，
+        # 拦截任何来源的超长连续静音（含 BGM 成片全轨无静音，自然通过）。
+        # 场景感知：narration_required=false（cover/transition）窗内静音属设计
+        # 特征不计入违规；无场景数据时降级为全片扫描并告警。
+        if duration > 0 and len(audio_streams) > 0:
+            da_rules = _load_dead_air_rules()
+            max_dead = float(da_rules.get('max_seconds_per_scene', 3.0))
+            long_silences = ffmpeg_detect_long_silences(
+                str(video_path),
+                noise_db=_load_alignment_rules().get('silence_db', -40),
+                min_silence=max_dead,
+                duration=duration)
+            narration_scenes = None
+            if narration_path:
+                cover_dur = 0.0
+                if config_path:
+                    _, cover_dur = _resolve_narration_from_config(config_path)
+                narration_scenes = _load_narration_scenes(narration_path, cover_dur)
+            elif config_path:
+                resolved_narration, cover_dur = _resolve_narration_from_config(config_path)
+                if resolved_narration:
+                    narration_scenes = _load_narration_scenes(resolved_narration, cover_dur)
+            if narration_scenes is None and long_silences:
+                self.warnings.append(
+                    "未提供场景数据（--narration 或 config 的 narration_source），"
+                    "死区终检降级为全片扫描，封面/转场静音可能误报")
+            violations = filter_dead_air_violations(
+                long_silences, narration_scenes, max_dead)
+            self.checks['no_dead_air'] = not violations
+            self.media_facts['dead_air_intervals'] = [
+                (round(st, 2), round(en, 2)) for st, en, _ in violations]
+            for st, en, dur_s in violations:
+                msg = (f"Dead air in final video: {st:.1f}-{en:.1f}s 连续静音 "
+                       f"计入 {dur_s:.1f}s > {max_dead}s（dead_air.max_seconds_per_scene，"
+                       f"已排除旁白非必需场景窗）" if narration_scenes is not None else
+                       f"Dead air in final video: {st:.1f}-{en:.1f}s 连续静音 "
+                       f"{dur_s:.1f}s > {max_dead}s（dead_air.max_seconds_per_scene）")
+                if da_rules.get('fail_on_violation', True):
+                    self.errors.append(msg)
+                else:
+                    self.warnings.append(msg)
+        
+        # 检查9：视觉边界检查状态
         self.checks['visual_check_passed'] = visual_check_passed
         if not visual_check_passed:
             self.warnings.append("Visual boundary check not passed or not verified")
@@ -623,11 +958,9 @@ class MediaQAGate:
             measured_fps = int(m.group(1)) / int(m.group(2))
         measured_w = video_stream.get('width')
         measured_h = video_stream.get('height')
-        self.media_facts = {
-            'measured_fps': measured_fps,
-            'measured_resolution': (f"{measured_w}x{measured_h}"
-                                    if measured_w and measured_h else None),
-        }
+        self.media_facts['measured_fps'] = measured_fps
+        self.media_facts['measured_resolution'] = (
+            f"{measured_w}x{measured_h}" if measured_w and measured_h else None)
         
         # 声明值（顶层优先，回退 project_info）
         declared_fps = cfg.get('fps', cfg.get('project_info', {}).get('fps'))
@@ -678,6 +1011,8 @@ def main():
     parser.add_argument('--visual-check-passed', action='store_true', 
                        help='Mark visual check as passed')
     parser.add_argument('--config', help='Pipeline config for declared-vs-measured check')
+    parser.add_argument('--narration', help='Project narration.json for scene-aware dead-air check '
+                                            '(缺省从 --config 的 narration_source 指针解析)')
     
     args = parser.parse_args()
     
@@ -686,7 +1021,8 @@ def main():
         video_path=args.video,
         subtitle_path=args.subtitle,
         visual_check_passed=args.visual_check_passed,
-        config_path=args.config
+        config_path=args.config,
+        narration_path=args.narration
     )
     
     print(f"[{'PASS' if passed else 'FAIL'}] Media QA Gate")

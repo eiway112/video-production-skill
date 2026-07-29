@@ -26,6 +26,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 
 import re
 import hashlib
+from datetime import datetime
 from pathlib import Path
 
 # Import shared GSAP time resolution utilities (T-block aware)
@@ -185,6 +186,112 @@ def _load_audio_sync_rules():
         return defaults
     except (json.JSONDecodeError, OSError):
         return defaults
+
+
+_VIDEO_QUALITY_RULES_CACHE = None
+
+
+def _load_video_quality_rules(rules_path=None):
+    """Load config/quality/video_quality_rules.json with defaults.
+
+    码率阈值单一权威源（双档制），media_qa_gate 交付终检读同一份文件。
+    读不到时回退默认双档 fail=300/warn=500 并打印告警。
+    文件声明按原样返回（不与默认双档键合并），保证旧单档键
+    min_video_bitrate_kbps 的兼容路径可被 _resolve_bitrate_thresholds 识别。
+    显式传入 rules_path 时绕过缓存（供回归测试验证配置生效）。
+    """
+    global _VIDEO_QUALITY_RULES_CACHE
+    use_cache = rules_path is None
+    if use_cache:
+        if _VIDEO_QUALITY_RULES_CACHE is not None:
+            return _VIDEO_QUALITY_RULES_CACHE
+        rules_path = (
+            Path(__file__).resolve().parents[1] / "配置" / "config" / "quality"
+            / "video_quality_rules.json"
+        )
+    defaults = {"min_video_bitrate_kbps_fail": 300, "min_video_bitrate_kbps_warn": 500}
+    result = defaults
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        declared = {k: v for k, v in loaded.items() if not k.startswith("$")}
+        if declared:
+            result = declared
+    except (json.JSONDecodeError, OSError):
+        print(f"  [WARN] 无法读取 {Path(rules_path).name}，视频码率阈值回退默认 fail=300/warn=500kbps")
+    if use_cache:
+        _VIDEO_QUALITY_RULES_CACHE = result
+    return result
+
+
+def _resolve_bitrate_thresholds(rules):
+    """解析码率双档阈值，返回 (fail_kbps, warn_kbps, legacy_single)。
+
+    双档键优先：实测 < fail 档 → 判定渲染失败/内容缺失（阻断）；
+    fail~warn 之间 → 低码率预警不阻断（纯文字动画码率天然偏低）。
+    仅存在旧单档键 min_video_bitrate_kbps 时按旧口径单档阻断
+    （legacy_single=True，调用方提示升级配置），不崩溃。
+    与 media_qa_gate._resolve_bitrate_thresholds 保持同口径。
+    """
+    fail_k = rules.get("min_video_bitrate_kbps_fail")
+    warn_k = rules.get("min_video_bitrate_kbps_warn")
+    if fail_k is not None or warn_k is not None:
+        fail_v = int(fail_k) if fail_k is not None else 300
+        warn_v = int(warn_k) if warn_k is not None else 500
+        return fail_v, max(fail_v, warn_v), False
+    legacy = rules.get("min_video_bitrate_kbps")
+    if legacy is not None:
+        return int(legacy), int(legacy), True
+    return 300, 500, False
+
+
+_TTS_CONCURRENCY_DEFAULT = 3
+_TTS_CONCURRENCY_MAX = 5
+
+
+def _load_tts_concurrency(cfg_path=None):
+    """Read tts_concurrency from config/system/hyperframes_config.json.
+
+    P2-01 TTS 并发数单一权威源。回退+告警模式（同 P1 阈值治理）：
+    文件缺失/键缺失/值非法一律回退默认 3 并打印一行告警；
+    硬上限 5（TTS 服务限流保护），超限按 5 执行并告警。
+    显式传入 cfg_path 供测试注入。
+    """
+    if cfg_path is None:
+        cfg_path = (
+            Path(__file__).resolve().parents[1] / "配置" / "config" / "system"
+            / "hyperframes_config.json"
+        )
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        n = loaded["tts_concurrency"]
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValueError(f"tts_concurrency={n!r}")
+    except (OSError, json.JSONDecodeError, KeyError, ValueError):
+        print(f"  [WARN] 无法从 {Path(cfg_path).name} 读取合法 tts_concurrency，"
+              f"回退默认 {_TTS_CONCURRENCY_DEFAULT}")
+        return _TTS_CONCURRENCY_DEFAULT
+    if n > _TTS_CONCURRENCY_MAX:
+        print(f"  [WARN] tts_concurrency={n} 超过硬上限 {_TTS_CONCURRENCY_MAX}，"
+              f"按 {_TTS_CONCURRENCY_MAX} 执行")
+        return _TTS_CONCURRENCY_MAX
+    return n
+
+
+def _parse_bitrate_value(raw):
+    """解析 ffprobe 的 bit_rate 字段为 int（bps），失败返回 None（码率未知）。
+
+    ffprobe 对部分容器/流返回 "N/A" 或缺失该键，直接 int() 会抛
+    ValueError 使门禁崩溃。返回 None 时调用方跳过码率门禁判定，
+    并追加 warning 保证可追溯（不判 FAIL/WARN 阻断，也不虚报）。
+    与 media_qa_gate._parse_bitrate_value 保持同口径。
+    """
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _build_timeline_manifest(temp_dir):
@@ -955,6 +1062,57 @@ async def step1_generate_tts(temp_dir):
     tts_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_tts_manifest(temp_dir)
 
+    # ========== P2-01 阶段1：并发生成 raw mp3（仅网络 TTS 步骤） ==========
+    # 预先分拣 cache-miss 且 raw 缺失的场景，Semaphore 限流并发调用 generate_tts。
+    # ffmpeg 上采样/manifest 写入/时长检查仍在下方原串行循环里按 SCENES 顺序执行，
+    # 保证确定性输出顺序与产物语义与串行版完全等价。concurrency=1 时不进池，
+    # raw 生成留在原循环内逐场景执行（原串行路径原样保留）。
+    concurrency = _load_tts_concurrency()
+    if concurrency > 1:
+        pending = []
+        for scene_id, start, end, text in SCENES:
+            h = _tts_cache_key(text)
+            hq_file = tts_dir / f"tts_{h}_hq.wav"
+            raw_file = temp_dir / f"scene_{scene_id}_{h}.mp3"
+            if not hq_file.exists() and not raw_file.exists():
+                pending.append((scene_id, text, raw_file))
+        if pending:
+            print(f"  [TTS-POOL] concurrency={concurrency} (cache-miss scenes: {len(pending)})")
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _pool_worker(scene_id, text, raw_file):
+                async with sem:
+                    print(f"  Generating scene {scene_id} TTS...")
+                    await generate_tts(text, raw_file)
+                    print(f"  Scene {scene_id}: raw TTS generated")
+
+            results = await asyncio.gather(
+                *[_pool_worker(sid, t, rf) for sid, t, rf in pending],
+                return_exceptions=True,
+            )
+            failed = [pending[i] for i, r in enumerate(results)
+                      if isinstance(r, BaseException)]
+            # 单场景失败不中止其他任务；全部结束后对失败场景串行兜底重试一次
+            still_failed = []
+            for scene_id, text, raw_file in failed:
+                print(f"  Scene {scene_id}: concurrent TTS failed, serial retry...")
+                try:
+                    await generate_tts(text, raw_file)
+                    print(f"  Scene {scene_id}: raw TTS generated (serial retry)")
+                except Exception as e:
+                    still_failed.append((scene_id, e))
+                    # 清掉可能的半成品 raw，避免下次续跑把坏文件洗进缓存
+                    if raw_file.exists():
+                        raw_file.unlink()
+            print(f"  [TTS-POOL] done: {len(pending) - len(still_failed)}"
+                  f"/{len(pending)} scene(s) ok, {len(still_failed)} failed")
+            if still_failed:
+                print(f"  [ERROR] TTS generation FAILED for {len(still_failed)} scene(s):")
+                for scene_id, e in still_failed:
+                    print(f"    ✗ scene {scene_id}: {e}")
+                print("  已成功场景的 raw mp3 已按文本哈希缓存，修复后重跑免重做。")
+                return False
+
     overflow_scenes = []
     new_entries = 0
     for scene_id, start, end, text in SCENES:
@@ -1019,6 +1177,14 @@ async def step1_generate_tts(temp_dir):
         expected_scenes=expected_tts_count,
         temp_dir=str(temp_dir)
     )
+    
+    # 验证结果持久化：落盘供 pipeline_runner 合并进 pipeline_state（完工报告追溯）。
+    # 无论通过与否都写，确保失败明细也可被追溯。
+    try:
+        from verify_tts_product import write_verify_result
+        write_verify_result(details, str(temp_dir))
+    except Exception:
+        pass
     
     if not is_valid:
         print(f"\n  [ERROR] TTS product validation FAILED:")
@@ -1876,12 +2042,14 @@ def step4_verify(output_path):
         if ct == "video":
             w, h = s.get("width", "?"), s.get("height", "?")
             fps = s.get("r_frame_rate", "?")
-            br = int(s.get("bit_rate", 0)) // 1000
+            br_bps = _parse_bitrate_value(s.get("bit_rate"))
+            br = br_bps // 1000 if br_bps is not None else "N/A"
             print(f"  Video: {cn} {w}x{h} {fps}fps {br}kbps")
         elif ct == "audio":
             sr = s.get("sample_rate", "?")
             ch = s.get("channels", "?")
-            br = int(s.get("bit_rate", 0)) // 1000
+            br_bps = _parse_bitrate_value(s.get("bit_rate"))
+            br = br_bps // 1000 if br_bps is not None else "N/A"
             print(f"  Audio: {cn} {sr}Hz {ch}ch {br}kbps")
 
     dur = float(fmt.get("duration", 0))
@@ -1902,6 +2070,26 @@ def _parse_srt_time(t):
     """Parse SRT time string (00:01:23,456) to seconds."""
     h, m, s = t.replace(',', '.').split(':')
     return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _write_media_quality_result(temp_dir, passed, errors, warnings):
+    """媒体质检结果落盘（供 pipeline_runner 合并进 pipeline_state 追溯）。
+
+    汇总 step7 的视频质检（_check_video_quality）、死区、字幕等全部错误/警告。
+    写入失败不抛异常，避免影响主流程。
+    """
+    try:
+        out_path = Path(temp_dir) / "media_quality_result.json"
+        payload = {
+            "passed": bool(passed),
+            "errors": errors,
+            "warnings": warnings,
+            "checked_at": datetime.now().isoformat(),
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def _check_video_quality(video_path, expected_duration=None):
@@ -1930,21 +2118,38 @@ def _check_video_quality(video_path, expected_duration=None):
         return errors, warnings
 
     vs = v_streams[0]
-    v_bitrate = int(vs.get("bit_rate", 0))
+    v_bitrate = _parse_bitrate_value(vs.get("bit_rate"))
     v_dur = float(vs.get("duration", 0))
 
-    # --- Bitrate check: 1080p video with content should be > 500kbps ---
-    if v_bitrate > 0:
+    # --- Bitrate check: 阈值单一权威源 video_quality_rules.json（双档制）---
+    # < fail 档 → 判定渲染失败/内容缺失阻断；fail~warn 之间 → 低码率预警
+    # 不阻断（纯文字动画实测 336-343kbps 属合法内容）。
+    # 码率无法解析（N/A/缺失）时跳过门禁并追加 warning 保证可追溯。
+    if v_bitrate is not None:
+        rules = _load_video_quality_rules()
+        fail_kbps, warn_kbps, legacy_single = _resolve_bitrate_thresholds(rules)
         v_br_kbps = v_bitrate // 1000
-        if v_br_kbps < 300:
+        if legacy_single:
+            warnings.append(
+                "video_quality_rules.json 仍为旧单档键 min_video_bitrate_kbps，"
+                "建议升级为双档 min_video_bitrate_kbps_fail/_warn"
+            )
+        if v_br_kbps < fail_kbps:
             errors.append(
-                f"Video bitrate critically low: {v_br_kbps}kbps "
+                f"Video bitrate too low: {v_br_kbps}kbps < {fail_kbps}kbps "
+                f"(video_quality_rules.min_video_bitrate_kbps_fail) "
                 f"\u2014 video likely blank (HTML scenes not rendering)"
             )
-        elif v_br_kbps < 500:
+        elif v_br_kbps < warn_kbps:
             warnings.append(
-                f"Video bitrate low: {v_br_kbps}kbps \u2014 may indicate insufficient visual content"
+                f"Video bitrate low: {v_br_kbps}kbps < {warn_kbps}kbps "
+                f"(video_quality_rules.min_video_bitrate_kbps_warn) "
+                f"\u2014 可能视觉内容不足，不阻断"
             )
+    else:
+        warnings.append(
+            "Video bitrate 无法解析（ffprobe 返回 N/A 或缺失），已跳过码率门禁"
+        )
 
     # --- Duration check: actual vs expected ---
     if expected_duration and v_dur > 0:
@@ -2299,6 +2504,9 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
         print(f"  [WARN] {len(warnings)} warning(s):")
         for w in warnings:
             print(f"    ⚠ {w}")
+
+    # 媒体质检结果持久化：落盘供 pipeline_runner 合并进 pipeline_state（完工报告追溯）
+    _write_media_quality_result(temp_dir, len(errors) == 0, errors, warnings)
 
     return len(errors) == 0
 

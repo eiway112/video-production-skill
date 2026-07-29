@@ -1,8 +1,9 @@
 """Visual boundary check — verify rendered content stays above subtitle zone.
 
-Extracts frames from the rendered video at each scene's midpoint,
-measures the lowest content pixel y-coordinate, and fails if any
-scene's content extends into the subtitle safety zone.
+Extracts frames from the rendered video at three sample points per scene
+(30% / 50% / 70% of scene duration), measures the lowest content pixel
+y-coordinate at each point, and fails if the worst-case measurement
+extends into the subtitle safety zone.
 
 This is a HARD GATE in the pipeline: it runs AFTER rendering and
 BEFORE subtitle burn-in. If content overlaps the subtitle zone,
@@ -20,6 +21,7 @@ import sys
 import subprocess
 import tempfile
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Force UTF-8 output on Windows GBK consoles
@@ -50,6 +52,11 @@ CONTENT_PIXEL_THRESHOLD = 20
 # Brightness threshold to distinguish content from dark background
 BRIGHTNESS_THRESHOLD = 80  # for R/G channels
 BLUE_THRESHOLD = 100       # for B channel (dark blue background)
+
+# Per-scene sample points (fraction of scene duration). Three-point sampling
+# catches entrance (30%), steady-state (50%) and late-appearing (70%) content;
+# the WORST measurement (max content_bottom) decides the scene verdict.
+SAMPLE_POINTS = (0.3, 0.5, 0.7)
 
 
 def find_ffmpeg():
@@ -164,11 +171,35 @@ def run_check(video_path, scenes, ffmpeg_exe="ffmpeg"):
                 })
                 continue
 
-            # Sample at 40% into the scene (after entrance animations, before exit)
-            sample_t = start + dur * 0.4
-            frame_path = os.path.join(tmp_dir, f"scene_{sid}.png")
+            # Extract all sample points in parallel (extract_frame is an
+            # independent subprocess with its own output file → thread-safe).
+            jobs = []  # (ratio, sample_t, frame_path)
+            for ratio in SAMPLE_POINTS:
+                sample_t = start + dur * ratio
+                frame_path = os.path.join(tmp_dir, f"scene_{sid}_p{int(ratio * 100)}.png")
+                jobs.append((ratio, sample_t, frame_path))
 
-            if not extract_frame(video_path, sample_t, frame_path, ffmpeg_exe):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [
+                    pool.submit(extract_frame, video_path, t, fp, ffmpeg_exe)
+                    for _, t, fp in jobs
+                ]
+                extracted = [f.result() for f in futures]
+
+            # Measure serially (in SAMPLE_POINTS order) for determinism.
+            samples = []
+            for (ratio, sample_t, frame_path), ok in zip(jobs, extracted):
+                if not ok:
+                    continue
+                content_bottom = measure_content_bottom(frame_path)
+                samples.append({
+                    "ratio": ratio,
+                    "t": round(sample_t, 1),
+                    "content_bottom": content_bottom,
+                    "gap": SUBTITLE_SAFETY_LINE - content_bottom,
+                })
+
+            if not samples:
                 results.append({
                     "scene": sid, "status": "ERROR",
                     "reason": "frame extraction failed",
@@ -176,8 +207,11 @@ def run_check(video_path, scenes, ffmpeg_exe="ffmpeg"):
                 })
                 continue
 
-            content_bottom = measure_content_bottom(frame_path)
-            gap = SUBTITLE_SAFETY_LINE - content_bottom
+            # Worst case = max content_bottom (first occurrence wins on tie).
+            worst = max(samples, key=lambda s: s["content_bottom"])
+            content_bottom = worst["content_bottom"]
+            gap = worst["gap"]
+            sample_t = worst["t"]
 
             status = "PASS" if content_bottom <= SUBTITLE_SAFETY_LINE else "FAIL"
 
@@ -187,56 +221,16 @@ def run_check(video_path, scenes, ffmpeg_exe="ffmpeg"):
                 "content_bottom": content_bottom,
                 "safety_line": SUBTITLE_SAFETY_LINE,
                 "gap": gap,
-                "sample_time": round(sample_t, 1),
+                "sample_time": sample_t,
+                "samples": samples,
             }
             results.append(result)
 
             if status == "FAIL":
                 violations.append(result)
-                print(f"  ✗ Scene {sid}: content_bottom=y{content_bottom} | safety=y{SUBTITLE_SAFETY_LINE} | OVERFLOW {abs(gap)}px @t={sample_t:.1f}s")
+                print(f"  ✗ Scene {sid}: content_bottom=y{content_bottom} | safety=y{SUBTITLE_SAFETY_LINE} | OVERFLOW {abs(gap)}px @t={sample_t:.1f}s (worst of {len(samples)} samples)")
             else:
-                print(f"  ✓ Scene {sid}: content_bottom=y{content_bottom} | gap={gap}px @t={sample_t:.1f}s")
-
-    # Also sample at 70% for scenes with late-appearing content
-    print("\n  [Second pass: sampling at 70% of scene duration]")
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        for scene in scenes:
-            sid = scene["id"]
-            start = scene["start"]
-            end = scene["end"]
-            dur = end - start
-
-            if dur < 2:
-                continue
-
-            sample_t = start + dur * 0.7
-            frame_path = os.path.join(tmp_dir, f"scene_{sid}_late.png")
-
-            if not extract_frame(video_path, sample_t, frame_path, ffmpeg_exe):
-                continue
-
-            content_bottom = measure_content_bottom(frame_path)
-            gap = SUBTITLE_SAFETY_LINE - content_bottom
-
-            if content_bottom > SUBTITLE_SAFETY_LINE:
-                # Only report if this is worse than the first pass
-                existing = next((r for r in results if r["scene"] == sid), None)
-                if existing and content_bottom > existing.get("content_bottom", 0):
-                    print(f"  ✗ Scene {sid} @70%: content_bottom=y{content_bottom} | OVERFLOW {abs(gap)}px @t={sample_t:.1f}s")
-                    # Update the result with the worse measurement
-                    existing["status"] = "FAIL"
-                    existing["content_bottom"] = content_bottom
-                    existing["gap"] = gap
-                    existing["sample_time"] = round(sample_t, 1)
-                    if existing not in violations:
-                        violations.append(existing)
-                elif not existing or existing["status"] != "FAIL":
-                    print(f"  ✗ Scene {sid} @70%: content_bottom=y{content_bottom} | OVERFLOW {abs(gap)}px @t={sample_t:.1f}s")
-                    violations.append({
-                        "scene": sid, "status": "FAIL",
-                        "content_bottom": content_bottom,
-                        "gap": gap, "sample_time": round(sample_t, 1),
-                    })
+                print(f"  ✓ Scene {sid}: content_bottom=y{content_bottom} | gap={gap}px @t={sample_t:.1f}s (worst of {len(samples)} samples)")
 
     passed = len(violations) == 0
     print()

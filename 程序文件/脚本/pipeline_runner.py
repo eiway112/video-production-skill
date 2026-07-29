@@ -30,12 +30,14 @@ OpenMontage 流水线步骤（按 pipeline 类型不同）：
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import io
 from datetime import datetime
@@ -64,6 +66,8 @@ STEPS = [
     ("verify", "渲染后时长验证"),
     ("visual_check", "视觉边界检测"),
     ("postprocess", "音频/字幕后处理"),
+    ("delivery", "交付验收与清理审计"),
+    ("completion_report", "完工报告"),
 ]
 
 # Hard gate: which steps MUST have passed before a given step can execute.
@@ -87,6 +91,100 @@ HARD_GATES = {
 }
 
 STEP_NAMES = [s[0] for s in STEPS]
+
+# 结构化错误码（P2 优化项4）：mark_failed 的 error_code 取值集合。
+# 语义分类固定，供完工报告/排障工具按码路由，避免解析自由文本 error。
+GATE_BLOCKED = "GATE_BLOCKED"            # 硬门禁拦截（前置步骤未通过）
+SUBPROCESS_FAILED = "SUBPROCESS_FAILED"  # 子进程非零退出
+OUTPUT_MISSING = "OUTPUT_MISSING"        # 产物文件缺失/为空
+VERIFY_FAILED = "VERIFY_FAILED"          # 验证/质检类失败
+QUICKFIX_BLOCKED = "QUICKFIX_BLOCKED"    # quick-fix 产物交付拦截
+UNKNOWN = "UNKNOWN"                      # 未分类失败
+
+
+def _cache_age_str(completed_iso):
+    """缓存年龄展示：ISO 时间 → '(12.3h ago)'；解析失败/缺失 → '(? ago)'，绝不抛异常。"""
+    try:
+        done = datetime.fromisoformat(completed_iso)
+        hours = (datetime.now() - done).total_seconds() / 3600.0
+        return f"({hours:.1f}h ago)"
+    except (TypeError, ValueError):
+        return "(? ago)"
+
+
+class _RenderProgressWatcher:
+    """render 阶段旁路进度观察者（P2 优化项3）。
+
+    daemon 线程每 10s 轮询 hyperframes 工作目录（work-*/captured-frames/frame_*.jpg）
+    的已捕获帧数并打印进度心跳。纯只读旁路：任何内部异常静默停止轮询，
+    绝不向外抛出、绝不影响渲染子进程与 step_render 返回值。整体可移除。
+
+    降级链：captured-frames 帧计数 → render_raw.mp4 文件大小 → 纯耗时心跳。
+    只统计本次渲染启动后有更新的目录/文件（mtime 门槛），避免旧渲染残留误报。
+    """
+
+    POLL_INTERVAL = 10  # 秒
+
+    def __init__(self, watch_dirs, render_raw, total_frames=0):
+        self.watch_dirs = [Path(d) for d in watch_dirs]
+        self.render_raw = Path(render_raw)
+        self.total_frames = total_frames  # <=0 表示时长未知，不显示百分比
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._start_time = time.time()
+
+    def start(self):
+        self._start_time = time.time()
+        self._thread = threading.Thread(
+            target=self._loop, name="render-progress-watcher", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout=15):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def _loop(self):
+        try:
+            while not self._stop_event.wait(self.POLL_INTERVAL):
+                self._report()
+        except Exception:
+            pass  # 静默停止：观察者故障绝不干扰渲染
+
+    def _elapsed_str(self):
+        secs = int(time.time() - self._start_time)
+        return f"{secs // 60}m{secs % 60:02d}s"
+
+    def _count_frames(self):
+        """返回本次渲染活跃 work 目录的帧数；找不到返回 None。"""
+        best = None
+        for root in self.watch_dirs:
+            if not root.is_dir():
+                continue
+            for cap in root.glob("work-*/captured-frames"):
+                if cap.stat().st_mtime < self._start_time:
+                    continue  # 旧渲染残留目录，跳过
+                n = sum(1 for _ in cap.glob("frame_*.jpg"))
+                if best is None or cap.stat().st_mtime > best[0]:
+                    best = (cap.stat().st_mtime, n)
+        return None if best is None else best[1]
+
+    def _report(self):
+        frames = self._count_frames()
+        elapsed = self._elapsed_str()
+        if frames is not None:
+            if self.total_frames > 0:
+                pct = min(100, frames * 100 // self.total_frames)
+                print(f"  [RENDER] ~{pct}% ({frames}/{self.total_frames} frames, "
+                      f"elapsed {elapsed})", flush=True)
+            else:
+                print(f"  [RENDER] {frames} frames captured, elapsed {elapsed}", flush=True)
+        elif (self.render_raw.exists()
+              and self.render_raw.stat().st_mtime >= self._start_time):
+            size_mb = self.render_raw.stat().st_size / 1024 / 1024
+            print(f"  [RENDER] elapsed {elapsed} (render_raw.mp4: {size_mb:.1f}MB)", flush=True)
+        else:
+            print(f"  [RENDER] elapsed {elapsed}", flush=True)
 
 
 def compile_sdl(sdl_path):
@@ -175,9 +273,11 @@ class PipelineState:
             self.data["steps"][step]["input_fingerprint"] = input_fingerprint
         self.save()
 
-    def mark_failed(self, step, error=""):
+    def mark_failed(self, step, error="", error_code=None):
         self.data["steps"][step]["status"] = "failed"
         self.data["steps"][step]["error"] = error[:200]
+        # 结构化错误码：未指定时归为 UNKNOWN；旧 state 缺此字段的读取方均用 .get 兼容
+        self.data["steps"][step]["error_code"] = error_code or UNKNOWN
         self.save()
 
     def mark_skipped(self, step, reason=""):
@@ -188,6 +288,14 @@ class PipelineState:
             "error": None,
             "reason": reason,
         }
+        self.save()
+
+    def set_verification(self, key, data):
+        """记录某项验证/质检的结构化结果（供完工报告追溯）。
+
+        单一权威源：验证明细由对应脚本落盘、此处只做合并，state 是唯一读出口。
+        """
+        self.data.setdefault("verifications", {})[key] = data
         self.save()
 
     def reset(self, reason=""):
@@ -411,30 +519,128 @@ class PipelineRunner:
     #       无指纹的旧状态一律重跑；命中缓存必须显式打印状态日期。
 
     def _step_inputs(self, step):
-        """每个步骤的输入文件清单（用于指纹计算）。"""
+        """每个步骤的输入文件清单（用于指纹计算）。
+
+        质量阈值表与主执行脚本纳入指纹：改阈值/改脚本后对应步骤缓存
+        自动失效重跑。克制原则：只登记每步真实消费的配置与脚本，不做全量覆盖。
+        """
         narration = self.source_dir / "narration.json"
         compiled = self.source_dir / "_compiled_scenes.json"
         tts_manifest = self.tts_dir / "tts_manifest.json"
+        quality_dir = CONFIG_DIR / "quality"
+        audio_rules = quality_dir / "audio_sync_rules.json"
+        enhance_script = SCRIPTS / "enhance_video_audio.py"
         inputs_map = {
             "preflight":    {"config": self.config_path, "html": self.html_path},
             "tts":          {"config": self.config_path, "narration": narration,
-                             "compiled_scenes": compiled},
+                             "compiled_scenes": compiled,
+                             "script": enhance_script},
             "timeline":     {"config": self.config_path, "html": self.html_path,
-                             "tts_manifest": tts_manifest},
+                             "tts_manifest": tts_manifest,
+                             "audio_sync_rules": audio_rules,
+                             "script": SCRIPTS / "adjust_timeline.py"},
             "preview":      {"config": self.config_path, "html": self.html_path},
             "render":       {"config": self.config_path, "html": self.html_path},
             "verify":       {"config": self.config_path, "html": self.html_path,
                              "render_raw": self.render_raw},
-            "visual_check": {"config": self.config_path, "render_raw": self.render_raw},
+            "visual_check": {"config": self.config_path, "render_raw": self.render_raw,
+                             "script": SCRIPTS / "visual_boundary_check.py"},
             "postprocess":  {"config": self.config_path, "html": self.html_path,
                              "render_raw": self.render_raw, "narration": narration,
-                             "tts_manifest": tts_manifest},
+                             "tts_manifest": tts_manifest,
+                             "audio_sync_rules": audio_rules,
+                             "subtitle_term_rules": quality_dir / "subtitle_term_rules.json",
+                             "narration_digits_rules": quality_dir / "narration_digits_rules.json",
+                             "video_quality_rules": quality_dir / "video_quality_rules.json",
+                             "script": enhance_script},
+            "delivery":     {"config": self.config_path, "video": self._delivery_paths()[0],
+                             "srt": self._delivery_paths()[1]},
+            # completion_report 消费 state 内容，但不能把 pipeline_state.json 整文件
+            # 纳入指纹——本步骤完成时 mark_completed 会写回该文件（自引用回路，
+            # 指纹永远漂移、缓存永不可命中）。改用稳定摘要：排除自写与易变字段，
+            # 保留其余 9 步记录（上游任何变化仍会使报告指纹失效）。
+            "completion_report": {"config": self.config_path, "video": self._delivery_paths()[0],
+                             "srt": self._delivery_paths()[1],
+                             "state_digest": "digest:" + self._stable_state_digest()},
         }
         return {k: str(v) for k, v in inputs_map.get(step, {}).items()}
+
+    def _stable_state_digest(self):
+        """state 内容的稳定摘要（completion_report 指纹专用）。
+
+        排除字段（均由本步骤自身或每次运行必然写入，属自引用来源）：
+          - last_run：每次 mark_started 都会更新
+          - steps.completion_report：本步骤自身记录（status/completed/input_fingerprint）
+        其余内容（另外 9 步的记录、verifications 等）全部参与摘要——
+        任一上游步骤重跑/状态变化都会改变摘要，报告缓存随之失效。
+        非路径字符串在 compute_inputs_fingerprint 中按字面值确定性参与哈希。
+        """
+        stable = {k: v for k, v in self.state.data.items() if k != "last_run"}
+        stable["steps"] = {k: v for k, v in stable.get("steps", {}).items()
+                           if k != "completion_report"}
+        blob = json.dumps(stable, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def _fingerprint(self, step):
         """计算步骤当前输入的联合指纹（步骤完成时记录用）。"""
         return compute_inputs_fingerprint(self._step_inputs(step))
+
+    def _delivery_paths(self):
+        """交付物路径解析：config.delivery 为权威源，否则用成果目录默认路径。
+
+        返回 (video_path, srt_path)。config 中声明的相对路径以仓根 ROOT 为基准。
+        """
+        delivery_cfg = self.config.get("delivery", {}) if isinstance(self.config, dict) else {}
+        if delivery_cfg.get("video"):
+            video_path = Path(delivery_cfg["video"])
+            if not video_path.is_absolute():
+                video_path = ROOT / video_path
+        else:
+            video_path = self.output_file
+        if delivery_cfg.get("subtitle"):
+            srt_path = Path(delivery_cfg["subtitle"])
+            if not srt_path.is_absolute():
+                srt_path = ROOT / srt_path
+        else:
+            srt_name = self.config.get("paths", {}).get("subtitle_name", f"{self.html_project}.srt")
+            srt_path = ROOT / "成果文件" / "字幕" / srt_name
+        return video_path, srt_path
+
+    def _delivery_blocked_steps(self):
+        """返回阻断交付的步骤清单（被 skipped 或未 passed 的渲染链步骤）。
+
+        --quick-fix 会把 7 个前置步骤标记为 skipped —— 此清单非空即禁止交付，
+        确保 quick-fix 产物不流入交付。
+        """
+        render_chain = ["preflight", "tts", "timeline", "preview", "render",
+                        "verify", "visual_check", "postprocess"]
+        blocked = []
+        for step in render_chain:
+            rec = self.state.data.get("steps", {}).get(step, {})
+            status = rec.get("status", "pending")
+            if status == "skipped":
+                blocked.append(f"{step} (skipped: {rec.get('reason', 'quick-fix')})")
+            elif status != "passed":
+                blocked.append(f"{step} (status={status})")
+        return blocked
+
+    def _merge_verification_file(self, key, result_path):
+        """读取子进程落盘的验证结果 JSON，合并进 state['verifications'][key]。
+
+        文件缺失/损坏时静默跳过（向后兼容：旧流程无此文件，
+        完工报告端会标注不可追溯而非崩溃）。
+        """
+        try:
+            p = Path(result_path)
+            if not p.exists():
+                return
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.state.set_verification(key, data)
+            passed = data.get("passed")
+            print(f"  [VERIFY] {key} result merged into pipeline_state (passed={passed})")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     def _step_dirty_reason(self, step):
         """步骤失效原因的纯判定（无日志副作用），供跳步判定与全链扫描共用。
@@ -483,7 +689,9 @@ class PipelineRunner:
         if reason is not None:
             return False
         old_fp = rec.get("input_fingerprint", "")
-        print(f"  [CACHED] Step passed at {completed}, input fingerprint verified ({old_fp[:12]}...) — skipping")
+        # 键名与 mark_completed 写入端一致（"completed"），缓存年龄仅作展示
+        age = _cache_age_str(rec.get("completed"))
+        print(f"  [CACHED] Step passed at {completed}, input fingerprint verified ({old_fp[:12]}...) — skipping {age}")
         return True
 
     # --- Pipeline Steps ---
@@ -505,7 +713,8 @@ class PipelineRunner:
             desc="preflight check"
         )
         if rc != 0:
-            self.state.mark_failed("preflight", "Static validation failed")
+            self.state.mark_failed("preflight", "Static validation failed",
+                                   error_code=VERIFY_FAILED)
             return False
 
         # Photo preprocessing: auto-crop if photo-crop-spec.json exists
@@ -519,7 +728,8 @@ class PipelineRunner:
                 desc="photo preprocessing"
             )
             if rc2 != 0:
-                self.state.mark_failed("preflight", "Photo preprocessing failed")
+                self.state.mark_failed("preflight", "Photo preprocessing failed",
+                                       error_code=SUBPROCESS_FAILED)
                 return False
 
         self.state.mark_completed("preflight", self._fingerprint("preflight"))
@@ -539,10 +749,13 @@ class PipelineRunner:
             cwd=str(SCRIPTS),
             desc="TTS generation"
         )
+        # 合并 TTS 产物验证结果（step1 落盘）→ pipeline_state，供完工报告追溯
+        self._merge_verification_file("tts_product", self.temp_dir / "tts_verify_result.json")
         if rc == 0:
             self.state.mark_completed("tts", self._fingerprint("tts"))
             return True
-        self.state.mark_failed("tts", "TTS generation failed")
+        self.state.mark_failed("tts", "TTS generation failed",
+                               error_code=SUBPROCESS_FAILED)
         return False
 
     def step_timeline(self):
@@ -589,7 +802,8 @@ class PipelineRunner:
             print(f"  Config reloaded: video_duration = {new_dur}s")
             self.state.mark_completed("timeline", self._fingerprint("timeline"))
             return True
-        self.state.mark_failed("timeline", "Timeline adjustment failed")
+        self.state.mark_failed("timeline", "Timeline adjustment failed",
+                               error_code=SUBPROCESS_FAILED)
         return False
 
     def step_preview(self):
@@ -626,7 +840,8 @@ class PipelineRunner:
         # Preview failure is FATAL — visual issues must be resolved before render.
         # This is the hard gate: do not waste 10+ minutes on a full render
         # when static preview has already detected structural problems.
-        self.state.mark_failed("preview", "Instant preview failed — fix visual issues before rendering")
+        self.state.mark_failed("preview", "Instant preview failed — fix visual issues before rendering",
+                               error_code=VERIFY_FAILED)
         return False
 
     def step_render(self):
@@ -649,25 +864,42 @@ class PipelineRunner:
                     print(f"  BLOCKED: Step '{prereq}' ({label}) has not passed.")
                     print(f"  RENDER REFUSED. Run preflight and preview first.")
                     print(f"  To override: use --force (not recommended)")
-                    self.state.mark_failed("render", f"Hard gate: {prereq} not passed")
+                    self.state.mark_failed("render", f"Hard gate: {prereq} not passed",
+                                           error_code=GATE_BLOCKED)
                     return False
 
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.state.mark_started("render")
 
         print("  Rendering HyperFrames (this takes ~11 minutes)...")
-        rc = self._run(
-            ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"],
-            cwd=str(self.source_dir),
-            env=self.env,
-            desc="HyperFrames render"
-        )
+        # 旁路进度观察者（P2 优化项3）：CLI 无原生进度参数（--json 仅限 --batch），
+        # 只读轮询帧数目录打印心跳。总帧数 = video_duration × 25fps（与渲染命令 --fps 一致）。
+        # hyperframes 的 work-*/captured-frames 实测生成在 temp_dir（render_raw 同级），
+        # 兼顾 source_dir 兜底。观察者失败不影响渲染判定，整体可移除。
+        try:
+            _total_frames = int(round(float(self.config.get("video_duration", 0)) * 25))
+        except (TypeError, ValueError):
+            _total_frames = 0
+        watcher = _RenderProgressWatcher(
+            [self.temp_dir, self.source_dir], self.render_raw, _total_frames)
+        watcher.start()
+        try:
+            rc = self._run(
+                ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"],
+                cwd=str(self.source_dir),
+                env=self.env,
+                desc="HyperFrames render"
+            )
+        finally:
+            watcher.stop()
         if rc != 0:
-            self.state.mark_failed("render", "HyperFrames render failed")
+            self.state.mark_failed("render", "HyperFrames render failed",
+                                   error_code=SUBPROCESS_FAILED)
             return False
 
         if not self.render_raw.exists():
-            self.state.mark_failed("render", "render_raw.mp4 not created")
+            self.state.mark_failed("render", "render_raw.mp4 not created",
+                                   error_code=OUTPUT_MISSING)
             return False
 
         size_mb = self.render_raw.stat().st_size / 1024 / 1024
@@ -699,7 +931,8 @@ class PipelineRunner:
             probe_data = json.loads(probe_result.stdout)
             rendered_dur = float(probe_data["format"]["duration"])
         except (json.JSONDecodeError, KeyError):
-            self.state.mark_failed("verify", "ffprobe returned invalid data")
+            self.state.mark_failed("verify", "ffprobe returned invalid data",
+                                   error_code=VERIFY_FAILED)
             return False
 
         # Read expected duration: prefer S-block (authoritative), fall back to config JSON
@@ -724,7 +957,8 @@ class PipelineRunner:
         if diff > 5.0:
             self.state.mark_failed(
                 "verify",
-                f"Duration mismatch: {rendered_dur:.1f}s vs {expected_dur:.1f}s ({dur_source}, diff {diff:.1f}s > 5s)"
+                f"Duration mismatch: {rendered_dur:.1f}s vs {expected_dur:.1f}s ({dur_source}, diff {diff:.1f}s > 5s)",
+                error_code=VERIFY_FAILED
             )
             print("  ERROR: Duration mismatch exceeds 5s. Investigate GSAP timeline.")
             # Scene-by-scene diagnostic: help locate which scene has the drift
@@ -780,7 +1014,8 @@ class PipelineRunner:
         if rc == 0:
             self.state.mark_completed("visual_check", self._fingerprint("visual_check"))
             return True
-        self.state.mark_failed("visual_check", "Content overflows subtitle safety zone")
+        self.state.mark_failed("visual_check", "Content overflows subtitle safety zone",
+                               error_code=VERIFY_FAILED)
         return False
 
     def step_postprocess(self):
@@ -794,11 +1029,113 @@ class PipelineRunner:
             cmd.append("--quick-fix")
 
         rc = self._run(cmd, cwd=str(SCRIPTS), desc="audio/subtitle post-processing")
+        # 合并媒体质检结果（step7 落盘）→ pipeline_state，供完工报告追溯
+        self._merge_verification_file("media_quality", self.temp_dir / "media_quality_result.json")
         if rc == 0:
             self.state.mark_completed("postprocess", self._fingerprint("postprocess"))
             return True
-        self.state.mark_failed("postprocess", "Post-processing failed")
+        self.state.mark_failed("postprocess", "Post-processing failed",
+                               error_code=SUBPROCESS_FAILED)
         return False
+
+    def step_delivery(self):
+        """交付验收与清理审计（最终交付关卡）。
+
+        1. quick-fix/门禁拦截：任一渲染链步骤 skipped 或未 passed → 拒收；
+        2. 成果文件校验：视频+字幕存在且非零（config.delivery 为权威源）；
+        3. 清理审计：列出待清理中间产物（默认 dry-run，不实际删除）。
+
+        注意：delivery 是最终交付关卡，quick-fix 产物必须被拦截；因此不设
+        quick-fix 跳过分支，且门禁检查先于缓存判定（防止被缓存命中绕过）。
+        """
+        # ── 门禁 1：quick-fix / 前置步骤拦截（先于缓存判定）──
+        blocked = self._delivery_blocked_steps()
+        if blocked:
+            self.state.mark_started("delivery")
+            print("  BLOCKED: 以下前置步骤被跳过或未通过，禁止交付：")
+            for b in blocked:
+                print(f"    X {b}")
+            print("  quick-fix 产物不得流入交付。请运行完整流水线（不带 --quick-fix）后再交付。")
+            self.state.mark_failed("delivery", f"Delivery blocked: {len(blocked)} step(s) skipped/not-passed",
+                                   error_code=QUICKFIX_BLOCKED)
+            return False
+
+        # 门禁通过后方可考虑缓存复用
+        if self._can_skip("delivery"):
+            return True
+
+        self.state.mark_started("delivery")
+
+        # ── 门禁 2：成果文件存在且非零 ──
+        video_path, srt_path = self._delivery_paths()
+        missing = []
+        for label, p in (("视频", video_path), ("字幕", srt_path)):
+            if not p.exists():
+                missing.append(f"{label}不存在: {p}")
+            elif p.stat().st_size == 0:
+                missing.append(f"{label}为空文件: {p}")
+        if missing:
+            print("  BLOCKED: 成果文件校验失败：")
+            for m in missing:
+                print(f"    X {m}")
+            self.state.mark_failed("delivery", f"Delivery artifacts invalid: {'; '.join(missing)}",
+                                   error_code=OUTPUT_MISSING)
+            return False
+
+        print(f"  成果视频: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        print(f"  成果字幕: {srt_path} ({srt_path.stat().st_size} bytes)")
+
+        # ── 清理审计（dry-run）：列出待清理中间产物，不实际删除 ──
+        # 破坏性清理必须由用户显式执行 project_cleanup.py --execute（AGENTS.md 破坏性操作审核）
+        print("  清理审计（dry-run，仅列出，不删除）：")
+        cleanup_targets = [self.render_raw, self.tts_dir]
+        if self.temp_dir.exists():
+            cleanup_targets.extend(sorted(self.temp_dir.glob("work-*")))
+        listed = 0
+        for t in cleanup_targets:
+            if t.exists():
+                listed += 1
+                kind = "DIR " if t.is_dir() else "FILE"
+                print(f"    [{kind}] {t}")
+        if listed == 0:
+            print("    (无待清理中间产物)")
+        else:
+            print(f"  共 {listed} 项待清理。执行清理请运行：project_cleanup.py --execute")
+
+        self.state.mark_completed("delivery", self._fingerprint("delivery"))
+        return True
+
+    def step_completion_report(self):
+        """完工报告：调用 generate_completion_report.py，状态源自其真实测量。
+
+        报告脚本 FAILED → 非零退出码 → 本步骤失败；runner 不硬编码任何成功字样。
+        """
+        if self._can_skip("completion_report"):
+            return True
+
+        self.state.mark_started("completion_report")
+
+        video_path, srt_path = self._delivery_paths()
+        report_out = self.temp_dir / "completion_report.json"
+        rc = self._run(
+            [str(VENV_PYTHON), "generate_completion_report.py",
+             "--project-name", self.html_project,
+             "--video-file", str(video_path),
+             "--subtitle-file", str(srt_path),
+             "--state-file", str(self.state.path),
+             "--output-file", str(report_out)],
+            cwd=str(SCRIPTS),
+            desc="completion report"
+        )
+        # 报告状态源自脚本真实测量：FAILED 时脚本退出非零（GATE_FAILURE），
+        # VALIDATED / VALIDATED_WITH_ISSUES 退出 0。此处不硬编码任何成功判定。
+        if rc != 0:
+            self.state.mark_failed("completion_report", "Completion report validation FAILED (see report)",
+                                   error_code=VERIFY_FAILED)
+            return False
+        print(f"  完工报告已生成: {report_out}")
+        self.state.mark_completed("completion_report", self._fingerprint("completion_report"))
+        return True
 
     def run(self, start_from=None):
         """Execute the pipeline."""

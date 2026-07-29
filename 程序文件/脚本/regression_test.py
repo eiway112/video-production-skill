@@ -1037,6 +1037,1244 @@ def test_narration_source_pointer_resolution() -> RegressionTestCase:
 
     return tc
 
+def _safe_import_rebinding_module(module_name):
+    """导入会在模块顶层重绑 stdout/stderr 的脚本模块（pipeline_runner /
+    enhance_video_audio 等）而不破坏测试进程的流。
+
+    这类脚本在模块顶层用 TextIOWrapper 重绑 sys.stdout/stderr（面向
+    独立进程运行），在测试进程内 import 会顶掉原流并在 GC 时
+    关闭共享 buffer（导致 'I/O operation on closed file'）。此处导入后 detach
+    新包装器并恢复原流，避免 I/O 崩溃。
+    """
+    import sys as _sys
+    import importlib
+    saved_out, saved_err = _sys.stdout, _sys.stderr
+    try:
+        mod = importlib.import_module(module_name)
+    finally:
+        for stream in (_sys.stdout, _sys.stderr):
+            if stream not in (saved_out, saved_err):
+                try:
+                    stream.detach()
+                except Exception:
+                    pass
+        _sys.stdout, _sys.stderr = saved_out, saved_err
+    return mod
+
+def _safe_import_pipeline_runner():
+    """兼容入口：安全导入 pipeline_runner（见 _safe_import_rebinding_module）。"""
+    return _safe_import_rebinding_module("pipeline_runner")
+
+def test_delivery_gate_blocks_quickfix() -> RegressionTestCase:
+    """用例19：delivery 拦截 quick-fix 产物（交付关卡）
+
+    背景：--quick-fix 会把 preflight..visual_check 共 7 步标记为 skipped，
+    以前流水线结束仅打印提醒，无任何机制阻止 quick-fix 产物流入交付。
+    本用例锁定：带 skipped 步骤的 state 下 delivery 必须判为拒收，且不能被缓存绕过。
+    """
+    tc = RegressionTestCase(
+        "delivery_gate_blocks_quickfix",
+        "验证 delivery 步骤在存在 skipped 步骤（quick-fix）时拒收"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            state = PipelineState(tmpdir / "pipeline_state.json")
+            # 构造 quick-fix 状态：7 个前置步骤 skipped，postprocess 已通过
+            for s in ["preflight", "tts", "timeline", "preview", "render", "verify", "visual_check"]:
+                state.mark_skipped(s, "quick-fix mode")
+            state.mark_started("postprocess")
+            state.mark_completed("postprocess")
+
+            # 不走 __init__（避免依赖真实 config/环境），直接注入步骤所需属性
+            runner = PipelineRunner.__new__(PipelineRunner)
+            runner.state = state
+            runner.force = False
+            runner.quick_fix = True
+            runner.config = {}
+            runner.html_project = "test_proj"
+            runner.output_file = tmpdir / "test_proj.mp4"
+            runner.temp_dir = tmpdir
+            runner.tts_dir = tmpdir / "tts_44k"
+            runner.render_raw = tmpdir / "render_raw.mp4"
+
+            # 阻断清单非空
+            blocked = runner._delivery_blocked_steps()
+            tc.assert_true(len(blocked) >= 7, "blocked list captures skipped render-chain steps")
+
+            # delivery 必须拒收
+            ok = runner.step_delivery()
+            tc.assert_true(not ok, "delivery returns False when steps skipped (quick-fix blocked)")
+            tc.assert_equal(state.data["steps"]["delivery"]["status"], "failed",
+                            "delivery step marked failed in state")
+
+            # 对照：全部步骤 passed 且成果文件存在时，不被前置门禁拦截
+            state2 = PipelineState(tmpdir / "pipeline_state2.json")
+            for s in ["preflight", "tts", "timeline", "preview", "render",
+                      "verify", "visual_check", "postprocess"]:
+                state2.mark_started(s)
+                state2.mark_completed(s)
+            runner.state = state2
+            tc.assert_equal(len(runner._delivery_blocked_steps()), 0,
+                            "no blocked steps when full render chain passed")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_verification_result_persistence() -> RegressionTestCase:
+    """用例20：验证结果持久化与完工报告消费
+
+    背景：verify_tts_product / enhance_video_audio 的验证结果旧未写入 pipeline_state，
+    导致 generate_completion_report 无法追溯。本用例锁定：verify 结果可落盘、
+    runner 可合并进 state['verifications']、完工报告能消费该节；且旧 state 降级不崩溃。
+    """
+    tc = RegressionTestCase(
+        "verification_result_persistence",
+        "验证 verifications 节落盘/合并到 pipeline_state 且完工报告能消费"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from verify_tts_product import write_verify_result
+        from generate_completion_report import generate_report
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # 1. verify 结果落盘
+            result = {"passed": True, "total_checks": 4, "passed_checks": 4,
+                      "errors": [], "warnings": ["minor warning"]}
+            out = write_verify_result(result, str(tmpdir))
+            tc.assert_true(out and Path(out).exists(), "tts_verify_result.json written to disk")
+
+            # 2. runner 合并进 state['verifications']
+            rstate = PipelineState(tmpdir / "pipeline_state.json")
+            for s in ["preflight", "tts", "timeline", "render", "verify", "postprocess"]:
+                rstate.mark_started(s)
+                rstate.mark_completed(s)
+            runner = PipelineRunner.__new__(PipelineRunner)
+            runner.state = rstate
+            runner._merge_verification_file("tts_product", Path(out))
+            tc.assert_true("tts_product" in rstate.data.get("verifications", {}),
+                           "runner merges verify result into state.verifications")
+            tc.assert_equal(rstate.data["verifications"]["tts_product"]["passed"], True,
+                            "merged verification preserves passed flag")
+
+            # 3. 完工报告消费 verifications 节
+            video = tmpdir / "v.mp4"
+            video.write_bytes(b"\x00" * 100000)
+            report = generate_report(
+                project_name="TestProject",
+                video_file=str(video),
+                subtitle_file=None,
+                state_file=str(rstate.path)
+            )
+            tc.assert_true("verification_tts_product_passed" in report["validation"],
+                           "completion report consumes verifications node")
+            tc.assert_equal(report["validation"]["verification_tts_product_passed"], True,
+                            "tts_product verification recorded as passed in report")
+
+            # 4. 向后兼容：旧 state 无 verifications 节 → 降级不崩溃
+            legacy = {"steps": {"preflight": {"status": "passed"}}}
+            legacy_file = tmpdir / "legacy_state.json"
+            legacy_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+            report2 = generate_report(
+                project_name="TestProject",
+                video_file=str(video),
+                subtitle_file=None,
+                state_file=str(legacy_file)
+            )
+            tc.assert_true("status" in report2,
+                           "legacy state without verifications degrades gracefully (no crash)")
+            tc.assert_equal(report2["data_sources"].get("verifications"),
+                            "not_recorded (legacy state, not traceable)",
+                            "legacy state flagged as not-traceable rather than crashing")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_quality_threshold_config_effective() -> RegressionTestCase:
+    """用例21：质量阈值配置生效（P1 单一权威源）
+
+    背景：verify_tts_product / media_qa_gate 旧版硬编码 silencedetect -40dB，
+    enhance_video_audio 硬编码码率阈值 300kbps —— 配置文件声明不生效。
+    2026-07-29 改为从 config/quality/*.json 读取（读不到回退默认并告警）。
+    本用例锁定：篡改临时副本后 loader 读到新值；缺失时回退默认值；
+    真实权威源中的声明值确实被消费方读到。
+    """
+    tc = RegressionTestCase(
+        "quality_threshold_config_effective",
+        "验证 silence_db / 码率双档阈值从配置读取生效且缺失时回退默认"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from verify_tts_product import _load_silence_db
+        import media_qa_gate
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # 1. 篡改临时 audio_sync_rules 副本的 silence_db → loader 读到新值
+            tampered_audio = tmpdir / "audio_sync_rules.json"
+            tampered_audio.write_text(json.dumps(
+                {"alignment": {"silence_db": -25}}), encoding='utf-8')
+            tc.assert_equal(_load_silence_db(tampered_audio), -25.0,
+                            "verify_tts_product reads tampered silence_db")
+
+            # 2. 配置缺失 → 回退默认 -40（告警不阻断）
+            tc.assert_equal(_load_silence_db(tmpdir / "missing.json"), -40.0,
+                            "missing rules falls back to -40dB default")
+
+            # 3. 篡改临时 video_quality_rules 副本的码率阈值 → loader 读到新值
+            tampered_video = tmpdir / "video_quality_rules.json"
+            tampered_video.write_text(json.dumps(
+                {"min_video_bitrate_kbps_fail": 200,
+                 "min_video_bitrate_kbps_warn": 800}), encoding='utf-8')
+            tc.assert_equal(
+                eva._load_video_quality_rules(tampered_video)["min_video_bitrate_kbps_warn"],
+                800, "enhance_video_audio reads tampered bitrate threshold")
+
+            # 4. 配置缺失 → 回退默认双档 fail=300/warn=500
+            missing_rules = eva._load_video_quality_rules(tmpdir / "missing.json")
+            tc.assert_equal(missing_rules["min_video_bitrate_kbps_fail"], 300,
+                            "missing video rules falls back to fail=300kbps default")
+            tc.assert_equal(missing_rules["min_video_bitrate_kbps_warn"], 500,
+                            "missing video rules falls back to warn=500kbps default")
+
+        # 5. 真实权威源：media_qa_gate 读到的 silence_db 必须等于配置声明值
+        rules_path = (script_dir.parent / "配置" / "config"
+                      / "quality" / "audio_sync_rules.json")
+        declared = json.loads(rules_path.read_text(encoding='utf-8'))["alignment"]["silence_db"]
+        tc.assert_equal(media_qa_gate._load_alignment_rules().get("silence_db"), declared,
+                        "media_qa_gate consumes declared silence_db from authoritative source")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_quality_config_fingerprint_invalidation() -> RegressionTestCase:
+    """用例22：质量配置/脚本纳入步骤指纹（P1 指纹覆盖扩展）
+
+    背景：旧版 _step_inputs 不覆盖 config/quality/ 阈值表与主执行脚本，
+    改阈值/改脚本后缓存照常命中。本用例锁定：timeline/postprocess/tts
+    步骤输入已登记真实消费的质量配置与脚本；修改 quality 配置后
+    _step_dirty_reason 判定 inputs-changed（缓存失效重跑）。
+    """
+    tc = RegressionTestCase(
+        "quality_config_fingerprint_invalidation",
+        "验证 quality 配置变化后 timeline/postprocess 指纹失效为 inputs-changed"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        saved_config_dir = _pr.CONFIG_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+                # 临时 CONFIG_DIR：quality 阈值表可控篡改，不碰真实配置
+                quality_dir = tmpdir / "quality"
+                quality_dir.mkdir(parents=True)
+                audio_rules = quality_dir / "audio_sync_rules.json"
+                audio_rules.write_text(json.dumps(
+                    {"alignment": {"silence_db": -38}}), encoding='utf-8')
+                video_rules = quality_dir / "video_quality_rules.json"
+                video_rules.write_text(json.dumps(
+                    {"min_video_bitrate_kbps": 500}), encoding='utf-8')
+                _pr.CONFIG_DIR = tmpdir
+
+                cfg_path = tmpdir / "cfg.json"
+                cfg_path.write_text("{}", encoding='utf-8')
+
+                state = PipelineState(tmpdir / "pipeline_state.json")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.force = False
+                runner.config = {}
+                runner.config_path = cfg_path
+                runner.html_project = "test_proj"
+                runner.source_dir = tmpdir
+                runner.html_path = tmpdir / "index.html"
+                runner.temp_dir = tmpdir
+                runner.tts_dir = tmpdir / "tts_44k"
+                runner.render_raw = tmpdir / "render_raw.mp4"
+                runner.output_file = tmpdir / "test_proj.mp4"
+
+                # 1. 指纹输入登记了质量配置与主执行脚本（克制原则：只登真实消费）
+                pp = runner._step_inputs("postprocess")
+                tc.assert_true(pp.get("audio_sync_rules", "").endswith("audio_sync_rules.json"),
+                               "postprocess inputs include audio_sync_rules")
+                tc.assert_true(pp.get("video_quality_rules", "").endswith("video_quality_rules.json"),
+                               "postprocess inputs include video_quality_rules")
+                tc.assert_true(pp.get("script", "").endswith("enhance_video_audio.py"),
+                               "postprocess inputs include enhance_video_audio.py itself")
+                tl = runner._step_inputs("timeline")
+                tc.assert_true(tl.get("audio_sync_rules", "").endswith("audio_sync_rules.json"),
+                               "timeline inputs include audio_sync_rules")
+                tc.assert_true(tl.get("script", "").endswith("adjust_timeline.py"),
+                               "timeline inputs include adjust_timeline.py itself")
+                tc.assert_true(runner._step_inputs("tts").get("script", "").endswith("enhance_video_audio.py"),
+                               "tts inputs include enhance_video_audio.py (TTS executor)")
+
+                # 2. 步骤带指纹完成 → 输入未变时缓存可复用
+                for s in ("timeline", "postprocess"):
+                    state.mark_started(s)
+                    state.mark_completed(s, runner._fingerprint(s))
+                    tc.assert_equal(runner._step_dirty_reason(s), None,
+                                    f"{s} cache reusable when inputs unchanged")
+
+                # 3. 篡改 quality 阈值表 → 对应步骤指纹失效
+                audio_rules.write_text(json.dumps(
+                    {"alignment": {"silence_db": -30}}), encoding='utf-8')
+                tc.assert_equal(runner._step_dirty_reason("timeline"), "inputs-changed",
+                                "timeline invalidated after audio_sync_rules edit")
+                tc.assert_equal(runner._step_dirty_reason("postprocess"), "inputs-changed",
+                                "postprocess invalidated after audio_sync_rules edit")
+
+                # 4. 只改 video_quality_rules → 仅 postprocess 失效（timeline 不消费它）
+                audio_rules.write_text(json.dumps(
+                    {"alignment": {"silence_db": -38}}), encoding='utf-8')
+                for s in ("timeline", "postprocess"):
+                    state.mark_started(s)
+                    state.mark_completed(s, runner._fingerprint(s))
+                video_rules.write_text(json.dumps(
+                    {"min_video_bitrate_kbps": 800}), encoding='utf-8')
+                tc.assert_equal(runner._step_dirty_reason("timeline"), None,
+                                "timeline unaffected by video_quality_rules edit")
+                tc.assert_equal(runner._step_dirty_reason("postprocess"), "inputs-changed",
+                                "postprocess invalidated after video_quality_rules edit")
+
+                tc.mark_passed()
+        finally:
+            _pr.CONFIG_DIR = saved_config_dir
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_bitrate_dual_tier_gate() -> RegressionTestCase:
+    """用例23：码率门禁双档制（误报根因修复锁定）
+
+    背景：纯文字动画项目实测码率 336-343kbps，被旧 500kbps 单档阻断拦下
+    （postprocess 必然失败）。2026-07-29 改为双档：<fail(300) 阻断，
+    fail~warn(300-500) 预警不阻断。本用例锁定：343kbps 判 WARN 不阻断、
+    250kbps 判 FAIL、旧单档键兼容路径按单档阻断且两侧脚本同口径。
+    """
+    tc = RegressionTestCase(
+        "bitrate_dual_tier_gate",
+        "验证码率双档：343kbps WARN 不阻断、250kbps FAIL、旧单档键兼容生效"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        dual = {"min_video_bitrate_kbps_fail": 300, "min_video_bitrate_kbps_warn": 500}
+        legacy = {"min_video_bitrate_kbps": 500}
+
+        # 1. 双档：343kbps → WARN 不阻断；250kbps → FAIL；600kbps → OK
+        level, fail_k, warn_k, is_legacy = media_qa_gate._classify_video_bitrate(343, dual)
+        tc.assert_equal(level, "warn", "343kbps classified as WARN (not blocking)")
+        tc.assert_equal((fail_k, warn_k, is_legacy), (300, 500, False),
+                        "dual-tier thresholds resolved as fail=300/warn=500")
+        tc.assert_equal(media_qa_gate._classify_video_bitrate(250, dual)[0], "fail",
+                        "250kbps classified as FAIL (blocking)")
+        tc.assert_equal(media_qa_gate._classify_video_bitrate(600, dual)[0], "ok",
+                        "600kbps classified as OK")
+
+        # 2. 旧单档键兼容：按单档阻断（343 < 500 → FAIL）且 legacy_single 标记生效
+        level_l, fail_l, warn_l, is_legacy_l = media_qa_gate._classify_video_bitrate(343, legacy)
+        tc.assert_equal((level_l, fail_l, warn_l, is_legacy_l), ("fail", 500, 500, True),
+                        "legacy single key blocks at 500kbps and flags upgrade hint")
+
+        # 3. 两侧脚本同口径：enhance_video_audio 解析结果与 media_qa_gate 一致
+        tc.assert_equal(eva._resolve_bitrate_thresholds(dual),
+                        media_qa_gate._resolve_bitrate_thresholds(dual),
+                        "both scripts resolve dual-tier thresholds identically")
+        tc.assert_equal(eva._resolve_bitrate_thresholds(legacy),
+                        media_qa_gate._resolve_bitrate_thresholds(legacy),
+                        "both scripts resolve legacy single key identically")
+
+        # 4. 真实权威源已升级为双档声明
+        declared = media_qa_gate._load_video_quality_rules()
+        tc.assert_true("min_video_bitrate_kbps_fail" in declared,
+                       "authoritative video_quality_rules.json declares dual-tier fail key")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_dead_air_scene_exclusion() -> RegressionTestCase:
+    """用例24：死区终检场景感知排除（封面误报根因修复锁定）
+
+    背景：quickstart-demo 的 3 秒封面（narration_required=false）无音频属
+    设计特征，被全片扫描检出 0-3.2s 静音 > 3.0s 误判 FAIL。2026-07-29
+    改为场景感知：旁白非必需窗内静音不计入，跨边界只计落在
+    narration_required=true 窗内的部分；无场景数据时降级为全片扫描。
+    """
+    tc = RegressionTestCase(
+        "dead_air_scene_exclusion",
+        "验证封面静音不计入死区、内容场景静音仍违规、无场景数据降级全片扫描"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from media_qa_gate import (
+            filter_dead_air_violations,
+            _load_narration_scenes,
+            _resolve_narration_from_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # 场景表：cover(0-3, narration_required=false) + 两个内容场景
+            narration_file = tmpdir / "narration.json"
+            narration_file.write_text(json.dumps({
+                "project": "test",
+                "scenes": [
+                    {"scene_id": 0, "type": "cover", "start": 0.0, "end": 3.0,
+                     "narration": ""},
+                    {"scene_id": 1, "type": "content", "start": 3.0, "end": 20.0,
+                     "narration": "内容一"},
+                    {"scene_id": 2, "type": "content", "start": 20.0, "end": 40.0,
+                     "narration": "内容二"}
+                ]
+            }, ensure_ascii=False), encoding='utf-8')
+
+            scenes = _load_narration_scenes(str(narration_file))
+            tc.assert_equal(len(scenes), 3, "three scenes loaded from narration.json")
+            tc.assert_equal(scenes[0].get("narration_required"), False,
+                            "cover scene resolved as narration_required=false")
+
+            # 1. 跨边界静音 0-3.2s：仅计入内容窗 3.0-3.2s（0.2s）→ 不违规
+            cover_seg = [(0.0, 3.2, 3.2)]
+            violations = filter_dead_air_violations(cover_seg, scenes, 3.0)
+            tc.assert_equal(violations, [],
+                            "0-3.2s silence counts only 0.2s inside content window (no violation)")
+
+            # 2. 内容场景内 >3s 静音仍违规（计入时长 = 实际重叠 4.0s）
+            content_seg = [(5.0, 9.0, 4.0)]
+            violations2 = filter_dead_air_violations(content_seg, scenes, 3.0)
+            tc.assert_equal(len(violations2), 1, "silence inside content scene still violates")
+            tc.assert_true(violations2 and abs(violations2[0][2] - 4.0) < 0.01,
+                           "counted duration equals in-window overlap (4.0s)")
+
+            # 3. 无场景数据（scenes=None）→ 降级为全片扫描（原口径，封面段也报）
+            degraded = filter_dead_air_violations(cover_seg, None, 3.0)
+            tc.assert_equal(degraded, cover_seg,
+                            "without scene data falls back to full-scan behavior")
+
+            # 4. config 指针解析：narration_source 相对路径回退到配置目录
+            cfg_file = tmpdir / "cfg.json"
+            cfg_file.write_text(json.dumps({
+                "cover_duration": 3.0,
+                "narration_source": "./narration.json"
+            }), encoding='utf-8')
+            resolved, cover_dur = _resolve_narration_from_config(str(cfg_file))
+            tc.assert_equal(Path(resolved).name if resolved else None, "narration.json",
+                            "narration_source pointer resolves relative to config dir")
+            tc.assert_equal(cover_dur, 3.0, "cover_duration read from config")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_silence_fallback_and_bitrate_na_tolerance() -> RegressionTestCase:
+    """用例25：silence_db 回退告警 + bit_rate 非数值容错（三维评审修复锁定）
+
+    背景：(a) media_qa_gate._load_alignment_rules 旧版配置读不到时静默回退
+    -38，与 verify_tts_product._load_silence_db 的 -40dB+告警口径不一致；
+    (b) ffprobe 对部分容器/流返回 bit_rate="N/A"，旧版 int() 直接抛
+    ValueError 使门禁脚本崩溃。2026-07-29 修复：回退 -40 并打印 WARN；
+    码率解析失败返回 None，门禁降级为 warning 可追溯不虚报。
+    """
+    tc = RegressionTestCase(
+        "silence_fallback_and_bitrate_na_tolerance",
+        "验证 silence_db 缺失回退 -40 且告警、bit_rate 非数值时门禁降级 warning 不崩溃"
+    )
+
+    try:
+        import sys
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # (a1) 配置文件缺失 → 回退 -40 且打印 WARN，其余默认键语义不变
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rules = media_qa_gate._load_alignment_rules(tmpdir / "missing.json")
+            tc.assert_equal(rules.get("silence_db"), -40.0,
+                            "missing rules file falls back to silence_db=-40")
+            tc.assert_true("[WARN]" in buf.getvalue() and "-40" in buf.getvalue(),
+                           "missing rules file prints WARN mentioning -40dB fallback")
+            tc.assert_equal(
+                (rules["p95_max_seconds"], rules["min_onsets"],
+                 rules["min_silence_seconds"], rules["fail_on_violation"]),
+                (0.6, 5, 0.5, True),
+                "other alignment defaults keep original values/semantics")
+
+            # (a2) JSON 解析失败 → 回退 -40 且告警
+            broken = tmpdir / "broken.json"
+            broken.write_text("{not-json", encoding='utf-8')
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                rules2 = media_qa_gate._load_alignment_rules(broken)
+            tc.assert_true(rules2.get("silence_db") == -40.0 and "[WARN]" in buf2.getvalue(),
+                           "broken JSON falls back to -40 with WARN")
+
+            # (a3) alignment 节无 silence_db 键 → 回退 -40 且告警，其余声明照常读取
+            no_key = tmpdir / "no_key.json"
+            no_key.write_text(json.dumps({"alignment": {"p95_max_seconds": 0.7}}),
+                              encoding='utf-8')
+            buf3 = io.StringIO()
+            with contextlib.redirect_stdout(buf3):
+                rules3 = media_qa_gate._load_alignment_rules(no_key)
+            tc.assert_true(rules3.get("silence_db") == -40.0 and "[WARN]" in buf3.getvalue(),
+                           "alignment without silence_db key falls back to -40 with WARN")
+            tc.assert_equal(rules3.get("p95_max_seconds"), 0.7,
+                            "declared keys still consumed when silence_db missing")
+
+            # (a4) 正常路径行为不变：权威源声明值（当前 -38）直读且无告警
+            buf4 = io.StringIO()
+            with contextlib.redirect_stdout(buf4):
+                normal = media_qa_gate._load_alignment_rules()
+            declared = json.loads(
+                (script_dir.parent / "配置" / "config" / "quality"
+                 / "audio_sync_rules.json").read_text(encoding='utf-8')
+            )["alignment"]["silence_db"]
+            tc.assert_equal(normal.get("silence_db"), declared,
+                            "normal path still reads declared silence_db (no fallback)")
+            tc.assert_true("[WARN]" not in buf4.getvalue(),
+                           "normal path prints no WARN")
+
+            # (b1) 解析辅助：N/A/None/缺失/非数值 → None 不抛异常；正常值直读
+            for raw in ("N/A", None, "", "abc", "0"):
+                tc.assert_equal(media_qa_gate._parse_bitrate_value(raw), None,
+                                f"media_qa_gate parses {raw!r} as None (unknown)")
+                tc.assert_equal(eva._parse_bitrate_value(raw), None,
+                                f"enhance_video_audio parses {raw!r} as None (unknown)")
+            tc.assert_equal(media_qa_gate._parse_bitrate_value("512000"), 512000,
+                            "numeric string bitrate parsed normally")
+            tc.assert_equal(eva._parse_bitrate_value(343000), 343000,
+                            "int bitrate parsed normally")
+
+            # (b2) enhance_video_audio._check_video_quality：bit_rate=N/A →
+            #      不崩溃、无码率 FAIL，追加跳过门禁 warning
+            class _FakeProbe:
+                stdout = json.dumps({
+                    "streams": [{"codec_type": "video",
+                                 "bit_rate": "N/A", "duration": "1.0"}],
+                    "format": {}})
+            saved_run = eva.subprocess.run
+            eva.subprocess.run = lambda *a, **k: _FakeProbe()
+            try:
+                errs, warns = eva._check_video_quality("fake.mp4")
+            finally:
+                eva.subprocess.run = saved_run
+            tc.assert_true(not any("bitrate" in e.lower() for e in errs),
+                           "N/A bitrate raises no bitrate FAIL in _check_video_quality")
+            tc.assert_true(any("已跳过码率门禁" in w for w in warns),
+                           "N/A bitrate degrades to traceable skip-warning (eva)")
+
+            # (b3) media_qa_gate 检查18调用侧：bit_rate=N/A → 门禁降级 warning
+            dummy_video = tmpdir / "dummy.mp4"
+            dummy_video.write_bytes(b"\x00" * 1024)
+
+            class _FakePlay:
+                returncode = 0
+            saved_streams = media_qa_gate.ffprobe_get_streams
+            saved_dur = media_qa_gate.ffprobe_get_duration
+            saved_sub = media_qa_gate.subprocess.run
+            media_qa_gate.ffprobe_get_streams = lambda p: [
+                {"codec_type": "video", "bit_rate": "N/A"}]
+            media_qa_gate.ffprobe_get_duration = lambda p: -1.0
+            media_qa_gate.subprocess.run = lambda *a, **k: _FakePlay()
+            try:
+                qa = media_qa_gate.MediaQAGate()
+                _, result = qa.validate(video_path=str(dummy_video))
+            finally:
+                media_qa_gate.ffprobe_get_streams = saved_streams
+                media_qa_gate.ffprobe_get_duration = saved_dur
+                media_qa_gate.subprocess.run = saved_sub
+            tc.assert_true(not any("bitrate" in e.lower() for e in result["errors"]),
+                           "N/A bitrate raises no bitrate error in media_qa_gate")
+            tc.assert_true(any("已跳过码率门禁" in w for w in result["warnings"]),
+                           "N/A bitrate degrades to traceable skip-warning (qa gate)")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_tts_concurrency_pool() -> RegressionTestCase:
+    """用例26：TTS 并发生成池（P2-01）
+
+    背景：step1_generate_tts 旧版逐场景串行调用网络 TTS，全冷缓存时 6 场景
+    需 6 次串行网络往返。P2-01 引入 _load_tts_concurrency 配置（默认3/硬上限5，
+    回退+告警）与 Semaphore 并发池：仅并发 generate_tts（raw 生成），ffmpeg
+    上采样/manifest 写入仍串行保持产物语义。本用例锁定：并发提速、单场景
+    失败串行兜底一次且不中止其他场景、兜底再失败清理半成品并整体 False、
+    concurrency=1 走原串行路径、配置缺失/超限回退+告警。
+    """
+    tc = RegressionTestCase(
+        "tts_concurrency_pool",
+        "验证 TTS 并发池提速、失败兜底、串行降级与并发配置回退"
+    )
+
+    try:
+        import asyncio
+        import io
+        import contextlib
+        import time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        scenes = [(i, (i - 1) * 10.0, i * 10.0, f"scene text {i}")
+                  for i in range(1, 7)]
+        saved_scenes = eva.SCENES
+        saved_gen = eva.generate_tts
+        saved_loader = eva._load_tts_concurrency
+        saved_ffmpeg = eva.run_ffmpeg
+        try:
+            eva.SCENES = scenes
+            # 池后首个 ffmpeg 上采样即截停：本用例只覆盖并发段，不做真实转码
+            eva.run_ffmpeg = lambda cmd, desc="": False
+
+            calls = {}
+
+            def make_fake(sleep_s, fail_texts=()):
+                async def _fake(text, output_path):
+                    calls[text] = calls.get(text, 0) + 1
+                    await asyncio.sleep(sleep_s)
+                    Path(output_path).write_bytes(b"RAW")  # 失败场景也留半成品
+                    if text in fail_texts:
+                        raise RuntimeError(f"simulated TTS failure: {text}")
+                return _fake
+
+            # (a) 并发度3 vs 同一 mock 的串行基准：总耗时 < 串行的 60%
+            eva._load_tts_concurrency = lambda cfg_path=None: 3
+            eva.generate_tts = make_fake(0.2)
+            with tempfile.TemporaryDirectory() as td:
+                buf = io.StringIO()
+                t0 = time.perf_counter()
+                with contextlib.redirect_stdout(buf):
+                    ret = asyncio.run(eva.step1_generate_tts(Path(td)))
+                concurrent_secs = time.perf_counter() - t0
+                tc.assert_equal(ret, False,
+                                "run truncated at mocked ffmpeg upsample (timing scope = pool phase)")
+                tc.assert_true("[TTS-POOL] concurrency=3" in buf.getvalue(),
+                               "concurrency=3 enters pool with [TTS-POOL] banner")
+
+            with tempfile.TemporaryDirectory() as td:
+                fake = make_fake(0.2)
+
+                async def _serial_baseline():
+                    for i, (_, _, _, text) in enumerate(scenes):
+                        await fake(text, Path(td) / f"serial_{i}.mp3")
+
+                t0 = time.perf_counter()
+                asyncio.run(_serial_baseline())
+                serial_secs = time.perf_counter() - t0
+            tc.assert_true(concurrent_secs < serial_secs * 0.6,
+                           f"pool(3) wall {concurrent_secs:.2f}s < 60% of serial {serial_secs:.2f}s")
+
+            # (b) 单场景失败：其他场景不中止；串行兜底一次；再失败清半成品并整体 False
+            calls.clear()
+            fail_text = scenes[2][3]  # scene 3
+            eva.generate_tts = make_fake(0.01, fail_texts={fail_text})
+            with tempfile.TemporaryDirectory() as td:
+                tmpdir = Path(td)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    ret = asyncio.run(eva.step1_generate_tts(tmpdir))
+                out = buf.getvalue()
+                tc.assert_equal(ret, False,
+                                "unrecoverable scene failure returns False overall")
+                tc.assert_true("serial retry" in out,
+                               "failed scene triggers serial fallback retry")
+                tc.assert_equal(calls.get(fail_text), 2,
+                                "failing scene called exactly twice (pool + one serial retry)")
+                ok_raws = [tmpdir / f"scene_{sid}_{eva._tts_cache_key(t)}.mp3"
+                           for sid, _, _, t in scenes if t != fail_text]
+                tc.assert_true(all(p.exists() for p in ok_raws),
+                               "other scenes finish raw generation (not aborted by the failure)")
+                bad_raw = tmpdir / f"scene_3_{eva._tts_cache_key(fail_text)}.mp3"
+                tc.assert_true(not bad_raw.exists(),
+                               "half-done raw of failed scene cleaned up")
+                tc.assert_true(all(calls.get(t) == 1 for _, _, _, t in scenes
+                                   if t != fail_text),
+                               "successful scenes not re-run by the fallback pass")
+
+            # (c) concurrency=1：不进池（无 [TTS-POOL]），raw 生成留在原串行循环
+            calls.clear()
+            eva._load_tts_concurrency = lambda cfg_path=None: 1
+            eva.generate_tts = make_fake(0.01)
+            with tempfile.TemporaryDirectory() as td:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    ret = asyncio.run(eva.step1_generate_tts(Path(td)))
+                out = buf.getvalue()
+                tc.assert_true("[TTS-POOL]" not in out,
+                               "concurrency=1 keeps original serial path (no [TTS-POOL])")
+                tc.assert_true("Generating scene 1 TTS" in out
+                               and calls.get(scenes[0][3]) == 1,
+                               "serial loop generates raw inline before ffmpeg cut-off")
+
+            # (d) 并发配置回退+告警（真实 _load_tts_concurrency，测试注入路径）
+            with tempfile.TemporaryDirectory() as td:
+                tmpdir = Path(td)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    n_missing = saved_loader(tmpdir / "missing.json")
+                tc.assert_equal(n_missing, 3, "missing config falls back to default 3")
+                tc.assert_true("[WARN]" in buf.getvalue(),
+                               "missing config prints WARN")
+
+                over = tmpdir / "over.json"
+                over.write_text(json.dumps({"tts_concurrency": 9}), encoding="utf-8")
+                buf2 = io.StringIO()
+                with contextlib.redirect_stdout(buf2):
+                    n_over = saved_loader(over)
+                tc.assert_true(n_over == 5 and "[WARN]" in buf2.getvalue(),
+                               "over-limit value capped to hard max 5 with WARN")
+
+                valid = tmpdir / "valid.json"
+                valid.write_text(json.dumps({"tts_concurrency": 2}), encoding="utf-8")
+                buf3 = io.StringIO()
+                with contextlib.redirect_stdout(buf3):
+                    n_valid = saved_loader(valid)
+                tc.assert_true(n_valid == 2 and "[WARN]" not in buf3.getvalue(),
+                               "valid declared value read without WARN")
+        finally:
+            eva.SCENES = saved_scenes
+            eva.generate_tts = saved_gen
+            eva._load_tts_concurrency = saved_loader
+            eva.run_ffmpeg = saved_ffmpeg
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_visual_boundary_three_point_sampling() -> RegressionTestCase:
+    """用例27：视觉边界三点采样（P2 优化项2）
+
+    背景：旧版每场景两次串行提帧（40%/70%），入场早段（30%）短暂越界的
+    内容漏检。P2 改为 SAMPLE_POINTS=(0.3,0.5,0.7) 单循环 + ThreadPoolExecutor(3)
+    并发提帧，取最坏采样点（max content_bottom）判定。本用例锁定：
+    仅 30% 点越界可检出、判定取最坏值、结果保留全部旧字段并新增 samples
+    数组、dur<2 场景 SKIP。
+    """
+    tc = RegressionTestCase(
+        "visual_boundary_three_point_sampling",
+        "验证三点采样检出早段越界、取最坏值判定且结果结构向后兼容"
+    )
+
+    try:
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import visual_boundary_check as vbc
+
+        tc.assert_equal(tuple(vbc.SAMPLE_POINTS), (0.3, 0.5, 0.7),
+                        "SAMPLE_POINTS fixed to 30%/50%/70%")
+
+        # (场景id, 采样点) → 模拟 content_bottom。场景1 仅 30% 点越界（>860，
+        # 旧 40/70 两点均 <860 会漏检）；场景2 最坏点在 50%（PASS 但取最坏值）。
+        table = {
+            ("1", "30"): 900, ("1", "50"): 700, ("1", "70"): 720,
+            ("2", "30"): 500, ("2", "50"): 800, ("2", "70"): 650,
+        }
+
+        def fake_extract(video_path, timestamp, output_path, ffmpeg_exe="ffmpeg"):
+            Path(output_path).write_bytes(b"fake-frame")
+            return True
+
+        def fake_measure(image_path):
+            _, sid, ptag = Path(image_path).stem.split("_")  # scene_1_p30
+            return table[(sid, ptag[1:])]
+
+        saved_extract = vbc.extract_frame
+        saved_measure = vbc.measure_content_bottom
+        try:
+            vbc.extract_frame = fake_extract
+            vbc.measure_content_bottom = fake_measure
+            scenes = [
+                {"id": 1, "start": 0.0, "end": 10.0},
+                {"id": 2, "start": 10.0, "end": 20.0},
+                {"id": 3, "start": 20.0, "end": 21.5},  # dur<2 → SKIP
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                passed, results = vbc.run_check("fake.mp4", scenes)
+        finally:
+            vbc.extract_frame = saved_extract
+            vbc.measure_content_bottom = saved_measure
+
+        tc.assert_equal(passed, False, "check fails when any sample point overflows")
+        r1, r2, r3 = results
+        tc.assert_equal((r1["status"], r1["content_bottom"], r1["gap"]),
+                        ("FAIL", 900, -40),
+                        "scene overflowing ONLY at 30% detected as FAIL (old 40/70 missed it)")
+        tc.assert_equal(r1["sample_time"], 3.0,
+                        "verdict anchored to the 30% sample time")
+        tc.assert_equal((r2["status"], r2["content_bottom"], r2["gap"]),
+                        ("PASS", 800, 60),
+                        "verdict takes worst sample (max content_bottom)")
+        for r in (r1, r2):
+            samples = r.get("samples", [])
+            tc.assert_equal(len(samples), 3,
+                            f"scene {r['scene']} carries 3-element samples array")
+            tc.assert_equal([s["ratio"] for s in samples], [0.3, 0.5, 0.7],
+                            f"scene {r['scene']} samples ordered by SAMPLE_POINTS")
+            tc.assert_true(all({"ratio", "t", "content_bottom", "gap"} <= set(s)
+                               for s in samples),
+                           f"scene {r['scene']} sample entries carry ratio/t/content_bottom/gap")
+            tc.assert_true({"scene", "status", "content_bottom", "safety_line",
+                            "gap", "sample_time"} <= set(r),
+                           f"scene {r['scene']} keeps all legacy result fields")
+        tc.assert_equal(r3["status"], "SKIP", "scene shorter than 2s skipped")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_render_progress_watcher() -> RegressionTestCase:
+    """用例28：render 进度观察者（P2 优化项3）
+
+    背景：渲染子进程长时间无输出，旁路观察者线程轮询
+    work-*/captured-frames/frame_*.jpg 帧数打印进度心跳；mtime 门槛防旧
+    渲染残留目录误报；降级链 帧计数→render_raw.mp4 大小→纯耗时；内部
+    异常静默停线程。本用例不等真实 10s 轮询周期：直接调用 _report()
+    做单元级断言；线程退出用实例级 POLL_INTERVAL 覆写注入短间隔。
+    """
+    tc = RegressionTestCase(
+        "render_progress_watcher",
+        "验证进度观察者百分比计算、mtime 门槛、降级链与线程可停"
+    )
+
+    try:
+        import io
+        import contextlib
+        import time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        Watcher = _pr._RenderProgressWatcher
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            render_raw = tmp / "render_raw.mp4"
+
+            # (a) 百分比：25/100 帧 → ~25%（目录 mtime 晚于 watcher 启动）
+            w = Watcher([tmp], render_raw, total_frames=100)
+            cap = tmp / "work-test" / "captured-frames"
+            cap.mkdir(parents=True)
+            for i in range(25):
+                (cap / f"frame_{i:06d}.jpg").write_bytes(b"j")
+            future = time.time() + 5
+            os.utime(cap, (future, future))
+            tc.assert_equal(w._count_frames(), 25,
+                            "frame counting reads active work dir")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w._report()
+            tc.assert_true("~25% (25/100 frames" in buf.getvalue(),
+                           "percentage computed as frames*100//total_frames")
+
+            # 帧数超过 total_frames 时封顶 100%（min 防护）
+            w_cap = Watcher([tmp], render_raw, total_frames=10)
+            os.utime(cap, (time.time() + 5,) * 2)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w_cap._report()
+            tc.assert_true("~100%" in buf.getvalue(), "percentage capped at 100%")
+
+            # mtime 门槛：目录 mtime 早于本次启动 → 旧渲染残留，不计数
+            w2 = Watcher([tmp], render_raw, total_frames=100)
+            past = time.time() - 3600
+            os.utime(cap, (past, past))
+            tc.assert_equal(w2._count_frames(), None,
+                            "stale captured-frames dir (old mtime) ignored")
+
+            # 降级链第2级：无帧计数但 render_raw 本次启动后有更新 → 报文件大小
+            render_raw.write_bytes(b"\x00" * (2 * 1024 * 1024))
+            os.utime(render_raw, (time.time() + 5,) * 2)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w2._report()
+            tc.assert_true("render_raw.mp4: 2.0MB" in buf.getvalue(),
+                           "degrades to render_raw size heartbeat")
+
+            # (b) 目录/文件全缺失 → 降级为纯耗时心跳，不抛异常
+            w3 = Watcher([tmp / "nonexistent"], tmp / "nonexistent" / "r.mp4",
+                         total_frames=0)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w3._report()
+            tc.assert_true("[RENDER] elapsed" in buf.getvalue(),
+                           "missing dirs degrade to elapsed-only heartbeat (no exception)")
+
+            # (c) stop() 后线程超时内退出（实例覆写 POLL_INTERVAL 注入短轮询）
+            w4 = Watcher([tmp], render_raw, total_frames=0)
+            w4.POLL_INTERVAL = 0.05
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w4.start()
+                time.sleep(0.2)
+                w4.stop(timeout=5)
+            tc.assert_true(w4._thread is not None and not w4._thread.is_alive(),
+                           "watcher thread exits within stop() timeout")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_error_code_and_cache_age() -> RegressionTestCase:
+    """用例29：结构化错误码与缓存年龄（P2 优化项4）
+
+    背景：mark_failed 旧版仅存自由文本 error，完工报告/排障工具无法按
+    类别路由；[CACHED] 行无缓存年龄。P2 引入错误码常量集合、
+    mark_failed(error_code) 落盘（None→UNKNOWN）与 _cache_age_str 展示辅助。
+    本用例锁定：错误码落盘、旧 state 缺字段读取方兼容、年龄解析三路径。
+    """
+    tc = RegressionTestCase(
+        "error_code_and_cache_age",
+        "验证 mark_failed 错误码落盘、旧 state 兼容与缓存年龄解析降级"
+    )
+
+    try:
+        import io
+        import contextlib
+        from datetime import timedelta
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        from generate_completion_report import generate_report
+
+        # 错误码常量集合语义固定（供报告/排障工具按码路由）
+        tc.assert_equal(
+            (_pr.GATE_BLOCKED, _pr.SUBPROCESS_FAILED, _pr.OUTPUT_MISSING,
+             _pr.VERIFY_FAILED, _pr.QUICKFIX_BLOCKED, _pr.UNKNOWN),
+            ("GATE_BLOCKED", "SUBPROCESS_FAILED", "OUTPUT_MISSING",
+             "VERIFY_FAILED", "QUICKFIX_BLOCKED", "UNKNOWN"),
+            "error code constant set fixed")
+
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+
+            # (a) mark_failed 带码落盘对应值；不带码落盘 UNKNOWN
+            state = _pr.PipelineState(tmpdir / "pipeline_state.json")
+            state.mark_started("render")
+            state.mark_failed("render", "ffmpeg exit 1",
+                              error_code=_pr.SUBPROCESS_FAILED)
+            state.mark_started("verify")
+            state.mark_failed("verify", "some failure")  # 未指定 → UNKNOWN
+            on_disk = json.loads(state.path.read_text(encoding="utf-8"))
+            tc.assert_equal(on_disk["steps"]["render"]["error_code"],
+                            "SUBPROCESS_FAILED",
+                            "explicit error_code persisted to state file")
+            tc.assert_equal(on_disk["steps"]["verify"]["error_code"], "UNKNOWN",
+                            "missing error_code argument persisted as UNKNOWN")
+
+            # (b) 旧 state 缺 error_code 字段：读取方不崩溃
+            legacy_file = tmpdir / "legacy_state.json"
+            legacy_file.write_text(json.dumps({
+                "steps": {
+                    "preflight": {"status": "passed",
+                                  "completed": "2026-07-01T00:00:00"},
+                    "render": {"status": "failed", "started": None,
+                               "completed": None, "error": "legacy failure"},
+                },
+                "last_run": None,
+            }, ensure_ascii=False), encoding="utf-8")
+            st2 = _pr.PipelineState(legacy_file)
+            tc.assert_equal(st2.last_failed_step(), "render",
+                            "legacy state readable (last_failed_step)")
+            tc.assert_true(
+                st2.data["steps"]["render"].get("error_code") is None,
+                "legacy record lacks error_code and .get returns None (no KeyError)")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                st2.print_status()  # 读取方1：状态打印不崩溃
+            tc.assert_true("legacy failure" in buf.getvalue(),
+                           "print_status renders legacy failed step without crash")
+            # 读取方2：完工报告透传——旧 state 无码时 issue 行不带 [CODE] 后缀
+            video = tmpdir / "v.mp4"
+            video.write_bytes(b"\x00" * 100000)
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                report = generate_report(
+                    project_name="LegacyState",
+                    video_file=str(video),
+                    subtitle_file=None,
+                    state_file=str(legacy_file))
+            render_issues = [i for i in report.get("issues", [])
+                             if "'render'" in i]
+            tc.assert_true(render_issues
+                           and all("[" not in i for i in render_issues),
+                           "completion report consumes legacy state without code suffix")
+
+        # (c) 缓存年龄解析三路径：正常 ISO / 缺失 / 畸形，均不抛异常
+        iso = (datetime.now() - timedelta(hours=12, minutes=18)).isoformat()
+        age = _pr._cache_age_str(iso)
+        tc.assert_true(age.startswith("(") and age.endswith("h ago)"),
+                       "normal ISO renders '(N.Nh ago)' format")
+        hours = float(age[1:age.index("h")])
+        tc.assert_true(11.5 <= hours <= 13.0,
+                       f"parsed age {hours:.1f}h within expected ~12.3h window")
+        tc.assert_equal(_pr._cache_age_str(None), "(? ago)",
+                        "missing completed timestamp degrades to '(? ago)'")
+        tc.assert_equal(_pr._cache_age_str("not-a-timestamp"), "(? ago)",
+                        "malformed timestamp degrades to '(? ago)'")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_completion_report_fingerprint_stability() -> RegressionTestCase:
+    """用例30：completion_report 指纹自引用漂移修复锁定
+
+    背景：旧版 _step_inputs 把 pipeline_state.json 整文件纳入 completion_report
+    指纹，而本步骤完成时 mark_completed 又写回该文件（last_run 每次运行必变），
+    自引用回路导致指纹永远漂移、该步骤永远重跑，全链 10 步 CACHED 不可达。
+    修复：改用 state 内容稳定摘要（排除 last_run 与自身步骤记录）。
+    本用例锁定：同一 state 指纹幂等；自写回不改变指纹；上游记录变化必失效。
+    """
+    tc = RegressionTestCase(
+        "completion_report_fingerprint_stability",
+        "验证 completion_report 指纹排除自写字段后稳定且仍随上游变化失效"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            state = PipelineState(tmpdir / "pipeline_state.json")
+            # 构造上游 9 步全部通过的 state（含验证明细）
+            for s in ["preflight", "tts", "timeline", "preview", "render",
+                      "verify", "visual_check", "postprocess", "delivery"]:
+                state.mark_started(s)
+                state.mark_completed(s)
+            state.set_verification("media_qa", {"passed": True})
+
+            # 不走 __init__（避免依赖真实 config/环境），直接注入所需属性
+            cfg_path = tmpdir / "cfg.json"
+            cfg_path.write_text("{}", encoding='utf-8')
+            runner = PipelineRunner.__new__(PipelineRunner)
+            runner.state = state
+            runner.force = False
+            runner.config = {}
+            runner.config_path = cfg_path
+            runner.html_project = "test_proj"
+            runner.source_dir = tmpdir
+            runner.html_path = tmpdir / "index.html"
+            runner.temp_dir = tmpdir
+            runner.tts_dir = tmpdir / "tts_44k"
+            runner.render_raw = tmpdir / "render_raw.mp4"
+            runner.output_file = tmpdir / "test_proj.mp4"
+
+            # 接线检查：指纹输入已改用稳定摘要，不再含 state 文件路径
+            inputs = runner._step_inputs("completion_report")
+            tc.assert_true(inputs.get("state_digest", "").startswith("digest:"),
+                           "completion_report inputs use stable state digest")
+            tc.assert_true("state" not in inputs,
+                           "raw pipeline_state.json path removed from fingerprint inputs")
+
+            # (a) 同一 state 下连续两次计算指纹必须相等（幂等）
+            fp1 = runner._fingerprint("completion_report")
+            fp2 = runner._fingerprint("completion_report")
+            tc.assert_equal(fp1, fp2, "fingerprint idempotent on identical state")
+
+            # (b) 模拟本步骤 mark_started/mark_completed 写回（含 last_run 更新）
+            #     后再算——自引用已消除，指纹仍相等，且跨运行缓存可命中
+            state.mark_started("completion_report")
+            state.mark_completed("completion_report", fp1)
+            fp3 = runner._fingerprint("completion_report")
+            tc.assert_equal(fp3, fp1, "fingerprint stable after self write-back")
+            tc.assert_equal(runner._step_dirty_reason("completion_report"), None,
+                            "completion_report cache reusable on next run (CACHED reachable)")
+
+            # (c) 任一上游步骤记录变化 → 指纹必须变化（真实消费关系不丢）
+            state.data["steps"]["render"]["status"] = "failed"
+            state.save()
+            fp4 = runner._fingerprint("completion_report")
+            tc.assert_true(fp4 != fp1, "upstream step record change invalidates fingerprint")
+            tc.assert_equal(runner._step_dirty_reason("completion_report"), "inputs-changed",
+                            "dirty reason is inputs-changed after upstream change")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_completion_report_fingerprint_stability() -> RegressionTestCase:
+    """用例30：completion_report 指纹自引用漂移修复锁定
+
+    背景：旧版 _step_inputs 把 pipeline_state.json 整文件纳入 completion_report
+    指纹，而本步骤完成时 mark_completed 又写回该文件（last_run 每次运行必变），
+    自引用回路导致指纹永远漂移、该步骤永远重跑，全链 10 步 CACHED 不可达。
+    修复：改用 state 内容稳定摘要（排除 last_run 与自身步骤记录）。
+    本用例锁定：同一 state 指纹幂等；自写回不改变指纹；上游记录变化必失效。
+    """
+    tc = RegressionTestCase(
+        "completion_report_fingerprint_stability",
+        "验证 completion_report 指纹排除自写字段后稳定且仍随上游变化失效"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            state = PipelineState(tmpdir / "pipeline_state.json")
+            # 构造上游 9 步全部通过的 state（含验证明细）
+            for s in ["preflight", "tts", "timeline", "preview", "render",
+                      "verify", "visual_check", "postprocess", "delivery"]:
+                state.mark_started(s)
+                state.mark_completed(s)
+            state.set_verification("media_qa", {"passed": True})
+
+            # 不走 __init__（避免依赖真实 config/环境），直接注入所需属性
+            cfg_path = tmpdir / "cfg.json"
+            cfg_path.write_text("{}", encoding='utf-8')
+            runner = PipelineRunner.__new__(PipelineRunner)
+            runner.state = state
+            runner.force = False
+            runner.config = {}
+            runner.config_path = cfg_path
+            runner.html_project = "test_proj"
+            runner.source_dir = tmpdir
+            runner.html_path = tmpdir / "index.html"
+            runner.temp_dir = tmpdir
+            runner.tts_dir = tmpdir / "tts_44k"
+            runner.render_raw = tmpdir / "render_raw.mp4"
+            runner.output_file = tmpdir / "test_proj.mp4"
+
+            # 接线检查：指纹输入已改用稳定摘要，不再含 state 文件路径
+            inputs = runner._step_inputs("completion_report")
+            tc.assert_true(inputs.get("state_digest", "").startswith("digest:"),
+                           "completion_report inputs use stable state digest")
+            tc.assert_true("state" not in inputs,
+                           "raw pipeline_state.json path removed from fingerprint inputs")
+
+            # (a) 同一 state 下连续两次计算指纹必须相等（幂等）
+            fp1 = runner._fingerprint("completion_report")
+            fp2 = runner._fingerprint("completion_report")
+            tc.assert_equal(fp1, fp2, "fingerprint idempotent on identical state")
+
+            # (b) 模拟本步骤 mark_started/mark_completed 写回（含 last_run 更新）
+            #     后再算——自引用已消除，指纹仍相等，且跨运行缓存可命中
+            state.mark_started("completion_report")
+            state.mark_completed("completion_report", fp1)
+            fp3 = runner._fingerprint("completion_report")
+            tc.assert_equal(fp3, fp1, "fingerprint stable after self write-back")
+            tc.assert_equal(runner._step_dirty_reason("completion_report"), None,
+                            "completion_report cache reusable on next run (CACHED reachable)")
+
+            # (c) 任一上游步骤记录变化 → 指纹必须变化（真实消费关系不丢）
+            state.data["steps"]["render"]["status"] = "failed"
+            state.save()
+            fp4 = runner._fingerprint("completion_report")
+            tc.assert_true(fp4 != fp1, "upstream step record change invalidates fingerprint")
+            tc.assert_equal(runner._step_dirty_reason("completion_report"), "inputs-changed",
+                            "dirty reason is inputs-changed after upstream change")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -1064,6 +2302,18 @@ class RegressionTestRunner:
             test_pipeline_cache_fingerprint_wiring,
             test_timeline_drift_resync,
             test_narration_source_pointer_resolution,
+            test_delivery_gate_blocks_quickfix,
+            test_verification_result_persistence,
+            test_quality_threshold_config_effective,
+            test_quality_config_fingerprint_invalidation,
+            test_bitrate_dual_tier_gate,
+            test_dead_air_scene_exclusion,
+            test_silence_fallback_and_bitrate_na_tolerance,
+            test_tts_concurrency_pool,
+            test_visual_boundary_three_point_sampling,
+            test_render_progress_watcher,
+            test_error_code_and_cache_age,
+            test_completion_report_fingerprint_stability,
         ]
         self.results = []
     

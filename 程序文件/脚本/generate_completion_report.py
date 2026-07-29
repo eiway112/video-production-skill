@@ -245,11 +245,34 @@ def generate_report(
                         report["validation"][f"step_{step}_passed"] = is_passed
                         
                         if not is_passed:
-                            report["issues"].append(f"Pipeline step '{step}' did not pass")
+                            # 透传结构化错误码（有则显示；旧 state 无此字段时不显示）
+                            ecode = step_record.get("error_code")
+                            suffix = f" [{ecode}]" if ecode else ""
+                            report["issues"].append(f"Pipeline step '{step}' did not pass{suffix}")
                             all_valid = False
                     else:
                         report["issues"].append(f"Pipeline step '{step}' not recorded")
                         all_valid = False
+
+                # 数据源3b：验证/质检结果追溯（verifications 节，由 pipeline_runner 合并写入）
+                # 向后兼容：旧 state 无此节 → 标注不可追溯（既不崩溃也不误判为失败）。
+                verifications = pipeline_state.get("verifications", {})
+                if verifications:
+                    report["data_sources"]["verifications"] = {
+                        k: {"passed": v.get("passed")} for k, v in verifications.items()
+                    }
+                    for vkey, vres in verifications.items():
+                        v_passed = bool(vres.get("passed", False))
+                        report["validation"][f"verification_{vkey}_passed"] = v_passed
+                        if not v_passed:
+                            errs = vres.get("errors", [])
+                            report["issues"].append(
+                                f"Verification '{vkey}' failed: "
+                                f"{errs[0] if errs else 'see result details'}"
+                            )
+                            all_valid = False
+                else:
+                    report["data_sources"]["verifications"] = "not_recorded (legacy state, not traceable)"
             except Exception as e:
                 report["issues"].append(f"Failed to read pipeline state: {e}")
                 all_valid = False

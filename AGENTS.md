@@ -47,6 +47,8 @@
 | 媒体 | 视频/音频流、时长一致、字幕不溢出 | postprocess 前 |
 | 报告 | 无硬编码 PASS，所有状态源自真实测量 | 交付阶段 |
 
+**视觉边界采样**：`visual_boundary_check.py` 在每场景时长的 30%/50%/70% 三点采样，取最坏值（content_bottom 最大者）判定场景 PASS/FAIL；比旧两点采样更严，旧项目边缘内容可能由 PASS 变 FAIL，属预期质量增强。
+
 **代码位置**：`verify_tts_product.py` + `media_qa_gate.py` + `generate_completion_report.py`
 
 ### 4. 完整依赖链强制
@@ -68,6 +70,7 @@ preflight → tts → timeline → render
 - render 不能跳过 tts（确保有音频）
 - postprocess 不能跳过 visual_check（确保画面合规）
 - 交付不能跳过 final_media_qa（确保质量）
+- `--quick-fix` 会将渲染链前置步骤标记为 `skipped`，delivery 硬门禁据此必然拦截（`error_code=QUICKFIX_BLOCKED`）——quick-fix 仅用于快速排查，不产生可交付产物
 
 ---
 
@@ -188,6 +191,8 @@ preflight → tts → timeline → render
 2. pipeline_state.json（流水线执行状态）
 3. SRT 解析（字幕统计）
 4. 文件系统（文件大小、修改时间）
+
+**结构化错误码**：`pipeline_state.json` 中失败步骤记录含 `error_code` 字段，取值 `GATE_BLOCKED` / `SUBPROCESS_FAILED` / `OUTPUT_MISSING` / `VERIFY_FAILED` / `QUICKFIX_BLOCKED` / `UNKNOWN`（未指定时归 `UNKNOWN`）；外部工具判定交付状态时应将 `QUICKFIX_BLOCKED` 视为禁止对外发布。
 
 **禁止**：任何硬编码的 "COMPLETED"、"PASS" 或 "成功"
 

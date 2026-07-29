@@ -34,6 +34,7 @@ import os
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
@@ -83,6 +84,37 @@ def ffprobe_has_audio_stream(audio_file: str) -> bool:
         pass
     return False
 
+_SILENCE_DB_CACHE = None
+
+
+def _load_silence_db(rules_path=None) -> float:
+    """读取 config/quality/audio_sync_rules.json → alignment.silence_db（单一权威源）。
+
+    与 media_qa_gate / enhance_video_audio 共用同一份规则文件。
+    读不到时回退默认 -40 并打印告警，不阻断主流程。
+    显式传入 rules_path 时绕过缓存（供回归测试验证配置生效）。
+    """
+    global _SILENCE_DB_CACHE
+    use_cache = rules_path is None
+    if use_cache:
+        if _SILENCE_DB_CACHE is not None:
+            return _SILENCE_DB_CACHE
+        rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
+                      / "quality" / "audio_sync_rules.json")
+    else:
+        rules_path = Path(rules_path)
+    try:
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        value = float(loaded["alignment"]["silence_db"])
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+        print(f"  [WARN] 无法读取 {Path(rules_path).name} 的 alignment.silence_db，回退默认 -40dB")
+        value = -40.0
+    if use_cache:
+        _SILENCE_DB_CACHE = value
+    return value
+
+
 def ffmpeg_detect_silence(audio_file: str, duration: float = None) -> float:
     """
     使用 ffmpeg silencedetect 检测音频中的静音
@@ -101,7 +133,7 @@ def ffmpeg_detect_silence(audio_file: str, duration: float = None) -> float:
             [
                 'ffmpeg',
                 '-i', str(Path(audio_file).resolve()),
-                '-af', 'silencedetect=n=-40dB:d=0.1',
+                '-af', f'silencedetect=n={_load_silence_db():g}dB:d=0.1',
                 '-f', 'null',
                 '-'
             ],
@@ -264,6 +296,29 @@ def validate_tts_output(
         'warnings': warnings,
         'details': details
     }
+
+def write_verify_result(result: Dict[str, Any], temp_dir: str,
+                        filename: str = "tts_verify_result.json") -> str:
+    """将 TTS 产物验证结果落盘（供 pipeline_runner 合并进 pipeline_state 追溯）。
+
+    参数 result 为 validate_tts_output 返回的明细字典。
+    返回写入的文件路径；写入失败时返回空字符串（不抛异常，避免影响主流程）。
+    """
+    try:
+        out_path = Path(temp_dir) / filename
+        payload = {
+            "passed": result.get("passed", False),
+            "total_checks": result.get("total_checks", 0),
+            "passed_checks": result.get("passed_checks", 0),
+            "errors": result.get("errors", []),
+            "warnings": result.get("warnings", []),
+            "checked_at": datetime.now().isoformat(),
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return str(out_path)
+    except Exception:
+        return ""
 
 def main():
     """命令行工具"""

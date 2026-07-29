@@ -73,7 +73,9 @@ python config_manager.py
    python pipeline_runner.py --config <项目名>.json --fresh
    ```
    门禁自动继承：preflight → tts → timeline → preview（硬阻断）→ render → verify → visual_check → postprocess。**禁止用 --force 绕过门禁**。
-2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。
+   - TTS 生成并发数由 `程序文件/配置/config/system/hyperframes_config.json` 的 `tts_concurrency` 控制（默认 3，硬上限 5，设 1 为串行；读取失败回退 3 并告警）；并发仅作用于 TTS 网络生成阶段，失败场景自动串行兜底重试一次。
+   - 渲染期间的 `[RENDER]` 前缀进度/心跳日志来自旁路观察者线程，纯观测输出，不改变渲染控制流与退出码。
+2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。
 3. 交付验收：
    ```
    python generate_completion_report.py（按脚本 --help 传参）
@@ -99,3 +101,4 @@ python config_manager.py
 - **配置里手工复制场景数据**而不指向 narration.json → 违反单一权威源，改一处漏一处。
 - **在素材目录或项目根目录生成中间文件** → 一律进 `过程产物/临时产物/`。
 - **渲染前不跑 preview 就 render** → 11 分钟渲染浪费在本可静态发现的问题上。
+- **visual_check 为三点采样**（场景时长 30%/50%/70%，取最坏值判定），比旧两点采样更严；旧项目边缘内容可能由 PASS 变 FAIL，属预期质量增强，应修内容而非绕门禁。
