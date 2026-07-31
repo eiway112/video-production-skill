@@ -242,6 +242,16 @@ def generate_report(
                             step_record.get("passed", False)
                             or step_record.get("status", "").lower() == "passed"
                         )
+                        # P0（2026-07-29）：类型化跳过（tts_enabled=false 声明的
+                        # 纯BGM路径，reason 以 "tts_disabled" 开头）视为满足——
+                        # 这是 config 显式声明的合法路径，记入 typed_skips 可审计；
+                        # quick-fix 跳过（reason='quick-fix mode'）仍按未通过处理。
+                        if (not is_passed and step in ("tts", "timeline")
+                                and str(step_record.get("status", "")).lower() == "skipped"
+                                and str(step_record.get("reason", "")).startswith("tts_disabled")):
+                            is_passed = True
+                            report["data_sources"].setdefault("typed_skips", {})[step] = \
+                                step_record.get("reason", "")
                         report["validation"][f"step_{step}_passed"] = is_passed
                         
                         if not is_passed:
@@ -252,6 +262,42 @@ def generate_report(
                             all_valid = False
                     else:
                         report["issues"].append(f"Pipeline step '{step}' not recorded")
+                        all_valid = False
+
+                # P0（2026-07-29）：产物-状态一致性检查。成片 mtime 与
+                # postprocess 完成时刻偏差超过容差 → 成片可能在流水线之外
+                # 被改写（eiway-122-wall 逃逸脚本直接覆写成片的教训）。
+                # 判定依据：正常路径下成片由 postprocess 步骤产出，其 mtime
+                # 与该步骤完成时刻应基本一致；容差 10s 覆盖文件系统时间精度
+                # 与流水线收尾写入（重命名/faststart），正常项目不会误伤。
+                # 用绝对差值：mtime 早于完成时刻超差同样可疑（陈旧产物/时钟回拨）。
+                _pp_completed = pipeline_steps.get("postprocess", {}).get("completed")
+                if _pp_completed and video_path.exists():
+                    try:
+                        _pp_ts = datetime.fromisoformat(_pp_completed).timestamp()
+                        _video_ts = video_path.stat().st_mtime
+                        _tolerance_s = 10.0
+                        _lag = _video_ts - _pp_ts
+                        _consistent = abs(_lag) <= _tolerance_s
+                        report["data_sources"]["state_product_check"] = {
+                            "postprocess_completed": _pp_completed,
+                            "video_mtime": datetime.fromtimestamp(_video_ts).isoformat(),
+                            "video_mtime_minus_completed_s": round(_lag, 3),
+                            "tolerance_s": _tolerance_s,
+                            "basis": ("成片 mtime 与 postprocess 完成时刻的绝对差不得超过容差"
+                                      "（10s，覆盖文件系统时间精度与收尾重命名/faststart 写入）；"
+                                      "超差说明成片在流水线之外被改写或为陈旧产物，拒收"),
+                        }
+                        report["validation"]["product_state_consistent"] = _consistent
+                        if not _consistent:
+                            report["issues"].append(
+                                f"Video mtime deviates {_lag:+.1f}s from postprocess "
+                                f"completion (tolerance ±{_tolerance_s}s) — product may "
+                                f"have been modified outside the pipeline; delivery rejected")
+                            all_valid = False
+                    except (ValueError, OSError) as _e:
+                        report["issues"].append(
+                            f"State-product consistency check failed: {_e}")
                         all_valid = False
 
                 # 数据源3b：验证/质检结果追溯（verifications 节，由 pipeline_runner 合并写入）

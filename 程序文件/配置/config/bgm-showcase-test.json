@@ -1,0 +1,15 @@
+{
+  "video_type": "product_showcase",
+  "tts_enabled": false,
+  "bgm_enabled": true,
+  "bgm_source": "bgm-test.wav",
+  "audio_bitrate": "256k",
+  "video_duration": 20.0,
+  "cover_duration": 3.0,
+  "narration_source": "./narration.json",
+  "paths": {
+    "video_name": "bgm-showcase-test.mp4",
+    "temp_subdir": "bgm-showcase-test_audio",
+    "html_project": "bgm-showcase-test"
+  }
+}

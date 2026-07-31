@@ -102,6 +102,20 @@ QUICKFIX_BLOCKED = "QUICKFIX_BLOCKED"    # quick-fix 产物交付拦截
 UNKNOWN = "UNKNOWN"                      # 未分类失败
 
 
+def _coerce_bool(value, default=True):
+    """配置布尔的安全解析：JSON 布尔直接用；字符串 "false"/"0"/"no" 视为 False。
+
+    防御 bool("false") is True 的经典陷阱（手写配置可能把布尔写成字符串）。
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
+
+
 def _cache_age_str(completed_iso):
     """缓存年龄展示：ISO 时间 → '(12.3h ago)'；解析失败/缺失 → '(? ago)'，绝不抛异常。"""
     try:
@@ -397,6 +411,13 @@ class PipelineRunner:
         video_name = paths.get("video_name", f"{self.html_project}.mp4")
         self.output_file = OUTPUT_DIR / video_name
 
+        # P0 类型体系（2026-07-29）：video_type 声明视频类型；tts_enabled=false
+        # 表示纯BGM无旁白路径——tts/timeline 走类型化跳过（typed skip），
+        # reason 以 "tts_disabled" 开头写入状态文件，与 quick-fix 跳过可区分。
+        # 默认 tts_enabled=true，既有配置行为零变化。
+        self.video_type = str(self.config.get("video_type", "") or "")
+        self.tts_enabled = _coerce_bool(self.config.get("tts_enabled", True))
+
         self.state = PipelineState(self.temp_dir / "pipeline_state.json")
         self.quick_fix = quick_fix
         self.force = force
@@ -610,17 +631,20 @@ class PipelineRunner:
         """返回阻断交付的步骤清单（被 skipped 或未 passed 的渲染链步骤）。
 
         --quick-fix 会把 7 个前置步骤标记为 skipped —— 此清单非空即禁止交付，
-        确保 quick-fix 产物不流入交付。
+        确保 quick-fix 产物不流入交付。类型化跳过（reason 以 tts_disabled 开头，
+        由 config 声明的合法路径）通过 _gate_satisfied 放行，不阻断交付。
         """
         render_chain = ["preflight", "tts", "timeline", "preview", "render",
                         "verify", "visual_check", "postprocess"]
         blocked = []
         for step in render_chain:
+            if self._gate_satisfied(step):
+                continue
             rec = self.state.data.get("steps", {}).get(step, {})
             status = rec.get("status", "pending")
             if status == "skipped":
                 blocked.append(f"{step} (skipped: {rec.get('reason', 'quick-fix')})")
-            elif status != "passed":
+            else:
                 blocked.append(f"{step} (status={status})")
         return blocked
 
@@ -672,6 +696,21 @@ class PipelineRunner:
             if reason is not None:
                 return step, reason
         return None, None
+
+    def _typed_skip_reason(self):
+        """类型化跳过的 reason 字符串（落入 pipeline_state.json，可审计）。"""
+        return f"tts_disabled(video_type={self.video_type or 'unspecified'})"
+
+    def _gate_satisfied(self, step):
+        """门禁判定：passed 满足；类型化跳过（reason 以 tts_disabled 开头）
+        也满足——这是配置声明的合法路径，不是 quick-fix 式的门禁绕过。
+        quick-fix 跳过（reason='quick-fix mode'）不满足门禁，语义不变；
+        typed-skip 记录不写入任何 error_code（mark_skipped 本就不写）。"""
+        rec = self.state.data.get("steps", {}).get(step, {})
+        if rec.get("status") == "passed":
+            return True
+        return (rec.get("status") == "skipped"
+                and str(rec.get("reason", "")).startswith("tts_disabled"))
 
     def _can_skip(self, step):
         """指纹校验的跳步判定。命中缓存时打印状态日期，保证旧状态可见。"""
@@ -736,6 +775,11 @@ class PipelineRunner:
         return True
 
     def step_tts(self):
+        if not self.tts_enabled:
+            reason = self._typed_skip_reason()
+            self.state.mark_skipped("tts", reason)
+            print(f"  [TYPE-SKIP] tts_enabled=false — TTS generation skipped ({reason})")
+            return True
         if self.quick_fix:
             self.state.mark_skipped("tts", "quick-fix mode")
             return True
@@ -759,6 +803,12 @@ class PipelineRunner:
         return False
 
     def step_timeline(self):
+        if not self.tts_enabled:
+            # 无 TTS 基准时"时间轴向 TTS 收敛"不适用——HTML S-block 即权威时长
+            reason = self._typed_skip_reason()
+            self.state.mark_skipped("timeline", reason)
+            print(f"  [TYPE-SKIP] tts_enabled=false — timeline adjustment skipped ({reason})")
+            return True
         if self.quick_fix:
             self.state.mark_skipped("timeline", "quick-fix mode")
             return True
@@ -859,7 +909,8 @@ class PipelineRunner:
         # Refusing to proceed without verified static checks.
         if not self.force:
             for prereq in HARD_GATES.get("render", []):
-                if not self.state.is_passed(prereq):
+                # typed-skip（tts_enabled=false）算满足；quick-fix skip 仍拦截
+                if not self._gate_satisfied(prereq):
                     label = dict(STEPS).get(prereq, prereq)
                     print(f"  BLOCKED: Step '{prereq}' ({label}) has not passed.")
                     print(f"  RENDER REFUSED. Run preflight and preview first.")
@@ -1067,9 +1118,15 @@ class PipelineRunner:
         self.state.mark_started("delivery")
 
         # ── 门禁 2：成果文件存在且非零 ──
+        # 纯BGM无旁白项目（tts_enabled=false）：无 SRT 产物，字幕项类型化豁免
         video_path, srt_path = self._delivery_paths()
+        artifacts = [("视频", video_path)]
+        if self.tts_enabled:
+            artifacts.append(("字幕", srt_path))
+        else:
+            print(f"  [TYPE-SKIP] 字幕验收豁免：{self._typed_skip_reason()}（无旁白，SRT 非交付物）")
         missing = []
-        for label, p in (("视频", video_path), ("字幕", srt_path)):
+        for label, p in artifacts:
             if not p.exists():
                 missing.append(f"{label}不存在: {p}")
             elif p.stat().st_size == 0:
@@ -1083,7 +1140,8 @@ class PipelineRunner:
             return False
 
         print(f"  成果视频: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f} MB)")
-        print(f"  成果字幕: {srt_path} ({srt_path.stat().st_size} bytes)")
+        if self.tts_enabled:
+            print(f"  成果字幕: {srt_path} ({srt_path.stat().st_size} bytes)")
 
         # ── 清理审计（dry-run）：列出待清理中间产物，不实际删除 ──
         # 破坏性清理必须由用户显式执行 project_cleanup.py --execute（AGENTS.md 破坏性操作审核）
@@ -1117,13 +1175,17 @@ class PipelineRunner:
 
         video_path, srt_path = self._delivery_paths()
         report_out = self.temp_dir / "completion_report.json"
+        cmd = [str(VENV_PYTHON), "generate_completion_report.py",
+               "--project-name", self.html_project,
+               "--video-file", str(video_path),
+               "--state-file", str(self.state.path),
+               "--output-file", str(report_out)]
+        # 纯BGM无旁白项目：无 SRT 产物，不传 --subtitle-file（报告端自然跳过字幕段，
+        # 与 step_delivery 的字幕豁免口径一致）
+        if self.tts_enabled:
+            cmd.extend(["--subtitle-file", str(srt_path)])
         rc = self._run(
-            [str(VENV_PYTHON), "generate_completion_report.py",
-             "--project-name", self.html_project,
-             "--video-file", str(video_path),
-             "--subtitle-file", str(srt_path),
-             "--state-file", str(self.state.path),
-             "--output-file", str(report_out)],
+            cmd,
             cwd=str(SCRIPTS),
             desc="completion report"
         )
@@ -1154,7 +1216,8 @@ class PipelineRunner:
         # Prevent jumping to render/postprocess without prerequisite steps passing.
         if start_from and not self.force and not self.quick_fix:
             required = HARD_GATES.get(start_from, [])
-            missing = [s for s in required if not self.state.is_passed(s)]
+            # typed-skip（tts_enabled=false）算满足前置；quick-fix skip 仍拦截
+            missing = [s for s in required if not self._gate_satisfied(s)]
             if missing:
                 print(f"BLOCKED: Cannot start from '{start_from}'")
                 for m in missing:

@@ -1,0 +1,20 @@
+{
+  "project": "纯BGM产品展示验证",
+  "description": "P0 纯BGM路径端到端验证载体：全场景 narration 为空，tts_enabled=false，BGM 为项目目录内 bgm-test.wav",
+  "scenes": [
+    {
+      "scene_id": 1,
+      "start": 3.0,
+      "end": 12.0,
+      "narration": "",
+      "narration_required": false
+    },
+    {
+      "scene_id": 2,
+      "start": 12.0,
+      "end": 20.0,
+      "narration": "",
+      "narration_required": false
+    }
+  ]
+}

@@ -72,6 +72,13 @@ preflight → tts → timeline → render
 - 交付不能跳过 final_media_qa（确保质量）
 - `--quick-fix` 会将渲染链前置步骤标记为 `skipped`，delivery 硬门禁据此必然拦截（`error_code=QUICKFIX_BLOCKED`）——quick-fix 仅用于快速排查，不产生可交付产物
 
+### 5. 仓库定位与发布纪律
+
+**规范**：本仓是**发布仓**，唯一开发源为「视频制作工作流」仓。
+- 本仓代码文件禁止直接编辑，仅接受从开发仓导出覆盖
+- 文档类热修可例外，但修改后必须回灌开发仓
+- 发布固定走「开发仓开发 → 导出 → 验证 → push」流程
+
 ---
 
 ## 操作规范（Tier 2）

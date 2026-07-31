@@ -101,6 +101,26 @@ COVER_DURATION = 0.0  # auto-detected from HTML data-cover-duration, or set via 
 BGM_ENABLED = True  # config 可用 "bgm_enabled": false 关闭合成 BGM（低频 drone 容易被感知为嗡嗡声）
 SUBTITLE_DISPLAY_REPLACEMENTS = {}  # 字幕显示层替换（如 毫米→mm），不影响 TTS 朗读文本
 
+# === P0 类型体系（2026-07-29，eiway-122-wall 纯BGM项目逃逸教训） ===
+VIDEO_TYPE = ""         # config "video_type"：视频类型声明（如 product_showcase），日志/报告可读
+TTS_ENABLED = True      # config "tts_enabled"：false = 纯BGM无旁白路径（默认 true，既有项目零变化）
+BGM_SOURCE = None       # config "bgm_source" 解析后的外部 BGM 文件 Path（纯BGM路径必填）
+AUDIO_BITRATE = "256k"  # config "audio_bitrate"：成片 AAC 码率（现状默认 256k 不变）
+
+
+def _coerce_bool(value, default=True):
+    """配置布尔的安全解析：JSON 布尔直接用；字符串 "false"/"0"/"no" 视为 False。
+
+    防御 bool("false") is True 的经典陷阱（手写配置可能把布尔写成字符串）。
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
+
 
 def _tts_cache_key(text):
     """Compute short hash from narration text for cache keying.
@@ -473,11 +493,47 @@ def load_config(config_path):
     """
     global SCENES, VIDEO_DURATION, VOICE, RATE, PITCH, TTS_ENGINE, QWEN_MODEL, BGM_ENABLED
     global SUBTITLE_DISPLAY_REPLACEMENTS
+    global VIDEO_TYPE, TTS_ENABLED, BGM_SOURCE, AUDIO_BITRATE
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     
     VIDEO_DURATION = float(cfg.get('video_duration', VIDEO_DURATION))
-    BGM_ENABLED = bool(cfg.get('bgm_enabled', BGM_ENABLED))
+    BGM_ENABLED = _coerce_bool(cfg.get('bgm_enabled', BGM_ENABLED))
+
+    # ---- P0 类型体系（2026-07-29）：纯BGM无旁白路径的类型化配置 ----
+    VIDEO_TYPE = str(cfg.get('video_type', '') or '')
+    TTS_ENABLED = _coerce_bool(cfg.get('tts_enabled', True))
+    AUDIO_BITRATE = str(cfg.get('audio_bitrate', AUDIO_BITRATE))
+    BGM_SOURCE = None
+    if cfg.get('bgm_source'):
+        # bgm_source 解析：绝对路径 → 工作流根目录相对 → HTML 项目目录。
+        # 声明了指针即以指针为权威，找不到直接报错（禁止静默回退合成 drone）。
+        raw_bgm = str(cfg['bgm_source'])
+        bgm_candidates = []
+        if os.path.isabs(raw_bgm):
+            bgm_candidates.append(Path(raw_bgm))
+        else:
+            bgm_candidates.append(WF_ROOT / raw_bgm)
+            _bgm_html_project = (cfg.get('paths') or {}).get('html_project', '')
+            if _bgm_html_project:
+                bgm_candidates.append(WF_HTML_BASE / _bgm_html_project / raw_bgm)
+        BGM_SOURCE = next((c for c in bgm_candidates if c.is_file()), None)
+        if BGM_SOURCE is None:
+            print(f"[ERROR] bgm_source='{raw_bgm}' 声明了外部 BGM，但以下位置均未找到：")
+            for c in bgm_candidates:
+                print(f"[ERROR]   - {c}")
+            print("[ERROR] 请修正 bgm_source 指针（禁止静默回退合成 BGM）。")
+            sys.exit(1)
+    if not TTS_ENABLED:
+        # 纯BGM路径门禁：无旁白时音频只能来自 BGM——必须显式声明来源，
+        # 禁止"无 TTS 又无 BGM"的静音成片，也不用合成正弦 drone 兜底。
+        if not BGM_ENABLED:
+            print("[ERROR] tts_enabled=false 但 bgm_enabled=false — 纯BGM路径要求 bgm_enabled=true")
+            sys.exit(1)
+        if BGM_SOURCE is None:
+            print("[ERROR] tts_enabled=false 时必须声明 bgm_source（外部 BGM 文件）——")
+            print("[ERROR] 合成正弦 drone 不适合作为成片唯一音轨。")
+            sys.exit(1)
     SUBTITLE_DISPLAY_REPLACEMENTS = cfg.get('subtitle_display_replacements', {}) or {}
     VOICE = cfg.get('voice', VOICE)
     RATE = cfg.get('rate', RATE)
@@ -501,18 +557,22 @@ def load_config(config_path):
     
     # 引擎与音色一致性门禁：qwen 引擎但 voice 是 Edge 格式（zh-CN-*Neural）→ 报错退出。
     # 不允许静默改写：配置指纹哈希的是声明值，运行时改写会让指纹与实际产物脱钩，
-    # 引擎切换时缓存不会失效（缓存投毒隐患）。
-    if TTS_ENGINE == 'qwen' and re.match(r'^[a-z]{2}-[A-Z]{2}-\w+Neural$', VOICE or ''):
+    # 引擎切换时缓存不会失效（缓存投毒隐患）。纯BGM路径（TTS_ENABLED=false）不涉及 TTS 引擎，豁免。
+    if TTS_ENABLED and TTS_ENGINE == 'qwen' and re.match(r'^[a-z]{2}-[A-Z]{2}-\w+Neural$', VOICE or ''):
         print(f"[ERROR] tts_engine=qwen 但 voice='{VOICE}' 是 Edge-TTS 格式，配置声明与实际引擎不符")
         print(f"[ERROR] 请修正 config：用 qwen 音色（如 'longanling'），或显式声明 tts_engine: 'edge'")
         sys.exit(1)
     
-    if TTS_ENGINE not in ('qwen', 'edge'):
+    if TTS_ENABLED and TTS_ENGINE not in ('qwen', 'edge'):
         print(f"[ERROR] Unknown tts_engine='{TTS_ENGINE}' — supported: 'qwen', 'edge'")
         sys.exit(1)
     
-    print(f"[INFO] TTS engine: {TTS_ENGINE}, voice: {VOICE}" +
-          (f", model: {QWEN_MODEL}" if TTS_ENGINE == 'qwen' else ''))
+    if TTS_ENABLED:
+        print(f"[INFO] TTS engine: {TTS_ENGINE}, voice: {VOICE}" +
+              (f", model: {QWEN_MODEL}" if TTS_ENGINE == 'qwen' else ''))
+    else:
+        print(f"[INFO] TTS disabled (tts_enabled=false) — pure-BGM audio path" +
+              (f", video_type={VIDEO_TYPE}" if VIDEO_TYPE else ""))
     
     if 'cover_duration' in cfg:
         global COVER_DURATION
@@ -1231,6 +1291,28 @@ def step2_generate_bgm(temp_dir):
             print("  BGM disabled by config, skipping\n")
         return True
 
+    if BGM_SOURCE:
+        # 外部 BGM（P0 纯BGM通路，2026-07-29）：每次重新生成（源文件/时长可能变化，
+        # 不走 exists 缓存），-stream_loop -1 循环补齐后按视频时长截断，
+        # 1s 淡入 + 尾部 2s 淡出，统一立体声 44.1kHz s16。
+        # 音量：纯BGM模式 BGM 即主音轨（1.0，响度交给 step3 loudnorm 统一到 -16 LUFS）；
+        # TTS 模式作背景垫底（mix.bgm_volume，默认 0.25）。
+        _mix_cfg = _load_audio_sync_rules().get("mix", {})
+        _bgm_vol = float(_mix_cfg.get("bgm_volume", 0.25)) if TTS_ENABLED else 1.0
+        _fade_start = max(0.0, VIDEO_DURATION - 2.0)
+        ok = run_ffmpeg([
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", str(BGM_SOURCE),
+            "-t", str(VIDEO_DURATION),
+            "-af", f"volume={_bgm_vol},afade=t=in:d=1,afade=t=out:st={_fade_start}:d=2",
+            "-ar", str(SAMPLE_RATE), "-ac", "2",
+            "-sample_fmt", "s16",
+            str(bgm_file)
+        ], "external bgm preparation")
+        if ok:
+            print(f"  External BGM prepared: {BGM_SOURCE.name} -> {bgm_file}\n")
+        return ok
+
     if bgm_file.exists():
         print("  BGM already exists, skipping\n")
         return True
@@ -1324,17 +1406,21 @@ def step3_merge_all(video_path, temp_dir, output_path):
                   f"rendered video ({actual_video_dur:.1f}s) — config/S-block timelines "
                   f"have drifted. Re-run adjust_timeline.py + re-render.")
             return False
-        last_end = max(end for _, _, end, _ in SCENES)
-        if last_end > actual_video_dur + 0.5:
-            print(f"  ERROR: last scene ends at {last_end:.1f}s but video is only "
-                  f"{actual_video_dur:.1f}s — narration would be cut off at the tail.")
-            return False
+        # 尾场旁白越界检查只对有旁白的项目成立：纯BGM路径无 TTS 输入，
+        # SCENES 仅作为视觉分镜元数据，不参与音频放置（空列表时 max() 也会崩）。
+        if TTS_ENABLED and SCENES:
+            last_end = max(end for _, _, end, _ in SCENES)
+            if last_end > actual_video_dur + 0.5:
+                print(f"  ERROR: last scene ends at {last_end:.1f}s but video is only "
+                      f"{actual_video_dur:.1f}s — narration would be cut off at the tail.")
+                return False
 
     # Build inputs: [0]=video, [1..N]=TTS scenes, [N+1]=BGM
     inputs = ["-i", str(video_path)]
     filter_parts = []
 
-    for i, (scene_id, start, end, text) in enumerate(SCENES):
+    # 纯BGM路径（TTS_ENABLED=false）：无 TTS 输入，BGM 即唯一音轨（amix inputs=1）
+    for i, (scene_id, start, end, text) in enumerate(SCENES if TTS_ENABLED else []):
         h = _get_tts_hash_from_manifest(manifest, scene_id, text)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
         if not hq_file.exists():
@@ -1363,15 +1449,17 @@ def step3_merge_all(video_path, temp_dir, output_path):
             f"adelay={delay_ms}|{delay_ms},apad,volume={tts_volume}[n{i}]")
 
     # BGM input（可选：bgm_enabled=false 时纯旁白混音，无背景音）
+    # 输入索引以实际 TTS 数量为准：纯BGM路径 _n_tts=0 → BGM 是输入[1]、amix inputs=1
+    _n_tts = len(SCENES) if TTS_ENABLED else 0
     if BGM_ENABLED:
         inputs.extend(["-i", str(bgm_file)])
-        bgm_idx = len(SCENES) + 1
-        mix_labels = "".join(f"[n{i}]" for i in range(len(SCENES))) + f"[{bgm_idx}]"
-        n_inputs = len(SCENES) + 1
+        bgm_idx = _n_tts + 1
+        mix_labels = "".join(f"[n{i}]" for i in range(_n_tts)) + f"[{bgm_idx}]"
+        n_inputs = _n_tts + 1
     else:
         print("  BGM disabled — mixing narration only")
-        mix_labels = "".join(f"[n{i}]" for i in range(len(SCENES)))
-        n_inputs = len(SCENES)
+        mix_labels = "".join(f"[n{i}]" for i in range(_n_tts))
+        n_inputs = _n_tts
     filter_parts.append(
         f"{mix_labels}amix=inputs={n_inputs}:duration=longest:dropout_transition=0:normalize=0,"
         f"alimiter=limit=0.95,"
@@ -1386,7 +1474,7 @@ def step3_merge_all(video_path, temp_dir, output_path):
         "-map", "[aout]",
         "-c:v", "copy",
         "-c:a", "aac",
-        "-b:a", "256k",
+        "-b:a", AUDIO_BITRATE,
         "-ar", str(SAMPLE_RATE),
         "-ac", "2",
         "-shortest",
@@ -2265,7 +2353,8 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
         overflow_tol = 0.3   # short videos: tight sync
         utilization_min = 0.55
 
-    for scene_id, start, end, text in SCENES:
+    # 纯BGM路径：无 TTS 基准 → overflow/utilization/dead-air 检查不适用（空列表短路）
+    for scene_id, start, end, text in (SCENES if TTS_ENABLED else []):
         h = _get_tts_hash_from_manifest(manifest, scene_id, text)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
         if not hq_file.exists():
@@ -2337,7 +2426,10 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
                 warnings.append(msg)
 
     # --- 2. Subtitle Timing Validation ---
-    if not subtitle_path.exists():
+    if not TTS_ENABLED:
+        # 纯BGM路径：无旁白 → SRT 不是交付要求（类型化豁免，非放松门禁）
+        print("  [INFO] Subtitle checks skipped: tts_enabled=false (no narration, SRT not required)")
+    elif not subtitle_path.exists():
         errors.append(f"Subtitle file not found: {subtitle_path}")
     else:
         srt_content = subtitle_path.read_text(encoding='utf-8-sig')
@@ -2463,7 +2555,7 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
     # preflight_check.narration_digits catches config-level violations upstream.
     # This step catches anything that slips through (hand-written HTML paths,
     # external SRT imports, whitelist gaps).
-    if subtitle_path.exists():
+    if TTS_ENABLED and subtitle_path.exists():
         try:
             _digit_findings = _lint_scan_srt(subtitle_path)
         except Exception as _e:
@@ -2479,7 +2571,7 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
     # --- 8. 术语规范化 lint（subtitle_term_rules.json → lint_patterns）---
     # 正常流程下 step5 的 _normalize_subtitle_terms 已消除这些形态；
     # 仍命中 = 外部 SRT 导入或词典缺口（如新扩展名），拒收并提示补词典。
-    if subtitle_path.exists():
+    if TTS_ENABLED and subtitle_path.exists():
         _srt_text = subtitle_path.read_text(encoding='utf-8-sig')
         for _rule in _load_subtitle_term_rules().get("lint_patterns", []):
             try:
@@ -2571,9 +2663,14 @@ async def main():
     # （只做 ffprobe 校验，秒级）；文本已变时必须重新生成，否则会用旧文案
     # 音频配新文案字幕（soundproof-craft 事故根因之一：旧代码在 quick-fix
     # 下整体跳过 step1，"TTS is already cached" 的假设从未被验证）。
-    ok = await step1_generate_tts(temp_dir)
-    if not ok:
-        sys.exit(1)
+    if TTS_ENABLED:
+        ok = await step1_generate_tts(temp_dir)
+        if not ok:
+            sys.exit(1)
+    else:
+        # P0 纯BGM路径（2026-07-29）：类型化豁免，非门禁绕过——
+        # 该跳过由 config tts_enabled=false 显式声明，与 --quick-fix 无关。
+        print("=== Step 1: TTS skipped (tts_enabled=false, pure-BGM path) ===\n")
 
     # --tts-only: exit after TTS generation (pre-pass for adjust_timeline.py)
     if args.tts_only:
@@ -2588,15 +2685,19 @@ async def main():
     if not ok:
         sys.exit(1)
 
-    ok = step5_generate_subtitles(subtitle_file, temp_dir)
-    if not ok:
-        print("\nSubtitle generation FAILED")
-        sys.exit(1)
+    if TTS_ENABLED:
+        ok = step5_generate_subtitles(subtitle_file, temp_dir)
+        if not ok:
+            print("\nSubtitle generation FAILED")
+            sys.exit(1)
 
-    ok = step6_burn_subtitles(output_file, subtitle_file, temp_dir)
-    if not ok:
-        print("\nSubtitle burn-in FAILED")
-        sys.exit(1)
+        ok = step6_burn_subtitles(output_file, subtitle_file, temp_dir)
+        if not ok:
+            print("\nSubtitle burn-in FAILED")
+            sys.exit(1)
+    else:
+        # 纯BGM路径：无旁白 → 无 SRT/烧录（类型化豁免，step7 同步豁免字幕检查）
+        print("=== Steps 5-6: Subtitles skipped (tts_enabled=false, no narration) ===\n")
 
     ok = step4_verify(output_file)
     if not ok:
