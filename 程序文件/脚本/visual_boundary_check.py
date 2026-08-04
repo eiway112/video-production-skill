@@ -53,10 +53,39 @@ CONTENT_PIXEL_THRESHOLD = 20
 BRIGHTNESS_THRESHOLD = 80  # for R/G channels
 BLUE_THRESHOLD = 100       # for B channel (dark blue background)
 
+# ── Content vacuum detection (有声无画门禁) ──────────────────────
+# 与 dead-air 门禁对称：那个拦“有画没声”，这个拦“有声没画”。
+# 成片反馈：旁白已开始念主体内容，但主视觉元素晚入场 8s+，画面长时间
+# 只有一行标题。判定：场景早期内容覆盖率远低于晚期（内容晚到）即拒收。
+VACUUM_MIN_SCENE_DUR = 6.0      # 短场景（封面/转场）不检
+
+VACUUM_CONTENT_TOP = 120        # 内容覆盖率统计区间：正文区顶部
+VACUUM_EARLY_RATIO = 0.35       # 早期覆盖率 < 晚期的 35% → 内容晚到
+VACUUM_MIN_LATE_COVERAGE = 0.15  # 晚期覆盖率本身很低（极简设计）则不判空窗
+
 # Per-scene sample points (fraction of scene duration). Three-point sampling
 # catches entrance (30%), steady-state (50%) and late-appearing (70%) content;
 # the WORST measurement (max content_bottom) decides the scene verdict.
 SAMPLE_POINTS = (0.3, 0.5, 0.7)
+
+
+def measure_content_coverage(image_path):
+    """内容覆盖率：正文区（y∈[VACUUM_CONTENT_TOP, 安全线]）含内容像素的行占比。
+
+    只有标题时覆盖率约 0.1，内容铺满时通常 > 0.4，区分度足够。
+    """
+    img = Image.open(image_path).convert("RGB")
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    y0, y1 = VACUUM_CONTENT_TOP, min(SUBTITLE_SAFETY_LINE, h - 1)
+    band = arr[y0:y1, 20:w-20, :]
+    r = band[:, :, 0].astype(int)
+    g = band[:, :, 1].astype(int)
+    b = band[:, :, 2].astype(int)
+    bright = (r > BRIGHTNESS_THRESHOLD) | (g > BRIGHTNESS_THRESHOLD) | (b > BLUE_THRESHOLD)
+    rows_with_content = (bright.sum(axis=1) > CONTENT_PIXEL_THRESHOLD).sum()
+    total_rows = max(y1 - y0, 1)
+    return rows_with_content / total_rows
 
 
 def find_ffmpeg():
@@ -232,6 +261,56 @@ def run_check(video_path, scenes, ffmpeg_exe="ffmpeg"):
             else:
                 print(f"  ✓ Scene {sid}: content_bottom=y{content_bottom} | gap={gap}px @t={sample_t:.1f}s (worst of {len(samples)} samples)")
 
+    # Second pass: content vacuum — narration playing over a near-empty frame
+    print("\n  [Second pass: content vacuum (early vs late coverage)]")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for scene in scenes:
+            sid = scene["id"]
+            start = scene["start"]
+            end = scene["end"]
+            dur = end - start
+
+            if dur < VACUUM_MIN_SCENE_DUR:
+                continue
+
+            # 早期采样点 = 观众容忍线（约7.5s，短场景取45%处）：
+            # 分批入场是正常设计，只拦“主内容迟于容忍线”的真空窗
+            early_t = start + min(7.5, dur * 0.45)
+            late_t = start + dur * 0.85
+            early_path = os.path.join(tmp_dir, f"scene_{sid}_early.png")
+            late_path = os.path.join(tmp_dir, f"scene_{sid}_full.png")
+            if not extract_frame(video_path, early_t, early_path, ffmpeg_exe):
+                continue
+            if not extract_frame(video_path, late_t, late_path, ffmpeg_exe):
+                continue
+
+            # Coverage measurement failure degrades to skip (never crash the gate).
+            try:
+                early_cov = measure_content_coverage(early_path)
+                late_cov = measure_content_coverage(late_path)
+            except Exception:
+                continue
+            existing = next((r for r in results if r["scene"] == sid), None)
+            if existing is not None:
+                existing["early_coverage"] = round(early_cov, 3)
+                existing["late_coverage"] = round(late_cov, 3)
+
+            if late_cov >= VACUUM_MIN_LATE_COVERAGE and early_cov < late_cov * VACUUM_EARLY_RATIO:
+                print(f"  ✗ Scene {sid}: CONTENT VACUUM — coverage {early_cov:.0%} @t={early_t:.1f}s"
+                      f" vs {late_cov:.0%} @t={late_t:.1f}s (main content enters too late)")
+                vac = {
+                    "scene": sid, "status": "FAIL", "kind": "content_vacuum",
+                    "early_coverage": round(early_cov, 3),
+                    "late_coverage": round(late_cov, 3),
+                    "sample_time": round(early_t, 1),
+                }
+                if existing is not None:
+                    existing["status"] = "FAIL"
+                    existing["kind"] = "content_vacuum"
+                violations.append(vac)
+            else:
+                print(f"  ✓ Scene {sid}: coverage {early_cov:.0%} → {late_cov:.0%}")
+
     passed = len(violations) == 0
     print()
     if passed:
@@ -239,9 +318,14 @@ def run_check(video_path, scenes, ffmpeg_exe="ffmpeg"):
     else:
         print(f"✗ VISUAL BOUNDARY CHECK FAILED — {len(violations)} scene(s) overflow:")
         for v in violations:
-            print(f"    Scene {v['scene']}: content at y={v['content_bottom']} overflows safety line y={SUBTITLE_SAFETY_LINE} by {abs(v['gap'])}px")
-        print(f"\n  Fix: Reduce content height in the overflowing scenes, then re-render.")
-        print(f"  Content must stay above y={SUBTITLE_SAFETY_LINE} to avoid subtitle overlap.")
+            if v.get("kind") == "content_vacuum":
+                print(f"    Scene {v['scene']}: content vacuum — early coverage "
+                      f"{v['early_coverage']:.0%} < {VACUUM_EARLY_RATIO:.0%} of late "
+                      f"{v['late_coverage']:.0%}; move main content entrance earlier")
+            else:
+                print(f"    Scene {v['scene']}: content at y={v['content_bottom']} overflows safety line y={SUBTITLE_SAFETY_LINE} by {abs(v['gap'])}px")
+        print(f"\n  Fix: overflow → reduce content height; vacuum → advance GSAP entrance times.")
+        print(f"  Content must stay above y={SUBTITLE_SAFETY_LINE} and appear while narration plays.")
 
     return passed, results
 

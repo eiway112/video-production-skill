@@ -38,6 +38,52 @@ import io
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
+# 交付门禁自适应参数表（单一权威源：config/quality/delivery_gate_rules.json）
+_DELIVERY_RULES_PATH = (
+    Path(__file__).resolve().parent.parent / "配置" / "config" / "quality" / "delivery_gate_rules.json"
+)
+# documented 默认值与配置文件保持一致；读取失败回退并告警，绝不让门禁静默旁路
+_DELIVERY_RULE_DEFAULTS = {
+    "product_consistency": {
+        "mtime_tolerance_base_seconds": 10.0,
+        "mtime_tolerance_ratio_of_duration": 0.05,
+        "mtime_tolerance_max_seconds": 120.0,
+    }
+}
+
+
+def _load_delivery_rules() -> Dict[str, Any]:
+    """加载交付门禁规则；失败回退 documented 默认值（打印告警，不抛异常）。"""
+    try:
+        with open(_DELIVERY_RULES_PATH, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        merged = json.loads(json.dumps(_DELIVERY_RULE_DEFAULTS))
+        for key, val in loaded.items():
+            if not key.startswith("$") and isinstance(val, dict):
+                merged.setdefault(key, {}).update(val)
+        return merged
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  WARNING: delivery_gate_rules.json unreadable ({e}) — "
+              f"falling back to built-in defaults", file=sys.stderr)
+        return json.loads(json.dumps(_DELIVERY_RULE_DEFAULTS))
+
+
+def _adaptive_mtime_tolerance(video_duration_s: float) -> float:
+    """产物 mtime 容差随视频时长自适应缩放（P0 整改，2026-08-04 prefab 复盘）。
+
+    教训：固定 ±10s 容差误判拒收了 618.9s 长视频的合格成片（实测偏差 -12.7s），
+    触发后续 9 小时连环重渲。容差 = base + ratio × 时长，封顶 max：
+    短视频保持严格（137s → ~17s），长视频按比例放宽（618.9s → ~41s），
+    封顶 120s 保证"隔天陈旧产物"量级的偏移仍会被拒收。
+    """
+    pc = _load_delivery_rules().get("product_consistency", {})
+    base = float(pc.get("mtime_tolerance_base_seconds", 10.0))
+    ratio = float(pc.get("mtime_tolerance_ratio_of_duration", 0.05))
+    cap = float(pc.get("mtime_tolerance_max_seconds", 120.0))
+    dur = max(0.0, float(video_duration_s or 0.0))
+    return min(cap, base + ratio * dur)
+
+
 def ffprobe_get_metadata(video_path: str) -> Dict[str, Any]:
     """使用 ffprobe 获取视频元数据"""
     try:
@@ -259,6 +305,11 @@ def generate_report(
                             ecode = step_record.get("error_code")
                             suffix = f" [{ecode}]" if ecode else ""
                             report["issues"].append(f"Pipeline step '{step}' did not pass{suffix}")
+                            # P0 整改（2026-08-04 prefab 复盘）：失败步骤的子进程日志
+                            # 路径透传到报告——用户不再面对"黑盒失败"，可直接打开日志排障
+                            log_path = step_record.get("log_path")
+                            if log_path:
+                                report["issues"].append(f"  ↳ step log: {log_path}")
                             all_valid = False
                     else:
                         report["issues"].append(f"Pipeline step '{step}' not recorded")
@@ -268,15 +319,18 @@ def generate_report(
                 # postprocess 完成时刻偏差超过容差 → 成片可能在流水线之外
                 # 被改写（eiway-122-wall 逃逸脚本直接覆写成片的教训）。
                 # 判定依据：正常路径下成片由 postprocess 步骤产出，其 mtime
-                # 与该步骤完成时刻应基本一致；容差 10s 覆盖文件系统时间精度
-                # 与流水线收尾写入（重命名/faststart），正常项目不会误伤。
+                # 与该步骤完成时刻应基本一致。
+                # P0 整改（2026-08-04 prefab 复盘）：容差不再固定 10s，改为
+                # base + ratio × 视频时长（封顶 max，参数见 delivery_gate_rules.json）。
+                # 固定容差曾误判拒收 618.9s 合格成片（-12.7s 超差），诱发 9 小时连环重渲。
                 # 用绝对差值：mtime 早于完成时刻超差同样可疑（陈旧产物/时钟回拨）。
                 _pp_completed = pipeline_steps.get("postprocess", {}).get("completed")
                 if _pp_completed and video_path.exists():
                     try:
                         _pp_ts = datetime.fromisoformat(_pp_completed).timestamp()
                         _video_ts = video_path.stat().st_mtime
-                        _tolerance_s = 10.0
+                        _video_dur_for_tol = float(report["validation"].get("video_duration", 0) or 0)
+                        _tolerance_s = round(_adaptive_mtime_tolerance(_video_dur_for_tol), 1)
                         _lag = _video_ts - _pp_ts
                         _consistent = abs(_lag) <= _tolerance_s
                         report["data_sources"]["state_product_check"] = {
@@ -284,15 +338,18 @@ def generate_report(
                             "video_mtime": datetime.fromtimestamp(_video_ts).isoformat(),
                             "video_mtime_minus_completed_s": round(_lag, 3),
                             "tolerance_s": _tolerance_s,
-                            "basis": ("成片 mtime 与 postprocess 完成时刻的绝对差不得超过容差"
-                                      "（10s，覆盖文件系统时间精度与收尾重命名/faststart 写入）；"
+                            "tolerance_basis_duration_s": _video_dur_for_tol,
+                            "basis": ("成片 mtime 与 postprocess 完成时刻的绝对差不得超过自适应容差"
+                                      "（base 10s + 5% × 视频时长，封顶 120s，参数见"
+                                      " config/quality/delivery_gate_rules.json）；"
                                       "超差说明成片在流水线之外被改写或为陈旧产物，拒收"),
                         }
                         report["validation"]["product_state_consistent"] = _consistent
                         if not _consistent:
                             report["issues"].append(
                                 f"Video mtime deviates {_lag:+.1f}s from postprocess "
-                                f"completion (tolerance ±{_tolerance_s}s) — product may "
+                                f"completion (adaptive tolerance ±{_tolerance_s}s for "
+                                f"{_video_dur_for_tol:.0f}s video) — product may "
                                 f"have been modified outside the pipeline; delivery rejected")
                             all_valid = False
                     except (ValueError, OSError) as _e:
@@ -300,7 +357,7 @@ def generate_report(
                             f"State-product consistency check failed: {_e}")
                         all_valid = False
 
-                # 数据源3b：验证/质检结果追溯（verifications 节，由 pipeline_runner 合并写入）
+                # 数据源b：验证/质检结果追溯（verifications 节，由 pipeline_runner 合并写入）
                 # 向后兼容：旧 state 无此节 → 标注不可追溯（既不崩溃也不误判为失败）。
                 verifications = pipeline_state.get("verifications", {})
                 if verifications:
@@ -322,9 +379,20 @@ def generate_report(
             except Exception as e:
                 report["issues"].append(f"Failed to read pipeline state: {e}")
                 all_valid = False
+        else:
+            # P0（2026-07-29）：state 文件缺失曾被完全静默旁路（eiway-122-wall
+            # 交付时无任何状态记录却生成了报告）——缺失即无法证明流水线执行过，
+            # 显式拒收。
+            report["issues"].append(
+                f"Pipeline state file missing: {state_file} — cannot verify "
+                f"pipeline execution; delivery rejected")
+            all_valid = False
     else:
-        report["issues"].append("Pipeline state file not provided")
-        # 这不一定是失败，但应该标记
+        # P0（2026-07-29）：未提供 state 同样无法核验流水线执行，不再只软提示。
+        report["issues"].append(
+            "Pipeline state file not provided — cannot verify pipeline execution; "
+            "delivery rejected")
+        all_valid = False
     
     # 总体判定（状态必须来自真实验证结果，禁止硬编码 COMPLETED/PASS/成功）
     if all_valid and not report["issues"]:

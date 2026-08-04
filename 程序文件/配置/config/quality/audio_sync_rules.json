@@ -9,14 +9,18 @@
   "shrink": {
     "enabled_by_default": true,
     "shrink_margin_seconds": 1.5,
-    "description": "pipeline_runner 传给 adjust_timeline.py 的 --shrink-margin：TTS 播完后为镜头预留的呼吸时间。需覆盖 GSAP 场景 pre-fade(0.5s) + 感官缓冲(1.0s)，避免音频尾音撞进画面淡出。"
+    "description": "pipeline_runner 与 adjust_timeline.py 共同消费的 --shrink-margin 唯一权威值：TTS 播完后为镜头预留的呼吸时间。需覆盖 GSAP 场景 pre-fade(0.5s) + 感官缓冲(1.0s)，避免音频尾音撞进画面淡出。禁止任何脚本另设分叉默认值（prefab 复盘：CLI 默认 1.0s 与本值 1.5s 分叉，造成 618.9→621.7→623.8s 三次时间轴漂移）。"
+  },
+  "duration_consistency": {
+    "max_diff_seconds": 1.0,
+    "description": "后处理前置门禁（pipeline_runner.step_postprocess 早失败检查）：config video_duration 与实际渲染产物时长的绝对偏差超过该值 → 立即拒跑并给出定点修复指引（重跑 adjust_timeline 或对齐 config 后 --quick-fix）。prefab 复盘：617.8s(config) vs 621.72s(render_raw) 的漂移曾拖到 enhance step3 混音门禁才暴露，白白消耗 TTS/BGM 再生成的时间与一次 40 分钟重渲染。"
   },
   "transition": {
     "tts_fade_in_ms": 40,
     "tts_fade_out_ms": 150,
     "min_inter_narration_gap_seconds": 0.5,
     "fail_on_violation": true,
-    "description": "音频过渡平滑规则：每段 TTS 混音前加微淡入(40ms防爆音)+尾部淡出(150ms自然收音)；相邻场景旁白间隔（上一场景 TTS 结束→下一场景开口）低于 min_inter_narration_gap_seconds → step7 拦截，防听感仓促。"
+    "description": "音频过渡平滑规则：每段 TTS 混音前加微淡入(40ms防爆音)+尾部淡出(150ms自然收音)；相邻场景旁白间隔（上一场景 TTS 结束→下一场景开口）低于 min_inter_narration_gap_seconds 时 step7 拦截，防听感仓促。"
   },
   "black_frame": {
     "min_black_seconds": 1.0,
@@ -32,6 +36,10 @@
     "loudnorm_TP": -1.5,
     "loudnorm_LRA": 11,
     "description": "TTS 音量增益(1.5x) + BGM音量(0.08x) + EBU R128 响度标准化(-16 LUFS)。amix normalize=0 禁用按输入数衰减。"
+  },
+  "sentence_pause": {
+    "min_seconds": 0.4,
+    "description": "段间停顿强制（enhance_video_audio._enforce_sentence_pauses）：TTS 引擎整段合成时句间停顿由内部韵律决定（skill-promo 实测同段音频句号停顿 0~0.38s 浮动，甚至为 0），标点不构成可靠控制面。以 ASR 强制对齐段级时间戳度量相邻字幕段声学间隔，不足 min_seconds 时在边界最低能量点插入差额静音并平移后续时间戳。设 0 可关闭。"
   },
   "alignment": {
     "p95_max_seconds": 0.6,

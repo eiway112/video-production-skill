@@ -79,6 +79,11 @@ preflight → tts → timeline → render
 - 文档类热修可例外，但修改后必须回灌开发仓
 - 发布固定走「开发仓开发 → 导出 → 验证 → push」流程
 
+**紧急热修例外**：满足以下全部条件时，允许直接修改本仓并事后回灌开发仓：
+1. 影响范围已确认为 P0（阻断渲染/交付）
+2. 修改范围不超过单文件 10 行
+3. 修改后 24 小时内完成开发仓回灌并通过回归测试
+
 ---
 
 ## 操作规范（Tier 2）
@@ -127,6 +132,15 @@ preflight → tts → timeline → render
 
 **工具**：`project_cleanup.py --execute` 提供事务式清理
 
+### 渲染纪律与错误恢复
+
+**预览驱动迭代**：修订任务修改 HTML 后，必须先跑 `instant_preview.py`（秒级出图）确认画面生效且无溢出，确认后才进入渲染；**禁止把全量渲染当预览用**。仅场景 div 内容变化时可用 `pipeline_runner.py --scene-patch` 走场景级增量渲染。
+
+**错误恢复纪律**：
+1. 步骤失败后**先定点诊断，禁止直接 `--fresh`** 全量重置——优先 `--resume`（自动回退到最早失效步）或 `--quick-fix`；长视频（≥300s）或有渲染产物时，`--fresh` 必须显式追加 `--confirm-fresh` 并确认破坏清单
+2. 每个子步骤的完整输出落盘至 `过程产物/日志/{config}_{step}_*.log`，失败时 `pipeline_state.json` 记录 `log_path`，完工报告 issues 同步引用
+3. 全量渲染前自动备份基线（`render_raw.prev.mp4`），已交付成片在覆盖前自动备份并受交付态拦截保护；覆盖已交付成片须改用 `_修订NN` 后缀
+
 ---
 
 ## 工作流路由（Tier 3）
@@ -159,6 +173,8 @@ preflight → tts → timeline → render
 - 任一场景 dead-air 超过阈值（默认 3.0s）→ 拒收
 
 **阈值表**：`config/quality/audio_sync_rules.json`
+
+**shrink margin 唯一权威值**：`audio_sync_rules.json` 的 1.5s，任何脚本不得另设分叉默认值
 
 ---
 
@@ -200,6 +216,8 @@ preflight → tts → timeline → render
 4. 文件系统（文件大小、修改时间）
 
 **结构化错误码**：`pipeline_state.json` 中失败步骤记录含 `error_code` 字段，取值 `GATE_BLOCKED` / `SUBPROCESS_FAILED` / `OUTPUT_MISSING` / `VERIFY_FAILED` / `QUICKFIX_BLOCKED` / `UNKNOWN`（未指定时归 `UNKNOWN`）；外部工具判定交付状态时应将 `QUICKFIX_BLOCKED` 视为禁止对外发布。
+
+**自适应门禁**：成片时间戳一致性校验的容差随时长缩放——`min(120s, 10s + 5% × 视频时长)`，参数集中在 `config/quality/delivery_gate_rules.json`，防止长视频被固定容差误杀。
 
 **禁止**：任何硬编码的 "COMPLETED"、"PASS" 或 "成功"
 

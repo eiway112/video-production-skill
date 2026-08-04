@@ -109,7 +109,7 @@ def measure_tts_durations(tts_dir, num_scenes, config_scenes=None):
     return durations
 
 
-def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrink_margin=1.0):
+def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrink_margin=1.5):
     """Calculate extension/shrink and cumulative offset for each scene.
 
     Bidirectional adjustment: the target margin between TTS end and scene end
@@ -122,7 +122,8 @@ def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrin
         tts_durations: [dur1, dur2, ...] actual TTS audio lengths
         buffer: minimum margin after TTS when --shrink is OFF (default 0.5s)
         shrink: enable bidirectional convergence to `shrink_margin`
-        shrink_margin: target margin beyond TTS (default 1.0s, active when --shrink)
+        shrink_margin: target margin beyond TTS (default 1.5s = audio_sync_rules.json
+            authoritative value; active when --shrink)
 
     Returns:
         extensions: [ext1, ext2, ...] how much each scene grows (negative = shrink)
@@ -412,6 +413,24 @@ def _write_narration_scenes(narration_path, scenes, cover_duration):
     print(f"  Updated narration_source: {narration_path}")
 
 
+def _default_shrink_margin():
+    """--shrink-margin 单一权威源：config/quality/audio_sync_rules.json。
+
+    prefab 复盘教训（2026-08-04）：本脚本 CLI 曾硬编码默认 1.0s，与权威配置
+    1.5s 分叉——人工运行与流水线运行产出不同时间轴，造成 618.9→621.7→623.8s
+    三次漂移、连环全量重渲。现在未显式传参时一律从配置读取；读取失败回退
+    1.5s（与配置 documented 值一致）并打印告警。
+    """
+    try:
+        from _script_env import ROOT
+        rules_path = ROOT / "程序文件" / "配置" / "config" / "quality" / "audio_sync_rules.json"
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            return float(json.load(f)["shrink"]["shrink_margin_seconds"])
+    except Exception:
+        print("  WARNING: audio_sync_rules.json unreadable — shrink margin falls back to 1.5s")
+        return 1.5
+
+
 def main():
     parser = argparse.ArgumentParser(description="Adjust GSAP timeline to fit TTS audio (bidirectional)")
     parser.add_argument("--html", default=None, help="HTML project name (e.g. wall-crack-remedy)")
@@ -419,9 +438,15 @@ def main():
     parser.add_argument("--tts-dir", required=True, help="Path to tts_44k directory")
     parser.add_argument("--shrink", action="store_true",
                         help="Enable window shrinking when surplus > shrink-margin")
-    parser.add_argument("--shrink-margin", type=float, default=1.0,
-                        help="Target margin beyond TTS when shrinking (default: 1.0s)")
+    parser.add_argument("--shrink-margin", type=float, default=None,
+                        help="Target margin beyond TTS when shrinking. Default: read from "
+                             "config/quality/audio_sync_rules.json (single source of truth, "
+                             "currently 1.5s). Pass explicitly only for one-off experiments.")
     args = parser.parse_args()
+
+    # margin 单一权威源：未显式传参 → 从 audio_sync_rules.json 读取
+    if args.shrink_margin is None:
+        args.shrink_margin = _default_shrink_margin()
 
     # Determine HTML project name (from arg or config)
     from _script_env import HTML_BASE, resolve_narration_scenes
@@ -567,13 +592,19 @@ def main():
         # manually edited (fresh baseline, already-converged S-block) while the
         # config was restored from an older backup, config still carries the
         # stale video_duration/scenes. Re-derive config from the authoritative
-        # S-block and write it back if drifted, so the two sources never disagree.
-        if s_map:
+        # boundaries (S-block or narration_source) and write it back if drifted,
+        # so the two sources never disagree.
+        if s_map or narration_path is not None:
             zeros = [0.0] * num_scenes
             synced = update_config(dict(cfg), cfg['scenes'], zeros, zeros, 0.0,
                                    cover_duration, boundaries=boundaries)
-            drifted = (synced['scenes'] != cfg['scenes'] or
-                       abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= 0.05)
+            if narration_path is not None:
+                # 指针模式：cfg['scenes'] 为绝对时间、synced['scenes'] 为 cover
+                # 相对时间，坐标系不同不可直接比对，仅以 video_duration 判定漂移
+                drifted = abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= 0.05
+            else:
+                drifted = (synced['scenes'] != cfg['scenes'] or
+                           abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= 0.05)
             if drifted:
                 cfg = synced
                 if narration_path is not None:
@@ -584,7 +615,8 @@ def main():
                 # so refresh backup + hash to keep restore idempotent.
                 shutil.copy2(config_path, config_bak)
                 _write_hash(config_hash_path, config_path.read_text(encoding='utf-8'))
-                print(f"  Config drift detected — resynced from S-block: "
+                source_label = 'S-block' if s_map else 'narration_source'
+                print(f"  Config drift detected — resynced from {source_label}: "
                       f"video_duration={cfg['video_duration']:.1f}s")
         return 0
 

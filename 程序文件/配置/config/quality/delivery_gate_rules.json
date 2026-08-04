@@ -1,0 +1,14 @@
+{
+  "$schema": "Delivery/completion gate adaptive parameters (consumed by generate_completion_report.py + pipeline_runner.py)",
+  "$description": "交付/完工门禁自适应参数表（单一权威源）。背景：2026-08-04 prefab-decor-spec 复盘——固定 ±10s 的产物 mtime 容差误判拒收了 618.9s 长视频的合格成片（实测偏差 -12.7s），随后 9 小时连环重渲。教训：门禁容差必须随视频时长缩放，短视频保持严格、长视频按比例放宽，且上限封顶防止门禁失效。读取失败时消费方回退到本文件内的 documented 默认值并打印告警。",
+  "product_consistency": {
+    "mtime_tolerance_base_seconds": 10.0,
+    "mtime_tolerance_ratio_of_duration": 0.05,
+    "mtime_tolerance_max_seconds": 120.0,
+    "description": "完工报告产物-状态一致性门禁容差 = base + ratio × 视频时长（封顶 max）。618.9s 视频 → 10+30.9=40.9s（覆盖长视频 faststart/重命名收尾与文件系统时间精度）；137s 短视频 → 16.9s，仍远小于'隔天陈旧产物'量级，防伪能力不降级。"
+  },
+  "fresh_guard": {
+    "confirm_required_min_duration_seconds": 300,
+    "description": "--fresh 受限门禁：config video_duration 达到该阈值（长视频，单次全量重渲染成本 30 分钟+）或 render_raw/成果文件已存在时，必须追加 --confirm-fresh 显式确认，否则打印破坏清单后拒绝执行。防止把'定点修复'误操作成'全量重置'（prefab 复盘根因2：15:28 --fresh 是灾难性恢复决策）。"
+  }
+}

@@ -85,7 +85,7 @@ def convert_pptx(filepath: Path, output_dir: Path) -> str:
                 lines.append("| " + " | ".join(headers) + " |")
                 lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
                 # Data rows
-                for row in table.rows[1:]:
+                for row in list(table.rows)[1:]:
                     cells = [cell.text.strip() for cell in row.cells]
                     lines.append("| " + " | ".join(cells) + " |")
                 lines.append("")

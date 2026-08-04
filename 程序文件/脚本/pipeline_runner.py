@@ -11,6 +11,7 @@
 
 HyperFrames 流水线步骤：
   preflight → tts → timeline → preview → render → verify → visual_check → postprocess
+  → delivery → completion_report
 
 OpenMontage 流水线步骤（按 pipeline 类型不同）：
   animated-explainer: preflight → parse_input → generate_script → plan_scenes → generate_assets → compose → publish
@@ -55,6 +56,9 @@ CONFIG_DIR = ROOT / "程序文件" / "配置" / "config"
 HTML_BASE = ROOT / "程序文件" / "源码" / "hyperframes"
 OUTPUT_DIR = ROOT / "成果文件" / "视频"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
+# P0 整改（2026-08-04 prefab 复盘）：子进程输出统一落盘——透明度是复盘得出的
+# 第一教训（当时 postprocess 失败无任何日志，排障只能靠状态文件反推）。
+LOG_DIR = ROOT / "过程产物" / "日志"
 
 # Step definitions with ordering
 STEPS = [
@@ -92,7 +96,7 @@ HARD_GATES = {
 
 STEP_NAMES = [s[0] for s in STEPS]
 
-# 结构化错误码（P2 优化项4）：mark_failed 的 error_code 取值集合。
+# 结构化错误码：mark_failed 的 error_code 取值集合。
 # 语义分类固定，供完工报告/排障工具按码路由，避免解析自由文本 error。
 GATE_BLOCKED = "GATE_BLOCKED"            # 硬门禁拦截（前置步骤未通过）
 SUBPROCESS_FAILED = "SUBPROCESS_FAILED"  # 子进程非零退出
@@ -261,6 +265,9 @@ class PipelineState:
                 # If recovery fails, start fresh
                 print(f"  RECOVERY FAILED: Starting with fresh state")
                 return {"steps": {}, "last_run": None}
+        # P0（2026-07-29）：状态文件缺失不再完全静默——显式提示从零开始，
+        # 避免"看似有历史、实际无状态"的误判（eiway-122-wall 逃逸教训）。
+        print(f"  [STATE] No pipeline state file: {self.path} — starting fresh (all steps will run)")
         return {"steps": {}, "last_run": None}
 
     def save(self):
@@ -287,11 +294,16 @@ class PipelineState:
             self.data["steps"][step]["input_fingerprint"] = input_fingerprint
         self.save()
 
-    def mark_failed(self, step, error="", error_code=None):
+    def mark_failed(self, step, error="", error_code=None, extra=None):
         self.data["steps"][step]["status"] = "failed"
         self.data["steps"][step]["error"] = error[:200]
         # 结构化错误码：未指定时归为 UNKNOWN；旧 state 缺此字段的读取方均用 .get 兼容
         self.data["steps"][step]["error_code"] = error_code or UNKNOWN
+        # P0 整改（2026-08-04 prefab 复盘）：透传附加诊断字段（如 log_path），
+        # 完工报告会将其显示在 issues 中，用户不再面对"黑盒失败"。
+        if extra:
+            for k, v in extra.items():
+                self.data["steps"][step][k] = v
         self.save()
 
     def mark_skipped(self, step, reason=""):
@@ -360,7 +372,33 @@ def _load_audio_sync_rules():
     rules_path = CONFIG_DIR / "quality" / "audio_sync_rules.json"
     defaults = {
         "dead_air": {"max_seconds_per_scene": 3.0, "fail_on_violation": True},
-        "shrink": {"enabled_by_default": True, "shrink_margin_seconds": 1.0},
+        # 回退值必须与 audio_sync_rules.json 的 documented 值一致（1.5s）。
+        # prefab 复盘：此处曾回退 1.0s，与权威配置分叉造成时间轴三连漂移。
+        "shrink": {"enabled_by_default": True, "shrink_margin_seconds": 1.5},
+        "duration_consistency": {"max_diff_seconds": 1.0},
+    }
+    if not rules_path.exists():
+        return defaults
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        for k, v in loaded.items():
+            if not k.startswith("$"):
+                defaults[k] = v
+        return defaults
+    except (json.JSONDecodeError, OSError):
+        return defaults
+
+
+def _load_delivery_gate_rules():
+    """Load config/quality/delivery_gate_rules.json with default fallback.
+
+    Consumed by PipelineRunner._fresh_guard (--fresh 受限阈值)。读取失败回退
+    documented 默认值，绝不让门禁静默旁路。
+    """
+    rules_path = CONFIG_DIR / "quality" / "delivery_gate_rules.json"
+    defaults = {
+        "fresh_guard": {"confirm_required_min_duration_seconds": 300},
     }
     if not rules_path.exists():
         return defaults
@@ -376,7 +414,7 @@ def _load_audio_sync_rules():
 
 
 class PipelineRunner:
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -421,13 +459,21 @@ class PipelineRunner:
         self.state = PipelineState(self.temp_dir / "pipeline_state.json")
         self.quick_fix = quick_fix
         self.force = force
+        self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
+        self._log_seq = 0
+        self._current_step = None      # run() 循环每步前设置，日志命名用
         # --fresh：验证/验收类运行的规定入口。清空旧状态，所有步骤真实重跑，
         # 但保留 HARD_GATES 门禁（区别于 --force 的门禁绕过语义）。
+        # P1 整改（prefab 复盘根因2）：高成本重置需 --confirm-fresh 显式确认。
         if fresh:
+            self._fresh_guard(confirm_fresh)
             prev = self.state.data.get("last_run")
             self.state.reset(reason=f"--fresh (previous last_run: {prev})")
             print(f"  [FRESH] Pipeline state reset (previous last_run: {prev or 'none'}) — all steps will truly re-run")
         self.gate_mode = gate_mode  # "render" or "audit"
+        # --scene-patch（opt-in）：render 步骤先尝试场景级增量渲染，白名单外
+        # 或任一自校验失败自动降级全量。verify/visual_check/postprocess 门禁照常。
+        self.scene_patch = scene_patch
         # Audio-sync policy: shrink oversized scene windows so TTS drives
         # the timeline. See AGENTS.md → 渲染纪律 → 音画同步.
         self.audio_sync_rules = _load_audio_sync_rules()
@@ -435,17 +481,116 @@ class PipelineRunner:
         # CLI --no-shrink overrides config default; explicit shrink=True/False wins.
         self.shrink = shrink if shrink is not None else shrink_default
 
+    def _next_log_path(self, desc):
+        """本次子进程调用的落盘日志路径：过程产物/日志/{config}_{step}_{序号}_{时刻}.log"""
+        self._log_seq = getattr(self, "_log_seq", 0) + 1
+        step = getattr(self, "_current_step", None) or "pipeline"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = re.sub(r"[^\w\-.]+", "_", desc)[:30].strip("_") or "cmd"
+        return LOG_DIR / f"{self.config_path.stem}_{step}_{self._log_seq:02d}_{slug}_{ts}.log"
+
     def _run(self, cmd, cwd=None, env=None, desc=""):
-        """Run subprocess, return exit code."""
+        """Run subprocess, return exit code.
+
+        P0 整改（2026-08-04 prefab 复盘）：stdout/stderr 合并后同时回显与落盘
+        （过程产物/日志/）。教训：prefab 项目 postprocess 失败时 stderr 未落盘，
+        排障只能靠状态文件反推。失败时打印日志路径；log_path 经 _fail() 写入
+        pipeline_state，完工报告透传给用户。
+        """
         print(f"  > {' '.join(str(c) for c in cmd[:6])}{'...' if len(cmd) > 6 else ''}")
         # Ensure child Python processes use UTF-8 I/O (avoid GBK codec errors on Windows)
         run_env = env or os.environ.copy()
         run_env.setdefault('PYTHONIOENCODING', 'utf-8')
-        result = subprocess.run(
-            cmd, cwd=cwd, env=run_env,
-            capture_output=False
-        )
-        return result.returncode
+
+        log_path = self._next_log_path(desc)
+        self.last_log_path = log_path
+        rc = -1
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+                log.write(f"$ {' '.join(str(c) for c in cmd)}\n")
+                log.write(f"# cwd: {cwd or os.getcwd()}\n")
+                log.write(f"# started: {datetime.now().isoformat()}\n")
+                log.write("=" * 72 + "\n")
+                log.flush()
+                proc = subprocess.Popen(
+                    cmd, cwd=cwd, env=run_env,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding='utf-8', errors='replace'
+                )
+                for line in proc.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
+                rc = proc.wait()
+                log.write("=" * 72 + "\n")
+                log.write(f"# finished: {datetime.now().isoformat()}  exit_code: {rc}\n")
+        except OSError as e:
+            print(f"  ERROR: subprocess launch failed: {e}")
+            rc = -1
+
+        if rc != 0:
+            print(f"  [LOG] Step failed (exit {rc}) — full log: {log_path}")
+        return rc
+
+    def _fail(self, step, error, error_code):
+        """失败登记统一入口：自动附带最近一次子进程日志路径（若有）。"""
+        extra = {}
+        log_path = getattr(self, "last_log_path", None)
+        if log_path and Path(log_path).exists():
+            extra["log_path"] = str(log_path)
+        self.state.mark_failed(step, error, error_code=error_code, extra=extra or None)
+
+    def _fresh_guard(self, confirm_fresh):
+        """--fresh 受限门禁（P1 整改，2026-08-04 prefab 复盘根因2）。
+
+        教训：15:28 用 --fresh 全量重置替代定点修复，直接导致合格成片被后续
+        裸渲染覆盖、3 次 40 分钟级重渲、9 小时失败收尾。现在：长视频或已有
+        渲染/交付产物时，必须 --confirm-fresh 显式确认，否则打印破坏清单后
+        拒绝执行，并给出低成本替代路径（--resume / --quick-fix / --scene-patch）。
+        """
+        rules = _load_delivery_gate_rules().get("fresh_guard", {})
+        min_dur = float(rules.get("confirm_required_min_duration_seconds", 300))
+        try:
+            dur = float(self.config.get("video_duration", 0) or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+
+        long_video = dur >= min_dur
+        inventory = []
+        if self.render_raw.exists() and self.render_raw.stat().st_size > 0:
+            inventory.append(f"  [FILE] {self.render_raw} "
+                             f"({self.render_raw.stat().st_size / 1024 / 1024:.1f} MB) — 将被重新渲染覆盖")
+        if self.output_file.exists() and self.output_file.stat().st_size > 0:
+            inventory.append(f"  [FILE] {self.output_file} — 成果目录现有文件将被新渲染覆盖")
+        if self.tts_dir.exists():
+            inventory.append(f"  [DIR ] {self.tts_dir} — TTS 产物将重新生成")
+        if self.temp_dir.exists():
+            for wd in sorted(self.temp_dir.glob("work-*")):
+                inventory.append(f"  [DIR ] {wd} — 渲染中间目录")
+
+        if not long_video and not inventory:
+            return  # 无可保护产物且非长视频：放行（测试/新项目常规路径）
+
+        print("  [FRESH-GUARD] --fresh 将全量重置并真实重跑所有步骤（含长时渲染）。受影响产物清单：")
+        if inventory:
+            for line in inventory:
+                print(line)
+        else:
+            print(f"  (无既有渲染/交付产物，但 {dur:.0f}s 视频的全量重渲染成本极高)")
+        if long_video:
+            print(f"  [FRESH-GUARD] 长视频判定：video_duration {dur:.0f}s ≥ 阈值 {min_dur:.0f}s")
+
+        if confirm_fresh:
+            print("  [FRESH-GUARD] 已提供 --confirm-fresh，继续执行。")
+            return
+
+        print("  REFUSED: 高成本重置需要显式确认（prefab 复盘：--fresh 曾被误用于定点修复场景）。")
+        print("  低成本替代路径（按优先级）：")
+        print("    1. --resume       从最早失效步续跑（指纹缓存跳过未变步骤）")
+        print("    2. --quick-fix    仅音画/字幕问题时免重渲染定点修复")
+        print("    3. --scene-patch  仅场景 div 内容变化时场景级增量渲染")
+        print("  确需全量重置：追加 --confirm-fresh 重新运行。")
+        sys.exit(1)
 
     def _run_with_retry(self, cmd, cwd=None, env=None, desc="", retries=1):
         """Run subprocess with auto-retry on transient failure (network/browser)."""
@@ -578,13 +723,17 @@ class PipelineRunner:
                              "srt": self._delivery_paths()[1]},
             # completion_report 消费 state 内容，但不能把 pipeline_state.json 整文件
             # 纳入指纹——本步骤完成时 mark_completed 会写回该文件（自引用回路，
-            # 指纹永远漂移、缓存永不可命中）。改用稳定摘要：排除自写与易变字段，
-            # 保留其余 9 步记录（上游任何变化仍会使报告指纹失效）。
-            "completion_report": {"config": self.config_path, "video": self._delivery_paths()[0],
+            # 指纹永远漂移、缓存永不可命中）。改用稳定摘要：排除自写与易变字段。
+            "completion_report": {"config": self.config_path,
+                             "video": self._delivery_paths()[0],
                              "srt": self._delivery_paths()[1],
                              "state_digest": "digest:" + self._stable_state_digest()},
         }
         return {k: str(v) for k, v in inputs_map.get(step, {}).items()}
+
+    def _fingerprint(self, step):
+        """计算步骤当前输入的联合指纹（步骤完成时记录用）。"""
+        return compute_inputs_fingerprint(self._step_inputs(step))
 
     def _stable_state_digest(self):
         """state 内容的稳定摘要（completion_report 指纹专用）。
@@ -592,9 +741,8 @@ class PipelineRunner:
         排除字段（均由本步骤自身或每次运行必然写入，属自引用来源）：
           - last_run：每次 mark_started 都会更新
           - steps.completion_report：本步骤自身记录（status/completed/input_fingerprint）
-        其余内容（另外 9 步的记录、verifications 等）全部参与摘要——
-        任一上游步骤重跑/状态变化都会改变摘要，报告缓存随之失效。
-        非路径字符串在 compute_inputs_fingerprint 中按字面值确定性参与哈希。
+        其余内容（其他步骤的记录等）全部参与摘要——任一上游步骤重跑/状态变化
+        都会改变摘要，报告缓存随之失效。
         """
         stable = {k: v for k, v in self.state.data.items() if k != "last_run"}
         stable["steps"] = {k: v for k, v in stable.get("steps", {}).items()
@@ -602,20 +750,20 @@ class PipelineRunner:
         blob = json.dumps(stable, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-    def _fingerprint(self, step):
-        """计算步骤当前输入的联合指纹（步骤完成时记录用）。"""
-        return compute_inputs_fingerprint(self._step_inputs(step))
-
     def _delivery_paths(self):
-        """交付物路径解析：config.delivery 为权威源，否则用成果目录默认路径。
+        """交付物路径解析：config.delivery 为权威源，缺省按交付惯例推导默认。
 
-        返回 (video_path, srt_path)。config 中声明的相对路径以仓根 ROOT 为基准。
+        返回 (video_path, srt_path)。config 中声明的相对路径以仓根 ROOT 为基准；
+        既有配置惯例 delivery.output_video 只声明成片文件名，落到 成果文件/视频/。
+        缺省默认：成果文件/视频/{video_name}、成果文件/字幕/{html_project}.srt。
         """
         delivery_cfg = self.config.get("delivery", {}) if isinstance(self.config, dict) else {}
         if delivery_cfg.get("video"):
             video_path = Path(delivery_cfg["video"])
             if not video_path.is_absolute():
                 video_path = ROOT / video_path
+        elif delivery_cfg.get("output_video"):
+            video_path = OUTPUT_DIR / delivery_cfg["output_video"]
         else:
             video_path = self.output_file
         if delivery_cfg.get("subtitle"):
@@ -628,11 +776,12 @@ class PipelineRunner:
         return video_path, srt_path
 
     def _delivery_blocked_steps(self):
-        """返回阻断交付的步骤清单（被 skipped 或未 passed 的渲染链步骤）。
+        """返回阻断交付的步骤清单（未满足门禁的渲染链步骤）。
 
-        --quick-fix 会把 7 个前置步骤标记为 skipped —— 此清单非空即禁止交付，
-        确保 quick-fix 产物不流入交付。类型化跳过（reason 以 tts_disabled 开头，
-        由 config 声明的合法路径）通过 _gate_satisfied 放行，不阻断交付。
+        门禁判定走 _gate_satisfied：类型化跳过（tts_enabled=false 声明的
+        tts/timeline，reason 以 tts_disabled 开头）是合法路径、不阻断交付；
+        quick-fix 跳过（reason='quick-fix mode'）与未通过步骤全部阻断——
+        确保 quick-fix 产物不流入交付。
         """
         render_chain = ["preflight", "tts", "timeline", "preview", "render",
                         "verify", "visual_check", "postprocess"]
@@ -704,8 +853,7 @@ class PipelineRunner:
     def _gate_satisfied(self, step):
         """门禁判定：passed 满足；类型化跳过（reason 以 tts_disabled 开头）
         也满足——这是配置声明的合法路径，不是 quick-fix 式的门禁绕过。
-        quick-fix 跳过（reason='quick-fix mode'）不满足门禁，语义不变；
-        typed-skip 记录不写入任何 error_code（mark_skipped 本就不写）。"""
+        quick-fix 跳过（reason='quick-fix mode'）不满足门禁，语义不变。"""
         rec = self.state.data.get("steps", {}).get(step, {})
         if rec.get("status") == "passed":
             return True
@@ -752,8 +900,7 @@ class PipelineRunner:
             desc="preflight check"
         )
         if rc != 0:
-            self.state.mark_failed("preflight", "Static validation failed",
-                                   error_code=VERIFY_FAILED)
+            self._fail("preflight", "Static validation failed", VERIFY_FAILED)
             return False
 
         # Photo preprocessing: auto-crop if photo-crop-spec.json exists
@@ -767,8 +914,7 @@ class PipelineRunner:
                 desc="photo preprocessing"
             )
             if rc2 != 0:
-                self.state.mark_failed("preflight", "Photo preprocessing failed",
-                                       error_code=SUBPROCESS_FAILED)
+                self._fail("preflight", "Photo preprocessing failed", SUBPROCESS_FAILED)
                 return False
 
         self.state.mark_completed("preflight", self._fingerprint("preflight"))
@@ -798,8 +944,7 @@ class PipelineRunner:
         if rc == 0:
             self.state.mark_completed("tts", self._fingerprint("tts"))
             return True
-        self.state.mark_failed("tts", "TTS generation failed",
-                               error_code=SUBPROCESS_FAILED)
+        self._fail("tts", "TTS generation failed", SUBPROCESS_FAILED)
         return False
 
     def step_timeline(self):
@@ -850,11 +995,39 @@ class PipelineRunner:
                 self.config = json.load(f)
             new_dur = self.config.get('video_duration', '?')
             print(f"  Config reloaded: video_duration = {new_dur}s")
+            self._record_timeline_run(new_dur)
             self.state.mark_completed("timeline", self._fingerprint("timeline"))
             return True
-        self.state.mark_failed("timeline", "Timeline adjustment failed",
-                               error_code=SUBPROCESS_FAILED)
+        self._fail("timeline", "Timeline adjustment failed", SUBPROCESS_FAILED)
         return False
+
+    def _record_timeline_run(self, new_dur):
+        """时间轴运行历史登记 + 非收敛漂移告警（P1 整改，prefab 复盘根因3）。
+
+        教训：prefab 项目总时长三连漂移 618.9→621.7→623.8s（margin 参数分叉 +
+        人工干预），每次漂移触发 30-40 分钟级全量重渲染。现连续两次时间轴结果
+        相差 >0.5s 即显式告警，提醒先确认参数权威源与变更来源再继续。
+        历史落在 pipeline_state.timeline_runs，完工报告可追溯。
+        """
+        try:
+            new_dur = float(new_dur)
+        except (TypeError, ValueError):
+            return
+        history = self.state.data.setdefault("timeline_runs", [])
+        if history:
+            try:
+                prev_dur = float(history[-1].get("duration", 0))
+            except (TypeError, ValueError):
+                prev_dur = 0.0
+            if prev_dur > 0:
+                delta = new_dur - prev_dur
+                if abs(delta) > 0.5:
+                    print(f"  [DRIFT-WARNING] 时间轴不收敛：{prev_dur:.1f}s → {new_dur:.1f}s ({delta:+.1f}s)")
+                    print("    每次漂移都会触发下游 render 全量重渲（30-40分钟级成本）。")
+                    print("    请确认：shrink-margin 是否来自同一权威源（audio_sync_rules.json）、")
+                    print("    narration/HTML 是否确有变更、config 是否被手工修改过。")
+        history.append({"at": datetime.now().isoformat(), "duration": round(new_dur, 1)})
+        self.state.save()
 
     def step_preview(self):
         """Instant preview: scene thumbnails + animation density analysis."""
@@ -890,8 +1063,8 @@ class PipelineRunner:
         # Preview failure is FATAL — visual issues must be resolved before render.
         # This is the hard gate: do not waste 10+ minutes on a full render
         # when static preview has already detected structural problems.
-        self.state.mark_failed("preview", "Instant preview failed — fix visual issues before rendering",
-                               error_code=VERIFY_FAILED)
+        self._fail("preview", "Instant preview failed — fix visual issues before rendering",
+                   VERIFY_FAILED)
         return False
 
     def step_render(self):
@@ -909,7 +1082,6 @@ class PipelineRunner:
         # Refusing to proceed without verified static checks.
         if not self.force:
             for prereq in HARD_GATES.get("render", []):
-                # typed-skip（tts_enabled=false）算满足；quick-fix skip 仍拦截
                 if not self._gate_satisfied(prereq):
                     label = dict(STEPS).get(prereq, prereq)
                     print(f"  BLOCKED: Step '{prereq}' ({label}) has not passed.")
@@ -920,37 +1092,84 @@ class PipelineRunner:
                     return False
 
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.state.mark_started("render")
 
-        print("  Rendering HyperFrames (this takes ~11 minutes)...")
-        # 旁路进度观察者（P2 优化项3）：CLI 无原生进度参数（--json 仅限 --batch），
-        # 只读轮询帧数目录打印心跳。总帧数 = video_duration × 25fps（与渲染命令 --fps 一致）。
-        # hyperframes 的 work-*/captured-frames 实测生成在 temp_dir（render_raw 同级），
-        # 兼顾 source_dir 兜底。观察者失败不影响渲染判定，整体可移除。
-        try:
-            _total_frames = int(round(float(self.config.get("video_duration", 0)) * 25))
-        except (TypeError, ValueError):
-            _total_frames = 0
-        watcher = _RenderProgressWatcher(
-            [self.temp_dir, self.source_dir], self.render_raw, _total_frames)
-        watcher.start()
-        try:
-            rc = self._run(
-                ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"],
-                cwd=str(self.source_dir),
-                env=self.env,
-                desc="HyperFrames render"
-            )
-        finally:
-            watcher.stop()
-        if rc != 0:
-            self.state.mark_failed("render", "HyperFrames render failed",
-                                   error_code=SUBPROCESS_FAILED)
+        # ── 交付物保护（P0 整改，prefab 复盘根因2）：渲染前拦截，绝不让 30-40 分钟
+        #    渲染白跑后才发现要覆盖已交付成片（AGENTS.md：已交付文件不得覆盖）──
+        if (self.output_file.exists() and self.output_file.stat().st_size > 0
+                and self._output_was_delivered() and not self.force):
+            self.state.mark_started("render")
+            print(f"  BLOCKED: 交付目标已是上一轮成功交付的成片：{self.output_file}")
+            print("  AGENTS.md 交付纪律：已交付文件不得覆盖，需修订时加后缀。")
+            print(f"  处理：config paths.video_name 改为 '{self.output_file.stem}_修订01.mp4' 后重跑；")
+            print("        或将旧成片移出成果目录；紧急情况用 --force 越过（不推荐）。")
+            self.state.mark_failed(
+                "render",
+                f"Output {self.output_file.name} is a delivered artifact — use revision suffix",
+                error_code=VERIFY_FAILED)
             return False
 
+        self.state.mark_started("render")
+
+        # ── Scene-patch (opt-in): 分类器判 PATCH 则段渲染+拼接产出 render_raw，
+        #    任何白名单外变更/自校验失败 → exit 3 → 自动降级 FULL 全量渲染 ──
+        patched = False
+        if self.scene_patch:
+            print("  [SCENE-PATCH] Trying scene-level incremental render...")
+            rc = self._run(
+                [str(VENV_PYTHON), "scene_patch_render.py",
+                 "--config", str(self.config_path), "--mode", "patch"],
+                cwd=str(SCRIPTS), env=self.env, desc="scene patch render"
+            )
+            if rc == 0:
+                patched = True
+                print("  [SCENE-PATCH] Patch applied — full render skipped")
+            else:
+                print(f"  [SCENE-PATCH] Falling back to FULL render (rc={rc})")
+
+        if not patched:
+            # ── 渲染中断恢复（P1 整改，prefab 复盘根因5）：全量重渲前备份上一版
+            #    render_raw——prefab 两次渲染中止于 87%/53% 后毫无恢复路径，只能
+            #    从零再来。备份在手：新渲染失败/中断时可回退基线走 --quick-fix。
+            if self.render_raw.exists() and self.render_raw.stat().st_size > 0:
+                prev_backup = self.render_raw.with_name("render_raw.prev.mp4")
+                shutil.copy2(self.render_raw, prev_backup)
+                print(f"  Previous render backed up: {prev_backup.name} "
+                      f"({prev_backup.stat().st_size / 1024 / 1024:.1f} MB)")
+            print("  Rendering HyperFrames (this takes ~11 minutes)...")
+            # 旁路进度观察者（P2 优化项3）：CLI 无原生进度参数（--json 仅限 --batch），
+            # 只读轮询帧数目录打印心跳。总帧数 = video_duration × 25fps（与渲染命令 --fps 一致）。
+            # hyperframes 的 work-*/captured-frames 实测生成在 temp_dir（render_raw 同级），
+            # 兼顾 source_dir 兕底。观察者失败不影响渲染判定，整体可移除。
+            try:
+                _total_frames = int(round(float(self.config.get("video_duration", 0)) * 25))
+            except (TypeError, ValueError):
+                _total_frames = 0
+            watcher = _RenderProgressWatcher(
+                [self.temp_dir, self.source_dir], self.render_raw, _total_frames)
+            watcher.start()
+            try:
+                rc = self._run(
+                    ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"],
+                    cwd=str(self.source_dir),
+                    env=self.env,
+                    desc="HyperFrames render"
+                )
+            finally:
+                watcher.stop()
+            if rc != 0:
+                # P1 整改（prefab 复盘）：渲染中断/失败不再等于归零——
+                # render_raw.prev.mp4（若有）保留了上一版可用渲染，给出定点恢复路径
+                hint = ""
+                prev = self.render_raw.with_name("render_raw.prev.mp4")
+                if prev.exists() and prev.stat().st_size > 0:
+                    hint = (f" — previous render preserved at {prev.name}; "
+                            f"if timeline unchanged, restore it + align config + --quick-fix "
+                            f"instead of a full re-render")
+                self._fail("render", f"HyperFrames render failed{hint}", SUBPROCESS_FAILED)
+                return False
+
         if not self.render_raw.exists():
-            self.state.mark_failed("render", "render_raw.mp4 not created",
-                                   error_code=OUTPUT_MISSING)
+            self._fail("render", "render_raw.mp4 not created", OUTPUT_MISSING)
             return False
 
         size_mb = self.render_raw.stat().st_size / 1024 / 1024
@@ -958,8 +1177,25 @@ class PipelineRunner:
 
         # Copy to output directory for post-processing
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        if self.output_file.exists() and self.output_file.stat().st_size > 0:
+            # 交付物保护第二道防线：已交付产物已在渲染前拦截；此处覆盖的是
+            # 非交付态旧产物（如上次失败运行残留），仍先备份保证物理不丢失。
+            pre_backup = self.temp_dir / f"{self.output_file.stem}.pre_render_backup.mp4"
+            shutil.copy2(self.output_file, pre_backup)
+            print(f"  Existing output backed up before overwrite: {pre_backup.name}")
         shutil.copy2(self.render_raw, self.output_file)
         print(f"  Copied to: {self.output_file}")
+
+        # 场景指纹 sidecar：供后续 --scene-patch 增量渲染做基线（尽力而为，
+        # 失败不阻塞交付；patch 成功路径已在脚本内部自行刷新 sidecar）
+        if not patched:
+            rc_sc = self._run(
+                [str(VENV_PYTHON), "scene_patch_render.py",
+                 "--config", str(self.config_path), "--mode", "sidecar"],
+                cwd=str(SCRIPTS), env=self.env, desc="scene fingerprints sidecar"
+            )
+            if rc_sc != 0:
+                print("  WARNING: sidecar write failed (scene-patch baseline unavailable)")
 
         self.state.mark_completed("render", self._fingerprint("render"))
         return True
@@ -1065,8 +1301,75 @@ class PipelineRunner:
         if rc == 0:
             self.state.mark_completed("visual_check", self._fingerprint("visual_check"))
             return True
-        self.state.mark_failed("visual_check", "Content overflows subtitle safety zone",
-                               error_code=VERIFY_FAILED)
+        self._fail("visual_check", "Content overflows subtitle safety zone", VERIFY_FAILED)
+        return False
+
+    def _output_was_delivered(self):
+        """判定 output_file 是否为上一轮成功交付的成片（交付物保护依据）。
+
+        依据：temp_dir/completion_report.json 状态为 VALIDATED*（完工报告全部
+        检查通过）且报告引用的视频与当前目标同名。prefab 复盘：上午已交付的
+        合格成片被下午的裸渲染直接覆盖丢失——交付态必须可识别、可拦截。
+        """
+        report_path = self.temp_dir / "completion_report.json"
+        if not report_path.exists():
+            return False
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                rep = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False
+        if not str(rep.get("status", "")).startswith("VALIDATED"):
+            return False
+        rep_video = str(rep.get("data_sources", {}).get("video_file", {}).get("path", "") or "")
+        # 报告未记录路径（旧格式）→ 保守视为已交付；记录了则必须同名才拦截
+        return (not rep_video) or Path(rep_video).name == self.output_file.name
+
+    def _probe_duration(self, path):
+        """ffprobe 实测媒体时长；失败返回 None（调用方决定是否放行）。"""
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_format", "-of", "json", str(path)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30)
+            return float(json.loads(r.stdout)["format"]["duration"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.TimeoutExpired):
+            return None
+
+    def _duration_consistency_ok(self):
+        """config↔渲染产物时长一致性早失败门禁（P1 整改，prefab 复盘根因4）。
+
+        教训：config 617.8s vs render_raw 621.72s 的漂移拖到 enhance step3 混音
+        门禁（±1.0s）才暴露，白白消耗一轮 TTS/BGM 再生成 + 后续 40 分钟重渲染。
+        现在在 runner 阶段早拒并给出定点修复指引。权威阈值：
+        audio_sync_rules.duration_consistency.max_diff_seconds。
+        quick-fix 模式无 render_raw，检查对象为成果目录文件（enhance 的输入源）。
+        """
+        target = self.output_file if self.quick_fix else self.render_raw
+        if not target.exists():
+            return True  # 产物缺失由后续步骤拦截，此处不重复报错
+        actual = self._probe_duration(target)
+        if actual is None:
+            return True  # ffprobe 不可用时不阻断，交由 enhance 内部门禁判定
+        try:
+            expected = float(self.config.get("video_duration", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        if expected <= 0:
+            return True
+        max_diff = float(self.audio_sync_rules.get("duration_consistency", {})
+                         .get("max_diff_seconds", 1.0))
+        diff = abs(actual - expected)
+        if diff <= max_diff:
+            print(f"  Duration consistency OK: config {expected:.1f}s vs actual {actual:.1f}s (diff {diff:.2f}s)")
+            return True
+        msg = (f"Duration drift: config {expected:.1f}s vs actual {actual:.1f}s "
+               f"(diff {diff:.1f}s > {max_diff:.1f}s)")
+        print(f"  ERROR: {msg}")
+        print("  定点修复指引（勿直接全量重渲）：")
+        print("    1. 时间轴确需变化 → 重跑 pipeline_runner（timeline 步骤会同步 config）后渲染")
+        print(f"    2. 渲染产物正确 → 手工对齐 config.video_duration={actual:.1f} 后 --quick-fix")
+        self.state.mark_failed("postprocess", msg, error_code=VERIFY_FAILED)
         return False
 
     def step_postprocess(self):
@@ -1074,6 +1377,10 @@ class PipelineRunner:
             return True
 
         self.state.mark_started("postprocess")
+
+        # ── 早失败检查：长耗时后处理启动前先验证时长一致性（prefab 复盘根因4）──
+        if not self._duration_consistency_ok():
+            return False
 
         cmd = [str(VENV_PYTHON), "enhance_video_audio.py", "--config", str(self.config_path)]
         if self.quick_fix:
@@ -1085,15 +1392,15 @@ class PipelineRunner:
         if rc == 0:
             self.state.mark_completed("postprocess", self._fingerprint("postprocess"))
             return True
-        self.state.mark_failed("postprocess", "Post-processing failed",
-                               error_code=SUBPROCESS_FAILED)
+        self._fail("postprocess", "Post-processing failed", SUBPROCESS_FAILED)
         return False
 
     def step_delivery(self):
         """交付验收与清理审计（最终交付关卡）。
 
-        1. quick-fix/门禁拦截：任一渲染链步骤 skipped 或未 passed → 拒收；
-        2. 成果文件校验：视频+字幕存在且非零（config.delivery 为权威源）；
+        1. quick-fix/门禁拦截：渲染链任一步骤未满足 _gate_satisfied → 拒收
+           （类型化跳过 tts_disabled 是配置声明的合法路径，不拦截）；
+        2. 成果文件校验：视频存在且非零；tts_enabled=false 的纯BGM项目豁免字幕；
         3. 清理审计：列出待清理中间产物（默认 dry-run，不实际删除）。
 
         注意：delivery 是最终交付关卡，quick-fix 产物必须被拦截；因此不设
@@ -1117,16 +1424,15 @@ class PipelineRunner:
 
         self.state.mark_started("delivery")
 
-        # ── 门禁 2：成果文件存在且非零 ──
-        # 纯BGM无旁白项目（tts_enabled=false）：无 SRT 产物，字幕项类型化豁免
+        # ── 门禁 2：成果文件存在且非零（纯BGM项目豁免字幕）──
         video_path, srt_path = self._delivery_paths()
-        artifacts = [("视频", video_path)]
+        checks = [("视频", video_path)]
         if self.tts_enabled:
-            artifacts.append(("字幕", srt_path))
+            checks.append(("字幕", srt_path))
         else:
-            print(f"  [TYPE-SKIP] 字幕验收豁免：{self._typed_skip_reason()}（无旁白，SRT 非交付物）")
+            print(f"  [TYPE-SKIP] tts_enabled=false — 纯BGM项目豁免字幕交付要求 ({self._typed_skip_reason()})")
         missing = []
-        for label, p in artifacts:
+        for label, p in checks:
             if not p.exists():
                 missing.append(f"{label}不存在: {p}")
             elif p.stat().st_size == 0:
@@ -1166,7 +1472,9 @@ class PipelineRunner:
     def step_completion_report(self):
         """完工报告：调用 generate_completion_report.py，状态源自其真实测量。
 
-        报告脚本 FAILED → 非零退出码 → 本步骤失败；runner 不硬编码任何成功字样。
+        报告脚本 FAILED → 非零退出码（EXIT_CODE.GATE_FAILURE=4）→ 本步骤失败；
+        runner 不硬编码任何成功字样。纯BGM项目（tts_enabled=false）无字幕产物，
+        不传 --subtitle-file（报告端 typed-skip 豁免 tts/timeline 步骤检查）。
         """
         if self._can_skip("completion_report"):
             return True
@@ -1180,20 +1488,14 @@ class PipelineRunner:
                "--video-file", str(video_path),
                "--state-file", str(self.state.path),
                "--output-file", str(report_out)]
-        # 纯BGM无旁白项目：无 SRT 产物，不传 --subtitle-file（报告端自然跳过字幕段，
-        # 与 step_delivery 的字幕豁免口径一致）
         if self.tts_enabled:
             cmd.extend(["--subtitle-file", str(srt_path)])
-        rc = self._run(
-            cmd,
-            cwd=str(SCRIPTS),
-            desc="completion report"
-        )
+        rc = self._run(cmd, cwd=str(SCRIPTS), desc="completion report")
         # 报告状态源自脚本真实测量：FAILED 时脚本退出非零（GATE_FAILURE），
         # VALIDATED / VALIDATED_WITH_ISSUES 退出 0。此处不硬编码任何成功判定。
         if rc != 0:
-            self.state.mark_failed("completion_report", "Completion report validation FAILED (see report)",
-                                   error_code=VERIFY_FAILED)
+            self._fail("completion_report", "Completion report validation FAILED (see report)",
+                       VERIFY_FAILED)
             return False
         print(f"  完工报告已生成: {report_out}")
         self.state.mark_completed("completion_report", self._fingerprint("completion_report"))
@@ -1216,7 +1518,6 @@ class PipelineRunner:
         # Prevent jumping to render/postprocess without prerequisite steps passing.
         if start_from and not self.force and not self.quick_fix:
             required = HARD_GATES.get(start_from, [])
-            # typed-skip（tts_enabled=false）算满足前置；quick-fix skip 仍拦截
             missing = [s for s in required if not self._gate_satisfied(s)]
             if missing:
                 print(f"BLOCKED: Cannot start from '{start_from}'")
@@ -1262,6 +1563,7 @@ class PipelineRunner:
                 continue
 
             print(f"--- Step {i+1}/{len(STEPS)}: {step_label} ---")
+            self._current_step = step_name  # 子进程日志命名用
             func = step_funcs[step_name]
             ok = func()
             if not ok:
@@ -1335,7 +1637,15 @@ Examples:
     parser.add_argument("--fresh", action="store_true",
                         help="Reset pipeline state and truly re-run every step, keeping "
                              "hard gates enforced. REQUIRED for verification/acceptance runs "
-                             "(cache-poisoning defense: never trust a stale pipeline_state.json).")
+                             "(cache-poisoning defense: never trust a stale pipeline_state.json). "
+                             "For long videos (>=300s) or when render/delivery artifacts exist, "
+                             "--confirm-fresh is additionally required (prefab postmortem: a "
+                             "misused --fresh caused 9h of wasted re-renders).")
+    parser.add_argument("--confirm-fresh", action="store_true",
+                        help="Explicit confirmation for a high-cost --fresh reset. Prints the "
+                             "destruction inventory and proceeds. Without it, --fresh is refused "
+                             "when existing artifacts or long renders would be destroyed, with "
+                             "low-cost alternatives suggested (--resume/--quick-fix/--scene-patch).")
     parser.add_argument("--gate-mode", choices=["audit", "render"],
                         default="render",
                         help="Preflight gate mode: 'audit' (warn-only) or 'render' (hard-block). "
@@ -1343,6 +1653,11 @@ Examples:
     parser.add_argument("--engine", choices=["hyperframes", "openmontage"],
                         default=None,
                         help="Pipeline engine (auto-detected from config if omitted)")
+    parser.add_argument("--scene-patch", action="store_true",
+                        help="Opt-in scene-level incremental render: when only scene div "
+                             "content changed (whitelist classifier), re-render changed scenes "
+                             "only and stitch with the baseline render_raw. Any non-whitelisted "
+                             "change or self-check failure falls back to FULL render automatically.")
     parser.add_argument("--no-shrink", action="store_true",
                         help="Disable auto-shrink of oversized scene windows. "
                              "By default, timeline adjustment collapses windows so TTS drives timing "
@@ -1407,6 +1722,8 @@ Examples:
         gate_mode=args.gate_mode,
         shrink=(not args.no_shrink),
         fresh=args.fresh,
+        scene_patch=args.scene_patch,
+        confirm_fresh=args.confirm_fresh,
     )
 
     if args.status:

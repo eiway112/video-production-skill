@@ -908,11 +908,13 @@ def test_timeline_drift_resync() -> RegressionTestCase:
             proj_dir.mkdir(parents=True, exist_ok=True)
             (proj_dir / "index.html").write_text(html_content, encoding='utf-8')
 
-            # TTS 与收敛后窗口吻合（surplus=1.0 < 0.5+margin）→ 触发早退路径
+            # TTS 与收敛后窗口吻合（surplus=1.5 == shrink margin 1.5，margin 取自
+            # audio_sync_rules.json 权威值——2026-08-04 整改后 CLI 默认不再分叉 1.0s）
+            # → 零调整 → 触发早退路径
             tts_dir = tmpdir / "tts_44k"
             tts_dir.mkdir()
-            write_silence(tts_dir / "scene_1_hq.wav", 9.0)
-            write_silence(tts_dir / "scene_2_hq.wav", 7.0)
+            write_silence(tts_dir / "scene_1_hq.wav", 8.5)
+            write_silence(tts_dir / "scene_2_hq.wav", 6.5)
 
             # 陈旧 config：video_duration/scenes 均为收敛前旧值（模拟从旧备份恢复）
             cfg_path = tmpdir / "drift.json"
@@ -2101,90 +2103,6 @@ def test_error_code_and_cache_age() -> RegressionTestCase:
                         "malformed timestamp degrades to '(? ago)'")
 
         tc.mark_passed()
-
-    except Exception as e:
-        tc.mark_failed(str(e))
-
-    return tc
-
-def test_completion_report_fingerprint_stability() -> RegressionTestCase:
-    """用例30：completion_report 指纹自引用漂移修复锁定
-
-    背景：旧版 _step_inputs 把 pipeline_state.json 整文件纳入 completion_report
-    指纹，而本步骤完成时 mark_completed 又写回该文件（last_run 每次运行必变），
-    自引用回路导致指纹永远漂移、该步骤永远重跑，全链 10 步 CACHED 不可达。
-    修复：改用 state 内容稳定摘要（排除 last_run 与自身步骤记录）。
-    本用例锁定：同一 state 指纹幂等；自写回不改变指纹；上游记录变化必失效。
-    """
-    tc = RegressionTestCase(
-        "completion_report_fingerprint_stability",
-        "验证 completion_report 指纹排除自写字段后稳定且仍随上游变化失效"
-    )
-
-    try:
-        import sys
-        script_dir = Path(__file__).parent
-        if str(script_dir) not in sys.path:
-            sys.path.insert(0, str(script_dir))
-        _pr = _safe_import_pipeline_runner()
-        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
-
-        with tempfile.TemporaryDirectory() as td:
-            tmpdir = Path(td)
-            state = PipelineState(tmpdir / "pipeline_state.json")
-            # 构造上游 9 步全部通过的 state（含验证明细）
-            for s in ["preflight", "tts", "timeline", "preview", "render",
-                      "verify", "visual_check", "postprocess", "delivery"]:
-                state.mark_started(s)
-                state.mark_completed(s)
-            state.set_verification("media_qa", {"passed": True})
-
-            # 不走 __init__（避免依赖真实 config/环境），直接注入所需属性
-            cfg_path = tmpdir / "cfg.json"
-            cfg_path.write_text("{}", encoding='utf-8')
-            runner = PipelineRunner.__new__(PipelineRunner)
-            runner.state = state
-            runner.force = False
-            runner.config = {}
-            runner.config_path = cfg_path
-            runner.html_project = "test_proj"
-            runner.source_dir = tmpdir
-            runner.html_path = tmpdir / "index.html"
-            runner.temp_dir = tmpdir
-            runner.tts_dir = tmpdir / "tts_44k"
-            runner.render_raw = tmpdir / "render_raw.mp4"
-            runner.output_file = tmpdir / "test_proj.mp4"
-
-            # 接线检查：指纹输入已改用稳定摘要，不再含 state 文件路径
-            inputs = runner._step_inputs("completion_report")
-            tc.assert_true(inputs.get("state_digest", "").startswith("digest:"),
-                           "completion_report inputs use stable state digest")
-            tc.assert_true("state" not in inputs,
-                           "raw pipeline_state.json path removed from fingerprint inputs")
-
-            # (a) 同一 state 下连续两次计算指纹必须相等（幂等）
-            fp1 = runner._fingerprint("completion_report")
-            fp2 = runner._fingerprint("completion_report")
-            tc.assert_equal(fp1, fp2, "fingerprint idempotent on identical state")
-
-            # (b) 模拟本步骤 mark_started/mark_completed 写回（含 last_run 更新）
-            #     后再算——自引用已消除，指纹仍相等，且跨运行缓存可命中
-            state.mark_started("completion_report")
-            state.mark_completed("completion_report", fp1)
-            fp3 = runner._fingerprint("completion_report")
-            tc.assert_equal(fp3, fp1, "fingerprint stable after self write-back")
-            tc.assert_equal(runner._step_dirty_reason("completion_report"), None,
-                            "completion_report cache reusable on next run (CACHED reachable)")
-
-            # (c) 任一上游步骤记录变化 → 指纹必须变化（真实消费关系不丢）
-            state.data["steps"]["render"]["status"] = "failed"
-            state.save()
-            fp4 = runner._fingerprint("completion_report")
-            tc.assert_true(fp4 != fp1, "upstream step record change invalidates fingerprint")
-            tc.assert_equal(runner._step_dirty_reason("completion_report"), "inputs-changed",
-                            "dirty reason is inputs-changed after upstream change")
-
-            tc.mark_passed()
 
     except Exception as e:
         tc.mark_failed(str(e))

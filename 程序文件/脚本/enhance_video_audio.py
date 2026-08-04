@@ -194,6 +194,7 @@ def _load_audio_sync_rules():
     defaults = {
         "dead_air": {"max_seconds_per_scene": 3.0, "fail_on_violation": True},
         "shrink": {"enabled_by_default": True, "shrink_margin_seconds": 1.0},
+        "sentence_pause": {"min_seconds": 0.4},
     }
     if not rules_path.exists():
         return defaults
@@ -314,6 +315,101 @@ def _parse_bitrate_value(raw):
     return value if value > 0 else None
 
 
+def _enforce_sentence_pauses(hq_file, sentences, min_pause):
+    """段间停顿强制——波形层根治（2026-07-28，skill-promo 句间零停顿事故）。
+
+    根因：TTS 引擎整段合成时句间停顿由内部韵律决定，同一段音频里
+    句号停顿可在 0~0.4s 浮动甚至为 0（实测 "……写着通过。" 与 "字幕
+    和画面……" rel 时间戳零间隔紧贴）。改标点只动文本层，约束不了
+    引擎，故在物理波形层强制：相邻字幕段声学间隔 < min_pause 时，
+    在边界 ±0.25s 内的最低能量点插入差额静音（8ms 淡入淡出防咔哒），
+    并把插入点之后的段时间戳整体平移。间隔度量基于 ASR 强制对齐
+    时间戳（单一权威源），平移后字幕/时间轴/溢出判定自动一致。
+
+    幂等：补齐后间隔 ≥ min_pause，重跑即 no-op（缓存命中路径也每轮
+    复检，无需重跑 ASR）。插入后仍不达标 → RuntimeError，禁止静默放行。
+
+    Returns (modified, sentences, total_inserted_seconds)
+    """
+    if min_pause <= 0 or len(sentences) < 2:
+        return False, sentences, 0.0
+    deficits = [
+        i for i in range(len(sentences) - 1)
+        if sentences[i + 1]['rel_start'] - sentences[i]['rel_end'] < min_pause - 0.02
+    ]
+    if not deficits:
+        return False, sentences, 0.0
+
+    import wave
+    import numpy as np
+    with wave.open(str(hq_file), 'rb') as wf:
+        n_ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    if sw != 2:
+        raise RuntimeError(f"sentence-pause enforce: {hq_file.name} 非 s16 wav (sampwidth={sw})")
+    audio = np.frombuffer(raw, dtype=np.int16).reshape(-1, n_ch).copy()
+
+    sentences = [dict(s) for s in sentences]
+    total_inserted = 0.0
+    for i in deficits:
+        gap = sentences[i + 1]['rel_start'] - sentences[i]['rel_end']
+        deficit = min_pause - gap
+        boundary = (sentences[i]['rel_end'] + sentences[i + 1]['rel_start']) / 2.0
+        # 窗口收紧到 ±0.08s：只允许在 ASR 边界附近微调下刀点。±0.25s 实测会
+        # 漂进前一句词内部（低能量起音段被误判为句间谷底），把静音插在词中间
+        lo = max(0, int((boundary - 0.08) * sr))
+        hi = min(len(audio), int((boundary + 0.08) * sr))
+        if hi - lo < 2:
+            cut = min(len(audio), max(0, int(boundary * sr)))
+        else:
+            env = np.abs(audio[lo:hi].astype(np.int32)).sum(axis=1).astype(np.float64)
+            win = max(1, int(0.015 * sr))
+            env = np.convolve(env, np.ones(win) / win, mode='same')
+            cut = lo + int(np.argmin(env))
+        fade = min(int(0.008 * sr), cut, len(audio) - cut)
+        if fade > 0:
+            audio[cut - fade:cut] = (
+                audio[cut - fade:cut].astype(np.float64)
+                * np.linspace(1.0, 0.0, fade)[:, None]).astype(np.int16)
+            audio[cut:cut + fade] = (
+                audio[cut:cut + fade].astype(np.float64)
+                * np.linspace(0.0, 1.0, fade)[:, None]).astype(np.int16)
+        n_ins = int(round(deficit * sr))
+        audio = np.concatenate(
+            [audio[:cut], np.zeros((n_ins, n_ch), dtype=np.int16), audio[cut:]])
+        inserted = n_ins / sr
+        cut_t = cut / sr
+        # 分侧收拢式平移：前段尾时刻不得越过插入点，后段起时刻先拉到插入点
+        # 再加平移量——无论 cut 落在边界哪一侧，新间隔数学上恒 ≥ min_pause
+        # （旧规则按位置同向平移，cut 早于段尾时两侧同移，间隔仍为 0）
+        for j, s in enumerate(sentences):
+            if j <= i:
+                if s['rel_end'] > cut_t:
+                    s['rel_end'] = round(cut_t, 3)
+            else:
+                new_start = max(s['rel_start'], cut_t) if j == i + 1 else s['rel_start']
+                s['rel_start'] = round(new_start + inserted, 3)
+                s['rel_end'] = round(s['rel_end'] + inserted, 3)
+        total_inserted += inserted
+
+    # 验证闭环：插入后所有间隔必须达标，否则炸给调用方（不写回残波形）
+    for i in range(len(sentences) - 1):
+        gap = sentences[i + 1]['rel_start'] - sentences[i]['rel_end']
+        if gap < min_pause - 0.05:
+            raise RuntimeError(
+                f"sentence-pause enforce 失败：{hq_file.name} 段 {i}→{i+1} 插入后间隔仍为 "
+                f"{gap:.3f}s < {min_pause}s，拒绝静默放行")
+
+    with wave.open(str(hq_file), 'wb') as wf:
+        wf.setnchannels(n_ch)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(np.ascontiguousarray(audio).tobytes())
+    return True, sentences, total_inserted
+
+
 def _build_timeline_manifest(temp_dir):
     """生成/刷新 _timeline_manifest.json —— 句级时间戳单一权威文件（P0-a）。
 
@@ -344,6 +440,7 @@ def _build_timeline_manifest(temp_dir):
     model_failed = False
     scenes_out = []
     aligned = 0
+    pause_min = float((_load_audio_sync_rules().get('sentence_pause') or {}).get('min_seconds', 0.4))
     for scene_id, start, end, text in SCENES:
         h = _tts_cache_key(text)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
@@ -363,34 +460,45 @@ def _build_timeline_manifest(temp_dir):
         prev = old_scenes.get(str(scene_id))
         if (prev and prev.get('tts_hash') == h and prev.get('method') == 'asr_forced'
                 and prev.get('sentences')):
-            # 缓存命中：rel 时刻不变，只刷新绝对边界
+            # 缓存命中：rel 时刻不变，只刷新绝对边界（不 continue，仍要过停顿强制复检）
             entry['method'] = 'asr_forced'
             entry['match_ratio'] = prev.get('match_ratio')
             entry['sentences'] = prev['sentences']
             aligned += 1
-            scenes_out.append(entry)
-            continue
-
-        segments = _split_text_to_segments(text) if text and text.strip() else []
-        result = None
-        if segments and not model_failed:
-            from _forced_align import load_align_model, align_scene
-            if model is None:
-                model = load_align_model()
-                if model is None:
-                    model_failed = True
-            if model is not None:
-                print(f"  Aligning scene {scene_id} (asr forced, {tts_dur:.1f}s)...")
-                result = align_scene(hq_file, text, segments, model=model)
-
-        if result:
-            entry['method'] = result['method']
-            entry['match_ratio'] = result['match_ratio']
-            entry['sentences'] = result['sentences']
-            aligned += 1
         else:
-            entry['method'] = 'unaligned'
-            entry['sentences'] = []
+            segments = _split_text_to_segments(text) if text and text.strip() else []
+            result = None
+            if segments and not model_failed:
+                from _forced_align import load_align_model, align_scene
+                if model is None:
+                    model = load_align_model()
+                    if model is None:
+                        model_failed = True
+                if model is not None:
+                    print(f"  Aligning scene {scene_id} (asr forced, {tts_dur:.1f}s)...")
+                    result = align_scene(hq_file, text, segments, model=model)
+
+            if result:
+                entry['method'] = result['method']
+                entry['match_ratio'] = result['match_ratio']
+                entry['sentences'] = result['sentences']
+                aligned += 1
+            else:
+                entry['method'] = 'unaligned'
+                entry['sentences'] = []
+
+        # 段间停顿强制：每轮必检（含缓存命中），达标即 no-op，不达标则
+        # 修改波形+平移时间戳后重测时长，下游（字幕/adjust_timeline/merge）
+        # 自动消费新值。unaligned 场景无可靠边界，不强制（对齐失败已有告警）。
+        if entry.get('method') == 'asr_forced' and entry.get('sentences'):
+            modified, new_sents, ins = _enforce_sentence_pauses(
+                hq_file, entry['sentences'], pause_min)
+            if modified:
+                entry['sentences'] = new_sents
+                entry['tts_duration'] = round(get_duration(str(hq_file)), 3)
+                entry['pause_inserted'] = round(ins, 3)
+                print(f"  Scene {scene_id}: sentence-pause enforced "
+                      f"(+{ins:.2f}s silence → {entry['tts_duration']:.2f}s)")
         scenes_out.append(entry)
 
     data = {
@@ -1382,7 +1490,7 @@ def step3_merge_all(video_path, temp_dir, output_path):
     loudnorm_tp = mix_cfg.get("loudnorm_TP", -1.5)
     loudnorm_lra = mix_cfg.get("loudnorm_LRA", 11)
     # 音频过渡平滑（transition 节）：微淡入防爆音 + 尾部淡出自然收音。
-    # atrim 在波形非零点硬切会产生喳喎声，TTS 裸拼进混音听感突兀（用户反馈：
+    # atrim 在波形非零点硬切会产生喀嗒声，TTS 裸拼进混音听感突兀（用户反馈：
     # 场景切换时音频衔接仓促）。参数单一权威源：audio_sync_rules.json。
     trans_cfg = audio_rules.get("transition", {})
     fade_in_s = float(trans_cfg.get("tts_fade_in_ms", 40)) / 1000.0
@@ -1627,75 +1735,87 @@ def _adaptive_punct_gap_segments(text, gaps, tts_dur, min_seg=1.5, max_dev_chars
     return segments, [t for _, t in chosen]
 
 
-def _wrap_subtitle_text(text, line_limit=22, min_tail=2):
-    """SRT 显示层智能换行：均衡分行 + 孤字控制（v2）。
+def _disp_width(text):
+    """字幕显示宽度：CJK/全角计 1，ASCII/半角计 0.5（字形约为汉字一半宽）。
 
-    旧实现贪心装满每行再断，len=line_limit+1 时必然产出单字尾行
-    （用户反馈：单个汉字跨行显示）。现改为均衡分行——先按需要的
-    行数折算每行目标长度，在目标位置附近择优断点（标点后 > 普通
-    边界），行间字数均匀，从数学上消除孤字。保留两条硬规则：
-      - ASCII 字母数字连串（QU38 / WSI 84 / 1200mm）内部绝不断开
-      - 标点不悬挂行首
-    收尾保底：任何尾行短于 min_tail → 并回上行或向前借断点修复。
+    按字符数计长会把 Skill 等 ASCII 词高估一倍宽度，导致混排文本
+    提前换行；改用显示宽度后纯 CJK 行上限不变，混排行可容纳更多字符。
     """
-    if len(text) <= line_limit:
-        return text
-    import math
-    ascii_re = re.compile(r'[A-Za-z0-9]')
+    return sum(0.5 if ord(ch) < 128 else 1.0 for ch in text)
 
-    def can_break(s, i):
-        a, b = s[i-1], s[i]
-        if ascii_re.match(b) and (ascii_re.match(a) or a == ' '):
-            return False  # ASCII 词组内部（QU38 / WSI 84 / 1200mm）不可断
-        if b in '，。；、：？！%…）」】》':
-            return False  # 避免标点悬挂行首
-        return True
 
-    def pick_cut(rest):
-        # 均衡目标：剩余文本按最少行数平均分摊，断点尽量靠近目标位置
-        remaining = max(2, math.ceil(len(rest) / line_limit))
-        target = math.ceil(len(rest) / remaining)
-        lo = max(1, target - 6)
-        hi = min(line_limit, len(rest) - min_tail)
-        best_punct = None
-        best_any = None
-        for i in range(lo, hi + 1):
-            if not can_break(rest, i):
-                continue
-            d = abs(i - target)
-            if rest[i-1] in '，。；、：？！' and (best_punct is None or d < best_punct[0]):
-                best_punct = (d, i)
-            if best_any is None or d < best_any[0]:
-                best_any = (d, i)
-        if best_punct:
-            return best_punct[1]
-        if best_any:
-            return best_any[1]
-        return max(min(target, hi), 1)  # 无合法断点（超长 ASCII 连串）：硬切保底
+_SUB_ASCII_RE = re.compile(r'[A-Za-z0-9]')
 
+
+def _sub_can_break(s, i):
+    a, b = s[i-1], s[i]
+    if _SUB_ASCII_RE.match(b) and (_SUB_ASCII_RE.match(a) or a == ' '):
+        return False  # ASCII 词组内部（QU38 / WSI 84 / 1200mm）不可断
+    if b in '，。；、：？！%…）」】》':
+        return False  # 避免标点悬挂行首
+    return True
+
+
+def _wrap_once(text, limit):
+    """按显示宽度 limit 贪心断行，返回行列表（断点规则同原算法）。"""
     lines = []
     rest = text
-    while len(rest) > line_limit:
-        cut = pick_cut(rest)
+    while _disp_width(rest) > limit:
+        # 宽度不超 limit 的最大前缀长度
+        w = 0.0
+        max_i = 0
+        for i, ch in enumerate(rest):
+            w += 0.5 if ord(ch) < 128 else 1.0
+            if w > limit:
+                break
+            max_i = i + 1
+        if max_i >= len(rest):
+            break
+        cut = -1
+        # 优先：窗口内最靠右的标点后断点
+        for i in range(max_i, 0, -1):
+            if rest[i-1] in '，。；、：？！' and _sub_can_break(rest, i):
+                cut = i
+                break
+        if cut < 0 or _disp_width(rest[:cut]) < limit * 0.4:
+            # 标点太靠前或没有 → 退而求其次找最靠右的合法断点
+            for i in range(max_i, 0, -1):
+                if _sub_can_break(rest, i):
+                    cut = i
+                    break
+        if cut <= 0:
+            cut = max_i
         lines.append(rest[:cut].rstrip())
         rest = rest[cut:].lstrip()
     if rest:
         lines.append(rest)
+    return lines
 
-    # 孤字修复保底：尾行短于 min_tail → 并回上行，装不下则向前借断点
-    while len(lines) > 1 and len(lines[-1]) < min_tail:
-        tail = lines.pop()
-        prev = lines.pop()
-        merged = prev + tail
-        if len(merged) <= line_limit:
-            lines.append(merged)
-            continue
-        cut = len(prev)
-        while cut > 1 and (len(merged) - cut < min_tail or not can_break(merged, cut)):
-            cut -= 1
-        lines.append(merged[:cut].rstrip())
-        lines.append(merged[cut:].lstrip())
-        break
+
+def _wrap_subtitle_text(text, line_limit=22, min_tail=4):
+    """SRT 显示层智能换行：标点优先断行、禁拆 ASCII 词组、孤行抑制。
+
+    libass 自动换行对 CJK 文本逐字硬断，会把 QU38、WSI 84、1200mm 等
+    完整名词拆到两行（用户反馈：QU38 被拆成 QU3/8）。改为在写 SRT 时
+    预先插入换行符：行宽不超 line_limit（低于 libass 自动换行阈值，
+    确保不被二次换行）。
+
+    孤行抑制（用户反馈："题。"/"Skill。"单字孤行）：贪心填满会把
+    首行塞到上限、尾行只剩 1-2 字符。当尾行显示宽度 < min_tail 时，
+    按行数均衡目标宽度重新断行，两行 12+12 优于 22+2。
+    """
+    if _disp_width(text) <= line_limit:
+        return text
+    lines = _wrap_once(text, line_limit)
+    if len(lines) >= 2 and _disp_width(lines[-1]) < min_tail:
+        total = _disp_width(text)
+        n = len(lines)
+        base = int(total / n) + 1  # 均衡目标：各行接近 total/n
+        for lim in range(base, line_limit + 1):
+            cand = _wrap_once(text, lim)
+            if len(cand) <= n and _disp_width(cand[-1]) >= min_tail:
+                lines = cand
+                break
     return '\n'.join(lines)
 
 
@@ -2011,7 +2131,7 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
             # 全局术语词典（subtitle_term_rules.json）：项目级替换之后应用，
             # 点Json→.json 等朗读层写法不再直通显示层
             display_text = _normalize_subtitle_terms(display_text)
-            # 智能换行：均衡分行，标点优先断行，禁拆 ASCII 词组，禁单字尾行
+            # 智能换行：标点优先断行，禁止拆散 QU38 / WSI 84 等 ASCII 词组
             display_text = _wrap_subtitle_text(display_text)
 
             entries.append((idx, start_t, end_t, display_text))
@@ -2209,7 +2329,7 @@ def _check_video_quality(video_path, expected_duration=None):
     v_bitrate = _parse_bitrate_value(vs.get("bit_rate"))
     v_dur = float(vs.get("duration", 0))
 
-    # --- Bitrate check: 阈值单一权威源 video_quality_rules.json（双档制）---
+    # --- Bitrate check: 阈值单一权威源 video_quality_rules.json（双档制） ---
     # < fail 档 → 判定渲染失败/内容缺失阻断；fail~warn 之间 → 低码率预警
     # 不阻断（纯文字动画实测 336-343kbps 属合法内容）。
     # 码率无法解析（N/A/缺失）时跳过门禁并追加 warning 保证可追溯。

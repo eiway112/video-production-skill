@@ -330,6 +330,8 @@ def find_local_gsap():
         # node_modules from npm install
         ROOT / "过程产物" / "临时产物" / "node_modules" / "gsap" / "dist" / "gsap.min.js",
         # HyperFrames project copies
+        ROOT / "程序文件" / "源码" / "hyperframes" / "hospital-partition-wall" / "gsap.min.js",
+        ROOT / "程序文件" / "源码" / "hyperframes" / "hotel-partition-wall" / "gsap.min.js",
         ROOT / "程序文件" / "源码" / "hyperframes" / "quickstart-demo" / "gsap.min.js",
     ]
     for path in gsap_candidates:

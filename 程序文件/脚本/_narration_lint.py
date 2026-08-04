@@ -37,6 +37,55 @@ class DigitFinding(NamedTuple):
     suggestion: str     # human-readable replacement hint
 
 
+class SpeechFinding(NamedTuple):
+    scope: str          # e.g. "scene 3 narration"
+    kind: str           # "dot_ext" | "semicolon"
+    matched: str        # e.g. "narration点json" / "；"
+    suggestion: str     # human-readable fix hint
+
+
+# 念读写法“xxx点扩展名”：为迁就 TTS 发音把“.”写成“点”的文件名表达
+_DOT_EXT_RE = re.compile(
+    r"[A-Za-z0-9_\-]+点(?:json|html?|md|py|js|ts|srt|mp4|mp3|wav|png|jpe?g|csv|txt|ya?ml|pdf)",
+    re.IGNORECASE,
+)
+
+
+def scan_speech_style(cfg: dict) -> List[SpeechFinding]:
+    """扫描念读文本与显示文本的配对缺口，以及弱停顿标点。
+
+    规则一（dot_ext）：旁白为迁就 TTS 发音写成“xxx点json”时，必须在
+    config 声明 subtitle_display_replacements 把字幕还原为“xxx.json”，
+    否则念读文本会原样烧进字幕（用户反馈：字幕出现“narration点json”）。
+
+    规则二（semicolon）：TTS 引擎对分号的停顿显著短于句号，语义独立的
+    断句用“；”会导致音频衔接仓促（用户反馈：句间几乎无停顿）。
+    属风格建议 → 调用方应降级为警告。
+    """
+    findings: List[SpeechFinding] = []
+    repl = cfg.get("subtitle_display_replacements", {}) or {}
+    for s in cfg.get("scenes", []) or []:
+        sid = s.get("scene_id", "?")
+        text = s.get("narration", "") or ""
+        scope = f"scene {sid} narration"
+        for m in _DOT_EXT_RE.finditer(text):
+            token = m.group(0)
+            # 替换键覆盖判定：key 包含 token 或 token 包含 key 即视为已配对
+            if any((token in k) or (k in token) for k in repl):
+                continue
+            display = token.replace("点", ".", 1)
+            findings.append(SpeechFinding(
+                scope, "dot_ext", token,
+                f"『{token}』是 TTS 念读写法，需在 config 声明 "
+                f'subtitle_display_replacements {{"{token}": "{display}"}} '
+                f"还原字幕显示文本"))
+        if "；" in text:
+            findings.append(SpeechFinding(
+                scope, "semicolon", "；",
+                "TTS 对分号停顿过短、听感仓促，语义独立断句建议改用句号"))
+    return findings
+
+
 # ── Configurable rule set (loaded once, cached) ─────────────────────
 _RULES_CACHE: Optional[dict] = None
 

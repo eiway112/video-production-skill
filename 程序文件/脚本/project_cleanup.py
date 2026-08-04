@@ -5,10 +5,12 @@
 
 清理维度:
   1. 渲染缓存    — work-* 目录、tts_44k、scene_N.mp3、bgm.wav
-  2. 中间视频    — render_raw.mp4、render_new.mp4、final_output.mp4
+  2. 中间视频    — render_new.mp4、final_output.mp4（render_raw.mp4 见下）
   3. 备份文件    — .noaudio.mp4（渲染成功后不再需要）
   4. 过期缓存    — 过程产物/缓存/ 中超过指定天数的文件
   5. 空目录      — 过程产物下的空子目录
+  6. 增量基线    — render_raw.mp4 + scene_fingerprints.json 为 --scene-patch
+                  增量渲染基线，保留最近一次，仅超过 stale-days 才列入清理
 
 安全机制:
   - 默认预览模式（dry-run），不删除任何文件
@@ -57,6 +59,7 @@ class CleanupReport:
     items: List[CleanupItem] = field(default_factory=list)
     deleted: List[CleanupItem] = field(default_factory=list)
     failed: List[CleanupItem] = field(default_factory=list)
+    retained: List[CleanupItem] = field(default_factory=list)  # 保留的增量基线（仅展示占用）
     freed_bytes: int = 0
 
     def add(self, item: CleanupItem):
@@ -86,7 +89,6 @@ RENDER_CACHE_PATTERNS = {
         "scene_*.mp3",  # 场景 TTS 原始文件
         "scene_*_hq.wav",
         "bgm.wav",      # 合成 BGM（可重新生成）
-        "render_raw.mp4",
         "render_new.mp4",
         "final_output.mp4",
         "final_with_subs.mp4",
@@ -97,6 +99,12 @@ RENDER_CACHE_PATTERNS = {
         "*noaudio*",        # 无音频备份文件（render_noaudio_backup.mp4 等）
     ],
 }
+
+# 增量渲染基线（scene-patch）：不再立即清理。render_raw.mp4 与同目录的
+# scene_fingerprints.json 是 --scene-patch 段渲染的拼接基线，删掉就只能全量
+# 重渲染（~11 分钟）。保留最近一次，仅当超过 stale-days 未更新才列入清理；
+# 保留期间在预览中显示占用量。
+PATCH_BASELINE_NAMES = ["render_raw.mp4", "scene_fingerprints.json"]
 
 # 散落在临时产物根目录的一次性调试/测试文件（文件名精确匹配）
 # 这些文件是开发调试过程中产生的临时脚本，不具有复用价值
@@ -159,6 +167,41 @@ def scan_render_cache(cm: ConfigManager, report: CleanupReport):
                     f, "render",
                     f"渲染中间文件 ({pattern})",
                     f.stat().st_size
+                ))
+
+
+def scan_patch_baseline(cm: ConfigManager, report: CleanupReport, stale_days: int):
+    """扫描增量渲染基线（render_raw.mp4 + scene_fingerprints.json）。
+
+    保留策略：未超过 stale-days 的基线不列入清理（记入 retained 展示占用），
+    超过 stale-days 才作为过期基线清理（删后可由全量渲染重建）。
+    """
+    temp_dir = cm.paths.process_temp
+    if not temp_dir.exists():
+        return
+
+    threshold = datetime.now() - timedelta(days=stale_days)
+    for name in PATCH_BASELINE_NAMES:
+        for f in temp_dir.rglob(name):
+            if not f.is_file():
+                continue
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                size = f.stat().st_size
+            except (OSError, PermissionError):
+                continue
+            age = (datetime.now() - mtime).days
+            if mtime < threshold:
+                report.add(CleanupItem(
+                    f, "render",
+                    f"过期增量渲染基线 ({age}天未更新, 阈值{stale_days}天)",
+                    size
+                ))
+            else:
+                report.retained.append(CleanupItem(
+                    f, "render",
+                    f"增量渲染基线（保留 {age}/{stale_days} 天, 供 --scene-patch 拼接）",
+                    size
                 ))
 
 
@@ -310,6 +353,7 @@ def print_preview(report: CleanupReport, category_filter: str = None):
 
     if not report.items:
         print("\n没有可清理的项目。")
+        _print_retained(report)
         return
 
     total_count = 0
@@ -337,7 +381,21 @@ def print_preview(report: CleanupReport, category_filter: str = None):
     print(f"\n{'─' * 60}")
     print(f"合计: {total_count} 项, {report.total_size_mb():.1f} MB")
     print(f"{'─' * 60}")
+    _print_retained(report)
     print(f"\n确认无误后运行: python project_cleanup.py --execute")
+
+
+def _print_retained(report: CleanupReport):
+    """展示保留中的增量渲染基线占用量（不列入清理）"""
+    if not report.retained:
+        return
+    total_mb = sum(i.size_bytes for i in report.retained) / 1024 / 1024
+    print(f"\n[增量渲染基线 — 保留中] ({len(report.retained)} 项, 占用 {total_mb:.1f} MB)")
+    for item in report.retained:
+        mb = item.size_bytes / 1024 / 1024
+        size_str = f" ({mb:.1f} MB)" if mb >= 1 else f" ({item.size_bytes // 1024} KB)"
+        print(f"  = {item.path.parent.name}/{item.path.name}{size_str}")
+        print(f"    {item.reason}")
 
 
 def execute_cleanup(report: CleanupReport, category_filter: str = None) -> CleanupReport:
@@ -393,6 +451,7 @@ def main():
 
     # 扫描所有类别
     scan_render_cache(cm, report)
+    scan_patch_baseline(cm, report, args.stale_days)
     scan_stale_cache(cm, report, args.stale_days)
     scan_backup_videos(cm, report)
     scan_scattered_scripts(cm, report)
