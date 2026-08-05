@@ -216,7 +216,7 @@ def _load_video_quality_rules(rules_path=None):
     """Load config/quality/video_quality_rules.json with defaults.
 
     码率阈值单一权威源（双档制），media_qa_gate 交付终检读同一份文件。
-    读不到时回退默认双档 fail=300/warn=500 并打印告警。
+    读不到时回退默认双档 fail=200/warn=500 并打印告警。
     文件声明按原样返回（不与默认双档键合并），保证旧单档键
     min_video_bitrate_kbps 的兼容路径可被 _resolve_bitrate_thresholds 识别。
     显式传入 rules_path 时绕过缓存（供回归测试验证配置生效）。
@@ -230,7 +230,7 @@ def _load_video_quality_rules(rules_path=None):
             Path(__file__).resolve().parents[1] / "配置" / "config" / "quality"
             / "video_quality_rules.json"
         )
-    defaults = {"min_video_bitrate_kbps_fail": 300, "min_video_bitrate_kbps_warn": 500}
+    defaults = {"min_video_bitrate_kbps_fail": 200, "min_video_bitrate_kbps_warn": 500}
     result = defaults
     try:
         with open(rules_path, "r", encoding="utf-8") as f:
@@ -239,7 +239,7 @@ def _load_video_quality_rules(rules_path=None):
         if declared:
             result = declared
     except (json.JSONDecodeError, OSError):
-        print(f"  [WARN] 无法读取 {Path(rules_path).name}，视频码率阈值回退默认 fail=300/warn=500kbps")
+        print(f"  [WARN] 无法读取 {Path(rules_path).name}，视频码率阈值回退默认 fail=200/warn=500kbps")
     if use_cache:
         _VIDEO_QUALITY_RULES_CACHE = result
     return result
@@ -2331,7 +2331,7 @@ def _check_video_quality(video_path, expected_duration=None):
 
     # --- Bitrate check: 阈值单一权威源 video_quality_rules.json（双档制） ---
     # < fail 档 → 判定渲染失败/内容缺失阻断；fail~warn 之间 → 低码率预警
-    # 不阻断（纯文字动画实测 336-343kbps 属合法内容）。
+    # 不阻断（合法纯文字动画实测 239-343kbps）。
     # 码率无法解析（N/A/缺失）时跳过门禁并追加 warning 保证可追溯。
     if v_bitrate is not None:
         rules = _load_video_quality_rules()

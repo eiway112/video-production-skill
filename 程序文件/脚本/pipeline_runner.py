@@ -414,7 +414,7 @@ def _load_delivery_gate_rules():
 
 
 class PipelineRunner:
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False, accept_over_budget=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -459,6 +459,8 @@ class PipelineRunner:
         self.state = PipelineState(self.temp_dir / "pipeline_state.json")
         self.quick_fix = quick_fix
         self.force = force
+        # 时长预算 soft 超限的显式放行开关（wp 批次复盘 P0，见 _budget_gate_ok）
+        self.accept_over_budget = accept_over_budget
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
         self._current_step = None      # run() 循环每步前设置，日志命名用
@@ -518,12 +520,26 @@ class PipelineRunner:
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding='utf-8', errors='replace'
                 )
-                for line in proc.stdout:
-                    print(line, end="", flush=True)
-                    log.write(line)
-                rc = proc.wait()
-                log.write("=" * 72 + "\n")
-                log.write(f"# finished: {datetime.now().isoformat()}  exit_code: {rc}\n")
+                completed_normally = False
+                try:
+                    for line in proc.stdout:
+                        print(line, end="", flush=True)
+                        log.write(line)
+                    rc = proc.wait()
+                    completed_normally = True
+                finally:
+                    # 中断可见性（wp 批次复盘 P1）：尾行必写。教训：
+                    # wp-select-basics 22:09 的 TTS 运行被外部中断后只留命令头，
+                    # 无尾行无状态记录，排障全靠猜。现在即使 Ctrl-C/异常也写
+                    # exit_code: INTERRUPTED，配合启动扫描可定位中断运行。
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                    except OSError:
+                        pass
+                    code = rc if completed_normally else "INTERRUPTED"
+                    log.write("=" * 72 + "\n")
+                    log.write(f"# finished: {datetime.now().isoformat()}  exit_code: {code}\n")
         except OSError as e:
             print(f"  ERROR: subprocess launch failed: {e}")
             rc = -1
@@ -996,6 +1012,9 @@ class PipelineRunner:
             new_dur = self.config.get('video_duration', '?')
             print(f"  Config reloaded: video_duration = {new_dur}s")
             self._record_timeline_run(new_dur)
+            # 时长预算门禁（wp 批次复盘 P0）：渲染前的最后拦截点
+            if not self._budget_gate_ok():
+                return False
             self.state.mark_completed("timeline", self._fingerprint("timeline"))
             return True
         self._fail("timeline", "Timeline adjustment failed", SUBPROCESS_FAILED)
@@ -1028,6 +1047,84 @@ class PipelineRunner:
                     print("    narration/HTML 是否确有变更、config 是否被手工修改过。")
         history.append({"at": datetime.now().isoformat(), "duration": round(new_dur, 1)})
         self.state.save()
+
+    def _budget_gate_ok(self):
+        """时长预算门禁（2026-08-05 wp 批次复盘 P0）。
+
+        教训：wp 批次 2/4 视频超 240s 预算（253.0s/248.9s），因预算约束未进入
+        门禁声明面，完工报告盖章 VALIDATED 13/13 后才被人工发现，各付出一次
+        约 25 分钟全链返工。现在：config 声明 duration_budget（{seconds,
+        enforcement: soft|hard}）即启用；未声明 = 门禁不生效（零副作用）。
+        检查点设在 timeline 步末尾——权威时长刚确定、渲染尚未开始，拦截成本<1s，
+        挽回的是单次 ~13 分钟渲染 + 交付后返工。
+        soft（默认）：超限阻断，需 --accept-over-budget 显式放行并在 state 留痕
+        （超预算≠不合格，处置是业务决策）；hard：超限直接 FAIL。
+        参数语义权威源：audio_sync_rules.duration_budget。
+        """
+        if self.quick_fix:
+            return True
+        spec = self.config.get("duration_budget") or {}
+        try:
+            budget = float(spec.get("seconds", 0) or 0)
+        except (TypeError, ValueError):
+            budget = 0.0
+        if budget <= 0:
+            return True
+        try:
+            actual = float(self.config.get("video_duration", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        if actual <= 0 or actual <= budget:
+            return True
+
+        over = actual - budget
+        msg = (f"Duration budget exceeded: actual {actual:.1f}s > "
+               f"budget {budget:.0f}s (+{over:.1f}s)")
+        enforcement = str(spec.get("enforcement", "soft")).lower()
+        if enforcement == "hard":
+            print(f"  ERROR: {msg} [enforcement=hard]")
+            print("  定点修复指引：从最长场景精简旁白后重跑流水线（tts/timeline 自动重算）。")
+            self.state.mark_failed("timeline", msg, error_code=VERIFY_FAILED)
+            return False
+        if self.accept_over_budget:
+            self.state.data["budget_decision"] = {
+                "decision": "accepted",
+                "actual_seconds": round(actual, 1),
+                "budget_seconds": budget,
+                "at": datetime.now().isoformat(),
+            }
+            self.state.save()
+            print(f"  [BUDGET] {msg} — --accept-over-budget 显式放行，决策已记录")
+            return True
+        print(f"  BLOCKED: {msg} [enforcement=soft]")
+        print("  超预算≠不合格，请做显式决策：")
+        print("    1. 接受当前时长 → 追加 --accept-over-budget 重跑（上游步骤命中缓存）")
+        print("    2. 精简至预算内 → 修改旁白后正常重跑")
+        self.state.mark_failed("timeline", msg, error_code=VERIFY_FAILED)
+        return False
+
+    def _warn_previous_interrupted_runs(self):
+        """启动扫描：历史日志缺尾行（疑似外部中断）时显式告警。
+
+        教训（wp 批次复盘 P1）：wp-select-basics 22:09 的 TTS 运行被外部中断，
+        日志只有命令头、pipeline_state 无任何失败记录，运行历史不可见。
+        现在按 config 名前缀扫描日志尾部，缺 '# finished:' 即告警（只告警不阻断）。
+        """
+        if not LOG_DIR.exists():
+            return
+        prefix = self.config_path.stem + "_"
+        for f in sorted(LOG_DIR.glob(f"{prefix}*.log")):
+            try:
+                with open(f, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    size = fh.tell()
+                    fh.seek(max(0, size - 512))
+                    tail = fh.read().decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            if "# finished:" not in tail:
+                print(f"  [WARN] 历史日志缺少尾行（该次运行疑似被外部中断）：{f.name}")
+                print("         若怀疑状态不可信，用 --fresh 全链重跑（长视频需 --confirm-fresh）。")
 
     def step_preview(self):
         """Instant preview: scene thumbnails + animation density analysis."""
@@ -1514,6 +1611,9 @@ class PipelineRunner:
         print(f"  Gate:     {self.gate_mode} ({'warn-only' if self.gate_mode == 'audit' else 'hard-block'})")
         print()
 
+        # 中断可见性：上次运行若被外部中断（日志缺尾行），在此显式告警
+        self._warn_previous_interrupted_runs()
+
         # ── Hard gate prerequisite check when --step is used ──
         # Prevent jumping to render/postprocess without prerequisite steps passing.
         if start_from and not self.force and not self.quick_fix:
@@ -1663,6 +1763,11 @@ Examples:
                              "By default, timeline adjustment collapses windows so TTS drives timing "
                              "(prevents audio dead-air between scenes). Use only when the storyboard "
                              "intentionally requires silent breathing space in specific scenes.")
+    parser.add_argument("--accept-over-budget", action="store_true",
+                        help="Explicitly accept a video that exceeds its declared duration_budget "
+                             "(soft enforcement). The decision is recorded in "
+                             "pipeline_state.budget_decision for audit. Without this flag an "
+                             "over-budget timeline is blocked before the expensive render step.")
 
     args = parser.parse_args()
 
@@ -1724,6 +1829,7 @@ Examples:
         fresh=args.fresh,
         scene_patch=args.scene_patch,
         confirm_fresh=args.confirm_fresh,
+        accept_over_budget=args.accept_over_budget,
     )
 
     if args.status:

@@ -1256,16 +1256,16 @@ def test_quality_threshold_config_effective() -> RegressionTestCase:
             # 3. 篡改临时 video_quality_rules 副本的码率阈值 → loader 读到新值
             tampered_video = tmpdir / "video_quality_rules.json"
             tampered_video.write_text(json.dumps(
-                {"min_video_bitrate_kbps_fail": 200,
+                {"min_video_bitrate_kbps_fail": 150,
                  "min_video_bitrate_kbps_warn": 800}), encoding='utf-8')
             tc.assert_equal(
                 eva._load_video_quality_rules(tampered_video)["min_video_bitrate_kbps_warn"],
                 800, "enhance_video_audio reads tampered bitrate threshold")
 
-            # 4. 配置缺失 → 回退默认双档 fail=300/warn=500
+            # 4. 配置缺失 → 回退默认双档 fail=200/warn=500
             missing_rules = eva._load_video_quality_rules(tmpdir / "missing.json")
-            tc.assert_equal(missing_rules["min_video_bitrate_kbps_fail"], 300,
-                            "missing video rules falls back to fail=300kbps default")
+            tc.assert_equal(missing_rules["min_video_bitrate_kbps_fail"], 200,
+                            "missing video rules falls back to fail=200kbps default")
             tc.assert_equal(missing_rules["min_video_bitrate_kbps_warn"], 500,
                             "missing video rules falls back to warn=500kbps default")
 
@@ -1392,9 +1392,10 @@ def test_quality_config_fingerprint_invalidation() -> RegressionTestCase:
 def test_bitrate_dual_tier_gate() -> RegressionTestCase:
     """用例23：码率门禁双档制（误报根因修复锁定）
 
-    背景：纯文字动画项目实测码率 336-343kbps，被旧 500kbps 单档阻断拦下
-    （postprocess 必然失败）。2026-07-29 改为双档：<fail(300) 阻断，
-    fail~warn(300-500) 预警不阻断。本用例锁定：343kbps 判 WARN 不阻断、
+    背景：纯文字动画项目实测码率 239-343kbps（短动画片 336-343、wp 批次长片 239-270），
+    被旧 500kbps 单档阻断拦下（postprocess 必然失败）。2026-07-29 改为双档：
+    <fail(300) 阻断，fail~warn(300-500) 预警不阻断；2026-08-05 wp 批次复盘后
+    fail 以实测为准降为 200。本用例锁定：343kbps 判 WARN 不阻断、
     250kbps 判 FAIL、旧单档键兼容路径按单档阻断且两侧脚本同口径。
     """
     tc = RegressionTestCase(
@@ -2193,6 +2194,149 @@ def test_completion_report_fingerprint_stability() -> RegressionTestCase:
 
     return tc
 
+def test_duration_budget_gate() -> RegressionTestCase:
+    """用例31：时长预算门禁（wp 批次复盘 P0）
+
+    背景：wp 批次 4 集视频 2 集超 240s 预算（253.0s/248.9s），因流水线无任何
+    预算门禁，完工报告盖章 VALIDATED 后才人工返工（各耗 ~25 分钟全链重跑）。
+    本用例锁定：hard 超限直接 FAIL；soft 超限需 --accept-over-budget 显式放行
+    并在 state 留痕；未声明预算/预算内 → 零副作用。
+    """
+    tc = RegressionTestCase(
+        "duration_budget_gate",
+        "验证时长预算门禁：hard阻断、soft需显式放行留痕、未声明零副作用"
+    )
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            def make_runner(cfg, accept=False, idx=0):
+                state = PipelineState(tmpdir / f"state_{idx}.json")
+                # 真实时序：预算门禁在 timeline 步内执行，此时该步必然已 started
+                state.mark_started("timeline")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.config = cfg
+                runner.quick_fix = False
+                runner.accept_over_budget = accept
+                return runner
+
+            # (a) hard：超限直接 FAIL，timeline 标记 failed
+            r1 = make_runner({"video_duration": 253.0,
+                              "duration_budget": {"seconds": 240, "enforcement": "hard"}}, idx=1)
+            tc.assert_true(not r1._budget_gate_ok(), "hard enforcement blocks over-budget")
+            tc.assert_equal(r1.state.data["steps"]["timeline"]["status"], "failed",
+                            "timeline marked failed under hard enforcement")
+
+            # (b) soft：无放行标志 → 阻断；带标志 → 放行且决策留痕
+            r2 = make_runner({"video_duration": 253.0,
+                              "duration_budget": {"seconds": 240}}, idx=2)
+            tc.assert_true(not r2._budget_gate_ok(),
+                           "soft blocks without --accept-over-budget")
+            r3 = make_runner({"video_duration": 253.0,
+                              "duration_budget": {"seconds": 240}}, accept=True, idx=3)
+            tc.assert_true(r3._budget_gate_ok(), "soft passes with --accept-over-budget")
+            dec = r3.state.data.get("budget_decision", {})
+            tc.assert_equal(dec.get("decision"), "accepted",
+                            "acceptance decision recorded in state")
+            tc.assert_equal(dec.get("actual_seconds"), 253.0,
+                            "recorded actual duration for audit")
+
+            # (c) 未声明 / 预算内 → 零副作用
+            r4 = make_runner({"video_duration": 253.0}, idx=4)
+            tc.assert_true(r4._budget_gate_ok(), "no budget declared → gate inactive")
+            r5 = make_runner({"video_duration": 212.0,
+                              "duration_budget": {"seconds": 240}}, idx=5)
+            tc.assert_true(r5._budget_gate_ok(), "within budget → pass")
+            tc.assert_true("budget_decision" not in r5.state.data,
+                           "no decision record when within budget")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_interrupted_run_visibility() -> RegressionTestCase:
+    """用例32：中断运行可见性（wp 批次复盘 P1）
+
+    背景：wp-select-basics 22:09 的 TTS 运行被外部中断后日志只有命令头、无尾行，
+    pipeline_state 无任何记录，运行历史不可见。本用例锁定：_run 日志尾行必写
+    （exit_code 真实），启动扫描能检出缺尾行的历史日志并告警、不误报正常日志。
+    """
+    tc = RegressionTestCase(
+        "interrupted_run_visibility",
+        "验证 _run 日志尾行必写 + 启动扫描检出疑似中断运行"
+    )
+    try:
+        import sys
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner = _pr.PipelineRunner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            orig_log_dir = _pr.LOG_DIR
+            _pr.LOG_DIR = tmpdir
+            try:
+                # (a) 正常子进程：尾行必写且 exit_code 真实
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.config_path = tmpdir / "proj_x.json"
+                runner._log_seq = 0
+                runner._current_step = None
+                runner.last_log_path = None
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = runner._run([sys.executable, "-c", "print('ok')"],
+                                     desc="footer test")
+                tc.assert_equal(rc, 0, "trivial subprocess exits 0")
+                logs = list(tmpdir.glob("proj_x_*.log"))
+                tc.assert_equal(len(logs), 1, "log file persisted")
+                content = logs[0].read_text(encoding="utf-8")
+                tc.assert_true("# finished:" in content and "exit_code: 0" in content,
+                               "footer written with true exit code")
+
+                # (b) 历史日志缺尾行 → 启动扫描必须告警
+                bad = tmpdir / "proj_x_tts_01_interrupted.log"
+                bad.write_text("$ fake\n# started: x\n" + "=" * 72 + "\n",
+                               encoding="utf-8")
+                buf2 = io.StringIO()
+                with contextlib.redirect_stdout(buf2):
+                    runner._warn_previous_interrupted_runs()
+                out = buf2.getvalue()
+                tc.assert_true(bad.name in out and "[WARN]" in out,
+                               "footer-less log detected and warned")
+
+                # (c) 有尾行的日志不误报
+                (tmpdir / "proj_x_ok.log").write_text(
+                    "$ fake\n# finished: x  exit_code: 0\n", encoding="utf-8")
+                buf3 = io.StringIO()
+                with contextlib.redirect_stdout(buf3):
+                    runner._warn_previous_interrupted_runs()
+                tc.assert_true("proj_x_ok.log" not in buf3.getvalue(),
+                               "logs with footer not false-alarmed")
+            finally:
+                _pr.LOG_DIR = orig_log_dir
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -2232,6 +2376,8 @@ class RegressionTestRunner:
             test_render_progress_watcher,
             test_error_code_and_cache_age,
             test_completion_report_fingerprint_stability,
+            test_duration_budget_gate,
+            test_interrupted_run_visibility,
         ]
         self.results = []
     

@@ -1,6 +1,6 @@
 {
   "$schema": "Video output quality rules for enhance_video_audio + media_qa_gate",
-  "$description": "视频产物码率门禁（单一权威源，双档制）。ffprobe 实测视频流码率 < min_video_bitrate_kbps_fail → 判定渲染失败/内容缺失（视频疑似空白，HTML 场景未渲染），enhance_video_audio.step7 与 media_qa_gate 交付前终检均阻断；介于 fail~warn 之间 → 低码率预警不阻断（纯文字动画等合法内容实测 336-343kbps，可能视觉内容不足，需人工复核画面）。阈值只在此声明一处，两侧脚本读不到时回退 fail=300/warn=500 并打印告警；旧单档键 min_video_bitrate_kbps 仍兼容（按单档阻断并提示升级）。",
-  "min_video_bitrate_kbps_fail": 300,
+  "$description": "视频产物码率门禁（单一权威源，双档制）。ffprobe 实测视频流码率 < min_video_bitrate_kbps_fail → 判定渲染失败/内容缺失（视频疑似空白，HTML 场景未渲染），enhance_video_audio.step7 与 media_qa_gate 交付前终检均阻断；介于 fail~warn 之间 → 低码率预警不阻断（合法纯文字动画实测 239-343kbps：2026-07 短动画片 336-343kbps，2026-08 wp 批次 4 集长片 239-270kbps，可能视觉内容不足，需人工复核画面）。阈值只在此声明一处，两侧脚本读不到时回退 fail=200/warn=500 并打印告警；旧单档键 min_video_bitrate_kbps 仍兼容（按单档阻断并提示升级）。",
+  "min_video_bitrate_kbps_fail": 200,
   "min_video_bitrate_kbps_warn": 500
 }

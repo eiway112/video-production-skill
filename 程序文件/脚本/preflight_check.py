@@ -79,6 +79,10 @@ class PreflightResult:
         self.errors = []
         self.warnings = []
         self._log_entries = []  # structured log for JSON output
+        # 内容画像（wp 批次复盘：退出纪律首次执行）：text_only 纯文字视频
+        # 本就无图片素材/设计产物，相关 4 条 WARN 属预期而非异常，降为 INFO，
+        # 消除常驻警告噪音（信号疲劳会淹没真问题）。config 声明 content_profile。
+        self.content_profile = ""
 
     def _log(self, level, check_id, msg):
         self._log_entries.append({
@@ -99,10 +103,19 @@ class PreflightResult:
             self._log("ERROR", check_id, msg)
             print(f"  ✗ ERROR: {msg}")
 
-    def warn(self, msg, check_id="unknown"):
+    def warn(self, msg, check_id="unknown", profile_exempt=False):
+        # profile_exempt：该警告对 text_only 画像属预期，降为 INFO 不计入 warnings
+        if profile_exempt and self.content_profile == "text_only":
+            self.info(f"{msg} (text_only 画像预期内，降级)", check_id)
+            return
         self.warnings.append(msg)
         self._log("WARN", check_id, msg)
         print(f"  ⚠ WARN: {msg}")
+
+    def info(self, msg, check_id="unknown"):
+        """仅记录不告警：供画像降级的预期内提示使用，不计入 warnings 总数。"""
+        self._log("INFO", check_id, msg)
+        print(f"  · INFO: {msg}")
 
     def ok(self, msg, check_id="unknown"):
         self._log("OK", check_id, msg)
@@ -202,7 +215,8 @@ def check_production_readiness(project_dir: Path, cfg: dict, r: PreflightResult)
         else:
             r.warn(
                 "No design artifacts found — recommend adding 'design_artifacts' "
-                "to config or placing beat_table/storyboard in project directory"
+                "to config or placing beat_table/storyboard in project directory",
+                profile_exempt=True
             )
 
     # 4. Asset scan evidence
@@ -213,7 +227,8 @@ def check_production_readiness(project_dir: Path, cfg: dict, r: PreflightResult)
         # Non-blocking: asset scan is recommended but not mandatory
         r.warn(
             "No asset_inventory.json — run asset_scanner.py --project "
-            f"{project_dir.name} --json to generate"
+            f"{project_dir.name} --json to generate",
+            profile_exempt=True
         )
 
 
@@ -316,7 +331,7 @@ def check_html_images(html_path: Path, r: PreflightResult):
     matches = src_pattern.findall(content)
 
     if not matches:
-        r.warn("No image references found in HTML")
+        r.warn("No image references found in HTML", profile_exempt=True)
         return
 
     found = 0
@@ -1095,7 +1110,8 @@ def check_image_clarity(html_path: Path, r: PreflightResult):
         # Note: Don't error if image missing - that's caught by check_image_refs
     
     if not checked_any:
-        r.warn("No critical images found to check clarity", check_id="image_clarity")
+        r.warn("No critical images found to check clarity", check_id="image_clarity",
+               profile_exempt=True)
 
 
 def check_subtitle_safe_zone(html_path: Path, r: PreflightResult):
@@ -1368,6 +1384,8 @@ def main():
                 pre_cfg = json.load(f)
         except (json.JSONDecodeError, ValueError):
             pass
+    # 内容画像：text_only 时素材类 WARN 降级为 INFO（消除常驻噪音）
+    r.content_profile = str(pre_cfg.get("content_profile", "") or "")
 
     # Resolve project directory for production readiness
     html_project_name = args.html or pre_cfg.get('paths', {}).get('html_project', '')

@@ -15,6 +15,9 @@
     "max_diff_seconds": 1.0,
     "description": "后处理前置门禁（pipeline_runner.step_postprocess 早失败检查）：config video_duration 与实际渲染产物时长的绝对偏差超过该值 → 立即拒跑并给出定点修复指引（重跑 adjust_timeline 或对齐 config 后 --quick-fix）。prefab 复盘：617.8s(config) vs 621.72s(render_raw) 的漂移曾拖到 enhance step3 混音门禁才暴露，白白消耗 TTS/BGM 再生成的时间与一次 40 分钟重渲染。"
   },
+  "duration_budget": {
+    "description": "时长预算门禁（pipeline_runner.step_timeline 末尾检查——权威时长刚确定、渲染尚未开始的最后拦截点）：项目 config 声明 duration_budget: {seconds, enforcement} 即启用；未声明 = 门禁不生效（零副作用，预算属业务声明而非全局默认）。enforcement=soft（默认）：超限阻断，需 --accept-over-budget 显式放行并在 pipeline_state.budget_decision 留痕（超预算≠不合格，属业务决策）；hard：超限直接 FAIL。教训（2026-08-05 wp批次复盘）：4集防水视频2集超240s预算（253.0s/248.9s），当时预算只存在于需求描述、门禁完全无感知，完工报告盖章 VALIDATED 13/13 后才人工发现返工，各耗一次约25分钟全链重跑。"
+  },
   "transition": {
     "tts_fade_in_ms": 40,
     "tts_fade_out_ms": 150,

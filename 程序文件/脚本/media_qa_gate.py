@@ -261,11 +261,11 @@ def _load_video_quality_rules() -> Dict[str, Any]:
     """读取 config/quality/video_quality_rules.json（带默认值）。
 
     与 enhance_video_audio._check_video_quality 同阈值同源（单一权威源），
-    读不到时回退默认双档 fail=300/warn=500 并打印告警。
+    读不到时回退默认双档 fail=200/warn=500 并打印告警。
     文件声明按原样返回（不与默认双档键合并），保证旧单档键
     min_video_bitrate_kbps 的兼容路径可被 _resolve_bitrate_thresholds 识别。
     """
-    defaults = {"min_video_bitrate_kbps_fail": 300, "min_video_bitrate_kbps_warn": 500}
+    defaults = {"min_video_bitrate_kbps_fail": 200, "min_video_bitrate_kbps_warn": 500}
     rules_path = (Path(__file__).resolve().parents[1] / "配置" / "config"
                   / "quality" / "video_quality_rules.json")
     try:
@@ -274,7 +274,7 @@ def _load_video_quality_rules() -> Dict[str, Any]:
         declared = {k: v for k, v in loaded.items() if not k.startswith("$")}
         return declared if declared else defaults
     except (json.JSONDecodeError, OSError):
-        print(f"  [WARN] 无法读取 {rules_path.name}，视频码率阈值回退默认 fail=300/warn=500kbps")
+        print(f"  [WARN] 无法读取 {rules_path.name}，视频码率阈值回退默认 fail=200/warn=500kbps")
         return defaults
 
 
