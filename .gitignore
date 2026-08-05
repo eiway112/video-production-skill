@@ -33,6 +33,9 @@ package-lock.json
 .idea/
 *.swp
 
+# Qoder IDE 自动生成产物（不随发布仓分发；.qoder/skills/ 为发布原生文件须保留）
+.qoder/repowiki/
+
 # OS
 .DS_Store
 Thumbs.db
