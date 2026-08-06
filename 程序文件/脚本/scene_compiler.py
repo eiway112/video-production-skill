@@ -2061,10 +2061,13 @@ def compile_sdl(sdl_data, output_dir, dry_run=False, auto_enrich=True):
 </html>'''
 
     # ── Step 7: Generate Pipeline Config ──
+    # TTS 默认对齐全仓主引擎 Qwen（AGENTS.md TTS 引擎纪律）：
+    # 旧默认 zh-CN-YunxiNeural 属 Edge-TTS，与 qwen 引擎搭配会被一致性门禁拒收。
     config = {
         'video_duration': video_duration,
         'cover_duration': cover_dur,
-        'voice': video.get('voice', 'zh-CN-YunxiNeural'),
+        'tts_engine': video.get('tts_engine', 'qwen'),
+        'voice': video.get('voice', 'longanling_v3'),
         'rate': video.get('rate', '+5%'),
         'pitch': video.get('pitch', '+0Hz'),
         'scenes': [],

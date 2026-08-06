@@ -178,6 +178,19 @@ preflight → tts → timeline → render
 
 ---
 
+## TTS 引擎纪律（Tier 3，2026-08-06）
+
+**原则**：全仓统一 Qwen（DashScope CosyVoice）为主引擎；Edge-TTS 仅限存量项目已声明的配置保留，新项目禁止声明 `tts_engine: "edge"`。禁止跨引擎自动降级（音色不一致）——失败即报错，修复后重跑。
+
+**默认链**（实测验证，见 `enhance_video_audio.py`）：
+- 默认：`cosyvoice-v3-flash` + `longanling_v3`（2026-08-06 从 cosyvoice-v2/longanling 升级，v3 韵律更自然；旧注释“v3 需专属域名”实测不成立）
+- 模型-音色严格配对（官方约束）：未显式声明 `qwen_model` 时由 `_infer_qwen_model` 按音色推断；存量 v2 音色（如 `longanling`）自动匹配 `cosyvoice-v2`，既有项目零变化
+- 情感控制：仅 Instruct 音色有效（`longanyang`/`longanhuan`），通过 config `tts_instruction`（或 `audio.instruction`）声明，格式严格遵循官方（如“你现在说话的角色是一个旁白，你说话的情感是neutral。”）；非 Instruct 音色声明指令会告警
+- 断句/句间停顿：TTS 内部韵律不可控，已由 `_enforce_sentence_pauses` 波形层强制（最小停顿 0.4s，见 `config/quality/audio_sync_rules.json` sentence_pause）
+- rate/pitch 沿用 Edge 语法声明（如 `+5%`/`+0Hz`），qwen 分支自动换算为 float（实测 rate 生效）
+
+---
+
 ## 交付约束（Tier 3）
 
 ### 素材文件治理

@@ -70,14 +70,33 @@ _load_env_files()
 # === TTS 引擎参数 ===
 # tts_engine 控制使用哪个 TTS 后端：
 #   - "qwen"（默认）：阿里云百炼 DashScope 的 CosyVoice / Qwen-Audio-TTS（需 DASHSCOPE_API_KEY）
-#   - "edge"：Edge-TTS（旧默认，无需 Key，保留作为可选）
+#   - "edge"：Edge-TTS（旧默认，无需 Key，仅存量项目显式声明保留）
 # 引擎不自动 fallback — AGENTS.md 明令禁止跨引擎自动降级（造成音色不一致）。
 TTS_ENGINE = "qwen"
-VOICE = "longanling"          # Qwen 默认音色：龙安灵（思维灵动女，20-30 岁）
-QWEN_MODEL = "cosyvoice-v2"   # cosyvoice-v2 支持 longan* 系列，走标准 dashscope 域名
+VOICE = "longanling_v3"       # Qwen 默认音色：龙安灵V3（思维灵动女，cosyvoice-v3-flash）
+# QWEN_MODEL 留空 = 按音色自动推断（_infer_qwen_model）；config 显式声明 qwen_model 为权威。
+# 2026-08-06 实测：v3 系列走标准 dashscope 端点即可（旧注释"需专属域名"不成立）。
+QWEN_MODEL = ""
 RATE = "+0%"                  # Edge 语法，Qwen 分支会自动换算成 float（0.5-2.0）
 PITCH = "+0Hz"
+TTS_INSTRUCTION = ""          # config tts_instruction：Instruct 音色的情感/场景指令（如 longanyang/longanhuan）
 SAMPLE_RATE = 44100
+
+# 官方音色规格（2026-08-06 核对）：支持 Instruct 情感指令的音色仅这几个，
+# 其余音色（含默认 longanling_v3）声明 instruction 无效，加载配置时告警。
+_INSTRUCT_CAPABLE_VOICES = {"longanyang", "longanhuan", "longhuhu_v3"}
+
+
+def _infer_qwen_model(voice):
+    """按音色推断 CosyVoice 模型——音色与模型严格配对（官方约束，不得混用）。
+
+    v3 专属音色（_v3 后缀 / longanyang / longanhuan）→ cosyvoice-v3-flash；
+    其余 v2 音色（longanling 等存量项目声明）→ cosyvoice-v2，保证既有项目零变化。
+    """
+    v = (voice or "").strip()
+    if v.endswith("_v3") or v in ("longanyang", "longanhuan"):
+        return "cosyvoice-v3-flash"
+    return "cosyvoice-v2"
 
 # === 默认配置 (CRM视频)，可通过 --config JSON 覆盖 ===
 # 格式: (场景ID, 起始秒, 结束秒, 旁白文本)
@@ -133,7 +152,7 @@ def _tts_cache_key(text):
     """
     normalized = re.sub(r'\s+', '', text.strip())
     model_tag = QWEN_MODEL if TTS_ENGINE == "qwen" else "edge"
-    cache_input = f"{normalized}|{TTS_ENGINE}|{model_tag}|{VOICE}|{RATE}|{PITCH}"
+    cache_input = f"{normalized}|{TTS_ENGINE}|{model_tag}|{VOICE}|{RATE}|{PITCH}|{TTS_INSTRUCTION or ''}"
     return hashlib.sha256(cache_input.encode('utf-8')).hexdigest()[:10]
 
 
@@ -600,7 +619,7 @@ def load_config(config_path):
     会自动加上 cover_duration，避免下游脚本再次叠加 COVER_DURATION。
     """
     global SCENES, VIDEO_DURATION, VOICE, RATE, PITCH, TTS_ENGINE, QWEN_MODEL, BGM_ENABLED
-    global SUBTITLE_DISPLAY_REPLACEMENTS
+    global SUBTITLE_DISPLAY_REPLACEMENTS, TTS_INSTRUCTION
     global VIDEO_TYPE, TTS_ENABLED, BGM_SOURCE, AUDIO_BITRATE
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
@@ -648,6 +667,7 @@ def load_config(config_path):
     PITCH = cfg.get('pitch', PITCH)
     TTS_ENGINE = cfg.get('tts_engine', TTS_ENGINE).lower()
     QWEN_MODEL = cfg.get('qwen_model', QWEN_MODEL)
+    TTS_INSTRUCTION = str(cfg.get('tts_instruction', TTS_INSTRUCTION) or '')
     
     # 支持 audio 对象中的语音参数（高优先级）
     if 'audio' in cfg and isinstance(cfg['audio'], dict):
@@ -662,6 +682,20 @@ def load_config(config_path):
             PITCH = _audio_cfg['pitch']
         if 'qwen_model' in _audio_cfg:
             QWEN_MODEL = _audio_cfg['qwen_model']
+        if 'instruction' in _audio_cfg:
+            TTS_INSTRUCTION = str(_audio_cfg['instruction'] or '')
+
+    # 模型解析：config 显式声明 qwen_model 为权威；未声明时按音色推断，
+    # 保证音色与模型严格配对（官方约束：不得跨模型混用音色）。
+    if TTS_ENGINE == 'qwen' and not QWEN_MODEL:
+        QWEN_MODEL = _infer_qwen_model(VOICE)
+
+    # Instruct 能力告警：非 Instruct 音色声明情感指令无效（官方音色规格），
+    # 不阻断——避免误伤平台后续放开，但必须让操作者知情。
+    if TTS_ENABLED and TTS_ENGINE == 'qwen' and TTS_INSTRUCTION \
+            and VOICE not in _INSTRUCT_CAPABLE_VOICES:
+        print(f"[WARN] voice='{VOICE}' 不支持 Instruct 情感指令，tts_instruction 不会生效")
+        print(f"[WARN] 需要情感控制时改用 Instruct 音色：{'/'.join(sorted(_INSTRUCT_CAPABLE_VOICES))}")
     
     # 引擎与音色一致性门禁：qwen 引擎但 voice 是 Edge 格式（zh-CN-*Neural）→ 报错退出。
     # 不允许静默改写：配置指纹哈希的是声明值，运行时改写会让指纹与实际产物脱钩，
@@ -677,7 +711,8 @@ def load_config(config_path):
     
     if TTS_ENABLED:
         print(f"[INFO] TTS engine: {TTS_ENGINE}, voice: {VOICE}" +
-              (f", model: {QWEN_MODEL}" if TTS_ENGINE == 'qwen' else ''))
+              (f", model: {QWEN_MODEL}" if TTS_ENGINE == 'qwen' else '') +
+              (f", instruction: {TTS_INSTRUCTION}" if TTS_ENGINE == 'qwen' and TTS_INSTRUCTION else ''))
     else:
         print(f"[INFO] TTS disabled (tts_enabled=false) — pure-BGM audio path" +
               (f", video_type={VIDEO_TYPE}" if VIDEO_TYPE else ""))
@@ -1108,6 +1143,7 @@ async def _qwen_tts(text, output_path):
 
     rate_f = _edge_rate_to_float(RATE, 'rate')
     pitch_f = _edge_rate_to_float(PITCH, 'pitch')
+    model = QWEN_MODEL or _infer_qwen_model(VOICE)  # 防御：免配置路径（默认 SCENES）直接调用时模型未解析
 
     max_retries = 5
     retry_delays = [3, 5, 10, 15, 20]
@@ -1115,8 +1151,11 @@ async def _qwen_tts(text, output_path):
         try:
             # SDK 同步接口，放到线程里避免阻塞 event loop
             def _call_sync():
+                kwargs = {}
+                if TTS_INSTRUCTION:  # 仅 Instruct 音色有效（加载配置时已告警检查）
+                    kwargs['instruction'] = TTS_INSTRUCTION
                 return HttpSpeechSynthesizer.call(
-                    model=QWEN_MODEL,
+                    model=model,
                     text=text,
                     voice=VOICE,
                     format='wav',
@@ -1125,6 +1164,7 @@ async def _qwen_tts(text, output_path):
                     pitch=pitch_f,
                     stream=False,
                     api_key=api_key,
+                    **kwargs,
                 )
             result = await aio.to_thread(_call_sync)
 
@@ -1153,7 +1193,7 @@ async def _qwen_tts(text, output_path):
             else:
                 raise RuntimeError(
                     f"Qwen TTS generation failed after {max_retries} retries. "
-                    f"Model={QWEN_MODEL}, Voice={VOICE}, Text={text[:50]}... "
+                    f"Model={model}, Voice={VOICE}, Text={text[:50]}... "
                     f"不自动降级到 Edge-TTS（避免音色不一致）——修复后重跑，"
                     f"或在 config 里声明 tts_engine: 'edge' 后重跑。"
                 ) from e

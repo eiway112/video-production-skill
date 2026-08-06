@@ -49,10 +49,13 @@ SCRIPTS = ROOT / "程序文件" / "脚本"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
 SAMPLE_RATE = 44100
 
-# Default voice parameters (same defaults as enhance_video_audio.py)
-DEFAULT_VOICE = "zh-CN-YunxiNeural"
-DEFAULT_RATE = "+10%"
+# Default voice parameters (aligned with enhance_video_audio.py — Qwen 主引擎)
+# 旧默认 zh-CN-YunxiNeural 属 Edge-TTS，与全仓 TTS 引擎纪律不符（AGENTS.md）。
+DEFAULT_VOICE = "longanling_v3"
+DEFAULT_RATE = "+5%"
 DEFAULT_PITCH = "+0Hz"
+
+_EDGE_VOICE_RE = re.compile(r'^[a-z]{2}-[A-Z]{2}-\w+Neural$')
 
 
 def get_duration(filepath):
@@ -72,29 +75,15 @@ def tts_cache_key(text, voice, rate, pitch):
 
 
 async def generate_tts(text, output_path, voice, rate, pitch):
-    """Generate TTS using edge_tts with retry."""
-    max_retries = 10
-    retry_delays = [5, 10, 15, 20, 30, 30, 30, 30, 30]
-    for attempt in range(1, max_retries + 1):
-        try:
-            import edge_tts
-            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-            await communicate.save(str(output_path))
-            if os.path.exists(output_path) and os.path.getsize(output_path) >= 100:
-                return
-            size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-            raise Exception(f"edge_tts produced invalid file ({size} bytes)")
-        except Exception as e:
-            if attempt < max_retries:
-                wait = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
-                print(f"  edge_tts attempt {attempt}/{max_retries} failed: {e}")
-                print(f"  Retrying in {wait}s...")
-                await asyncio.sleep(wait)
-            else:
-                raise RuntimeError(
-                    f"TTS generation failed after {max_retries} retries. "
-                    f"Voice: {voice}, Text: {text[:50]}..."
-                ) from e
+    """复用 enhance_video_audio 的统一合成实现（单一权威源：重试/门禁/缓存逻辑不双写）。
+
+    引擎按音色格式判定：zh-CN-*Neural → edge（存量兼容），其余 → qwen。
+    """
+    import enhance_video_audio as eva
+    eva.VOICE, eva.RATE, eva.PITCH = voice, rate, pitch
+    eva.TTS_ENGINE = 'edge' if _EDGE_VOICE_RE.match(voice or '') else 'qwen'
+    eva.QWEN_MODEL = ''  # 由 _qwen_tts 内部按音色推断
+    await eva.generate_tts(text, output_path)
 
 
 def load_narrations(filepath):
@@ -214,6 +203,8 @@ def build_config(narrations, tts_results, voice, rate, pitch,
 
     config = {
         "video_duration": total_duration,
+        # 显式声明引擎，与实际合成所用引擎一致（按音色格式判定，同 generate_tts）
+        "tts_engine": "edge" if _EDGE_VOICE_RE.match(voice or '') else "qwen",
         "voice": voice,
         "rate": rate,
         "pitch": pitch,
