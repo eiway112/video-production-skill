@@ -129,7 +129,7 @@ class ConfigManager:
             "browser_path": os.environ.get("HYPERFRAMES_BROWSER_PATH", ""),
             "ffmpeg_path": os.environ.get("HYPERFRAMES_FFMPEG_PATH", ""),
             "default_resolution": "1920x1080",
-            "default_fps": 30,
+            "default_fps": 25,  # 与 hyperframes_config.json 权威值一致（渲染器实际输出，2026-08-07 对齐）
             "default_format": "mp4"
         }
 
