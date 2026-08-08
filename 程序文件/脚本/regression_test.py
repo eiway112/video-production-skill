@@ -2337,6 +2337,232 @@ def test_interrupted_run_visibility() -> RegressionTestCase:
 
     return tc
 
+
+def test_preview_safety_zone_precheck() -> RegressionTestCase:
+    """用例33：预览安全区预检（prefab 复盘决策一，2026-08-07）
+
+    背景：prefab-agent-launch 场景3 溢出字幕安全区 34px，消耗一次 37 分钟
+    全量渲染后才在 visual_check 暴露。决策：布局溢出判定前移到秒级预览——
+    instant_preview.check_preview_safety 对 preview 截图测量 content_bottom，
+    超过安全线 y=860 即返回 violations（退出码2阻断渲染）。本用例用合成
+    截图锁定：溢出场景必被检出，合规场景不误报。
+    """
+    tc = RegressionTestCase(
+        "preview_safety_zone_precheck",
+        "验证 preview 阶段安全区预检：溢出检出 + 合规不误报"
+    )
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        # instant_preview 模块顶层重绑 sys.stdout/stderr，需安全导入
+        instant_preview = _safe_import_rebinding_module("instant_preview")
+        from visual_boundary_check import SUBTITLE_SAFETY_LINE
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            def _make_scene_png(path, band_y):
+                """黑底 + 白色内容带（带底部位于 band_y），模拟场景截图。"""
+                img = Image.new("RGB", (1920, 1080), (0, 0, 0))
+                px = img.load()
+                for y in range(band_y - 30, band_y + 1):
+                    for x in range(100, 1820):
+                        px[x, y] = (255, 255, 255)
+                img.save(path)
+
+            # 溢出场景（带底 y=890 > 860）与合规场景（带底 y=520）
+            _make_scene_png(tmp / "preview_s1_t0.png", 890)
+            _make_scene_png(tmp / "preview_s2_t5.png", 520)
+            manifest = [
+                {"sceneId": "s1", "time": 0, "file": "s1_t0.png"},
+                {"sceneId": "s2", "time": 5, "file": "s2_t5.png"},
+                {"sceneId": "s3", "time": 9, "file": "s3_missing.png"},  # 无截图 → 跳过
+            ]
+            violations = instant_preview.check_preview_safety(manifest, str(tmp))
+
+            tc.assert_equal(len(violations), 1, "exactly one scene overflows")
+            v = violations[0]
+            tc.assert_equal(v["scene"], "s1", "overflow scene identified")
+            tc.assert_equal(v["content_bottom"], 890, "content_bottom measured")
+            tc.assert_equal(v["overflow_px"], 890 - SUBTITLE_SAFETY_LINE,
+                            "overflow px relative to safety line")
+            tc.assert_true(not any(x["scene"] == "s2" for x in violations),
+                           "compliant scene not false-alarmed")
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_render_watchdog_stall_kill() -> RegressionTestCase:
+    """用例34：渲染卡死看门狗（prefab 复盘决策二，2026-08-07）
+
+    背景：prefab-agent-launch 渲染 #1 卡 0%（0/5305 帧）12 分钟无任何诊断。
+    决策：_RenderProgressWatcher 增加卡死检测——进度连续 stall_seconds 零增长
+    且总耗时已过 grace_seconds → 杀进程树 fail-fast；阈值权威源
+    config/quality/render_rules.json，纳入 render 步指纹。本用例锁定：
+    卡死判定触发杀进程、有进度不误杀、配置可加载、_run 注入进程句柄。
+    """
+    tc = RegressionTestCase(
+        "render_watchdog_stall_kill",
+        "验证看门狗卡死判定/不误杀/配置权威源/进程注入"
+    )
+    try:
+        import io
+        import types
+        import contextlib
+        import time as _time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        Watcher = _pr._RenderProgressWatcher
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            render_raw = tmp / "render_raw.mp4"
+            wd_cfg = {"enabled": True, "grace_seconds": 0.5, "stall_seconds": 0.5}
+
+            # (a) 零进度超阈值 → 判定卡死并杀进程树
+            w = Watcher([tmp], render_raw, 0, watchdog=wd_cfg)
+            killed = []
+            w._kill_process_tree = lambda pid: killed.append(pid)
+            w.attach_process(types.SimpleNamespace(pid=12345))
+            w._start_time = _time.time() - 1.0        # 总耗时已过 grace
+            w._last_progress_ts = _time.time() - 1.0  # 进度已停滞 1s
+            w._last_progress_val = 0                  # 与 _progress_value() 一致
+            with contextlib.redirect_stdout(io.StringIO()):
+                w._check_watchdog()
+            tc.assert_true(w.stalled, "stall detected")
+            tc.assert_equal(killed, [12345], "process tree killed (fail-fast)")
+
+            # (b) 刚启动（进度刚刷新）→ 不误杀
+            w2 = Watcher([tmp], render_raw, 0, watchdog=wd_cfg)
+            killed2 = []
+            w2._kill_process_tree = lambda pid: killed2.append(pid)
+            w2.attach_process(types.SimpleNamespace(pid=22222))
+            with contextlib.redirect_stdout(io.StringIO()):
+                w2._check_watchdog()  # 首次调用：进度基线刚建立，stall≈0
+            tc.assert_true(not w2.stalled and not killed2,
+                           "fresh progress not false-killed")
+
+            # (c) 看门狗禁用 → 绝不触发
+            w3 = Watcher([tmp], render_raw, 0, watchdog={"enabled": False})
+            w3.attach_process(types.SimpleNamespace(pid=33333))
+            w3._start_time = _time.time() - 9999
+            w3._last_progress_ts = _time.time() - 9999
+            w3._last_progress_val = 0
+            with contextlib.redirect_stdout(io.StringIO()):
+                w3._check_watchdog()
+            tc.assert_true(not w3.stalled, "disabled watchdog never fires")
+
+            # (d) 配置权威源：render_rules.json 存在、可解析、阈值字段齐全
+            rules_path = _pr.CONFIG_DIR / "quality" / "render_rules.json"
+            tc.assert_true(rules_path.exists(), "render_rules.json exists")
+            rules = json.loads(rules_path.read_text(encoding="utf-8"))
+            wd = rules.get("watchdog", {})
+            tc.assert_true("grace_seconds" in wd and "stall_seconds" in wd,
+                           "watchdog thresholds declared")
+            loaded = _pr._load_render_rules()
+            tc.assert_equal(loaded["watchdog"]["stall_seconds"], wd["stall_seconds"],
+                            "_load_render_rules reads authoritative config")
+
+            # (e) _run 注入进程句柄（看门狗拿得到 pid 才能杀树）
+            orig_log_dir = _pr.LOG_DIR
+            _pr.LOG_DIR = tmp
+            try:
+                runner = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+                runner.config_path = tmp / "proj_x.json"
+                runner._log_seq = 0
+                runner._current_step = None
+                runner.last_log_path = None
+                w4 = Watcher([tmp], render_raw, 0, watchdog=wd_cfg)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = runner._run([sys.executable, "-c", "print('ok')"],
+                                     desc="watchdog attach", attach_watchdog=w4)
+                tc.assert_equal(rc, 0, "trivial subprocess exits 0")
+                tc.assert_true(w4._proc is not None,
+                               "watchdog received process handle via _run")
+            finally:
+                _pr.LOG_DIR = orig_log_dir
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_preflight_blocks_missing_design_artifacts() -> RegressionTestCase:
+    """用例35：无设计产物 → preflight 阻断（prefab 复盘决策三，2026-08-07）
+
+    背景：prefab-agent-launch 无任何分镜设计就进入生产，内容沦为旧素材
+    拼凑、用户需求未体现；此前设计产物缺失仅 WARN 放行。决策：升级为
+    阻断错误，自动探测模式补 narration.design.json，声明指针失效也硬报错。
+    """
+    tc = RegressionTestCase(
+        "preflight_blocks_missing_design_artifacts",
+        "验证设计产物缺失/失效指针阻断 preflight，存量格式可探测"
+    )
+    try:
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import preflight_check as pf
+
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "demo-project"
+            proj.mkdir()
+            (proj / "index.html").write_text("<html></html>", encoding="utf-8")
+
+            # (a) 无设计产物 → 阻断错误（不再是 WARN）
+            r1 = pf.PreflightResult(mode="render")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_production_readiness(proj, {}, r1)
+            tc.assert_true(any("No design artifacts" in e for e in r1.errors),
+                           "missing design artifacts produce blocking error")
+            tc.assert_true(not r1.passed, "preflight failed without design")
+
+            # (b) storyboard_*.md → 自动探测通过
+            (proj / "storyboard_demo.md").write_text("# 分镜", encoding="utf-8")
+            r2 = pf.PreflightResult(mode="render")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_production_readiness(proj, {}, r2)
+            tc.assert_true(not any("No design artifacts" in e for e in r2.errors),
+                           "storyboard md detected, no blocking error")
+            (proj / "storyboard_demo.md").unlink()
+
+            # (c) narration.design.json → 自动探测通过（新增模式）
+            (proj / "narration.design.json").write_text("{}", encoding="utf-8")
+            r3 = pf.PreflightResult(mode="render")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_production_readiness(proj, {}, r3)
+            tc.assert_true(not any("No design artifacts" in e for e in r3.errors),
+                           "narration.design.json detected")
+            (proj / "narration.design.json").unlink()
+
+            # (d) 声明了 design_artifacts 但指针失效 → 硬报错
+            r4 = pf.PreflightResult(mode="render")
+            cfg = {"design_artifacts": {"storyboard": str(proj / "gone.md")}}
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_production_readiness(proj, cfg, r4)
+            tc.assert_true(any("not found" in e for e in r4.errors),
+                           "broken design_artifacts pointer is a hard error")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -2378,6 +2604,9 @@ class RegressionTestRunner:
             test_completion_report_fingerprint_stability,
             test_duration_budget_gate,
             test_interrupted_run_visibility,
+            test_preview_safety_zone_precheck,
+            test_render_watchdog_stall_kill,
+            test_preflight_blocks_missing_design_artifacts,
         ]
         self.results = []
     

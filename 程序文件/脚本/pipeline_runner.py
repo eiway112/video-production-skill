@@ -143,16 +143,28 @@ class _RenderProgressWatcher:
 
     POLL_INTERVAL = 10  # 秒
 
-    def __init__(self, watch_dirs, render_raw, total_frames=0):
+    def __init__(self, watch_dirs, render_raw, total_frames=0, watchdog=None):
         self.watch_dirs = [Path(d) for d in watch_dirs]
         self.render_raw = Path(render_raw)
         self.total_frames = total_frames  # <=0 表示时长未知，不显示百分比
+        # 卡死看门狗（prefab 复盘决策二，2026-08-07）：阈值来自
+        # config/quality/render_rules.json，见 _load_render_rules()。
+        self.watchdog = watchdog or {}
+        self.stalled = False      # 看门狗判定卡死并杀进程树后置位
+        self._proc = None         # attach_process() 注入的渲染子进程
+        self._last_progress_val = None
+        self._last_progress_ts = time.time()
         self._stop_event = threading.Event()
         self._thread = None
         self._start_time = time.time()
 
+    def attach_process(self, proc):
+        """_run 的 Popen 成功后调用：看门狗需要进程句柄才能在卡死时杀进程树。"""
+        self._proc = proc
+
     def start(self):
         self._start_time = time.time()
+        self._last_progress_ts = time.time()
         self._thread = threading.Thread(
             target=self._loop, name="render-progress-watcher", daemon=True)
         self._thread.start()
@@ -187,6 +199,55 @@ class _RenderProgressWatcher:
                     best = (cap.stat().st_mtime, n)
         return None if best is None else best[1]
 
+    def _progress_value(self):
+        """看门狗进度度量（单调非减）：帧数 → render_raw 大小降级链。
+        两者皆无时返回 0——"什么都没发生"本身就是进度（prefab 渲染 #1
+        卡 0 帧 12 分钟正是这种形态）。"""
+        frames = self._count_frames()
+        if frames is not None:
+            return frames
+        if (self.render_raw.exists()
+                and self.render_raw.stat().st_mtime >= self._start_time):
+            return self.render_raw.stat().st_size
+        return 0
+
+    def _kill_process_tree(self, pid):
+        """杀渲染进程树。独立方法便于回归测试替换。"""
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=30)
+            else:
+                os.kill(pid, 9)
+        except Exception as e:
+            print(f"  [WATCHDOG] kill failed: {e}", flush=True)
+
+    def _check_watchdog(self):
+        """卡死判定：进度连续 stall_seconds 零增长且总耗时已过 grace_seconds
+        → 判定卡死，杀进程树 fail-fast。教训：prefab-agent-launch 渲染 #1
+        卡 0%（0/5305 帧）12 分钟无任何诊断，只能干等崩溃。"""
+        wd = self.watchdog
+        if not wd.get("enabled") or self.stalled or self._proc is None:
+            return
+        now = time.time()
+        val = self._progress_value()
+        if val != self._last_progress_val:
+            self._last_progress_val = val
+            self._last_progress_ts = now
+        stall = now - self._last_progress_ts
+        total = now - self._start_time
+        if stall >= wd.get("stall_seconds", 300) and total >= wd.get("grace_seconds", 360):
+            self.stalled = True
+            print(f"\n  [WATCHDOG] Render stalled: zero progress for {int(stall)}s "
+                  f"(elapsed {self._elapsed_str()}) — killing render process tree "
+                  f"(fail-fast). Thresholds: render_rules.json", flush=True)
+            try:
+                pid = self._proc.pid
+            except Exception:
+                pid = None
+            if pid:
+                self._kill_process_tree(pid)
+
     def _report(self):
         frames = self._count_frames()
         elapsed = self._elapsed_str()
@@ -203,6 +264,7 @@ class _RenderProgressWatcher:
             print(f"  [RENDER] elapsed {elapsed} (render_raw.mp4: {size_mb:.1f}MB)", flush=True)
         else:
             print(f"  [RENDER] elapsed {elapsed}", flush=True)
+        self._check_watchdog()
 
 
 def compile_sdl(sdl_path):
@@ -413,6 +475,29 @@ def _load_delivery_gate_rules():
         return defaults
 
 
+def _load_render_rules():
+    """Load config/quality/render_rules.json with default fallback.
+
+    Consumed by step_render (渲染卡死看门狗，prefab 复盘决策二)。读取失败
+    回退 documented 默认值，绝不让看门狗静默旁路。
+    """
+    rules_path = CONFIG_DIR / "quality" / "render_rules.json"
+    defaults = {
+        "watchdog": {"enabled": True, "grace_seconds": 360, "stall_seconds": 300},
+    }
+    if not rules_path.exists():
+        return defaults
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        for k, v in loaded.items():
+            if not k.startswith("$"):
+                defaults[k] = v
+        return defaults
+    except (json.JSONDecodeError, OSError):
+        return defaults
+
+
 class PipelineRunner:
     def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False, accept_over_budget=False):
         self.config_path = Path(config_path)
@@ -479,6 +564,8 @@ class PipelineRunner:
         # Audio-sync policy: shrink oversized scene windows so TTS drives
         # the timeline. See AGENTS.md → 渲染纪律 → 音画同步.
         self.audio_sync_rules = _load_audio_sync_rules()
+        # 渲染纪律：看门狗阈值权威源（config/quality/render_rules.json）。
+        self.render_rules = _load_render_rules()
         shrink_default = self.audio_sync_rules.get("shrink", {}).get("enabled_by_default", True)
         # CLI --no-shrink overrides config default; explicit shrink=True/False wins.
         self.shrink = shrink if shrink is not None else shrink_default
@@ -491,7 +578,7 @@ class PipelineRunner:
         slug = re.sub(r"[^\w\-.]+", "_", desc)[:30].strip("_") or "cmd"
         return LOG_DIR / f"{self.config_path.stem}_{step}_{self._log_seq:02d}_{slug}_{ts}.log"
 
-    def _run(self, cmd, cwd=None, env=None, desc=""):
+    def _run(self, cmd, cwd=None, env=None, desc="", attach_watchdog=None):
         """Run subprocess, return exit code.
 
         P0 整改（2026-08-04 prefab 复盘）：stdout/stderr 合并后同时回显与落盘
@@ -520,6 +607,9 @@ class PipelineRunner:
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding='utf-8', errors='replace'
                 )
+                # 看门狗注入（prefab 复盘决策二）：卡死时杀的是这个进程树。
+                if attach_watchdog is not None:
+                    attach_watchdog.attach_process(proc)
                 completed_normally = False
                 try:
                     for line in proc.stdout:
@@ -641,6 +731,19 @@ class PipelineRunner:
             if browser:
                 env["HYPERFRAMES_BROWSER_PATH"] = browser
 
+        # 2026-08-07 GPU/显示驱动栈病态规避（Todesk 虚拟显示 + Chrome shutdown 内核态挂起）：
+        # 现象：渲染卡在 file_server 之后的 GPU 探测（probeHardwareWebGlInfo 的 browser.close() 永不返回，0/5305 帧）；
+        # headless-shell 在该环境下还会 0xC0000005 崩溃。
+        # 规避：① PRODUCER_HEADLESS_SHELL_PATH 指向 puppeteer 缓存的完整 chrome.exe（自动发现）；
+        #       ② 渲染命令追加 --no-browser-gpu 跳过 GPU 探测（software 模式，画质不受影响，截图捕获路径）。
+        # 机器重启可清除该病态（昨日同命令成功即证据），届时此规避无副作用，保留即可。
+        if not env.get("PRODUCER_HEADLESS_SHELL_PATH"):
+            _chrome_cache = Path.home() / ".cache" / "puppeteer" / "chrome"
+            if _chrome_cache.exists():
+                for _exe in sorted(_chrome_cache.rglob("chrome-win64/chrome.exe"), reverse=True):
+                    env["PRODUCER_HEADLESS_SHELL_PATH"] = str(_exe)
+                    break
+
         # FFmpeg + FFprobe (ASCII symlink for Chinese paths)
         ffmpeg_exe = shutil.which("ffmpeg")
         if ffmpeg_exe:
@@ -722,7 +825,8 @@ class PipelineRunner:
                              "audio_sync_rules": audio_rules,
                              "script": SCRIPTS / "adjust_timeline.py"},
             "preview":      {"config": self.config_path, "html": self.html_path},
-            "render":       {"config": self.config_path, "html": self.html_path},
+            "render":       {"config": self.config_path, "html": self.html_path,
+                             "render_rules": quality_dir / "render_rules.json"},
             "verify":       {"config": self.config_path, "html": self.html_path,
                              "render_raw": self.render_raw},
             "visual_check": {"config": self.config_path, "render_raw": self.render_raw,
@@ -1242,14 +1346,20 @@ class PipelineRunner:
             except (TypeError, ValueError):
                 _total_frames = 0
             watcher = _RenderProgressWatcher(
-                [self.temp_dir, self.source_dir], self.render_raw, _total_frames)
+                [self.temp_dir, self.source_dir], self.render_raw, _total_frames,
+                watchdog=self.render_rules.get("watchdog", {}))
             watcher.start()
             try:
+                render_cmd = ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"]
+                # 2026-08-07 GPU 栈病态规避：software 模式跳过探测浏览器（见 _setup_env 注释）
+                if self.env.get("PRODUCER_HEADLESS_SHELL_PATH"):
+                    render_cmd.append("--no-browser-gpu")
                 rc = self._run(
-                    ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"],
+                    render_cmd,
                     cwd=str(self.source_dir),
                     env=self.env,
-                    desc="HyperFrames render"
+                    desc="HyperFrames render",
+                    attach_watchdog=watcher
                 )
             finally:
                 watcher.stop()
@@ -1262,7 +1372,14 @@ class PipelineRunner:
                     hint = (f" — previous render preserved at {prev.name}; "
                             f"if timeline unchanged, restore it + align config + --quick-fix "
                             f"instead of a full re-render")
-                self._fail("render", f"HyperFrames render failed{hint}", SUBPROCESS_FAILED)
+                if watcher.stalled:
+                    wd = self.render_rules.get("watchdog", {})
+                    reason = ("Render stalled — watchdog killed the process tree (fail-fast); "
+                              f"thresholds stall={wd.get('stall_seconds')}s/"
+                              f"grace={wd.get('grace_seconds')}s (render_rules.json)")
+                else:
+                    reason = "HyperFrames render failed"
+                self._fail("render", f"{reason}{hint}", SUBPROCESS_FAILED)
                 return False
 
         if not self.render_raw.exists():

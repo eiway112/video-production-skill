@@ -191,6 +191,9 @@ def check_production_readiness(project_dir: Path, cfg: dict, r: PreflightResult)
         r.ok("No photos/ directory (photo registry not required)")
 
     # 3. Design artifacts from config
+    # 决策三（prefab 复盘，2026-08-07）：设计产物是强制上游环节——
+    # 无分镜设计就直接生产，内容必然沦为旧素材拼凑（prefab-agent-launch
+    # 实证）。缺失/失效一律阻断，最小达标路径见下方 error 文案。
     design = cfg.get('design_artifacts', {})
     if design:
         for artifact_type, artifact_path in design.items():
@@ -201,22 +204,31 @@ def check_production_readiness(project_dir: Path, cfg: dict, r: PreflightResult)
             if p.exists():
                 r.ok(f"Design artifact '{artifact_type}': {p.name}")
             else:
-                r.warn(f"Design artifact '{artifact_type}' not found: {artifact_path}")
+                # 声明了但指向不存在的文件 = 失效指针，硬报错禁止静默放行
+                r.error(
+                    f"Declared design artifact '{artifact_type}' not found: "
+                    f"{artifact_path} — fix the pointer or remove the declaration"
+                )
     else:
         # Auto-detect common design artifacts in project directory
         auto_found = []
-        for pattern in ["beat_table*", "storyboard*", "*分镜*", "*beat*"]:
+        for pattern in ["beat_table*", "storyboard*", "*分镜*", "*beat*",
+                        "narration.design.json"]:
             matches = list(project_dir.glob(pattern))
             auto_found.extend(matches)
+        # 去重：同一文件可能命中多个模式（如 storyboard_分镜设计.md 首跑实证）
+        auto_found = list(dict.fromkeys(auto_found))
 
         if auto_found:
             for f in auto_found:
                 r.ok(f"Design artifact (auto-detected): {f.name}")
         else:
-            r.warn(
-                "No design artifacts found — recommend adding 'design_artifacts' "
-                "to config or placing beat_table/storyboard in project directory",
-                profile_exempt=True
+            r.error(
+                "No design artifacts found — production blocked. "
+                "Minimum requirement: place storyboard_<name>.md (分镜设计) or "
+                "narration.design.json in the project directory, or declare "
+                "'design_artifacts' in config. Template: AI视频制作工作流模板/"
+                "分镜设计模板_AI导演模式.md"
             )
 
     # 4. Asset scan evidence

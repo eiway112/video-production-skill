@@ -1,0 +1,10 @@
+{
+  "$schema": "Render discipline rules for pipeline_runner (watchdog)",
+  "$description": "见 AGENTS.md → 渲染纪律。参数语义权威源，禁止任何脚本另设分叉默认值。",
+  "watchdog": {
+    "enabled": true,
+    "grace_seconds": 360,
+    "stall_seconds": 300,
+    "description": "渲染卡死看门狗（prefab 复盘决策二，2026-08-07）：_RenderProgressWatcher 每 10s 采样一次进度（captured-frames 帧数 → render_raw 大小降级链），若进度连续 stall_seconds 零增长且渲染总时长已超过 grace_seconds，判定卡死并 taskkill 整个渲染进程树 fail-fast。教训：prefab-agent-launch 渲染 #1 卡 0%（0/5305 帧）12 分钟无任何诊断，只能人工盯守杀掉；正常 compile+probe 阶段 <1 分钟，grace 覆盖病态慢启动，绝不允许无进度空转超过 grace+stall。"
+  }
+}

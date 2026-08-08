@@ -236,6 +236,49 @@ def analyze_animation_density(html_content, scenes, cover_duration=3.0):
     return results
 
 
+def check_preview_safety(manifest_entries, temp_dir):
+    """字幕安全区预检（prefab 复盘决策一，2026-08-07）。
+
+    复用 visual_boundary_check.measure_content_bottom 对 preview 截图测量
+    content_bottom，把布局溢出的判定从“渲染完成后”前移到秒级预览：
+    prefab-agent-launch 场景3 溢出 34px 曾消耗一次 37 分钟全量渲染才暴露，
+    同类问题必须在预览阶段阻断。
+
+    Args:
+        manifest_entries: capture_manifest.json 的 scenes 列表
+                          （每项含 sceneId / time / file）。
+        temp_dir: preview 截图副本所在目录（preview_{file}）。
+
+    Returns:
+        violations: [{scene, content_bottom, overflow_px, time}]，每场景取最差样本。
+    """
+    from visual_boundary_check import measure_content_bottom, SUBTITLE_SAFETY_LINE
+
+    worst_per_scene = {}
+    for entry in manifest_entries:
+        dst = Path(temp_dir) / f"preview_{entry['file']}"
+        if not dst.exists():
+            continue
+        bottom = measure_content_bottom(str(dst))
+        sid = entry["sceneId"]
+        if sid not in worst_per_scene or bottom > worst_per_scene[sid][0]:
+            worst_per_scene[sid] = (bottom, entry.get("time", 0))
+
+    print(f"\n  [Safety Zone Pre-check] safety line y={SUBTITLE_SAFETY_LINE}")
+    violations = []
+    for sid, (bottom, t) in sorted(worst_per_scene.items(), key=lambda kv: str(kv[0])):
+        if bottom > SUBTITLE_SAFETY_LINE:
+            overflow = bottom - SUBTITLE_SAFETY_LINE
+            print(f"    \u2717 Scene {sid}: content_bottom=y{bottom} "
+                  f"OVERFLOW {overflow}px @{t:.0f}s")
+            violations.append({"scene": sid, "content_bottom": bottom,
+                               "overflow_px": overflow, "time": t})
+        else:
+            print(f"    \u2713 Scene {sid}: content_bottom=y{bottom} "
+                  f"gap={SUBTITLE_SAFETY_LINE - bottom}px @{t:.0f}s")
+    return violations
+
+
 def generate_grid(screenshots, scene_info, output_path, cols=4):
     """Generate a thumbnail grid from screenshots using Pillow.
 
@@ -465,6 +508,7 @@ def main():
         print(f"  {start:6.0f}s-{end:6.0f}s: {count:>3} events [{rating}]{marker}")
 
     # --- Phase 2: Chrome Screenshots via puppeteer-core (unless --density-only) ---
+    safety_violations = []
     if not args.density_only:
         print("\n--- Phase 2: Chrome Screenshots (puppeteer-core) ---")
 
@@ -556,6 +600,14 @@ def main():
                             dst = temp_dir / f"preview_{entry['file']}"
                             if src.exists():
                                 shutil.copy2(str(src), str(dst))
+
+                        # 安全区预检（prefab 复盘决策一）：溢出在此阻断，
+                        # 不把布局问题拖到全量渲染后才暴露。
+                        try:
+                            safety_violations = check_preview_safety(
+                                manifest.get("scenes", []), temp_dir)
+                        except ImportError as e:
+                            print(f"  [Safety Zone Pre-check] skipped ({e})")
                     else:
                         print("  No screenshots to generate grid from")
                 else:
@@ -649,6 +701,16 @@ def main():
     # Overall assessment
     report_lines.append("")
     report_lines.append("== Overall Assessment ==")
+    # 安全区预检结果（prefab 复盘决策一）：溢出是硬阻断，不是建议
+    if safety_violations:
+        report_lines.append(f"  [FAIL] {len(safety_violations)} scene(s) overflow subtitle safety zone:")
+        for v in safety_violations:
+            report_lines.append(
+                f"         Scene {v['scene']}: content_bottom=y{v['content_bottom']} "
+                f"overflow {v['overflow_px']}px @{v['time']:.0f}s")
+        report_lines.append("         -> reduce content height / tighten padding-bottom, then re-preview")
+    elif not args.density_only:
+        report_lines.append("  [PASS] All scenes stay above subtitle safety line")
     total_deserts = len(desert_windows)
     total_sparse = len(sparse_windows)
     if total_deserts == 0 and total_sparse <= 1:
@@ -667,6 +729,12 @@ def main():
     print()
     print(report_text)
 
+    # 安全区溢出 → 非零退出：pipeline_runner.step_preview 视 preview 失败为 FATAL，
+    # render 硬门禁随之拒跑，布局问题不再消耗全量渲染。
+    if safety_violations:
+        print(f"\nPREVIEW FAILED: {len(safety_violations)} scene(s) overflow the subtitle "
+              f"safety zone — fix layout before rendering.")
+        return 2
     return 0
 
 
