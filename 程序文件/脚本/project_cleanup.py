@@ -294,7 +294,7 @@ def scan_scattered_scripts(cm: ConfigManager, report: CleanupReport):
 def scan_cdrive_residuals(report: CleanupReport):
     """扫描 C:\\temp 中工作流产生的残留文件（Chrome profile、预览截图等）
 
-        工作流临时文件应使用 _script_env.PREVIEW_TEMP（默认为根目录上级的 temp_chrome_preview），不应堆积在 C 盘。
+        工作流临时文件应使用 _script_env.PREVIEW_TEMP（默认为工作区上级 D:\ 的 temp_chrome_preview），不应堆积在 C 盘。
     """
     c_temp = Path(r"C:\temp")
     if not c_temp.exists():

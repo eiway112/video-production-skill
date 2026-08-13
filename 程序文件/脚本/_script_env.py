@@ -64,9 +64,9 @@ if not VENV_PYTHON.exists():
     VENV_PYTHON = Path(sys.executable)
 
 # Chrome 预览专用 ASCII 临时目录（Chrome 不支持中文 user-data-dir）：
-# 默认放在工作流根目录的上级（避免污染工作区），可用环境变量覆盖
+# 默认放在工作区根目录的上级（D:\ 盘，避免污染工作区根目录），可用环境变量覆盖
 PREVIEW_TEMP = Path(os.environ.get(
-    "HYPERFRAMES_PREVIEW_TEMP", str(ROOT.parent / "temp_chrome_preview")))
+    "HYPERFRAMES_PREVIEW_TEMP", str(ROOT.parent.parent / "temp_chrome_preview")))
 
 
 def resolve_narration_scenes(cfg: dict, config_path, cover_duration=None):

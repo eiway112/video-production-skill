@@ -1153,7 +1153,9 @@ async def _qwen_tts(text, output_path):
             def _call_sync():
                 kwargs = {}
                 if TTS_INSTRUCTION:  # 仅 Instruct 音色有效（加载配置时已告警检查）
-                    kwargs['instruction'] = TTS_INSTRUCTION
+                    # HTTP 接口参数名是 instruct（不是 instruction，2026-08-07 实测：
+                    # instruction 会被引擎拒收 428）；官方限长 128 字符
+                    kwargs['instruct'] = TTS_INSTRUCTION
                 return HttpSpeechSynthesizer.call(
                     model=model,
                     text=text,

@@ -33,8 +33,8 @@ class BackupManager:
     def __init__(self, backup_root: Path = None):
         self.cm = ConfigManager()
         if backup_root is None:
-            # 默认备份到工作流根目录的上级 _备份文件/（避免硬编码盘符）
-            backup_root = WF_ROOT.parent / "_备份文件"
+            # 默认备份到工作区根目录的 _整理与清理/_备份/（避免硬编码盘符）
+            backup_root = WF_ROOT.parent / "_整理与清理" / "_备份"
         self.backup_root = backup_root
 
     def create_backup(self, label: str = None, mode: str = "selective") -> Path:
