@@ -10,5 +10,10 @@
   "fresh_guard": {
     "confirm_required_min_duration_seconds": 300,
     "description": "--fresh 受限门禁：config video_duration 达到该阈值（长视频，单次全量重渲染成本 30 分钟+）或 render_raw/成果文件已存在时，必须追加 --confirm-fresh 显式确认，否则打印破坏清单后拒绝执行。防止把'定点修复'误操作成'全量重置'（prefab 复盘根因2：15:28 --fresh 是灾难性恢复决策）。"
+  },
+  "audit": {
+    "prohibited_terms": ["final", "v01", "render", "raw", "tmp", "draft"],
+    "require_srt_same_stem": true,
+    "description": "交付审计（generate_completion_report.py --audit）权威参数，2026-08-19 新增。背景：SKILL.md 旧版自评量表由执行者自评（违反 agent-wiki 角色分离'模型不得给自己打分'），改为治具裁定。prohibited_terms 为交付文件名禁用技术词（config delivery.prohibited_terms 声明优先）；require_srt_same_stem 要求字幕与成片同基名。审计 5 维度：端到端真实性/门禁完整性/交付合规/分镜忠实度/收尾完成度，全部由真实数据推导，任一维度失败即 GATE_FAILURE。"
   }
 }

@@ -2563,6 +2563,278 @@ def test_preflight_blocks_missing_design_artifacts() -> RegressionTestCase:
 
     return tc
 
+
+def test_delivery_audit_fixture_verdict() -> RegressionTestCase:
+    """用例36：交付审计治具裁定（agent-wiki 角色分离落地，2026-08-19）
+
+    背景：SKILL.md 旧版自评量表由执行者自评，违反"模型不得给自己打分"。
+    交付审计 5 维度改为 generate_completion_report.run_delivery_audit 治具推导。
+    本用例锁定：禁用技术词/srt 异名/force 留痕/缺 verifications 各维度必须
+    裁定失败，合规输入必须全维通过；禁止任何人把审计改回软提示。
+    """
+    tc = RegressionTestCase(
+        "delivery_audit_fixture_verdict",
+        "验证交付审计5维度由真实数据裁定：违规必FAIL、合规必PASS"
+    )
+
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from generate_completion_report import run_delivery_audit
+
+        def _base_report():
+            """构造一份全绿的完工报告骨架（测量数据由调用方覆写）"""
+            return {
+                "status": "VALIDATED",
+                "issues": [],
+                "validation": {
+                    "step_preflight_passed": True, "step_tts_passed": True,
+                    "step_timeline_passed": True, "step_render_passed": True,
+                    "step_verify_passed": True, "step_postprocess_passed": True,
+                    "has_video_stream": True, "has_audio_stream": True,
+                    "verification_tts_product_passed": True,
+                    "verification_media_quality_passed": True,
+                    "product_state_consistent": True,
+                },
+                "data_sources": {"video_file": {"ffprobe_available": True}},
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            # 权威旁白源（维度4：指针可解析 + 指纹留档）
+            narration = tmpdir / "narration.json"
+            narration.write_text(json.dumps({"scenes": [
+                {"scene_id": 1, "start": 0, "end": 10, "narration": "测试旁白", "type": "gsap"}
+            ]}, ensure_ascii=False), encoding='utf-8')
+            cfg_path = tmpdir / "cfg.json"
+            cfg_path.write_text(json.dumps({
+                "cover_duration": 0,
+                "narration_source": "./narration.json",
+                "delivery": {"prohibited_terms": ["final", "v01", "render", "raw", "tmp", "draft"]},
+            }, ensure_ascii=False), encoding='utf-8')
+            state_path = tmpdir / "pipeline_state.json"
+            state_path.write_text(json.dumps({"steps": {}}), encoding='utf-8')
+
+            video_ok = tmpdir / "业务主题.mp4"
+            srt_ok = tmpdir / "业务主题.srt"
+            video_ok.write_bytes(b"")
+            srt_ok.write_bytes(b"")
+
+            # 1. 合规输入：5 维度全过
+            audit = run_delivery_audit(_base_report(), str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(audit["passed"], "compliant delivery passes all 5 dimensions")
+            tc.assert_true("sha256=" in audit["dimensions"]["storyboard_fidelity"]["evidence"],
+                           "narration fingerprint recorded for traceability")
+
+            # 2. 禁用技术词入名 → 交付合规 FAIL
+            video_bad = tmpdir / "业务主题_final.mp4"
+            video_bad.write_bytes(b"")
+            audit = run_delivery_audit(_base_report(), str(video_bad), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(not audit["dimensions"]["delivery_compliance"]["passed"],
+                            "prohibited term in filename fails delivery_compliance")
+            tc.assert_true(not audit["passed"], "prohibited term fails overall audit")
+
+            # 3. srt 与 mp4 异基名 → 交付合规 FAIL
+            srt_bad = tmpdir / "另一个名字.srt"
+            srt_bad.write_bytes(b"")
+            audit = run_delivery_audit(_base_report(), str(video_ok), str(srt_bad),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(not audit["dimensions"]["delivery_compliance"]["passed"],
+                            "srt/mp4 stem mismatch fails delivery_compliance")
+
+            # 4. --force 绕过留痕 → 门禁完整性 FAIL
+            state_path.write_text(json.dumps(
+                {"steps": {}, "forced_run": {"at": "2026-08-19T10:00:00"}}), encoding='utf-8')
+            audit = run_delivery_audit(_base_report(), str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(not audit["dimensions"]["gate_integrity"]["passed"],
+                            "forced_run marker fails gate_integrity")
+            state_path.write_text(json.dumps({"steps": {}}), encoding='utf-8')
+
+            # 5. verifications 缺失（旧 state）→ 门禁完整性 FAIL（禁止静默放行）
+            rpt = _base_report()
+            rpt["validation"] = {k: v for k, v in rpt["validation"].items()
+                                 if not k.startswith("verification_")}
+            audit = run_delivery_audit(rpt, str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(not audit["dimensions"]["gate_integrity"]["passed"],
+                            "missing verifications fails gate_integrity")
+
+            # 6. narration 指针失效 → 分镜忠实度 FAIL（P0-03 硬报错语义延续）
+            narration.unlink()
+            audit = run_delivery_audit(_base_report(), str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(not audit["dimensions"]["storyboard_fidelity"]["passed"],
+                            "broken narration_source fails storyboard_fidelity")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_render_budget_gate() -> RegressionTestCase:
+    """用例37：渲染成本预算门禁（P1 渲染成本治理，2026-08-19）
+
+    背景：prefab 批次复盘实证"3 次 40 分钟级重渲 + 9 小时失败收尾"——
+    全量重渲次数失控是成本失控的直接形态。本用例锁定：全量渲染尝试次数
+    达到 render_budget.max_full_renders 后，hard 直接 FAIL、soft 需
+    --accept-over-render 显式放行并留痕；未声明预算/预算内/--force 各自语义。
+    """
+    tc = RegressionTestCase(
+        "render_budget_gate",
+        "验证渲染预算门禁：hard阻断、soft需显式放行留痕、未声明零副作用"
+    )
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            def make_runner(render_rules, accept=False, force=False, idx=0):
+                state = PipelineState(tmpdir / f"state_{idx}.json")
+                # 真实时序：预算门禁在 render 步内执行，此时该步必然已 started
+                state.mark_started("render")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.render_rules = render_rules
+                runner.force = force
+                runner.accept_over_render = accept
+                return runner
+
+            budget_soft = {"render_budget": {"max_full_renders": 3,
+                                             "enforcement": "soft"}}
+            budget_hard = {"render_budget": {"max_full_renders": 3,
+                                             "enforcement": "hard"}}
+
+            # (a) 未声明 render_budget → 门禁不生效（零副作用）
+            r1 = make_runner({}, idx=1)
+            tc.assert_true(r1._render_budget_gate_ok(),
+                           "no budget declared → gate inactive")
+
+            # (b) 预算内（2/3 次尝试）→ 放行且无决策留痕
+            r2 = make_runner(budget_soft, idx=2)
+            r2._render_metrics()["full_render_attempts"] = 2
+            tc.assert_true(r2._render_budget_gate_ok(), "within budget → pass")
+            tc.assert_true("render_budget_decision" not in r2.state.data,
+                           "no decision record when within budget")
+
+            # (c) soft 超限（3/3）无放行标志 → 阻断，render 标记 failed
+            r3 = make_runner(budget_soft, idx=3)
+            r3._render_metrics()["full_render_attempts"] = 3
+            tc.assert_true(not r3._render_budget_gate_ok(),
+                           "soft blocks without --accept-over-render")
+            tc.assert_equal(r3.state.data["steps"]["render"]["status"], "failed",
+                            "render marked failed when soft-blocked")
+
+            # (d) soft 超限 + 放行标志 → 通过且决策留痕
+            r4 = make_runner(budget_soft, accept=True, idx=4)
+            r4._render_metrics()["full_render_attempts"] = 3
+            tc.assert_true(r4._render_budget_gate_ok(),
+                           "soft passes with --accept-over-render")
+            dec = r4.state.data.get("render_budget_decision", {})
+            tc.assert_true(dec.get("accepted") is True,
+                           "acceptance recorded in render_budget_decision")
+            tc.assert_equal(dec.get("attempts"), 3,
+                            "decision records attempt count at grant time")
+
+            # (e) hard 超限 → 直接 FAIL（放行标志亦无效）
+            r5 = make_runner(budget_hard, accept=True, idx=5)
+            r5._render_metrics()["full_render_attempts"] = 3
+            tc.assert_true(not r5._render_budget_gate_ok(),
+                           "hard enforcement FAILs regardless of flag")
+
+            # (f) --force 越过（语义同 HARD_GATES：留痕走 forced_run 通道）
+            r6 = make_runner(budget_soft, force=True, idx=6)
+            r6._render_metrics()["full_render_attempts"] = 5
+            tc.assert_true(r6._render_budget_gate_ok(),
+                           "--force bypasses render budget")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_pre_render_duration_consistency() -> RegressionTestCase:
+    """用例38：渲染前时长一致性预检（2026-08-23 agent-wiki-promo 复盘）
+
+    背景：run2 的 adjust_timeline 静默回退 HTML 至 150s 基线后判"零调整"，
+    HTML/config 分叉直达 45 分钟全量渲染，渲染后验证才发现。本预检 O(1)
+    拦截：分叉阻断留痕、一致放行、--force 绕过、无 data-duration 零副作用。
+    """
+    tc = RegressionTestCase(
+        "pre_render_duration_consistency",
+        "验证渲染前时长一致性预检：HTML/config 分叉阻断、一致放行、force绕过"
+    )
+    try:
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            src = tmpdir / "proj"
+            src.mkdir()
+            html = src / "index.html"
+
+            def make_runner(html_dur, cfg_dur, force=False, tag=""):
+                html.write_text(
+                    f'<div id="root" data-duration="{html_dur}"></div>',
+                    encoding="utf-8")
+                state = PipelineState(tmpdir / f"state_{tag}.json")
+                state.mark_started("render")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.force = force
+                runner.source_dir = src
+                runner.config = {"video_duration": cfg_dur}
+                return runner
+
+            # (a) HTML 150s vs config 160.6s → 阻断 + render 标记失败
+            r1 = make_runner(150, 160.6, tag="diverge")
+            tc.assert_true(not r1._pre_render_duration_consistent(),
+                           "duration divergence blocks before render")
+            tc.assert_equal(r1.state.data["steps"]["render"]["status"], "failed",
+                            "render marked failed on divergence")
+
+            # (b) 一致（容差内）→ 放行
+            r2 = make_runner(160.6, 160.6, tag="aligned")
+            tc.assert_true(r2._pre_render_duration_consistent(), "aligned duration passes")
+
+            # (c) --force 绕过（语义同 HARD_GATES）
+            r3 = make_runner(150, 160.6, force=True, tag="force")
+            tc.assert_true(r3._pre_render_duration_consistent(),
+                           "--force bypasses consistency check")
+
+            # (d) HTML 无 data-duration → 零副作用（preflight 职责不重叠）
+            html.write_text("<div></div>", encoding="utf-8")
+            state = PipelineState(tmpdir / "state_nodur.json")
+            state.mark_started("render")
+            r4 = PipelineRunner.__new__(PipelineRunner)
+            r4.state, r4.force, r4.source_dir = state, False, src
+            r4.config = {"video_duration": 100}
+            tc.assert_true(r4._pre_render_duration_consistent(),
+                           "missing data-duration has no side effect")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -2607,6 +2879,9 @@ class RegressionTestRunner:
             test_preview_safety_zone_precheck,
             test_render_watchdog_stall_kill,
             test_preflight_blocks_missing_design_artifacts,
+            test_delivery_audit_fixture_verdict,
+            test_render_budget_gate,
+            test_pre_render_duration_consistency,
         ]
         self.results = []
     

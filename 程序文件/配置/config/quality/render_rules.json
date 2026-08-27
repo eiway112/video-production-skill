@@ -6,5 +6,10 @@
     "grace_seconds": 360,
     "stall_seconds": 300,
     "description": "渲染卡死看门狗（prefab 复盘决策二，2026-08-07）：_RenderProgressWatcher 每 10s 采样一次进度（captured-frames 帧数 → render_raw 大小降级链），若进度连续 stall_seconds 零增长且渲染总时长已超过 grace_seconds，判定卡死并 taskkill 整个渲染进程树 fail-fast。教训：prefab-agent-launch 渲染 #1 卡 0%（0/5305 帧）12 分钟无任何诊断，只能人工盯守杀掉；正常 compile+probe 阶段 <1 分钟，grace 覆盖病态慢启动，绝不允许无进度空转超过 grace+stall。"
+  },
+  "render_budget": {
+    "max_full_renders": 3,
+    "enforcement": "soft",
+    "description": "渲染成本预算门禁（2026-08-19，P1 渲染成本治理）：单项目生命周期内全量渲染次数（含失败/中断，按尝试计）达到该值后拦截。soft（默认）：阻断并要求 --accept-over-render 显式放行，决策留痕 state.render_budget_decision；hard：直接 FAIL。阈值来源非拍脑袋：prefab 批次复盘实证'裸渲染覆盖、3 次 40 分钟级重渲、9 小时失败收尾'——第 3 次全量重渲之后问题已不是渲染能解决的，必须停下来诊断。计数器在 pipeline_state.render_metrics.full_render_attempts，--fresh 重置（真实重跑语义）。scene-patch/quick-fix 不计入。真实基线数据由 render_metrics 度量积累后再校准本阈值。"
   }
 }

@@ -42,6 +42,7 @@ import threading
 import time
 import io
 from datetime import datetime
+from typing import Any, Dict
 from pathlib import Path
 from _gsap_time_utils import parse_scene_map
 from pipeline_state_fingerprint import compute_inputs_fingerprint
@@ -484,6 +485,7 @@ def _load_render_rules():
     rules_path = CONFIG_DIR / "quality" / "render_rules.json"
     defaults = {
         "watchdog": {"enabled": True, "grace_seconds": 360, "stall_seconds": 300},
+        "render_budget": {"max_full_renders": 3, "enforcement": "soft"},
     }
     if not rules_path.exists():
         return defaults
@@ -499,7 +501,7 @@ def _load_render_rules():
 
 
 class PipelineRunner:
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False, accept_over_budget=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -546,6 +548,8 @@ class PipelineRunner:
         self.force = force
         # 时长预算 soft 超限的显式放行开关（wp 批次复盘 P0，见 _budget_gate_ok）
         self.accept_over_budget = accept_over_budget
+        # 渲染成本预算 soft 超限的显式放行开关（2026-08-19，见 _render_budget_gate_ok）
+        self.accept_over_render = accept_over_render
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
         self._current_step = None      # run() 循环每步前设置，日志命名用
@@ -558,6 +562,15 @@ class PipelineRunner:
             self.state.reset(reason=f"--fresh (previous last_run: {prev})")
             print(f"  [FRESH] Pipeline state reset (previous last_run: {prev or 'none'}) — all steps will truly re-run")
         self.gate_mode = gate_mode  # "render" or "audit"
+        # --force 绕过留痕（交付审计维度2数据基础，2026-08-19）：门禁被 --force
+        # 绕过属于可审计事实，写入 state 供 generate_completion_report --audit
+        # 的 gate_integrity 维度裁定；非 force 运行全链成功完成时清除（见 run() 收尾）。
+        if self.force:
+            self.state.data["forced_run"] = {
+                "at": datetime.now().isoformat(),
+                "note": "--force bypassed gate cache/HARD_GATES for this run",
+            }
+            self.state.save()
         # --scene-patch（opt-in）：render 步骤先尝试场景级增量渲染，白名单外
         # 或任一自校验失败自动降级全量。verify/visual_check/postprocess 门禁照常。
         self.scene_patch = scene_patch
@@ -1207,6 +1220,113 @@ class PipelineRunner:
         self.state.mark_failed("timeline", msg, error_code=VERIFY_FAILED)
         return False
 
+    def _render_metrics(self) -> Dict[str, Any]:
+        """渲染成本度量节（render_metrics）的读写入口，度量先行（2026-08-19）。
+
+        字段：full_render_attempts（全量渲染尝试次数，含失败/中断）、
+        full_render_total_seconds（累计成功+失败的全量渲染墙钟耗时）、
+        scene_patch_attempts / scene_patch_hits、watchdog_kills。
+        数据同时服务预算门禁判定与完工报告成本透出；真实基线校准阈值靠它积累。
+        """
+        metrics = self.state.data.get("render_metrics")
+        if not isinstance(metrics, dict):
+            metrics = {
+                "full_render_attempts": 0,
+                "full_render_total_seconds": 0.0,
+                "scene_patch_attempts": 0,
+                "scene_patch_hits": 0,
+                "watchdog_kills": 0,
+            }
+            self.state.data["render_metrics"] = metrics
+        return metrics
+
+    def _pre_render_duration_consistent(self) -> bool:
+        """渲染前时长一致性预检（2026-08-23，agent-wiki-promo 复盘 🟢）。
+
+        教训：run2 的 adjust_timeline 把 HTML 静默回退基线（160.6→150s）后判定
+        "零调整"，HTML 与 config 永久分叉，渲染后时长验证才发现，浪费 45 分钟
+        全量渲染。渲染预算门禁是最后防线而非预防线——本预检 O(1) 完成，在昂贵
+        渲染启动前拦截分叉。检查项：HTML data-duration == config video_duration
+        （容差 0.1s）；--force 绕过（语义同 HARD_GATES）。
+        """
+        if self.force:
+            return True
+        try:
+            html_text = (self.source_dir / "index.html").read_text(encoding="utf-8")
+        except OSError:
+            return True  # HTML 缺失由 preflight 覆盖，此处不重复裁定
+        m = re.search(r'data-duration="([\d.]+)"', html_text)
+        if not m:
+            return True
+        try:
+            html_dur = float(m.group(1))
+            cfg_dur = float(self.config.get("video_duration") or 0)
+        except (TypeError, ValueError):
+            return True
+        if cfg_dur > 0 and abs(html_dur - cfg_dur) >= 0.1:
+            msg = (f"Pre-render duration divergence: HTML data-duration={html_dur}s vs "
+                   f"config video_duration={cfg_dur}s — blocked before expensive render")
+            self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
+            print(f"  BLOCKED: HTML 总时长 ({html_dur}s) ≠ config video_duration ({cfg_dur}s)")
+            print("  渲染是终点验证手段不是调试工具——分叉的时间轴不值得一次全量渲染。")
+            print("  恢复：--resume 重跑 timeline 步；若仍报零调整，删除项目目录的")
+            print(f"  index.html.bak 与 index.html.hash 后重跑。")
+            return False
+        return True
+
+    def _render_budget_gate_ok(self) -> bool:
+        """渲染成本预算门禁（2026-08-19，P1 渲染成本治理）。
+
+        检查点设在全量渲染启动前——单项目生命周期内全量渲染尝试次数达到
+        render_rules.render_budget.max_full_renders 后拦截。阈值实证来源：
+        prefab 批次复盘"3 次 40 分钟级重渲 + 9 小时失败收尾"——第 3 次之后
+        问题已不是渲染能解决的，必须停下来定点诊断。
+        soft（默认）：阻断，需 --accept-over-render 显式放行并留痕
+        state.render_budget_decision；hard：直接 FAIL。
+        参数语义权威源：render_rules.render_budget。scene-patch/quick-fix 不计入。
+        """
+        budget = self.render_rules.get("render_budget")
+        if not isinstance(budget, dict):
+            return True
+        max_renders = budget.get("max_full_renders")
+        if not isinstance(max_renders, int) or max_renders < 1:
+            return True
+        attempts = int(self._render_metrics().get("full_render_attempts", 0))
+        if attempts < max_renders:
+            return True
+
+        enforcement = str(budget.get("enforcement", "soft")).strip().lower()
+        msg = (f"Render budget exhausted: {attempts}/{max_renders} full-render attempts "
+               f"({self._render_metrics().get('full_render_total_seconds', 0) / 60:.0f} min accumulated)")
+        if self.force:
+            print(f"  WARNING: {msg} — bypassed via --force (留痕 forced_run)")
+            return True
+        if enforcement == "hard":
+            self.state.mark_failed("render", f"{msg} [enforcement=hard]",
+                                   error_code=VERIFY_FAILED)
+            return False
+        decision = self.state.data.get("render_budget_decision")
+        if self.accept_over_render and isinstance(decision, dict) \
+                and decision.get("accepted") and decision.get("attempts") == attempts:
+            return True
+        if self.accept_over_render:
+            self.state.data["render_budget_decision"] = {
+                "accepted": True,
+                "attempts": attempts,
+                "reason": "explicit --accept-over-render",
+                "at": datetime.now().isoformat(),
+            }
+            self.state.save()
+            print(f"  [BUDGET] {msg} — --accept-over-render 显式放行，决策已记录")
+            return True
+        print(f"  BLOCKED: {msg} [enforcement=soft]")
+        print("  渲染次数超限通常意味着问题不在渲染本身——先定点诊断再决定：")
+        print("    1. 诊断既往失败（日志见 过程产物/日志/，state 含 log_path）")
+        print("    2. 确需继续 → 追加 --accept-over-render 重跑（决策留痕）")
+        print("    3. 局部修订 → 优先 --scene-patch / --quick-fix（不计入预算）")
+        self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
+        return False
+
     def _warn_previous_interrupted_runs(self):
         """启动扫描：历史日志缺尾行（疑似外部中断）时显式告警。
 
@@ -1311,11 +1431,20 @@ class PipelineRunner:
 
         self.state.mark_started("render")
 
+        # ── 渲染前时长一致性预检（2026-08-23 agent-wiki-promo 复盘 🟢）：
+        #    O(1) 拦截 HTML/config 时长分叉，防 timeline 静默回退直达全量渲染
+        #    （见 _pre_render_duration_consistent，45 分钟渲染浪费事故）──
+        if not self._pre_render_duration_consistent():
+            return False
+
         # ── Scene-patch (opt-in): 分类器判 PATCH 则段渲染+拼接产出 render_raw，
         #    任何白名单外变更/自校验失败 → exit 3 → 自动降级 FULL 全量渲染 ──
         patched = False
         if self.scene_patch:
             print("  [SCENE-PATCH] Trying scene-level incremental render...")
+            _metrics = self._render_metrics()
+            _metrics["scene_patch_attempts"] = int(_metrics.get("scene_patch_attempts", 0)) + 1
+            self.state.save()
             rc = self._run(
                 [str(VENV_PYTHON), "scene_patch_render.py",
                  "--config", str(self.config_path), "--mode", "patch"],
@@ -1323,11 +1452,18 @@ class PipelineRunner:
             )
             if rc == 0:
                 patched = True
+                _metrics = self._render_metrics()
+                _metrics["scene_patch_hits"] = int(_metrics.get("scene_patch_hits", 0)) + 1
+                self.state.save()
                 print("  [SCENE-PATCH] Patch applied — full render skipped")
             else:
                 print(f"  [SCENE-PATCH] Falling back to FULL render (rc={rc})")
 
         if not patched:
+            # ── 渲染成本预算门禁（P1，2026-08-19）：全量渲染启动前拦截，
+            #    超预算需 --accept-over-render 显式放行（见 _render_budget_gate_ok）──
+            if not self._render_budget_gate_ok():
+                return False
             # ── 渲染中断恢复（P1 整改，prefab 复盘根因5）：全量重渲前备份上一版
             #    render_raw——prefab 两次渲染中止于 87%/53% 后毫无恢复路径，只能
             #    从零再来。备份在手：新渲染失败/中断时可回退基线走 --quick-fix。
@@ -1348,6 +1484,11 @@ class PipelineRunner:
             watcher = _RenderProgressWatcher(
                 [self.temp_dir, self.source_dir], self.render_raw, _total_frames,
                 watchdog=self.render_rules.get("watchdog", {}))
+            # 成本度量：尝试次数在启动前计入（含失败/中断），耗时含 compile+probe
+            _metrics = self._render_metrics()
+            _metrics["full_render_attempts"] = int(_metrics.get("full_render_attempts", 0)) + 1
+            self.state.save()
+            _render_t0 = time.monotonic()
             watcher.start()
             try:
                 render_cmd = ["npx.cmd", "hyperframes", "render", "-o", str(self.render_raw), "--workers", "1", "--fps", "25", "--low-memory-mode", "--protocol-timeout", "600000"]
@@ -1363,6 +1504,13 @@ class PipelineRunner:
                 )
             finally:
                 watcher.stop()
+            _metrics = self._render_metrics()
+            _metrics["full_render_total_seconds"] = round(
+                float(_metrics.get("full_render_total_seconds", 0.0))
+                + (time.monotonic() - _render_t0), 1)
+            if watcher.stalled:
+                _metrics["watchdog_kills"] = int(_metrics.get("watchdog_kills", 0)) + 1
+            self.state.save()
             if rc != 0:
                 # P1 整改（prefab 复盘）：渲染中断/失败不再等于归零——
                 # render_raw.prev.mp4（若有）保留了上一版可用渲染，给出定点恢复路径
@@ -1795,6 +1943,13 @@ class PipelineRunner:
         print("=" * 60)
         print(f"  Video:    {self.output_file}")
 
+        # 非 force 运行全链成功 → 历史 --force 留痕已过时（当前状态由合规运行
+        # 重新建立），清除以免交付审计 gate_integrity 误判。force 运行自身保留。
+        if not self.force and "forced_run" in self.state.data:
+            del self.state.data["forced_run"]
+            self.state.save()
+            print("  [AUDIT] stale forced_run marker cleared (clean full run completed)")
+
         # Move .noaudio backup out of output dir
         backup_name = self.output_file.stem + ".noaudio.mp4"
         backup_path = self.output_file.parent / backup_name
@@ -1885,6 +2040,12 @@ Examples:
                              "(soft enforcement). The decision is recorded in "
                              "pipeline_state.budget_decision for audit. Without this flag an "
                              "over-budget timeline is blocked before the expensive render step.")
+    parser.add_argument("--accept-over-render", action="store_true",
+                        help="Explicitly accept exceeding the render_budget (render_rules.json, "
+                             "soft enforcement). The decision is recorded in "
+                             "pipeline_state.render_budget_decision for audit. Without this flag "
+                             "a full render is blocked once full-render attempts reach the limit — "
+                             "diagnose first; scene-patch/quick-fix are never budgeted.")
 
     args = parser.parse_args()
 
@@ -1947,6 +2108,7 @@ Examples:
         scene_patch=args.scene_patch,
         confirm_fresh=args.confirm_fresh,
         accept_over_budget=args.accept_over_budget,
+        accept_over_render=args.accept_over_render,
     )
 
     if args.status:

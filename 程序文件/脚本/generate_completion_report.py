@@ -48,6 +48,10 @@ _DELIVERY_RULE_DEFAULTS = {
         "mtime_tolerance_base_seconds": 10.0,
         "mtime_tolerance_ratio_of_duration": 0.05,
         "mtime_tolerance_max_seconds": 120.0,
+    },
+    "audit": {
+        "prohibited_terms": ["final", "v01", "render", "raw", "tmp", "draft"],
+        "require_srt_same_stem": True,
     }
 }
 
@@ -82,6 +86,140 @@ def _adaptive_mtime_tolerance(video_duration_s: float) -> float:
     cap = float(pc.get("mtime_tolerance_max_seconds", 120.0))
     dur = max(0.0, float(video_duration_s or 0.0))
     return min(cap, base + ratio * dur)
+
+
+def run_delivery_audit(report: Dict[str, Any],
+                       video_file: str,
+                       subtitle_file: Optional[str],
+                       state_file: Optional[str],
+                       config_file: str) -> Dict[str, Any]:
+    """交付审计（agent-wiki 角色分离落地：模型不得给自己打分）。
+
+    背景：SKILL.md 旧版"自评量表"由执行者自评 5 维度，属 Generator 自证。
+    本函数把 5 维度全部改为从真实数据推导，治具裁定，退出码说话：
+      1. end_to_end_authenticity  ← 全步 passed + 音视频流真实存在
+      2. gate_integrity           ← verifications 全过 + 无 --force 绕过留痕
+      3. delivery_compliance      ← 交付文件名无技术词 + srt 与 mp4 同基名
+      4. storyboard_fidelity      ← narration_source 指针可解析、场景指纹可追溯
+      5. completion_integrity     ← 报告状态 VALIDATED + ffprobe 实测 + 产物一致性已执行
+
+    参数 config_file 为项目流水线配置（审计模式下必填，供 prohibited_terms 与
+    narration_source 解析）。返回 {"dimensions": {...}, "passed": bool}。
+    """
+    import hashlib
+
+    validation = report.get("validation", {})
+    audit_rules = _load_delivery_rules().get("audit", {})
+    dims: Dict[str, Dict[str, Any]] = {}
+
+    # ── 维度1：端到端真实性 ──
+    step_checks = {k: v for k, v in validation.items()
+                   if k.startswith("step_") and k.endswith("_passed")}
+    d1 = (bool(step_checks) and all(step_checks.values())
+          and validation.get("has_video_stream", False)
+          and validation.get("has_audio_stream", False))
+    dims["end_to_end_authenticity"] = {
+        "passed": d1,
+        "evidence": f"{sum(step_checks.values())}/{len(step_checks)} steps passed, "
+                    f"video_stream={validation.get('has_video_stream')}, "
+                    f"audio_stream={validation.get('has_audio_stream')}",
+    }
+
+    # ── 维度2：门禁完整性 ──
+    d2_reasons = []
+    verif_checks = {k: v for k, v in validation.items()
+                    if k.startswith("verification_") and k.endswith("_passed")}
+    if not verif_checks:
+        d2_reasons.append("verifications not recorded in state (gate evidence missing)")
+    elif not all(verif_checks.values()):
+        d2_reasons.append(f"{sum(1 for v in verif_checks.values() if not v)} verification(s) failed")
+    forced_run = None
+    if state_file and Path(state_file).exists():
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                forced_run = json.load(f).get("forced_run")
+        except (OSError, json.JSONDecodeError):
+            forced_run = None
+    if forced_run:
+        d2_reasons.append(f"--force bypass recorded at {forced_run.get('at', '?')}")
+    dims["gate_integrity"] = {
+        "passed": not d2_reasons,
+        "evidence": "; ".join(d2_reasons) if d2_reasons
+                    else f"{len(verif_checks)} verifications passed, no --force trace",
+    }
+
+    # ── 维度3：交付合规 ──
+    d3_reasons = []
+    cfg: Dict[str, Any] = {}
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        d3_reasons.append(f"config unreadable: {e}")
+    prohibited = (cfg.get("delivery") or {}).get(
+        "prohibited_terms", audit_rules.get("prohibited_terms", []))
+    delivered = [Path(video_file).stem]
+    if subtitle_file:
+        delivered.append(Path(subtitle_file).stem)
+    for stem in delivered:
+        low = stem.lower()
+        hits = [t for t in prohibited if str(t).lower() in low]
+        if hits:
+            d3_reasons.append(f"prohibited term(s) {hits} in '{stem}'")
+    if audit_rules.get("require_srt_same_stem", True):
+        if not subtitle_file:
+            d3_reasons.append("subtitle file not provided — cannot confirm same-stem delivery")
+        elif Path(subtitle_file).stem != Path(video_file).stem:
+            d3_reasons.append(
+                f"srt stem '{Path(subtitle_file).stem}' != mp4 stem '{Path(video_file).stem}'")
+    dims["delivery_compliance"] = {
+        "passed": not d3_reasons,
+        "evidence": "; ".join(d3_reasons) if d3_reasons
+                    else f"no prohibited terms, srt/mp4 same stem",
+    }
+
+    # ── 维度4：分镜忠实度（narration 指针闭环可追溯）──
+    d4_reasons = []
+    narration_evidence = "narration_source not declared (inline scenes in config)"
+    if 'narration_source' in cfg:
+        try:
+            # 复用 _script_env 的权威解析（P0-03 指针闭环：失效指针硬报错）
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from _script_env import resolve_narration_scenes
+            scenes, source_path = resolve_narration_scenes(
+                cfg, config_file, float(cfg.get("cover_duration", 0) or 0))
+            digest = hashlib.sha256(
+                Path(source_path).read_bytes()).hexdigest()[:16]
+            narration_evidence = (f"{Path(source_path).name}: "
+                                  f"{len(scenes)} content scenes, sha256={digest}")
+        except Exception as e:
+            d4_reasons.append(f"narration_source broken at audit time: {e}")
+    dims["storyboard_fidelity"] = {
+        "passed": not d4_reasons,
+        "evidence": "; ".join(d4_reasons) if d4_reasons else narration_evidence,
+    }
+    report["data_sources"]["narration_authority"] = narration_evidence
+
+    # ── 维度5：收尾完成度 ──
+    d5_reasons = []
+    if report.get("status") != "VALIDATED":
+        d5_reasons.append(f"report status is {report.get('status')}, not VALIDATED")
+    video_src = report.get("data_sources", {}).get("video_file", {})
+    if not video_src.get("ffprobe_available"):
+        d5_reasons.append("ffprobe metadata unavailable — duration not measured")
+    if "product_state_consistent" not in validation:
+        d5_reasons.append("product-state consistency check not executed")
+    elif not validation["product_state_consistent"]:
+        d5_reasons.append("product-state consistency check failed")
+    dims["completion_integrity"] = {
+        "passed": not d5_reasons,
+        "evidence": "; ".join(d5_reasons) if d5_reasons
+                    else "status VALIDATED, ffprobe measured, mtime consistency passed",
+    }
+
+    passed = all(d["passed"] for d in dims.values())
+    return {"dimensions": dims, "passed": passed,
+            "basis": "agent-wiki 角色分离：5 维度全部由真实数据推导，治具裁定，禁止自证"}
 
 
 def ffprobe_get_metadata(video_path: str) -> Dict[str, Any]:
@@ -144,7 +282,9 @@ def generate_report(
     project_name: str,
     video_file: str,
     subtitle_file: Optional[str] = None,
-    state_file: Optional[str] = None
+    state_file: Optional[str] = None,
+    audit: bool = False,
+    config_file: Optional[str] = None
 ) -> Dict[str, Any]:
     """生成数据驱动的完工报告
     
@@ -153,6 +293,8 @@ def generate_report(
       video_file: 视频文件路径
       subtitle_file: 字幕文件路径
       state_file: pipeline_state.json 路径
+      audit: True 时追加交付审计（5 维度治具裁定，见 run_delivery_audit）
+      config_file: 项目流水线配置路径（audit=True 时必填）
     
     返回：
       完工报告字典
@@ -376,6 +518,24 @@ def generate_report(
                             all_valid = False
                 else:
                     report["data_sources"]["verifications"] = "not_recorded (legacy state, not traceable)"
+
+                # 数据源c：渲染成本度量（render_metrics 节，pipeline_runner 写入，2026-08-19）
+                # 只透传不裁定——成本不作质量门禁（预算门禁在渲染时点判定并留痕）；
+                # 旧 state 无此节 → 不输出（向后兼容）。
+                render_metrics = pipeline_state.get("render_metrics")
+                if isinstance(render_metrics, dict):
+                    cost = {
+                        "full_render_attempts": render_metrics.get("full_render_attempts", 0),
+                        "full_render_total_minutes": round(
+                            float(render_metrics.get("full_render_total_seconds", 0)) / 60.0, 1),
+                        "scene_patch_attempts": render_metrics.get("scene_patch_attempts", 0),
+                        "scene_patch_hits": render_metrics.get("scene_patch_hits", 0),
+                        "watchdog_kills": render_metrics.get("watchdog_kills", 0),
+                    }
+                    decision = pipeline_state.get("render_budget_decision")
+                    if isinstance(decision, dict):
+                        cost["budget_decision"] = decision
+                    report["data_sources"]["render_cost"] = cost
             except Exception as e:
                 report["issues"].append(f"Failed to read pipeline state: {e}")
                 all_valid = False
@@ -411,7 +571,15 @@ def generate_report(
         "failed_checks": sum(1 for v in bool_checks.values() if v is False),
         "issues_count": len(report["issues"])
     }
-    
+
+    # 交付审计（--audit）：5 维度治具裁定，替代 SKILL.md 旧版自评量表。
+    # 必须在 status/validation_summary 定型之后执行（维度5 消费它们）。
+    if audit:
+        if not config_file:
+            raise ValueError("audit=True requires config_file (delivery audit needs pipeline config)")
+        report["audit"] = run_delivery_audit(
+            report, video_file, subtitle_file, state_file, config_file)
+
     return report
 
 def main():
@@ -422,15 +590,24 @@ def main():
     parser.add_argument('--video-file', required=True, help='Path to output video file')
     parser.add_argument('--subtitle-file', help='Path to output subtitle file')
     parser.add_argument('--state-file', help='Path to pipeline_state.json')
+    parser.add_argument('--config-file', help='Pipeline config JSON path (required with --audit)')
+    parser.add_argument('--audit', action='store_true',
+                        help='Run delivery audit (5 dimensions, fixture-verdict; replaces self-scoring)')
     parser.add_argument('--output-file', help='Output report file path')
     
     args = parser.parse_args()
-    
+
+    if args.audit and not args.config_file:
+        print("ERROR: --audit requires --config-file", file=sys.stderr)
+        sys.exit(EXIT_CODE.CONFIG_ERROR)
+
     report = generate_report(
         project_name=args.project_name,
         video_file=args.video_file,
         subtitle_file=args.subtitle_file,
-        state_file=args.state_file
+        state_file=args.state_file,
+        audit=args.audit,
+        config_file=args.config_file
     )
     
     # 输出报告
@@ -446,6 +623,14 @@ def main():
             print(f"  - {issue}")
     else:
         print(f"\n[OK] No issues found")
+
+    # 审计段输出与裁定（治具裁定优先于报告状态：审计不过即交付拒收）
+    audit = report.get("audit")
+    if audit:
+        print(f"\n[DELIVERY AUDIT] {'PASSED' if audit['passed'] else 'FAILED'}")
+        for dim, res in audit["dimensions"].items():
+            mark = "PASS" if res["passed"] else "FAIL"
+            print(f"  [{mark}] {dim}: {res['evidence']}")
     
     # 保存报告文件
     if args.output_file:
@@ -454,6 +639,17 @@ def main():
         print(f"\n[OK] Report saved: {args.output_file}")
     
     # 以状态码退出（更新为 Result Object）
+    # 审计具有最终裁定权：即使报告 VALIDATED，审计任一维度失败即交付拒收。
+    audit_failed = bool(report.get("audit")) and not report["audit"]["passed"]
+    if audit_failed:
+        failed_dims = [d for d, r in report["audit"]["dimensions"].items() if not r["passed"]]
+        result = Result.failure(
+            code=EXIT_CODE.GATE_FAILURE,
+            message=f"Delivery audit FAILED on dimension(s): {', '.join(failed_dims)}",
+            data={"audit": report["audit"], "issues": report['issues']}
+        )
+        result.print_to_stdout()
+        sys.exit(result.code)
     if report['status'] in ('VALIDATED', 'VALIDATED_WITH_ISSUES'):
         result = Result.success(
             data={

@@ -478,6 +478,7 @@ def main():
     html_hash_path = html_path.parent / (html_path.name + '.hash')
     config_hash_path = config_path.with_suffix('.hash')
 
+    html_restore_pending = False
     if not html_bak.exists():
         # First run: backup original, record hash
         shutil.copy2(html_path, html_bak)
@@ -496,10 +497,15 @@ def main():
             html_content = html_path.read_text(encoding='utf-8')
             print(f"  Manual edit detected, fresh baseline")
         else:
-            # No manual edit: restore backup to prevent double-application
-            shutil.copy2(html_bak, html_path)
-            html_content = html_path.read_text(encoding='utf-8')
-            print(f"  Restored HTML from backup")
+            # No manual edit: restoring the backup prevents double-application,
+            # but ONLY when boundaries are parsed from the HTML itself
+            # (S-block/config legacy). In narration_source pointer mode the
+            # boundaries already carry the adjusted values, so restoring the
+            # baseline HTML would roll back GSAP times/data-duration while
+            # narration keeps adjusted values -> permanent divergence
+            # (2026-08-22 agent-wiki-promo incident: rendered 150s vs 160.6s).
+            # Defer the decision until the scene source is known.
+            html_restore_pending = True
 
     if not config_bak.exists():
         # First run: backup original, record hash
@@ -533,6 +539,17 @@ def main():
     if narration_path is not None:
         cfg['scenes'] = ptr_scenes
         print(f"  Scene source: narration_source ({narration_path.name}, {len(ptr_scenes)} scenes)")
+
+    # Deferred baseline restore (see backup section). In pointer mode the
+    # hash-verified HTML is already consistent with narration boundaries;
+    # restoring the pre-adjustment backup would desynchronize them.
+    if html_restore_pending:
+        if narration_path is not None:
+            print("  Pointer mode: HTML hash-verified, keeping current (no baseline restore)")
+        else:
+            shutil.copy2(html_bak, html_path)
+            html_content = html_path.read_text(encoding='utf-8')
+            print(f"  Restored HTML from backup")
 
     # Parse scene boundaries — prefer S-block (authoritative), fall back to config JSON
     boundaries, s_map = parse_boundaries_from_sblock(html_content)
@@ -587,6 +604,20 @@ def main():
 
     if abs(total_ext) < 0.1 and all(abs(e) < 0.1 for e in extensions):
         print("\n  No adjustment needed (all scenes within tolerance).")
+        # Pointer mode drift guard: hash-verified HTML should already match
+        # narration boundaries. If data-duration diverges, the HTML was
+        # externally clobbered (e.g. restored from a stale baseline backup);
+        # GSAP times cannot be resynced from here -> fail loud, recover by
+        # deleting index.html.bak/.hash and re-running.
+        if narration_path is not None:
+            dur_m = re.search(r'data-duration="([\d.]+)"', html_content)
+            html_dur = float(dur_m.group(1)) if dur_m else None
+            if html_dur is None or abs(html_dur - boundaries[-1][1]) >= 0.05:
+                print(f"\n  ERROR: HTML data-duration ({html_dur}s) diverges from "
+                      f"narration_source end ({boundaries[-1][1]:.1f}s).\n"
+                      f"  Recover: delete {html_bak.name} + {html_hash_path.name} "
+                      f"in the project dir, then re-run this step.")
+                return EXIT_CODE.GATE_FAILURE
         _write_hash(html_hash_path, html_content)
         # Zero adjustment does NOT imply config is in sync: when the HTML was
         # manually edited (fresh baseline, already-converged S-block) while the

@@ -75,23 +75,27 @@ python config_manager.py
    门禁自动继承：preflight → tts → timeline → preview（硬阻断）→ render → verify → visual_check → postprocess。**禁止用 --force 绕过门禁**。
    - TTS 生成并发数由 `程序文件/配置/config/system/hyperframes_config.json` 的 `tts_concurrency` 控制（默认 3，硬上限 5，设 1 为串行；读取失败回退 3 并告警）；并发仅作用于 TTS 网络生成阶段，失败场景自动串行兜底重试一次。
    - 渲染期间的 `[RENDER]` 前缀进度/心跳日志来自旁路观察者线程，纯观测输出，不改变渲染控制流与退出码。
-2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。
+2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。渲染成本受预算门禁治理：全量渲染尝试次数达到 `render_rules.json render_budget.max_full_renders`（默认 3）后自动阻断——超限通常意味着问题不在渲染本身，先定点诊断；确需继续用 `--accept-over-render` 显式放行留痕；局部修订优先 `--scene-patch`/`--quick-fix`（不计入预算）。
 3. 交付验收：
    ```
-   python generate_completion_report.py（按脚本 --help 传参）
+   python generate_completion_report.py（按脚本 --help 传参，交付验收必须追加 --audit --config-file <项目配置>）
    ```
-   报告数据必须源自 ffprobe/pipeline_state/SRT 真实测量。
+   报告数据必须源自 ffprobe/pipeline_state/SRT 真实测量。`--audit` 执行交付审计：5 维度全部由真实数据推导、治具裁定，任一维度失败退出码 4，禁止声明交付。
 4. 收尾：确认 `成果文件/视频/`、`成果文件/字幕/` 产物就位（路径前置展示给用户）→ `project_cleanup.py --execute` 清理中间产物。已交付文件永不覆盖，修订加 `_修订NN` 后缀。
 
-## 自评量表（阶段D完成后逐项打分，任一项 <3 不得声明完成）
+## 交付审计（阶段D强制，退出码 0 才可声明完成）
 
-| 维度 | 5分标准 |
-|------|--------|
-| 端到端真实性 | mp4 由本次流水线真实产出，pipeline_state.json 全步 passed 且带指纹 |
-| 门禁完整性 | 无 --force，preview/verify/visual_check/postprocess 全部真实通过 |
-| 交付合规 | 中文业务命名、srt 同名、无覆盖已交付文件 |
-| 分镜忠实度 | 成片与用户确认的分镜表一致，无擅自增删场景 |
-| 收尾完成度 | 完工报告基于真实测量 + 中间产物已清理 |
+**原则：模型不得给自己打分**（agent-wiki 角色分离）。旧版“自评量表”已废除——执行者不自评，由 `generate_completion_report.py --audit` 治具裁定：
+
+| 维度 | 数据来源 |
+|------|---------|
+| 端到端真实性 | pipeline_state 全步 passed + 音视频流实测 |
+| 门禁完整性 | verifications 节全过 + 无 `--force` 绕过留痕（state `forced_run`） |
+| 交付合规 | 文件名无禁用技术词（config `prohibited_terms`）+ srt/mp4 同基名 |
+| 分镜忠实度 | `narration_source` 指针可解析 + 场景指纹（sha256）留档 |
+| 收尾完成度 | 报告状态 VALIDATED + ffprobe 实测 + 产物 mtime 一致性已执行 |
+
+审计失败 → 修复对应维度后重跑，禁止手工改 state 或报告绕过。
 
 ## 常见陷阱
 

@@ -41,7 +41,15 @@ async function main() {
     fs.mkdirSync(outputDir, { recursive: true });
 
     const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    const scenes = config.scenes || [];
+    // 兼容两种配置格式：顶层 scenes 或 timeline.scene_metadata（scene → scene_id 映射）
+    let scenes = config.scenes || [];
+    if (scenes.length === 0 && config.timeline && Array.isArray(config.timeline.scene_metadata)) {
+        const cov = config.cover_duration || 0;
+        // scene_metadata 的 start/end 已包含封面偏移，扣除后与 config.scenes 语义对齐
+        scenes = config.timeline.scene_metadata
+            .filter(s => s.type !== 'cover')
+            .map(s => ({ scene_id: s.scene, start: s.start - cov, end: s.end - cov }));
+    }
     const coverDuration = config.cover_duration || 0;
 
     console.log(`Preview Capture: ${scenes.length} scenes, cover=${coverDuration}s`);
@@ -69,8 +77,27 @@ async function main() {
         }
     });
 
-    const port = 8767;
-    await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+    let port = 8767;
+    // 端口占用回退：上次运行残留的僵尸进程可能占着默认端口，递增重试而非直接崩溃
+    await new Promise((resolve, reject) => {
+        const tryListen = (p) => {
+            const onError = (err) => {
+                if (err.code === 'EADDRINUSE' && p < 8780) {
+                    server.removeListener('error', onError);
+                    tryListen(p + 1);
+                } else {
+                    reject(err);
+                }
+            };
+            server.once('error', onError);
+            server.listen(p, '127.0.0.1', () => {
+                server.removeListener('error', onError);
+                port = p;
+                resolve();
+            });
+        };
+        tryListen(port);
+    });
     console.log(`HTTP server: http://127.0.0.1:${port}`);
 
     let browser;
@@ -165,6 +192,10 @@ async function main() {
         fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
         console.log(`\nManifest: ${manifestPath}`);
         console.log(`Captured: ${manifest.scenes.length} screenshots`);
+
+        // 产物已落盘，直接强制退出——browser.close() 实测会永久挂起，不得 await
+        // （历史症状：manifest 写完后进程挂死，上游 120s 超时把完整输出一并丢弃）
+        process.exit(0);
 
     } catch (err) {
         console.error(`Fatal error: ${err.message}`);
