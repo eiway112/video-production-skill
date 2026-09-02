@@ -56,6 +56,10 @@ SCRIPTS = ROOT / "程序文件" / "脚本"
 CONFIG_DIR = ROOT / "程序文件" / "配置" / "config"
 HTML_BASE = ROOT / "程序文件" / "源码" / "hyperframes"
 OUTPUT_DIR = ROOT / "成果文件" / "视频"
+# 交付登记表（git 追踪）：mp4 成片按资产策略不入 git，"已交付"若只能从 temp 里的
+# 完工报告反推，则 temp 归档/清理后判据即失效，且交付清单在任何地方都不可核。
+# 本文件是交付态的权威登记，由 step_completion_report 成功后写入。
+DELIVERY_REGISTRY = ROOT / "成果文件" / "交付登记.json"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
 # P0 整改（2026-08-04 prefab 复盘）：子进程输出统一落盘——透明度是复盘得出的
 # 第一教训（当时 postprocess 失败无任何日志，排障只能靠状态文件反推）。
@@ -1177,6 +1181,10 @@ class PipelineRunner:
         soft（默认）：超限阻断，需 --accept-over-budget 显式放行并在 state 留痕
         （超预算≠不合格，处置是业务决策）；hard：超限直接 FAIL。
         参数语义权威源：audio_sync_rules.duration_budget。
+
+        留痕分工：`budget_decision` 只在**显式放行**时写入（决策事实，一条）；
+        `duration_budget_check` 记录**检查点是否真的评估过**及其结论（within_budget /
+        not_adjudicated），使门禁可证真。未声明预算与 quick_fix 保持零副作用。
         """
         if self.quick_fix:
             return True
@@ -1190,14 +1198,23 @@ class PipelineRunner:
         try:
             actual = float(self.config.get("video_duration", 0) or 0)
         except (TypeError, ValueError):
+            actual = 0.0
+        enforcement = str(spec.get("enforcement", "soft")).lower()
+        # 通过路径同样留痕：否则"state 无记录"既不能证真也不能证伪（2026-09-01 盘查）
+        if actual <= 0:
+            self._record_budget_check("not_adjudicated", 0.0, budget, enforcement)
+            print(f"  [BUDGET] 无法裁定：config video_duration 缺失或为 0，"
+                  f"未与预算 {budget:.0f}s 比较 [enforcement={enforcement}]")
             return True
-        if actual <= 0 or actual <= budget:
+        if actual <= budget:
+            self._record_budget_check("within_budget", actual, budget, enforcement)
+            print(f"  [BUDGET] OK: actual {actual:.1f}s ≤ budget {budget:.0f}s "
+                  f"[enforcement={enforcement}]")
             return True
 
         over = actual - budget
         msg = (f"Duration budget exceeded: actual {actual:.1f}s > "
                f"budget {budget:.0f}s (+{over:.1f}s)")
-        enforcement = str(spec.get("enforcement", "soft")).lower()
         if enforcement == "hard":
             print(f"  ERROR: {msg} [enforcement=hard]")
             print("  定点修复指引：从最长场景精简旁白后重跑流水线（tts/timeline 自动重算）。")
@@ -1219,6 +1236,17 @@ class PipelineRunner:
         print("    2. 精简至预算内 → 修改旁白后正常重跑")
         self.state.mark_failed("timeline", msg, error_code=VERIFY_FAILED)
         return False
+
+    def _record_budget_check(self, decision, actual, budget, enforcement):
+        """时长预算检查点的执行留痕（使"门禁跑过"成为可核证据，而非仅凭无记录反推）"""
+        self.state.data["duration_budget_check"] = {
+            "decision": decision,
+            "actual_seconds": round(actual, 1) if actual > 0 else None,
+            "budget_seconds": budget,
+            "enforcement": enforcement,
+            "at": datetime.now().isoformat(),
+        }
+        self.state.save()
 
     def _render_metrics(self) -> Dict[str, Any]:
         """渲染成本度量节（render_metrics）的读写入口，度量先行（2026-08-19）。
@@ -1428,6 +1456,42 @@ class PipelineRunner:
                 f"Output {self.output_file.name} is a delivered artifact — use revision suffix",
                 error_code=VERIFY_FAILED)
             return False
+
+        # ── 成果槽位无背书残留告警（agent-wiki-promo 复盘 2026-08-31）：槽位里有成片
+        #    但没有任何交付背书时，按定义"不是交付物"，上面的保护门禁会放过——而人
+        #    在成果目录里看到它就会当成已交付成片取用。本次 150s 旧基线正是以此形态
+        #    占了规范交付名 9 天。不阻断（覆盖残留是合法诉求），只点名实测值 + 留痕。──
+        if (self.output_file.exists() and self.output_file.stat().st_size > 0
+                and not self._output_was_delivered()):
+            _measured = self._probe_duration(self.output_file)
+            try:
+                _declared = float(self.config.get("video_duration", 0) or 0)
+            except (TypeError, ValueError):
+                _declared = 0.0
+            if _measured is None or _declared <= 0:
+                _verdict = ""
+                _detail = (f"实测 {_measured if _measured is not None else '未知'}s"
+                           f" / config 声明 {_declared or '未声明'}s（数值不可比，不做裁定）")
+            else:
+                _tol = float(self.audio_sync_rules.get("duration_consistency", {})
+                             .get("max_diff_seconds", 1.0))
+                _diff = abs(_measured - _declared)
+                _verdict = "不一致" if _diff > _tol else "一致"
+                _detail = (f"实测 {_measured:.1f}s vs config 声明 {_declared:.1f}s"
+                           f"（差 {_diff:.1f}s，阈值 {_tol:.1f}s）→ 与当前声明{_verdict}")
+            print(f"  [ORPHAN-SLOT] 成果槽位已存在文件，但无交付背书（既无登记表条目，"
+                  f"也无 VALIDATED 完工报告）：{self.output_file.name}")
+            print(f"    {_detail}")
+            print("    该文件将被本次渲染覆盖。若它其实是一份交付物（交付证据曾被清理/归档"
+                  "导致判据失效），请先移出成果目录或改用修订后缀，再继续。")
+            self.state.data["orphan_slot_warning"] = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "file": self.output_file.name,
+                "measured_seconds": _measured,
+                "declared_seconds": _declared or None,
+                "verdict": _verdict or None,
+            }
+            self.state.save()
 
         self.state.mark_started("render")
 
@@ -1666,13 +1730,75 @@ class PipelineRunner:
         self._fail("visual_check", "Content overflows subtitle safety zone", VERIFY_FAILED)
         return False
 
+    @staticmethod
+    def _registry_read(registry_path=None):
+        """读取交付登记表；文件缺失/损坏时返回空登记表（登记缺失不致命，由调用方裁定）。"""
+        path = Path(registry_path) if registry_path else DELIVERY_REGISTRY
+        empty = {
+            "$description": "已交付成片登记表——本仓唯一版本化的交付台账（mp4 成片不入 git）。"
+                            "由 pipeline_runner 完工报告成功后自动写入，禁止手工编辑；"
+                            "删除条目不会删除成片，但会让交付物保护门禁失去该成片的交付依据。"
+                            "覆盖边界：本表自 2026-08-31 起登记，此前历史成片不入表，"
+                            "其交付判据回退至 VALIDATED 完工报告。",
+            "deliveries": [],
+        }
+        if not path.exists():
+            return empty
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return empty
+        if not isinstance(data, dict) or not isinstance(data.get("deliveries"), list):
+            return empty
+        return data
+
+    def _registry_entry(self, video_name, registry_path=None):
+        """按成片文件名查交付登记条目；未登记返回 None。"""
+        for entry in self._registry_read(registry_path).get("deliveries", []):
+            if isinstance(entry, dict) and entry.get("video") == video_name:
+                return entry
+        return None
+
+    def _record_delivery(self, video_path, srt_path, report_status):
+        """交付登记：完工报告裁定后把成片实测值登记入 git 追踪的交付台账。
+
+        落点在 completion_report 之后而非 delivery 步——"已交付"的成立以完工报告
+        裁定为准，delivery 步通过但报告 FAILED 的产物不该获得交付身份。
+        登记值一律来自实测（ffprobe 时长 + 文件字节数），不写任何自述结论。
+        """
+        entry = {
+            "video": Path(video_path).name,
+            "subtitle": Path(srt_path).name if srt_path else None,
+            "project": self.html_project,
+            "config": Path(self.config_path).name,
+            "duration_seconds": self._probe_duration(video_path),
+            "bytes": Path(video_path).stat().st_size if Path(video_path).exists() else None,
+            "report_status": report_status,
+            "delivered_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        data = self._registry_read()
+        # 同名成片按登记时间保留最新一条（修订版走 _修订NN 名，不产生同名覆盖）
+        deliveries = [e for e in data["deliveries"]
+                      if not (isinstance(e, dict) and e.get("video") == entry["video"])]
+        deliveries.append(entry)
+        deliveries.sort(key=lambda e: str(e.get("delivered_at") or ""))
+        data["deliveries"] = deliveries
+        DELIVERY_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        with open(DELIVERY_REGISTRY, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return entry
+
     def _output_was_delivered(self):
         """判定 output_file 是否为上一轮成功交付的成片（交付物保护依据）。
 
-        依据：temp_dir/completion_report.json 状态为 VALIDATED*（完工报告全部
-        检查通过）且报告引用的视频与当前目标同名。prefab 复盘：上午已交付的
-        合格成片被下午的裸渲染直接覆盖丢失——交付态必须可识别、可拦截。
+        判据优先级：①交付登记表命中（权威、git 追踪）；②temp_dir/completion_report.json
+        状态为 VALIDATED* 且报告引用的视频与当前目标同名——作为登记表启用前的历史回退。
+        prefab 复盘：上午已交付的合格成片被下午的裸渲染直接覆盖丢失——交付态必须
+        可识别、可拦截。
         """
+        if self._registry_entry(self.output_file.name) is not None:
+            return True
         report_path = self.temp_dir / "completion_report.json"
         if not report_path.exists():
             return False
@@ -1861,6 +1987,23 @@ class PipelineRunner:
             return False
         print(f"  完工报告已生成: {report_out}")
         self.state.mark_completed("completion_report", self._fingerprint("completion_report"))
+        # 交付登记：仅当完工报告裁定为 VALIDATED* 才授予交付身份（报告状态源自脚本
+        # 真实测量，此处不自行判断）。登记是尽力而为——失败只告警，不翻转步骤结论。
+        try:
+            with open(report_out, "r", encoding="utf-8") as f:
+                rep_status = str(json.load(f).get("status", ""))
+        except (json.JSONDecodeError, OSError):
+            rep_status = ""
+        if rep_status.startswith("VALIDATED"):
+            try:
+                entry = self._record_delivery(video_path,
+                                              srt_path if srt_path.exists() else None,
+                                              rep_status)
+                print(f"  [REGISTRY] 交付登记已写入 {DELIVERY_REGISTRY.name}: "
+                      f"{entry['video']} "
+                      f"({entry['duration_seconds']}s, {entry['bytes']} bytes)")
+            except OSError as e:
+                print(f"  WARNING: 交付登记写入失败（交付物保护门禁将退回完工报告判据）: {e}")
         return True
 
     def run(self, start_from=None):

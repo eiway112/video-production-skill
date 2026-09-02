@@ -881,7 +881,9 @@ def test_timeline_drift_resync() -> RegressionTestCase:
     import wave
 
     script_dir = Path(__file__).parent
-    proj_name = "_regress-drift-resync"
+    # 夹具必须落在 HTML_BASE 下（adjust_timeline 按 paths.html_project 解析该目录）；
+    # 名称带 pid：固定路径下，并发运行的 finally rmtree 会删掉对方正在使用的夹具。
+    proj_name = f"_regress-drift-resync-{os.getpid()}"
     proj_dir = script_dir.parent / "源码" / "hyperframes" / proj_name
 
     # 最小 HTML：S-block 为权威源（严格 JSON），已收敛到 21s（含 3s 封面）
@@ -977,7 +979,8 @@ def test_narration_source_pointer_resolution() -> RegressionTestCase:
     import subprocess
 
     script_dir = Path(__file__).parent
-    proj_name = "_regress-narr-source"
+    # pid 后缀：理由同 test_timeline_drift_resync（并发套迭互删夹具）
+    proj_name = f"_regress-narr-source-{os.getpid()}"
     proj_dir = script_dir.parent / "源码" / "hyperframes" / proj_name
 
     probe = (
@@ -2200,11 +2203,12 @@ def test_duration_budget_gate() -> RegressionTestCase:
     背景：wp 批次 4 集视频 2 集超 240s 预算（253.0s/248.9s），因流水线无任何
     预算门禁，完工报告盖章 VALIDATED 后才人工返工（各耗 ~25 分钟全链重跑）。
     本用例锁定：hard 超限直接 FAIL；soft 超限需 --accept-over-budget 显式放行
-    并在 state 留痕；未声明预算/预算内 → 零副作用。
+    并在 state 留痕；预算内通过同样留痕（duration_budget_check，使门禁可证真）；
+    仅未声明预算 = 零副作用。
     """
     tc = RegressionTestCase(
         "duration_budget_gate",
-        "验证时长预算门禁：hard阻断、soft需显式放行留痕、未声明零副作用"
+        "验证时长预算门禁：hard阻断、soft需显式放行留痕、通过路径留执行痕、未声明零副作用"
     )
     try:
         import sys
@@ -2249,14 +2253,26 @@ def test_duration_budget_gate() -> RegressionTestCase:
             tc.assert_equal(dec.get("actual_seconds"), 253.0,
                             "recorded actual duration for audit")
 
-            # (c) 未声明 / 预算内 → 零副作用
+            # (c) 预算内 → 通过且留下"检查点跑过"的痕迹；未声明 → 零副作用
             r4 = make_runner({"video_duration": 253.0}, idx=4)
             tc.assert_true(r4._budget_gate_ok(), "no budget declared → gate inactive")
+            tc.assert_true("duration_budget_check" not in r4.state.data,
+                           "undeclared budget keeps zero side effect")
             r5 = make_runner({"video_duration": 212.0,
                               "duration_budget": {"seconds": 240}}, idx=5)
             tc.assert_true(r5._budget_gate_ok(), "within budget → pass")
             tc.assert_true("budget_decision" not in r5.state.data,
                            "no decision record when within budget")
+            chk = r5.state.data.get("duration_budget_check", {})
+            tc.assert_equal(chk.get("decision"), "within_budget",
+                            "pass path leaves an auditable checkpoint record")
+            tc.assert_equal(chk.get("actual_seconds"), 212.0,
+                            "checkpoint records measured duration")
+            r6 = make_runner({"duration_budget": {"seconds": 240}}, idx=6)
+            tc.assert_true(r6._budget_gate_ok(), "missing video_duration → pass")
+            tc.assert_equal(r6.state.data.get("duration_budget_check", {}).get("decision"),
+                            "not_adjudicated",
+                            "no authoritative duration is recorded as unadjudicated, not as pass")
 
             tc.mark_passed()
 
@@ -2835,6 +2851,269 @@ def test_pre_render_duration_consistency() -> RegressionTestCase:
 
     return tc
 
+
+def test_delivery_registry_backing() -> RegressionTestCase:
+    """用例39：交付登记表背书（2026-08-31 agent-wiki-promo 复盘 🟢）
+
+    背景：mp4 成片不入 git，git 里没有任何地方记录"交付了什么"。交付物保护门禁
+    因此只能认 temp_dir 里的 VALIDATED 完工报告——8-22 那次跑到 verify 就中断，
+    报告未生成，150s 旧基线以"无背书孤儿"形态占了规范交付名 9 天，门禁按定义放过。
+    本用例锁定：登记表命中即视为已交付（不依赖易被清理的报告）、未登记且无 VALIDATED
+    报告判为非交付（孤儿可识别）、登记表缺失/损坏零副作用、登记值一律来自实测。
+    """
+    tc = RegressionTestCase(
+        "delivery_registry_backing",
+        "验证交付登记表作为交付态权威背书：命中拦截、未登记判孤儿、缺失/损坏零副作用"
+    )
+    _saved_registry = None
+    try:
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            _saved_registry = _pr.DELIVERY_REGISTRY
+            _pr.DELIVERY_REGISTRY = tmpdir / "成果文件" / "交付登记.json"
+
+            def make_runner(video_name="业务主题_推广介绍.mp4", tag=""):
+                out = tmpdir / "成果文件" / "视频" / video_name
+                out.parent.mkdir(parents=True, exist_ok=True)
+                if not out.exists():
+                    out.write_bytes(b"\x00" * 1024)
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = PipelineState(tmpdir / f"state_{tag}.json")
+                runner.output_file = out
+                runner.temp_dir = tmpdir / f"temp_{tag}"
+                runner.html_project = "demo-project"
+                runner.config_path = tmpdir / "config.json"
+                runner._probe_duration = lambda p: 160.6
+                return runner
+
+            # (a) 登记表不存在 → 判据为空，不误报已交付（零副作用）
+            r0 = make_runner(tag="missing")
+            tc.assert_true(r0._registry_entry(r0.output_file.name) is None,
+                           "missing registry yields no entry")
+            tc.assert_true(not r0._output_was_delivered(),
+                           "missing registry does not claim delivered")
+
+            # (b) 登记后：命中，且登记值全部来自实测
+            entry = r0._record_delivery(r0.output_file,
+                                        r0.temp_dir / "字幕.srt", "VALIDATED 13/13")
+            tc.assert_equal(entry.get("duration_seconds"), 160.6,
+                            "registry records probed duration, not declared")
+            tc.assert_equal(entry.get("bytes"), 1024,
+                            "registry records actual file size")
+            tc.assert_true(r0._registry_entry("业务主题_推广介绍.mp4") is not None,
+                           "recorded delivery is findable by video name")
+            tc.assert_true(_pr.DELIVERY_REGISTRY.exists(),
+                           "registry file created under 成果文件/")
+
+            # (c) 交付态判据升级：无完工报告也能识别为已交付（本次事故的正解）
+            tc.assert_true(not (r0.temp_dir / "completion_report.json").exists(),
+                           "no completion report present in this scenario")
+            tc.assert_true(r0._output_was_delivered(),
+                           "registry hit alone marks delivered")
+
+            # (d) 未登记的槽位（孤儿）→ 判为非交付，允许被新渲染覆盖
+            orphan = make_runner("另一项目_推广介绍.mp4", tag="orphan")
+            tc.assert_true(not orphan._output_was_delivered(),
+                           "unbacked slot is not treated as delivered")
+
+            # (e) 历史回退仍生效：无登记但有同名的 VALIDATED 报告 → 已交付
+            legacy = make_runner("旧机制项目_推广介绍.mp4", tag="legacy")
+            legacy.temp_dir.mkdir(parents=True, exist_ok=True)
+            (legacy.temp_dir / "completion_report.json").write_text(
+                json.dumps({"status": "VALIDATED 12/13",
+                            "data_sources": {"video_file": {
+                                "path": str(legacy.output_file)}}}),
+                encoding="utf-8")
+            tc.assert_true(legacy._output_was_delivered(),
+                           "VALIDATED report fallback still recognizes delivery")
+
+            # (f) 报告指向别的成片 → 不冒名拦截
+            other = make_runner("同名不同片.mp4", tag="mismatch")
+            other.temp_dir.mkdir(parents=True, exist_ok=True)
+            (other.temp_dir / "completion_report.json").write_text(
+                json.dumps({"status": "VALIDATED 12/13",
+                            "data_sources": {"video_file": {
+                                "path": str(tmpdir / "成果文件" / "视频" / "别的片.mp4")}}}),
+                encoding="utf-8")
+            tc.assert_true(not other._output_was_delivered(),
+                           "report for a different video does not block by name")
+
+            # (g) 同名重复登记 → 覆盖为最新一条，不产生重复条目
+            r0._record_delivery(r0.output_file, None, "VALIDATED 13/13")
+            names = [e.get("video") for e in
+                     _pr.PipelineRunner._registry_read().get("deliveries", [])]
+            tc.assert_equal(names.count("业务主题_推广介绍.mp4"), 1,
+                            "re-recording upserts instead of duplicating")
+
+            # (h) 登记表损坏 → 回退空表，不抛异常（损坏不致命，由调用方裁定）
+            _pr.DELIVERY_REGISTRY.write_text("{ not json", encoding="utf-8")
+            tc.assert_equal(len(_pr.PipelineRunner._registry_read()["deliveries"]), 0,
+                            "corrupt registry degrades to empty")
+            tc.assert_true(legacy._registry_entry("旧机制项目_推广介绍.mp4") is None,
+                           "corrupt registry yields no entry (fallback decides)")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    finally:
+        if _saved_registry is not None:
+            _pr.DELIVERY_REGISTRY = _saved_registry
+
+    return tc
+
+
+def test_config_single_source_timeline_rejected() -> RegressionTestCase:
+    """用例40：config 内嵌 timeline 节 → preflight 报错（单一权威源，2026-08-31）
+
+    背景：11 个存量项目 config 内嵌 t_block/scene_metadata，无任何语义消费者
+    （唯一按数据读取它的 preflight_simple.py 不在流水线内；scene_patch_render.py:123
+    仅把它并入 config 哈希，不解读内容），清除前普查 21 份含该节者中 14 份已与自身
+    video_duration 分叉（统计取自 git 清除前版本）；8-22 的 verify 报错定位正是被
+    这份死数据误导。本次清除死数据并把红线代码化。
+    """
+    tc = RegressionTestCase(
+        "config_single_source_timeline_rejected",
+        "验证 preflight 拒绝 config 内嵌非空 timeline 节，空节/缺省零副作用"
+    )
+    try:
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import preflight_check as pf
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+
+            def run_check(cfg, name):
+                p = td / f"{name}.json"
+                p.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+                r = pf.PreflightResult(mode="render")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pf.check_json_config(p, r)
+                return r
+
+            def has_timeline_error(r):
+                return any("'timeline' block" in e for e in r.errors)
+
+            base = {"video_duration": 100,
+                    "scenes": [{"scene_id": "s0", "start": 0, "end": 100}]}
+
+            # (a) 非空 scene_metadata → 阻断
+            r1 = run_check(dict(base, timeline={"scene_metadata":
+                                                [{"scene": 0, "start": 0, "end": 90}]}),
+                           "with_metadata")
+            tc.assert_true(has_timeline_error(r1),
+                           "non-empty scene_metadata in config is rejected")
+            tc.assert_true(not r1.passed, "preflight fails on dual-source config")
+
+            # (b) 非空 t_block → 阻断
+            r2 = run_check(dict(base, timeline={"t_block": {"s0": 0, "s1": 90}}),
+                           "with_tblock")
+            tc.assert_true(has_timeline_error(r2), "non-empty t_block is rejected")
+
+            # (c) 空节（历史脚手架产物）→ 不判，零误报
+            r3 = run_check(dict(base, timeline={"t_block": {}, "scene_metadata": []}),
+                           "empty_block")
+            tc.assert_true(not has_timeline_error(r3),
+                           "empty timeline block not flagged")
+
+            # (d) 未声明 timeline → 零副作用（存量合规 config 的常态）
+            r4 = run_check(dict(base), "no_timeline")
+            tc.assert_true(not has_timeline_error(r4),
+                           "config without timeline unaffected")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_fresh_guard_requires_confirmation() -> RegressionTestCase:
+    """用例41：--fresh 受限门禁（补 2026-08-31 普查发现的覆盖空白）
+
+    背景：prefab 复盘（2026-08-04）把 --fresh 误用列为根因2——一次全量重置换回
+    3 次 40 分钟级重渲与 9 小时失败收尾。门禁代码一直在位，但全仓回归套件 0 处
+    引用（同批普查另有 HARD_GATES/scene-patch 的引用计数可核），属"有门禁无测试"
+    的盲区。本用例锁定四态语义，防后续重构静默改掉确认要求。
+    """
+    tc = RegressionTestCase(
+        "fresh_guard_requires_confirmation",
+        "验证 --fresh 门禁：无产物放行、有产物/长视频需 --confirm-fresh、确认后可继续"
+    )
+    try:
+        import io
+        import contextlib
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner = _pr.PipelineRunner
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+
+            def make_runner(duration, with_render_raw=False, with_tts=False, tag=""):
+                r = PipelineRunner.__new__(PipelineRunner)
+                r.config = {"video_duration": duration}
+                r.render_raw = td / f"render_raw_{tag}.mp4"
+                r.output_file = td / "成果文件" / "视频" / "业务主题_推广介绍.mp4"
+                r.tts_dir = td / (f"tts_dir_{tag}" if with_tts else f"tts_absent_{tag}")
+                r.temp_dir = td / "temp"
+                if with_tts:
+                    r.tts_dir.mkdir(parents=True, exist_ok=True)
+                if with_render_raw:
+                    r.render_raw.write_bytes(b"\x00" * 2048)
+                return r
+
+            def guard_outcome(r, confirm=False):
+                """返回 'refused' / 'allowed'。"""
+                buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        r._fresh_guard(confirm)
+                    return "allowed", buf.getvalue()
+                except SystemExit:
+                    return "refused", buf.getvalue()
+
+            # (a) 短视频 + 无任何产物 → 放行（测试/新项目常规路径零摩擦）
+            v, _ = guard_outcome(make_runner(60, tag="a"))
+            tc.assert_equal(v, "allowed", "short video without artifacts passes guard")
+
+            # (b) 短视频但已有 render_raw → 拒绝，且列出受影响清单
+            v, out = guard_outcome(make_runner(60, with_render_raw=True, tag="b"))
+            tc.assert_equal(v, "refused", "existing render_raw requires confirmation")
+            tc.assert_true("将被重新渲染覆盖" in out, "refusal prints affected-artifact inventory")
+            tc.assert_true("--resume" in out, "refusal offers low-cost alternatives")
+
+            # (c) 同场景追加 --confirm-fresh → 放行
+            v, _ = guard_outcome(make_runner(60, with_render_raw=True, tag="c"),
+                                 confirm=True)
+            tc.assert_equal(v, "allowed", "--confirm-fresh releases the guard")
+
+            # (d) 长视频即使无既有产物仍需确认（重渲染成本本身即风险）
+            r_long = make_runner(600, tag="d")
+            tc.assert_true(not r_long.render_raw.exists(), "no artifact present in long case")
+            v, out = guard_outcome(r_long)
+            tc.assert_equal(v, "refused", "long video requires confirmation without artifacts")
+            tc.assert_true("长视频判定" in out, "refusal states the long-video verdict")
+
+            # (e) 长视频 + TTS 产物 + 确认 → 放行
+            v, _ = guard_outcome(make_runner(600, with_tts=True, tag="e"), confirm=True)
+            tc.assert_equal(v, "allowed", "long video proceeds once confirmed")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -2882,6 +3161,9 @@ class RegressionTestRunner:
             test_delivery_audit_fixture_verdict,
             test_render_budget_gate,
             test_pre_render_duration_consistency,
+            test_delivery_registry_backing,
+            test_config_single_source_timeline_rejected,
+            test_fresh_guard_requires_confirmation,
         ]
         self.results = []
     

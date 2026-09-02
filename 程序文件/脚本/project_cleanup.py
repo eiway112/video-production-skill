@@ -18,6 +18,8 @@
   - 永不触碰 成果文件/ 中的正式交付物
   - 删除前生成完整清单供确认
   - 删除后运行 project_audit 验证
+  - 目录遍历不穿越重解析点（Windows junction / 符号链接）：穿越会把目录外
+    资产的体积计入本目录（虚增），也会把目录外路径列入删除候选（越界）
 
 用法:
   python project_cleanup.py                    # 预览所有可清理项
@@ -39,6 +41,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from config_manager import ConfigManager
+from _fs_walk import dir_size as _dir_size, rglob as _rglob_no_reparse, walk as _walk
 
 # 过期缓存天数阈值（可通过 --stale-days 覆盖）
 STALE_DAYS = 30
@@ -124,18 +127,6 @@ SCATTERED_SCRIPT_NAMES = {
 }
 
 
-def _dir_size(path: Path) -> int:
-    """计算目录总大小"""
-    total = 0
-    try:
-        for f in path.rglob("*"):
-            if f.is_file():
-                total += f.stat().st_size
-    except (OSError, PermissionError):
-        pass
-    return total
-
-
 def scan_render_cache(cm: ConfigManager, report: CleanupReport):
     """扫描渲染缓存（递归查找，支持嵌套在音频子目录下的 work-* 目录）"""
     temp_dir = cm.paths.process_temp
@@ -144,14 +135,14 @@ def scan_render_cache(cm: ConfigManager, report: CleanupReport):
 
     # 递归查找所有 work-* 目录（可能嵌套在 crm_audio/、pw_audio/ 等子目录下）
     cache_dirs = []
-    for d in temp_dir.rglob("work-*"):
+    for d in _rglob_no_reparse(temp_dir, "work-*"):
         if d.is_dir():
             cache_dirs.append(d)
             size = _dir_size(d)
             report.add(CleanupItem(d, "render", "HyperFrames 渲染工作目录", size))
 
     # 递归查找所有 tts_44k 目录
-    for d in temp_dir.rglob("tts_44k"):
+    for d in _rglob_no_reparse(temp_dir, "tts_44k"):
         if d.is_dir():
             cache_dirs.append(d)
             size = _dir_size(d)
@@ -159,7 +150,7 @@ def scan_render_cache(cm: ConfigManager, report: CleanupReport):
 
     # 递归查找渲染中间文件（跳过已位于缓存目录内的文件，避免重复计数）
     for pattern in RENDER_CACHE_PATTERNS["files"]:
-        for f in temp_dir.rglob(pattern):
+        for f in _rglob_no_reparse(temp_dir, pattern):
             if f.is_file():
                 if any(f.is_relative_to(d) for d in cache_dirs):
                     continue
@@ -182,7 +173,7 @@ def scan_patch_baseline(cm: ConfigManager, report: CleanupReport, stale_days: in
 
     threshold = datetime.now() - timedelta(days=stale_days)
     for name in PATCH_BASELINE_NAMES:
-        for f in temp_dir.rglob(name):
+        for f in _rglob_no_reparse(temp_dir, name):
             if not f.is_file():
                 continue
             try:
@@ -264,12 +255,9 @@ def scan_empty_dirs(cm: ConfigManager, report: CleanupReport):
 
     # 自底向上检查（先处理深层空目录）
     for dirpath, dirnames, filenames in sorted(
-        process_dir.walk() if hasattr(process_dir, 'walk')
-        else _walk(process_dir),
-        key=lambda x: len(x[0].parts) if isinstance(x[0], Path) else x[0].count("/"),
-        reverse=True
+        _walk(process_dir), key=lambda x: len(x[0].parts), reverse=True
     ):
-        dp = Path(dirpath) if isinstance(dirpath, str) else dirpath
+        dp = dirpath
         if dp == process_dir:
             continue
         if not any(dp.iterdir()):
@@ -294,7 +282,7 @@ def scan_scattered_scripts(cm: ConfigManager, report: CleanupReport):
 def scan_cdrive_residuals(report: CleanupReport):
     """扫描 C:\\temp 中工作流产生的残留文件（Chrome profile、预览截图等）
 
-        工作流临时文件应使用 _script_env.PREVIEW_TEMP（默认为工作区上级 D:\ 的 temp_chrome_preview），不应堆积在 C 盘。
+        工作流临时文件应使用 _script_env.PREVIEW_TEMP（默认为工作区上级 D 盘根下的 temp_chrome_preview），不应堆积在 C 盘。
     """
     c_temp = Path(r"C:\temp")
     if not c_temp.exists():
@@ -313,20 +301,9 @@ def scan_cdrive_residuals(report: CleanupReport):
         for match in glob_mod.glob(str(c_temp / pattern)):
             p = Path(match)
             if p.is_dir():
-                try:
-                    total = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-                except (PermissionError, OSError):
-                    total = 0
-                report.add(CleanupItem(p, "cdrive", "工作流临时文件残留于C盘", total))
+                report.add(CleanupItem(p, "cdrive", "工作流临时文件残留于C盘", _dir_size(p)))
             elif p.is_file():
                 report.add(CleanupItem(p, "cdrive", "工作流临时文件残留于C盘", p.stat().st_size))
-
-
-def _walk(path: Path):
-    """Path.walk 的兼容实现"""
-    import os
-    for dirpath, dirnames, filenames in os.walk(str(path)):
-        yield Path(dirpath), dirnames, filenames
 
 
 # ─────────────────────────────────────────────────────────

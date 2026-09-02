@@ -314,6 +314,20 @@ def check_json_config(config_path: Path, r: PreflightResult):
                     f"(delta={issue['curr_start'] - issue['prev_end']:.1f}s)"
                 )
 
+    # 单一权威源（AGENTS.md §1）：config 不得内嵌场景/时间轴数据。
+    # 该节无任何语义消费者：主链的场景/时间轴一律来自 narration.json + HTML T-block；
+    # 唯一按数据读取它的 preflight_simple.py 不在流水线内，scene_patch_render.py:123
+    # 只是把它并入 config 哈希（"渲染相关配置变更"的代理，不解读其内容）。
+    # 2026-08-22 曾因它与 narration/HTML 分叉而误导 verify 报错定位。
+    # 空节不判（历史脚手架脚本 fix_project_structures.py 会写空壳）。
+    stale_timeline = cfg.get('timeline') or {}
+    if stale_timeline.get('t_block') or stale_timeline.get('scene_metadata'):
+        r.error(
+            "config declares a non-empty 'timeline' block — scene/timeline authority "
+            "is narration.json + HTML T-block; no script reads this block as data and "
+            "it drifts silently. Delete the 'timeline' key (AGENTS.md §1 单一权威源)"
+        )
+
     # Check .bak exists (rule: config_backup_pair)
     pair = uv.check_backup_pair(config_path, validate="json")
     bak_path = pair.data["bak_path"]
