@@ -153,7 +153,7 @@ preflight → tts → timeline → render
 | HyperFrames HTML | HyperFrames → 渲染 | ⭐⭐ |
 | PPT/Word | Doc2Markdown → HyperFrames → 渲染 | ⭐⭐ |
 | Markdown 脚本 | OpenMontage → 渲染 | ⭐ |
-| 网页 URL | website-to-hyperframes | ⭐ |
+| 网页 URL | 抓取 HTML → HyperFrames 渲染 | ⭐ |
 
 ### 参照文档
 
