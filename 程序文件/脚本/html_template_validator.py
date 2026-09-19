@@ -9,10 +9,11 @@ HTML 模板校验器 (HTML Template Validator)
 检查项（来源：新路径实施_踩坑清单与防范检查表.md 阶段C）：
   1. 占位符残留 — [Image]、placeholder、src=""
   2. 图片引用存在性 — 所有 <img src> 引用真实文件
-  3. subtitle-safe 高度 — 120-150px（成功项目基准 130-140px）
-  4. .sc padding-bottom — ≥ safe-height + 20px（推荐 150-170px）
+  3. subtitle-safe 高度 — 1080 基准 120-150px（成功项目基准 130-140px）
+  4. .sc padding-bottom — ≥ safe-height + 20px（1080 基准推荐 150-170px）
   5. 装饰层 opacity — 主光晕 0.08-0.15，最低 ≥ 0.06
-  6. 装饰元素 y 坐标 — 底边 ≤ 840px（远离 y=860 安全线）
+  6. 装饰元素 y 坐标 — 底边 ≤ 1080 基准 840px（远离字幕安全线）
+     以上 px 阈值均随 HTML 声明的画布高度等比换算，竖版不沿用 1080 数值
   7. 封面时长 — data-cover-duration 应为 3
   8. config.json 场景数与 HTML scene 数一致
 
@@ -33,13 +34,33 @@ from datetime import datetime
 from _script_env import ROOT, HTML_BASE, LOG_PATH, append_audit_log  # noqa: E402, F401
 
 # ===== 成功项目参数基准（踩坑清单 §八） =====
+# 基准值为 1080 高画布的实测 px，实际判据按 HTML 声明的画布高度等比换算
+# （见 canvas_px / extract_canvas_height）：竖版 1920 高沿用 1080 常量会把
+# 合规版面判成越界。h=1080 时换算结果与基准值逐位一致。
+BASELINE_FRAME_H = 1080
 SAFE_HEIGHT_RANGE = (120, 150)          # subtitle-safe height px
 PADDING_BOTTOM_MIN_OFFSET = 20          # padding-bottom ≥ safe-height + 此值
 PADDING_BOTTOM_RECOMMENDED = (150, 170) # 推荐范围
+PADDING_BOTTOM_TOLERANCE = 30           # 超过推荐上限此值才判"过大"
 GLOW_OPACITY_MIN = 0.06                # 装饰层最低 opacity
 GLOW_OPACITY_RECOMMENDED = (0.08, 0.15)  # 主光晕推荐
 DECOR_MAX_Y = 840                       # 装饰元素底边 y 上限
 COVER_DURATION_EXPECTED = "3"           # 封面时长秒
+
+
+def canvas_px(baseline_px, frame_h):
+    """1080 基准 px → 该画布高度的等比值。"""
+    return round(baseline_px * frame_h / BASELINE_FRAME_H)
+
+
+def extract_canvas_height(content: str) -> int:
+    """HTML 声明的画布高度（data-height 或 body{height}），缺失回退 1080 基准。"""
+    m = re.search(r'data-width="\d+"[^>]*data-height="(\d+)"', content)
+    if not m:
+        m = re.search(r'body\s*\{[^}]*height\s*:\s*(\d+)px', content)
+    if m and int(m.group(1)) > 0:
+        return int(m.group(1))
+    return BASELINE_FRAME_H
 
 
 def check_placeholders(content: str) -> list:
@@ -100,33 +121,41 @@ def extract_padding_bottom(content: str) -> list:
     return values
 
 
-def check_safe_zone(content: str) -> list:
-    """校验字幕安全区参数。"""
+def check_safe_zone(content: str, frame_h: int = BASELINE_FRAME_H) -> list:
+    """校验字幕安全区参数（阈值按画布高度等比换算）。"""
     issues = []
     safe_h = extract_safe_height(content)
+    safe_min = canvas_px(SAFE_HEIGHT_RANGE[0], frame_h)
+    safe_max = canvas_px(SAFE_HEIGHT_RANGE[1], frame_h)
+    pad_min_offset = canvas_px(PADDING_BOTTOM_MIN_OFFSET, frame_h)
+    pad_rec = (canvas_px(PADDING_BOTTOM_RECOMMENDED[0], frame_h),
+               canvas_px(PADDING_BOTTOM_RECOMMENDED[1], frame_h))
 
     if safe_h is None:
         issues.append("未找到 .subtitle-safe height 定义")
     else:
-        if safe_h < SAFE_HEIGHT_RANGE[0]:
+        if safe_h < safe_min:
             issues.append(
-                f"subtitle-safe height={safe_h}px < {SAFE_HEIGHT_RANGE[0]}px（过低，字幕可能溢出）")
-        elif safe_h > SAFE_HEIGHT_RANGE[1]:
+                f"subtitle-safe height={safe_h}px < {safe_min}px"
+                f"（画布高{frame_h}，过低，字幕可能溢出）")
+        elif safe_h > safe_max:
             issues.append(
-                f"subtitle-safe height={safe_h}px > {SAFE_HEIGHT_RANGE[1]}px（过高，画面底部被遮挡）")
+                f"subtitle-safe height={safe_h}px > {safe_max}px"
+                f"（画布高{frame_h}，过高，画面底部被遮挡）")
 
     # padding-bottom 检查
     paddings = extract_padding_bottom(content)
     for source, pb_val in paddings:
         if source == 'CSS .sc':
             # 全局 .sc 定义：严格校验
-            if safe_h and pb_val < safe_h + PADDING_BOTTOM_MIN_OFFSET:
+            if safe_h and pb_val < safe_h + pad_min_offset:
                 issues.append(
-                    f"CSS .sc padding-bottom={pb_val}px < safe-height({safe_h})+{PADDING_BOTTOM_MIN_OFFSET}"
+                    f"CSS .sc padding-bottom={pb_val}px < safe-height({safe_h})+{pad_min_offset}"
                     f"（内容可能侵入字幕区）")
-            elif pb_val > PADDING_BOTTOM_RECOMMENDED[1] + 30:
+            elif pb_val > pad_rec[1] + canvas_px(PADDING_BOTTOM_TOLERANCE, frame_h):
                 issues.append(
-                    f"CSS .sc padding-bottom={pb_val}px 过大（推荐 {PADDING_BOTTOM_RECOMMENDED[0]}-{PADDING_BOTTOM_RECOMMENDED[1]}px）")
+                    f"CSS .sc padding-bottom={pb_val}px 过大"
+                    f"（画布高{frame_h}，推荐 {pad_rec[0]}-{pad_rec[1]}px）")
         else:
             # inline 覆盖：可能是封面场景居中布局，放宽阈值
             if safe_h and pb_val < safe_h:
@@ -155,9 +184,10 @@ def check_glow_opacity(content: str) -> list:
     return issues
 
 
-def check_decoration_y(content: str) -> list:
-    """校验装饰元素 y 坐标（底边 ≤ 840px）。"""
+def check_decoration_y(content: str, frame_h: int = BASELINE_FRAME_H) -> list:
+    """校验装饰元素 y 坐标（底边 ≤ 等比换算后的上限，1080 基准 840px）。"""
     issues = []
+    decor_max_y = canvas_px(DECOR_MAX_Y, frame_h)
     # 提取 .glow/.ghost 等装饰元素的 top 值
     decor_patterns = re.findall(
         r'class="(?:glow|ghost)"[^>]*style="[^"]*?(?:top|bottom)\s*:\s*(-?\d+)\s*px[^"]*?'
@@ -170,9 +200,10 @@ def check_decoration_y(content: str) -> list:
         # 估算底边 = top + height（仅对正 top 值有效）
         if top >= 0:
             bottom = top + height
-            if bottom > DECOR_MAX_Y and height > 0:
+            if bottom > decor_max_y and height > 0:
                 issues.append(
-                    f"装饰元素 bottom≈{bottom}px > {DECOR_MAX_Y}px（侵入字幕安全线）")
+                    f"装饰元素 bottom≈{bottom}px > {decor_max_y}px"
+                    f"（画布高{frame_h}，侵入字幕安全线）")
     return issues
 
 
@@ -237,6 +268,7 @@ def run_validation(project: str) -> dict:
         return result
 
     content = html_path.read_text(encoding='utf-8')
+    frame_h = extract_canvas_height(content)
 
     # 1. 占位符
     ph = check_placeholders(content)
@@ -259,7 +291,7 @@ def run_validation(project: str) -> dict:
         result['pass'] = False
 
     # 3. 字幕安全区
-    sz_issues = check_safe_zone(content)
+    sz_issues = check_safe_zone(content, frame_h)
     result['checks'].append({
         'name': '字幕安全区',
         'status': 'FAIL' if sz_issues else 'PASS',
@@ -277,11 +309,12 @@ def run_validation(project: str) -> dict:
     })
 
     # 5. 装饰元素 y 坐标
-    y_issues = check_decoration_y(content)
+    y_issues = check_decoration_y(content, frame_h)
     result['checks'].append({
         'name': '装饰元素 y 坐标',
         'status': 'WARN' if y_issues else 'PASS',
-        'detail': '; '.join(y_issues) if y_issues else f'装饰底边 ≤ {DECOR_MAX_Y}px',
+        'detail': '; '.join(y_issues) if y_issues
+        else f'装饰底边 ≤ {canvas_px(DECOR_MAX_Y, frame_h)}px（画布高{frame_h}）',
     })
 
     # 6. 封面时长
@@ -310,6 +343,7 @@ def run_validation(project: str) -> dict:
         'scene_count': len(set(scene_ids)),
         'html_lines': content.count('\n') + 1,
         'safe_height': extract_safe_height(content),
+        'canvas_height': frame_h,
     }
 
     return result

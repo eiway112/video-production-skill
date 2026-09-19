@@ -25,6 +25,49 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
+# PPT 原生图片格式：原字节直接落盘（免二次编码损失）；其余（webp 等）转 PNG。
+_NATIVE_IMAGE_EXTS = {"PNG": "png", "JPEG": "jpg", "GIF": "gif",
+                      "BMP": "bmp", "TIFF": "tif"}
+
+
+def _picture_blob(shape):
+    """取 PICTURE shape 的原始字节，取不到返回 None。
+
+    不能用 shape.image：python-pptx 只对 image_content_types 白名单内的部件返回
+    ImagePart，webp 等未在 [Content_Types].xml 注册的部件退化为通用 Part，
+    shape.image 会抛 AttributeError('Part' object has no attribute 'image')。
+    """
+    try:
+        rId = shape._element.blip_rId
+        if not rId:
+            return None
+        return shape.part.related_part(rId).blob
+    except Exception:
+        return None
+
+
+def _write_picture(blob, img_dir, stem):
+    """按真实格式写盘，返回文件名；不可解码的图片格式返回 None（交调用方记为跳过）。"""
+    if not blob:
+        return None
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(blob))
+        fmt = (im.format or "").upper()
+    except Exception:
+        return None
+    if fmt in _NATIVE_IMAGE_EXTS:
+        name = f"{stem}.{_NATIVE_IMAGE_EXTS[fmt]}"
+        (img_dir / name).write_bytes(blob)
+        return name
+    name = f"{stem}.png"
+    try:
+        im.load()
+        im.save(img_dir / name, "PNG")
+    except Exception:
+        return None
+    return name
+
 
 def convert_pptx(filepath: Path, output_dir: Path) -> str:
     """PPTX → Markdown: 每个 slide 一个章节"""
@@ -41,6 +84,7 @@ def convert_pptx(filepath: Path, output_dir: Path) -> str:
 
     total_slides = len(prs.slides)
     img_count = 0
+    skipped = []
 
     for i, slide in enumerate(prs.slides, 1):
         layout = slide.slide_layout.name if slide.slide_layout else "unknown"
@@ -67,14 +111,12 @@ def convert_pptx(filepath: Path, output_dir: Path) -> str:
             # Extract images
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 img_count += 1
-                blob = shape.image.blob
-                ext = shape.image.content_type.split("/")[-1]
-                if ext == "jpeg":
-                    ext = "jpg"
-                img_name = f"slide{i}_img{img_count}.{ext}"
-                img_path = img_dir / img_name
-                img_path.write_bytes(blob)
-                lines.append(f"\n![{shape.name}](images/{img_name})\n")
+                stem = f"slide{i}_img{img_count}"
+                name = _write_picture(_picture_blob(shape), img_dir, stem)
+                if name:
+                    lines.append(f"\n![{shape.name}](images/{name})\n")
+                else:
+                    skipped.append(f"{stem} ({shape.name})")
 
             # Extract tables
             if shape.has_table:
@@ -89,6 +131,9 @@ def convert_pptx(filepath: Path, output_dir: Path) -> str:
                     cells = [cell.text.strip() for cell in row.cells]
                     lines.append("| " + " | ".join(cells) + " |")
                 lines.append("")
+
+    if skipped:
+        print(f"  跳过 {len(skipped)} 个无法解码的图片部件: {', '.join(skipped)}")
 
     return "\n".join(lines)
 
@@ -146,18 +191,18 @@ def convert_docx(filepath: Path, output_dir: Path) -> str:
             lines.append("")
 
     # Extract embedded images from relationships
+    skipped = []
     for rel_id, rel in doc.part.rels.items():
         if "image" in rel.reltype:
             img_count += 1
-            blob = rel.target_part.blob
-            content_type = rel.target_part.content_type
-            ext = content_type.split("/")[-1]
-            if ext == "jpeg":
-                ext = "jpg"
-            img_name = f"doc_img{img_count}.{ext}"
-            img_path = img_dir / img_name
-            img_path.write_bytes(blob)
-            lines.append(f"\n![image](images/{img_name})\n")
+            name = _write_picture(rel.target_part.blob, img_dir, f"doc_img{img_count}")
+            if name:
+                lines.append(f"\n![image](images/{name})\n")
+            else:
+                skipped.append(f"doc_img{img_count}")
+
+    if skipped:
+        print(f"  跳过 {len(skipped)} 个无法解码的图片部件: {', '.join(skipped)}")
 
     return "\n".join(lines)
 

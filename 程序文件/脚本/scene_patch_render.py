@@ -50,6 +50,7 @@ HTML_BASE = ROOT / "程序文件" / "源码" / "hyperframes"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
 
 SIDECAR_NAME = "scene_fingerprints.json"
+VERDICT_NAME = "scene_patch_verdict.json"
 SIDECAR_VERSION = 1
 EXIT_FALLBACK = 3
 
@@ -162,11 +163,15 @@ def extract_scene_times(html, config):
     if starts != sorted(starts) or starts[0] != 0.0:
         return None, "T-block-not-monotonic"
 
-    # S-block 数值 end 与 data-duration 一致性（脏数据强制降级，R8）
+    # 时长见证（2026-09-03 R8 重构）：S-block 数值 end 只是见证之一，不是唯一见证。
+    # 旧实现把"脚本里没有 end: 字面量"一律判不可信 → 现行手写风格（T-block +
+    # root data-duration，不写 S-block end）的基线永久降级 FULL，增量渲染零投产
+    # （wsi-hotel-cases 基线实测 scene_times_error=S-block-end-unverifiable）。
+    # 重构后：end 字面量**在场即必须自洽**（脏数据仍强制降级，R8 语义保留）；
+    # 缺席改由三重见证承接 —— ①root data-duration ②config video_duration 交叉校验
+    # ③classify 帧网格 total_frames == round(duration*fps)（取自基线成片实测）。
     ends = [float(v) for v in re.findall(r'\bend:\s*([\d.]+)', script_all)]
-    if not ends:
-        return None, "S-block-end-unverifiable"
-    if abs(max(ends) - duration) > 0.05:
+    if ends and abs(max(ends) - duration) > 0.05:
         return None, f"S-block-end({max(ends)}) != data-duration({duration})"
 
     # config 时间源交叉校验
@@ -174,11 +179,29 @@ def extract_scene_times(html, config):
     if abs(cfg_dur - duration) > 0.05:
         return None, f"config video_duration({cfg_dur}) != data-duration({duration})"
 
+    # 帧网格可段渲染守卫：每个场景窗口至少占 1 帧，否则段渲染 expect_frames=0
+    try:
+        fps = float(config.get("fps", 25)) or 25.0
+    except (TypeError, ValueError):
+        fps = 25.0
+
     times = []
     for i, (sid, _, _, _) in enumerate(blocks):
         end = starts[i + 1] if i + 1 < len(starts) else duration
+        if round(end * fps) - round(starts[i] * fps) < 1:
+            return None, f"scene-window-sub-frame({sid}: {starts[i]}-{end} @ {fps}fps)"
         times.append({"id": sid, "start": starts[i], "end": end})
     return times, None
+
+
+def scene_time_witness(html):
+    """时长见证级别，写入 sidecar 供 classify 留痕。
+
+    s-block-end        — 脚本含数值 end 字面量（并与 data-duration 自洽）
+    duration-cross-check — end 字面量缺席，靠 data-duration + config + 帧网格见证
+    """
+    script_all = "\n".join(re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html))
+    return "s-block-end" if re.search(r'\bend:\s*[\d.]+', script_all) else "duration-cross-check"
 
 
 # ── ffmpeg / ffprobe ──
@@ -189,6 +212,33 @@ def _ffmpeg():
 
 def _ffprobe():
     return os.environ.get("HYPERFRAMES_FFPROBE_PATH") or shutil.which("ffprobe") or "ffprobe"
+
+
+def _segment_timeout_seconds():
+    """段渲染硬超时（秒）：复用 render_rules.json watchdog 的 grace + stall。
+
+    该文件自述为"参数语义权威源，禁止任何脚本另设分叉默认值"，故此处读取而非
+    自定义；仅在文件不可读时退回其文档化默认值（360 + 300）。超时的语义是
+    "降级全量渲染"，不是"判定失败交付"，因此取宽于段长的上界是安全方向。
+    """
+    rules = ROOT / "程序文件" / "配置" / "config" / "quality" / "render_rules.json"
+    try:
+        wd = json.loads(rules.read_text(encoding="utf-8")).get("watchdog", {})
+        return float(wd.get("grace_seconds", 360)) + float(wd.get("stall_seconds", 300))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 660.0
+
+
+def _kill_tree(pid):
+    """杀渲染进程树，与 pipeline_runner._RenderProgressWatcher._kill 同法。"""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=30)
+        else:
+            os.kill(pid, 9)
+    except Exception as e:
+        print(f"  [SCENE-PATCH] kill failed: {e}")
 
 
 def probe_video(path):
@@ -261,6 +311,7 @@ class PatchRenderer:
         self.temp_dir = TEMP_BASE / paths.get("temp_subdir", f"{self.html_project}_audio")
         self.render_raw = self.temp_dir / "render_raw.mp4"
         self.sidecar_path = self.temp_dir / SIDECAR_NAME
+        self.verdict_path = self.temp_dir / VERDICT_NAME
         self.fps = int(self.config.get("fps", 25))
 
     # ── sidecar ──
@@ -285,6 +336,7 @@ class PatchRenderer:
             "has_audio": info["has_audio"],
             "scene_times": times,          # None 表示时间源不可信（classify 时强制 FULL）
             "scene_times_error": err,
+            "scene_times_witness": scene_time_witness(html) if times else None,
             **fp,
         }
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -348,7 +400,8 @@ class PatchRenderer:
         if len(changed) * 2 > len(cur["scene_order"]):
             return full(f"too-many-scenes-changed({len(changed)}/{len(cur['scene_order'])})")
 
-        ctx = {"base": base, "times": times, "html": html}
+        ctx = {"base": base, "times": times, "html": html,
+               "witness": base.get("scene_times_witness") or "s-block-end"}
         return "PATCH", changed, "", ctx
 
     # ── patch（段渲染 + 拼接 + 自校验） ──
@@ -401,8 +454,20 @@ class PatchRenderer:
                "-c", wrapper_path.name, "-o", str(out_mp4),
                "--fps", str(self.fps), "--workers", "1",
                "--low-memory-mode", "--protocol-timeout", "600000"]
-        print(f"  > {' '.join(cmd[:6])}...")
-        rc = subprocess.run(cmd, cwd=str(self.source_dir)).returncode
+        # 与 pipeline_runner 全量渲染同条件的 GPU 栈病态规避（2026-08-07）：
+        # 缺此条时段渲染会独走 GPU 探测路径，在该环境下可永不返回。
+        if os.environ.get("PRODUCER_HEADLESS_SHELL_PATH"):
+            cmd.append("--no-browser-gpu")
+        limit = _segment_timeout_seconds()
+        print(f"  > {' '.join(cmd[:6])}... (hard timeout {limit:.0f}s)")
+        proc = subprocess.Popen(cmd, cwd=str(self.source_dir))
+        try:
+            rc = proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc.pid)
+            print(f"  SEGMENT RENDER TIMEOUT > {limit:.0f}s — process tree killed; "
+                  f"falling back to FULL")
+            return False
         if rc != 0 or not out_mp4.exists():
             print(f"  SEGMENT RENDER FAILED (rc={rc})")
             return False
@@ -466,14 +531,56 @@ class PatchRenderer:
                 ok = False
         return ok
 
+    def _record_verdict(self, verdict, reason, changed, outcome, witness, t0):
+        """裁定留痕（数据而非仅 stdout）：供 pipeline_runner 写入 state 与完工报告。
+
+        2026-09-03：增量渲染长期零投产的原因之一是"没用上"只体现在 stdout，
+        state 里没有任何字段能证明分类器跑过、为何降级。写盘失败不改变返回值——
+        留痕是观测面，不得反过来影响渲染判定。
+        """
+        rec = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "verdict": verdict,
+            "reason": reason,
+            "changed_scenes": changed,
+            "time_witness": witness,
+            "outcome": outcome,
+            "elapsed_seconds": round(time.time() - t0, 1),
+        }
+        try:
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.verdict_path, "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"  WARNING: verdict record failed: {e}")
+        return rec
+
     def patch(self):
         t0 = time.time()
         verdict, changed, reason, ctx = self.classify()
         if verdict != "PATCH":
             print(f"  CLASSIFY: FULL ({reason})")
+            self._record_verdict(verdict, reason, changed, "fallback-full", None, t0)
             return EXIT_FALLBACK
         times = ctx["times"]
-        print(f"  CLASSIFY: PATCH — changed scenes: {', '.join(changed)}")
+        witness = ctx.get("witness")
+        print(f"  CLASSIFY: PATCH — changed scenes: {', '.join(changed)} "
+              f"(time witness: {witness})")
+        rc, outcome = self._patch_execute(ctx, changed, times)
+        self._record_verdict(verdict, reason, changed, outcome, witness, t0)
+        return rc
+
+    def _patch_execute(self, ctx, changed, times):
+        """段渲染 + 拼接 + 自校验。返回 (rc, outcome)。"""
+        # wrapper 落在项目源码目录：上次段渲染被超时杀掉时 finally 不会执行，
+        # 残留的 _patch_seg_*.html 会让 hyperframes lint 报 multiple_root_compositions，
+        # 干扰后续全量渲染。开工前先清掉同前缀残留（只认这一个前缀）。
+        for stale in self.source_dir.glob("_patch_seg_*.html"):
+            try:
+                stale.unlink()
+                print(f"  Removed stale wrapper: {stale.name}")
+            except OSError:
+                pass
 
         segs = self._plan_segments(times, changed)
         for kind, sf, ef, ids in segs:
@@ -490,31 +597,30 @@ class PatchRenderer:
                 wrappers.append(wrapper)
                 out = patch_dir / f"seg_{n}.mp4"
                 if not self._render_segment(wrapper, out, ef - sf):
-                    return EXIT_FALLBACK
+                    return EXIT_FALLBACK, "segment-render-failed"
                 seg_files[n] = out
 
             patched = patch_dir / "render_patched.mp4"
             if not self._stitch(segs, seg_files, patched):
-                return EXIT_FALLBACK
+                return EXIT_FALLBACK, "stitch-failed"
 
             info = probe_video(patched)
             base_frames = ctx["base"]["total_frames"]
             if not info or info["frames"] != base_frames:
                 print(f"  FRAME COUNT MISMATCH: patched={info and info['frames']}, "
                       f"baseline={base_frames}")
-                return EXIT_FALLBACK
+                return EXIT_FALLBACK, "frame-count-mismatch"
             print(f"  Frame count verified: {info['frames']} == baseline")
 
             if not self._self_check(patched, segs, times, changed, patch_dir / "shots"):
                 print("  SELF-CHECK FAILED — falling back to FULL")
-                return EXIT_FALLBACK
+                return EXIT_FALLBACK, "self-check-failed"
 
             os.replace(patched, self.render_raw)
-            print(f"  render_raw.mp4 replaced (patched, {time.time() - t0:.1f}s total)")
-            rc = self.write_sidecar()
-            if rc != 0:
-                return EXIT_FALLBACK
-            return 0
+            print(f"  render_raw.mp4 replaced (patched)")
+            if self.write_sidecar() != 0:
+                return EXIT_FALLBACK, "sidecar-refresh-failed"
+            return 0, "applied"
         finally:
             for w in wrappers:
                 try:
@@ -533,9 +639,12 @@ def main():
     if args.mode == "sidecar":
         sys.exit(pr.write_sidecar())
     if args.mode == "classify":
-        verdict, changed, reason, _ = pr.classify()
-        print(json.dumps({"verdict": verdict, "changed": changed, "reason": reason},
-                         ensure_ascii=False))
+        t0 = time.time()
+        verdict, changed, reason, ctx = pr.classify()
+        pr._record_verdict(verdict, reason, changed, "classify-only",
+                           ctx.get("witness"), t0)
+        print(json.dumps({"verdict": verdict, "changed": changed, "reason": reason,
+                          "time_witness": ctx.get("witness")}, ensure_ascii=False))
         sys.exit(0 if verdict == "PATCH" else EXIT_FALLBACK)
     sys.exit(pr.patch())
 

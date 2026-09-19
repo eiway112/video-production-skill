@@ -18,6 +18,26 @@ const http = require('http');
 // Chrome path (same as HyperFrames uses)
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 
+const FALLBACK_SIZE = { width: 1920, height: 1080 };
+
+function readCompositionSize(htmlPath) {
+    let html;
+    try {
+        html = fs.readFileSync(htmlPath, 'utf-8');
+    } catch (e) {
+        return FALLBACK_SIZE;
+    }
+    let m = html.match(/data-width="(\d+)"[^>]*data-height="(\d+)"/);
+    if (!m) {
+        m = html.match(/body\s*\{[^}]*width\s*:\s*(\d+)px[^}]*height\s*:\s*(\d+)px/);
+    }
+    if (!m) return FALLBACK_SIZE;
+    const width = parseInt(m[1], 10);
+    const height = parseInt(m[2], 10);
+    if (!(width > 0 && height > 0)) return FALLBACK_SIZE;
+    return { width, height };
+}
+
 async function main() {
     const args = process.argv.slice(2);
     if (args.length < 3) {
@@ -39,6 +59,10 @@ async function main() {
     }
 
     fs.mkdirSync(outputDir, { recursive: true });
+
+    // 预览视口必须等于组合画布尺寸，否则竖版项目截到 16:9 画布，
+    // 安全区预检与网格图全部失真。画布权威源是组合自己的声明。
+    const compositionSize = readCompositionSize(htmlPath);
 
     const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     // 兼容两种配置格式：顶层 scenes 或 timeline.scene_metadata（scene → scene_id 映射）
@@ -115,14 +139,15 @@ async function main() {
                 '--no-sandbox',
                 '--disable-gpu',
                 '--disable-web-security',
-                '--window-size=1920,1080',
+                `--window-size=${compositionSize.width},${compositionSize.height}`,
                 '--disable-extensions',
                 '--disable-background-networking',
             ],
         });
 
         const page = await browser.newPage();
-        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setViewport({ width: compositionSize.width, height: compositionSize.height });
+        console.log(`Viewport: ${compositionSize.width}x${compositionSize.height} (composition)`);
 
         const url = `http://127.0.0.1:${port}/${encodeURIComponent(htmlFile)}`;
         console.log(`Loading: ${url}`);

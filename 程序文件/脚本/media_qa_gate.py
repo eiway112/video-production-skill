@@ -4,38 +4,47 @@
 最终媒体质量验收模块（Final Media QA Gate）
 
 功能：
-  在交付前进行最后一层完整质量检查
-  
-  检查项目（18项）：
-  1. 视频/音频流存在性
-  2. 音频非静音检测
-  3. 音频响度检测
-  4. 时长一致性检查
-  5. 字幕格式有效性
-  6. 字幕时间单调性
-  7. 字幕不越过视频结尾
-  8. 字幕文本非空
-  9. 视觉边界检查状态
-  10. 文件可播放性检查
-  11. 文件输出路径和命名正确性
-  12. 字幕-语音对齐度（P0-b：silencedetect 语音起口 ↔ SRT 起点，p95 门禁）
-  13. 配置声明-实测一致性（config 声明的 fps/resolution ↔ ffprobe 实测，防失效配置）
-  14. 黑场-字幕重叠（blackdetect 物理测量：黑场区间与字幕窗口重叠超阈值 = 画面空档但音频持续）
-  15. 字幕单字跨行（单个 CJK 汉字独占一行 = 排版孤字，破坏阅读体验）
-  16. 字幕术语规范（朗读层形态直通显示层，如『点Json』应为『.json』）
-  17. 死区终检（silencedetect 物理扫描成品，连续静音超过 dead_air.max_seconds_per_scene → 拒收；
-      场景感知：narration_required=false 的封面/转场窗内静音属设计特征，不计入违规）
-  18. 视频码率下限（双档：实测 < min_video_bitrate_kbps_fail → 拒收；fail~warn 之间 → 低码率预警不阻断）
+  在交付前进行最后一层完整质量检查。每项检查按四态词汇报告
+  （PASS / FAIL / UNTESTED / NOT_APPLICABLE，见 _gate_status.py），
+  总裁定 verdict 按 FAIL > UNTESTED > PASS 推导——"检查没跑成"不得
+  压成"全部通过"（2026-09-18 审核 A04）。生产链接入点：
+  pipeline_runner.step_postprocess 末端，经 adjudicate() 裁定。
+
+  检查项清单（以 `_mark` 登记名为权威键，运行时计数见报告 `total_checks`；
+  本文档不写项数、代码注释不编"检查N"号——两处手抄均已实测漂移过，
+  2026-09-19 审核 A12。清单与运行时的双向一致由回归用例锁定）：
+  video_file_exists              视频文件存在
+  video_stream_exists            视频流存在
+  audio_stream_exists            音频流存在
+  video_bitrate_ok               视频码率下限（双档：fail 拒收 / warn 预警，阈值源 video_quality_rules.json）
+  duration_valid                 时长有效（ffprobe 取不到＝未测，测到 0＝违规）
+  audio_not_silent               音频非静音（silencedetect）
+  playable                       文件可播放性（ffmpeg 解码试跑）
+  subtitle_file_exists           字幕文件存在
+  subtitle_not_empty             字幕条目非空
+  subtitle_times_ordered         字幕时间单调性
+  subtitle_not_overflow          字幕不越过视频结尾
+  subtitle_audio_alignment       字幕-语音对齐度（P0-b：silencedetect 起口 ↔ SRT 起点，p95 门禁；
+                               BGM 遮蔽→合法不适用，纯旁白样本不足→未测不得记通过）
+  no_black_frame_with_subtitle   黑场-字幕重叠（blackdetect 物理测量：画面空档而音频持续）
+  no_single_char_subtitle_line   字幕单字跨行（单个 CJK 汉字独占一行＝排版孤字）
+  subtitle_terms_normalized      字幕术语规范（朗读层形态直通显示层，如『点Json』应为『.json』）
+  output_naming_valid            输出路径与命名（AGENTS.md 交付约束：禁止技术词命名）
+  no_dead_air                    死区终检（连续静音超 audio_sync_rules.dead_air 阈值→拒收；
+                               场景感知：narration_required=false 的封面/转场窗内静音不计违规）
+  visual_boundary_verified       视觉边界检查状态（上游 visual_boundary_check 结论透传）
+  declared_matches_measured      配置声明-实测一致性（config 的 fps/resolution ↔ ffprobe 实测）
 
 用法：
   from media_qa_gate import MediaQAGate
-  
+
   qa = MediaQAGate()
   passed, result = qa.validate(
       video_path='wall-crack-remedy.mp4',
       subtitle_path='wall-crack-remedy.srt'
   )
-  
+  print(result['verdict'], result['status_counts'])
+
   if not passed:
       for error in result['errors']:
           print(f"ERROR: {error}")
@@ -43,11 +52,15 @@
 """
 
 import os
+import sys
 import subprocess
 import json
 from pathlib import Path
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 import re
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _gate_status as gs
 
 def ffprobe_get_streams(video_path: str) -> Dict[str, Any]:
     """使用 ffprobe 获取媒体流信息"""
@@ -134,38 +147,6 @@ def ffmpeg_detect_silence(audio_file: str, duration: float = None) -> float:
     except Exception:
         pass
     return -1.0
-
-def ffmpeg_get_loudness(audio_file: str) -> Tuple[float, float]:
-    """检测音频响度 (LUFS)"""
-    try:
-        result = subprocess.run(
-            [
-                'ffmpeg',
-                '-i', audio_file,
-                '-af', 'ebur128=video=0',
-                '-f', 'null',
-                '-'
-            ],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=30
-        )
-        
-        # 解析 LUFS 值
-        integrated = None
-        for line in result.stderr.split('\n'):
-            if 'Integrated loudness:' in line:
-                match = re.search(r'([-\d.]+)\s+LUFS', line)
-                if match:
-                    integrated = float(match.group(1))
-                    break
-        
-        return integrated, 0.0
-    except Exception:
-        pass
-    return None, None
 
 def _load_alignment_rules(rules_path=None) -> Dict[str, Any]:
     """读取 config/quality/audio_sync_rules.json 的 alignment 节（带默认值）。
@@ -327,6 +308,26 @@ def _parse_bitrate_value(raw) -> Any:
     return value if value > 0 else None
 
 
+def _config_bgm_declared(config_path: str) -> bool:
+    """config 是否声明启用 BGM（顶层 bgm_enabled，回退 audio.bgm_enabled）。
+
+    供对齐度检查归类：BGM 遮蔽全轨静音时 silencedetect 起口不可测属
+    声明导致的合法不适用（NOT_APPLICABLE），而非漏检。读不到 config 时
+    按未声明处理（False）——保守归入未测面，不放行。
+    """
+    if not config_path:
+        return False
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    value = cfg.get('bgm_enabled', (cfg.get('audio') or {}).get('bgm_enabled', False))
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', '1', 'yes', 'on')
+    return bool(value)
+
+
 def _resolve_narration_from_config(config_path: str) -> Tuple[Any, float]:
     """从 pipeline config 解析 narration.json 路径与 cover_duration。
 
@@ -402,7 +403,7 @@ def _load_narration_scenes(narration_path: str, cover_duration: float = 0.0):
 def filter_dead_air_violations(segments: List[Tuple[float, float, float]],
                                scenes,
                                max_dead: float) -> List[Tuple[float, float, float]]:
-    """场景感知的死区违规过滤（检查17核心逻辑，纯函数供回归测试）。
+    """场景感知的死区违规过滤（no_dead_air 的核心过滤，纯函数供回归测试）。
 
     封面/转场（narration_required=false）场景窗内的静音属设计特征，
     不计入死区违规；跨越边界的静音段只计入落在 narration_required=true
@@ -423,7 +424,7 @@ def filter_dead_air_violations(segments: List[Tuple[float, float, float]],
 
 # 交付命名门禁（AGENTS.md → 文件与交付 → 命名）：技术词不得出现在交付文件名中，
 # 交付名应为业务描述性名称（如 quickstart-demo.mp4 / 墙体裂缝修补.mp4）。
-# 清单集中定义于此，检查11为唯一消费方。
+# 清单集中定义于此，output_naming_valid 为唯一消费方。
 FORBIDDEN_NAME_TOKENS = ("final", "v01", "render", "raw", "tmp")
 _FORBIDDEN_NAME_RE = re.compile(
     r'(?<![a-z0-9])(' + '|'.join(FORBIDDEN_NAME_TOKENS) + r')(?![a-z0-9])')
@@ -449,11 +450,13 @@ def _load_term_lint_patterns() -> List[Dict[str, str]]:
 
 
 def ffmpeg_detect_black_intervals(video_path: str, min_black: float = 1.0,
-                                  pix_th: float = 0.10) -> List[Tuple[float, float]]:
+                                  pix_th: float = 0.10) -> Optional[List[Tuple[float, float]]]:
     """用 blackdetect 物理扫描成片，返回黑场区间列表 [(start, end), ...]。
 
     这是对"观众实际看到什么"的直接测量，与声明层（T-block/S-block）
     无关——即使时间轴声明自洽，渲染产物出现黑场也会被此检测捕获。
+    扫描失败（ffmpeg 异常/超时/非零退出）返回 None，与"扫过且无黑场"的
+    空列表区分——前者是未测，不得压成通过（四态契约，2026-09-18 A04）。
     """
     try:
         result = subprocess.run(
@@ -464,7 +467,9 @@ def ffmpeg_detect_black_intervals(video_path: str, min_black: float = 1.0,
             timeout=180
         )
     except Exception:
-        return []
+        return None
+    if result.returncode != 0:
+        return None
     intervals = []
     for line in (result.stderr or '').splitlines():
         m = re.search(r'black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)', line)
@@ -475,11 +480,13 @@ def ffmpeg_detect_black_intervals(video_path: str, min_black: float = 1.0,
 
 def ffmpeg_detect_long_silences(video_path: str, noise_db: float = -40,
                                 min_silence: float = 3.0,
-                                duration: float = None) -> List[Tuple[float, float, float]]:
+                                duration: float = None
+                                ) -> Optional[List[Tuple[float, float, float]]]:
     """用 silencedetect 扫描成片，返回超过 min_silence 的连续静音段 [(start, end, dur), ...]。
 
     d= 直接设为死区上限，ffmpeg 只报告超限段 —— 输出即违规清单。
     尾部静音可能只有 silence_start 没有 silence_end，给定 duration 时补齐为收尾段。
+    扫描失败返回 None（未测），与"扫过且无超限静音"的空列表区分（四态契约，A04）。
     """
     try:
         result = subprocess.run(
@@ -490,7 +497,9 @@ def ffmpeg_detect_long_silences(video_path: str, noise_db: float = -40,
             timeout=120
         )
     except Exception:
-        return []
+        return None
+    if result.returncode != 0:
+        return None
     segments = []
     start = None
     for line in (result.stderr or '').splitlines():
@@ -509,11 +518,13 @@ def ffmpeg_detect_long_silences(video_path: str, noise_db: float = -40,
 
 def ffmpeg_detect_speech_onsets(video_path: str, duration: float,
                                 noise_db: float = -38,
-                                min_silence: float = 0.5) -> List[float]:
+                                min_silence: float = 0.5
+                                ) -> Optional[List[float]]:
     """从成片音轨提取语音起口时刻（silence_end 事件 = 长停顿后开口）。
 
     适用于纯旁白成片（bgm_enabled=false）；含 BGM 时全轨无静音段，
-    返回空列表，调用方降级为警告（min_onsets 门槛）。
+    返回空列表，调用方按"合法不适用（BGM 遮蔽声明）/未测（样本不足）"归类。
+    扫描失败（ffmpeg 异常/非零退出）返回 None＝未测，不得读成通过（A04）。
     """
     try:
         result = subprocess.run(
@@ -524,7 +535,9 @@ def ffmpeg_detect_speech_onsets(video_path: str, duration: float,
             timeout=120
         )
     except Exception:
-        return []
+        return None
+    if result.returncode != 0:
+        return None
     onsets = []
     for line in (result.stderr or '').splitlines():
         m = re.search(r'silence_end:\s*([\d.]+)', line)
@@ -583,64 +596,89 @@ def parse_srt(srt_path: str) -> List[Dict[str, Any]]:
     return entries
 
 class MediaQAGate:
-    """最终媒体质量验收门禁"""
-    
+    """最终媒体质量验收门禁（四态报告，2026-09-18 A04）。
+
+    每项检查记录 PASS / FAIL / UNTESTED / NOT_APPLICABLE 之一（_gate_status 词汇），
+    总裁定 verdict 按 FAIL > UNTESTED > PASS 推导；"检查没跑成"与"跑过且干净"
+    在结果里可区分——旧实现把不可测（BGM 遮蔽起口、ffmpeg 扫描失败、bitrate
+    解析不到）压成 checks=True，正是"全部通过"假象的来源。
+    """
+
     def __init__(self):
         self.errors = []
         self.warnings = []
-        self.checks = {}
+        self.statuses = {}
+        self.status_notes = {}
         self.alignment = {}
         self.media_facts = {}
-    
-    def validate(self, 
-                 video_path: str, 
+
+    @property
+    def checks(self) -> Dict[str, bool]:
+        """兼容视图：仅 PASS 记 True。新消费方应读 check_statuses。"""
+        return {k: v == gs.PASS for k, v in self.statuses.items()}
+
+    def _mark(self, name: str, status: str, note: str = ""):
+        self.statuses[name] = status
+        if note:
+            self.status_notes[name] = note
+
+    def validate(self,
+                 video_path: str,
                  subtitle_path: str = None,
-                 visual_check_passed: bool = False,
+                 visual_check_passed=False,
                  config_path: str = None,
                  narration_path: str = None) -> Tuple[bool, Dict[str, Any]]:
         """执行完整的媒体质量验收
-        
+
         参数：
           video_path: 视频文件路径
-          subtitle_path: 字幕文件路径（可选）
-          visual_check_passed: 视觉边界检查是否通过
-          config_path: pipeline 配置文件路径（可选，提供后执行检查13：声明-实测一致性；
-                       同时用于解析 narration_source 供检查17场景感知排除）
+          subtitle_path: 字幕文件路径（None＝按声明豁免字幕，字幕组检查记 NOT_APPLICABLE）
+          visual_check_passed: True/False，或 "not_applicable"（quick-fix 等声明性跳过，
+                               不伪装成通过也不判违规）
+          config_path: pipeline 配置文件路径（可选，提供后执行 declared_matches_measured：声明-实测一致性；
+                       同时用于解析 narration_source 供 no_dead_air 场景感知排除）
           narration_path: 项目 narration.json 路径（可选，显式指定优先于 config 指针解析）
-        
+
         返回：
-          (通过/失败, 详细检查结果)
+          (无 FAIL 违规, 详细检查结果；含 verdict/check_statuses/untested/not_applicable)
         """
         self.errors = []
         self.warnings = []
-        self.checks = {}
+        self.statuses = {}
+        self.status_notes = {}
         self.alignment = {}
         self.media_facts = {}
-        
+
         video_path = Path(video_path)
-        
-        # 检查1：视频文件存在
+
+        # 检查 video_file_exists：视频文件存在
         if not video_path.exists():
+            self._mark('video_file_exists', gs.FAIL, f"文件不存在: {video_path}")
             self.errors.append(f"Video file not found: {video_path}")
             return False, self._result()
-        
+        self._mark('video_file_exists', gs.PASS)
+
         # 获取媒体流信息
         streams = ffprobe_get_streams(str(video_path))
         duration = ffprobe_get_duration(str(video_path))
-        
-        # 检查2：视频流存在
+
+        # 检查 video_stream_exists：视频流存在
         video_streams = [s for s in streams if s.get('codec_type') == 'video']
-        self.checks['video_stream_exists'] = len(video_streams) > 0
-        if not self.checks['video_stream_exists']:
+        if video_streams:
+            self._mark('video_stream_exists', gs.PASS)
+        else:
+            self._mark('video_stream_exists', gs.FAIL)
             self.errors.append("No video stream found")
-        
-        # 检查3：音频流存在
+
+        # 检查 audio_stream_exists：音频流存在
         audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
-        self.checks['audio_stream_exists'] = len(audio_streams) > 0
-        if not self.checks['audio_stream_exists']:
+        if audio_streams:
+            self._mark('audio_stream_exists', gs.PASS)
+        else:
+            self._mark('audio_stream_exists', gs.FAIL)
             self.errors.append("No audio stream found")
-        
-        # 检查18：视频码率下限（阈值单一权威源：video_quality_rules.json，双档制）
+
+        # 检查 video_bitrate_ok：视频码率下限（阈值单一权威源：video_quality_rules.json，双档制）
         # < fail 档 = 画面近乎空白（HTML 场景未渲染）阻断；fail~warn 之间 =
         # 低码率预警不阻断（纯文字动画合法内容码率天然偏低）。与
         # enhance_video_audio step7 同口径，此处是交付前最后防线。
@@ -655,65 +693,113 @@ class MediaQAGate:
                     self.warnings.append(
                         f"video_quality_rules.json 仍为旧单档键 min_video_bitrate_kbps，"
                         f"建议升级为双档 min_video_bitrate_kbps_fail/_warn")
-                self.checks['video_bitrate_ok'] = level != 'fail'
                 if level == 'fail':
+                    self._mark('video_bitrate_ok', gs.FAIL)
                     self.errors.append(
                         f"Video bitrate too low: {v_br_kbps}kbps < {fail_kbps}kbps "
                         f"(video_quality_rules.min_video_bitrate_kbps_fail) — 判定渲染失败或内容缺失")
                 elif level == 'warn':
+                    self._mark('video_bitrate_ok', gs.PASS, "低码率预警未阻断")
                     self.warnings.append(
                         f"Video bitrate low: {v_br_kbps}kbps < {warn_kbps}kbps "
                         f"(video_quality_rules.min_video_bitrate_kbps_warn) — 可能视觉内容不足，不阻断")
+                else:
+                    self._mark('video_bitrate_ok', gs.PASS)
             else:
+                self._mark('video_bitrate_ok', gs.UNTESTED,
+                           "ffprobe bit_rate 为 N/A 或缺失，码率门禁未执行")
                 self.warnings.append(
                     "Video bitrate 无法解析（ffprobe 返回 N/A 或缺失），已跳过码率门禁")
-        
-        # 检查4：时长有效
-        self.checks['duration_valid'] = duration > 0
-        if not self.checks['duration_valid']:
-            self.errors.append(f"Invalid duration: {duration}")
         else:
-            # 检查5：音频非静音
+            self._mark('video_bitrate_ok', gs.UNTESTED, "无视频流，码率不可测")
+
+        # 检查 duration_valid：时长有效（ffprobe 失败＝未测，由裁定层阻断；测到 0＝违规）
+        if duration < 0:
+            self._mark('duration_valid', gs.UNTESTED, "ffprobe 取不到时长")
+            self.warnings.append("Could not read duration via ffprobe")
+        elif duration > 0:
+            self._mark('duration_valid', gs.PASS)
+        else:
+            self._mark('duration_valid', gs.FAIL)
+            self.errors.append(f"Invalid duration: {duration}")
+
+        # 检查 audio_not_silent：音频非静音
+        if duration > 0:
             if len(audio_streams) > 0:
                 silence_dur = ffmpeg_detect_silence(str(video_path), duration)
-                self.checks['audio_not_silent'] = silence_dur >= 0 and silence_dur < duration - 1.0
                 if silence_dur < 0:
+                    self._mark('audio_not_silent', gs.UNTESTED, "silencedetect 扫描失败")
                     self.warnings.append("Could not detect silence")
                 elif silence_dur >= duration - 1.0:
+                    self._mark('audio_not_silent', gs.FAIL)
                     self.errors.append(f"Audio is silent (or nearly silent): {silence_dur:.1f}s of {duration:.1f}s")
-                elif silence_dur > duration * 0.5:
-                    self.warnings.append(f"Audio contains excessive silence: {silence_dur:.1f}s of {duration:.1f}s")
-        
-        # 检查6：文件可播放性
+                else:
+                    self._mark('audio_not_silent', gs.PASS)
+                    if silence_dur > duration * 0.5:
+                        self.warnings.append(f"Audio contains excessive silence: {silence_dur:.1f}s of {duration:.1f}s")
+            else:
+                self._mark('audio_not_silent', gs.UNTESTED, "无音频流，静音不可测")
+        else:
+            self._mark('audio_not_silent', gs.UNTESTED, "时长不可测")
+
+        # 检查 playable：文件可播放性
         try:
             result = subprocess.run(
                 ['ffmpeg', '-t', '1', '-i', str(video_path), '-f', 'null', '-'],
                 capture_output=True,
                 timeout=10
             )
-            self.checks['playable'] = result.returncode == 0
-            if not self.checks['playable']:
+            if result.returncode == 0:
+                self._mark('playable', gs.PASS)
+            else:
+                self._mark('playable', gs.FAIL)
                 self.errors.append("Video file is not playable or corrupted")
         except Exception as e:
+            self._mark('playable', gs.UNTESTED, f"可播放性探测异常: {e}")
             self.warnings.append(f"Could not verify playability: {e}")
-        
+
         # 字幕相关检查
-        if subtitle_path:
+        _SUBTITLE_CHECK_KEYS = ('subtitle_file_exists', 'subtitle_not_empty',
+                                'subtitle_times_ordered', 'subtitle_not_overflow',
+                                'subtitle_audio_alignment',
+                                'no_black_frame_with_subtitle',
+                                'no_single_char_subtitle_line',
+                                'subtitle_terms_normalized')
+        if subtitle_path is None:
+            # 声明性豁免（如纯 BGM 项目）：字幕组检查合法不适用，不计违规也不计通过
+            for _k in _SUBTITLE_CHECK_KEYS:
+                self._mark(_k, gs.NOT_APPLICABLE, "未提供字幕（项目声明豁免）")
+        else:
             subtitle_path = Path(subtitle_path)
-            
-            # 检查7：字幕文件存在
+
+            # 检查 subtitle_file_exists：字幕文件存在
             if not subtitle_path.exists():
+                self._mark('subtitle_file_exists', gs.FAIL, str(subtitle_path))
                 self.errors.append(f"Subtitle file not found: {subtitle_path}")
+                for _k in _SUBTITLE_CHECK_KEYS:
+                    if _k != 'subtitle_file_exists':
+                        self._mark(_k, gs.UNTESTED, "字幕文件缺失，无法测量")
             else:
+                self._mark('subtitle_file_exists', gs.PASS)
                 # 解析字幕
                 entries = parse_srt(str(subtitle_path))
-                
-                # 检查8：字幕条目非空
-                self.checks['subtitle_not_empty'] = len(entries) > 0
-                if not self.checks['subtitle_not_empty']:
-                    self.errors.append("Subtitle file is empty or malformed")
+
+                # 检查 subtitle_not_empty：字幕条目非空
+                if entries:
+                    self._mark('subtitle_not_empty', gs.PASS)
                 else:
-                    # 检查9：时间单调性
+                    self._mark('subtitle_not_empty', gs.FAIL)
+                    self.errors.append("Subtitle file is empty or malformed")
+                    for _k in ('subtitle_times_ordered', 'subtitle_not_overflow',
+                               'subtitle_audio_alignment',
+                               'no_black_frame_with_subtitle',
+                               'no_single_char_subtitle_line',
+                               'subtitle_terms_normalized'):
+                        self._mark(_k, gs.UNTESTED, "字幕解析 0 条，无法测量")
+                    entries = None
+
+                if entries is not None:
+                    # 检查 subtitle_times_ordered：时间单调性
                     all_ordered = True
                     for i in range(len(entries) - 1):
                         if entries[i]['end_ms'] > entries[i+1]['start_ms']:
@@ -724,21 +810,27 @@ class MediaQAGate:
                                 f"entry {entries[i+1]['index']} starts at {entries[i+1]['start_ms']}"
                             )
                             break
-                    self.checks['subtitle_times_ordered'] = all_ordered
-                    
-                    # 检查10：字幕不越过视频结尾
+                    self._mark('subtitle_times_ordered',
+                               gs.PASS if all_ordered else gs.FAIL)
+
+                    # 检查 subtitle_not_overflow：字幕不越过视频结尾
                     if duration > 0 and len(entries) > 0:
                         max_end_ms = max(e['end_ms'] for e in entries)
                         max_end_s = max_end_ms / 1000.0
                         overflow = max_end_s - duration
-                        self.checks['subtitle_not_overflow'] = overflow <= 0.5  # 允许 500ms 误差
-                        if overflow > 0.5:
+                        if overflow > 0.5:  # 允许 500ms 误差
+                            self._mark('subtitle_not_overflow', gs.FAIL)
                             self.errors.append(
                                 f"Subtitle overflow: last entry ends at {max_end_s:.1f}s, "
                                 f"video ends at {duration:.1f}s (+{overflow:.1f}s over)"
                             )
-                    
-                    # 检查12：字幕-语音对齐度（P0-b，Audio-First 门禁）
+                        else:
+                            self._mark('subtitle_not_overflow', gs.PASS)
+                    else:
+                        self._mark('subtitle_not_overflow', gs.UNTESTED,
+                                   "视频时长不可测，无法比对字幕结尾")
+
+                    # 检查 subtitle_audio_alignment：字幕-语音对齐度（P0-b，Audio-First 门禁）
                     # 成片音轨 silencedetect 起口 ↔ 最近 SRT 条目起点，p95 偏差超阈值拒收。
                     # 阈值单一权威源：config/quality/audio_sync_rules.json → alignment 节。
                     if duration > 0 and len(audio_streams) > 0:
@@ -758,43 +850,83 @@ class MediaQAGate:
                             # 被检出为新起口），观众无失步感 → 偏差记 0。
                             # 只对字幕窗口之外的起口测最近起点偏差，
                             # 真正的整体错位（起口在无字幕区）仍会被拦截。
+                            # 注意：该归零口径使 p95=0 只说明"每个起口都落在某条
+                            # 字幕窗口内"，不得读成逐句精确同步（A08 语义澄清）。
                             for st, en in srt_windows:
                                 if st - 0.15 <= t <= en:
                                     return 0.0
                             return min(abs(s - t) for s in srt_starts)
 
-                        deviations = sorted(_onset_deviation(t) for t in onsets)
-                        p95 = None
-                        if deviations:
-                            idx = max(0, int(len(deviations) * 0.95 + 0.999) - 1)
-                            p95 = deviations[idx]
-                        self.alignment = {
-                            'onsets_detected': len(onsets),
-                            'p95_deviation_seconds': round(p95, 3) if p95 is not None else None,
-                            'max_deviation_seconds': round(deviations[-1], 3) if deviations else None,
-                            'threshold_p95_seconds': rules['p95_max_seconds'],
-                        }
-                        if len(onsets) < rules['min_onsets']:
-                            # 含 BGM 成片全轨无静音段 → 无法测量，降级为警告不拦截
-                            self.checks['subtitle_audio_alignment'] = True
+                        if onsets is None:
+                            self._mark('subtitle_audio_alignment', gs.UNTESTED,
+                                       "silencedetect 起口扫描失败")
                             self.warnings.append(
-                                f"Subtitle-audio alignment not measurable: only "
-                                f"{len(onsets)} speech onsets detected "
-                                f"(min {rules['min_onsets']}, BGM may mask silences)"
-                            )
-                        elif p95 > rules['p95_max_seconds']:
-                            self.checks['subtitle_audio_alignment'] = False
-                            msg = (f"Subtitle-audio misalignment: p95 deviation "
-                                   f"{p95:.3f}s > {rules['p95_max_seconds']}s "
-                                   f"({len(onsets)} onsets, max {deviations[-1]:.3f}s)")
-                            if rules.get('fail_on_violation', True):
-                                self.errors.append(msg)
-                            else:
-                                self.warnings.append(msg)
+                                "Subtitle-audio alignment scan failed (ffmpeg error)")
                         else:
-                            self.checks['subtitle_audio_alignment'] = True
+                            deviations = sorted(_onset_deviation(t) for t in onsets)
+                            p95 = None
+                            if deviations:
+                                idx = max(0, int(len(deviations) * 0.95 + 0.999) - 1)
+                                p95 = deviations[idx]
+                            self.alignment = {
+                                'onsets_detected': len(onsets),
+                                'p95_deviation_seconds': round(p95, 3) if p95 is not None else None,
+                                'max_deviation_seconds': round(deviations[-1], 3) if deviations else None,
+                                'threshold_p95_seconds': rules['p95_max_seconds'],
+                                # A08 语义澄清（随记录面下发，禁止下游把 p95=0
+                                # 读成逐句精确同步）：本指标只裁定"每个语音
+                                # 起口是否落在某条字幕窗口内/距最近起点多远"。
+                                'measure_semantics': (
+                                    "onset↔nearest SRT-window deviation with "
+                                    "in-window zeroing; p95=0 means every onset "
+                                    "falls inside some subtitle window — NOT "
+                                    "per-sentence sync precision"),
+                            }
+                            if len(onsets) < rules['min_onsets']:
+                                if _config_bgm_declared(config_path):
+                                    # config 声明启用 BGM：全轨无静音段是设计形态，
+                                    # silencedetect 口径合法不适用（不阻断，也不计通过）
+                                    self._mark('subtitle_audio_alignment', gs.NOT_APPLICABLE,
+                                               f"仅 {len(onsets)} 起口（min {rules['min_onsets']}），"
+                                               f"config 声明 bgm_enabled，silencedetect 口径不适用")
+                                    self.warnings.append(
+                                        f"Subtitle-audio alignment not measurable: only "
+                                        f"{len(onsets)} speech onsets detected "
+                                        f"(min {rules['min_onsets']}, BGM declared — "
+                                        f"silence-based check not applicable)"
+                                    )
+                                else:
+                                    # 纯旁白项目起口样本不足：裁定依据缺失＝未测，
+                                    # 不得压成通过（旧实现 checks=True 即 A04 原缺陷）
+                                    self._mark('subtitle_audio_alignment', gs.UNTESTED,
+                                               f"仅 {len(onsets)} 起口 < min_onsets "
+                                               f"{rules['min_onsets']}，p95 无从裁定")
+                                    self.warnings.append(
+                                        f"Subtitle-audio alignment UNTESTED: only "
+                                        f"{len(onsets)} speech onsets detected "
+                                        f"(min {rules['min_onsets']}) — not adjudicated"
+                                    )
+                            elif p95 > rules['p95_max_seconds']:
+                                msg = (f"Subtitle-audio misalignment: p95 deviation "
+                                       f"{p95:.3f}s > {rules['p95_max_seconds']}s "
+                                       f"({len(onsets)} onsets, max {deviations[-1]:.3f}s)")
+                                if rules.get('fail_on_violation', True):
+                                    self._mark('subtitle_audio_alignment', gs.FAIL)
+                                    self.errors.append(msg)
+                                else:
+                                    self._mark('subtitle_audio_alignment', gs.PASS,
+                                               "fail_on_violation=false，超限仅预警")
+                                    self.warnings.append(msg)
+                            else:
+                                self._mark('subtitle_audio_alignment', gs.PASS)
+                    elif len(audio_streams) == 0:
+                        self._mark('subtitle_audio_alignment', gs.UNTESTED,
+                                   "无音频流，起口不可测")
+                    else:
+                        self._mark('subtitle_audio_alignment', gs.UNTESTED,
+                                   "时长不可测")
 
-                    # 检查14：黑场-字幕重叠（物理测量，直接回答"观众看到什么"）
+                    # 检查 no_black_frame_with_subtitle：黑场-字幕重叠（物理测量，直接回答"观众看到什么"）
                     # 背景：曾出现 end-fade 声明与场景窗口脱钩，尾部 ~5s 黑场
                     # 但音频/字幕持续播放。声明层门禁（step0）只能拦截已知
                     # 形态，此处用 blackdetect 对渲染产物做无假设扫描。
@@ -805,30 +937,47 @@ class MediaQAGate:
                             str(video_path),
                             min_black=bf_rules['min_black_seconds'],
                             pix_th=bf_rules['pixel_threshold'])
-                        max_ov = bf_rules['max_overlap_with_narration_seconds']
-                        srt_spans = [(e['start_ms'] / 1000.0, e['end_ms'] / 1000.0)
-                                     for e in entries]
-                        violations = []
-                        for bs, be in black_intervals:
-                            for ss, se in srt_spans:
-                                overlap = min(be, se) - max(bs, ss)
-                                if overlap > max_ov:
-                                    violations.append((bs, be, ss, se, overlap))
-                        self.media_facts['black_intervals'] = [
-                            (round(bs, 2), round(be, 2))
-                            for bs, be in black_intervals]
-                        self.checks['no_black_frame_with_subtitle'] = not violations
-                        for bs, be, ss, se, overlap in violations:
-                            msg = (f"Black screen while subtitle showing: black "
-                                   f"{bs:.1f}-{be:.1f}s overlaps subtitle "
-                                   f"{ss:.1f}-{se:.1f}s by {overlap:.1f}s "
-                                   f"(threshold {max_ov}s) — 画面空档但音频/字幕持续")
-                            if bf_rules.get('fail_on_violation', True):
-                                self.errors.append(msg)
+                        if black_intervals is None:
+                            self._mark('no_black_frame_with_subtitle', gs.UNTESTED,
+                                       "blackdetect 扫描失败")
+                            self.warnings.append("Black-frame scan failed (ffmpeg error)")
+                        else:
+                            max_ov = bf_rules['max_overlap_with_narration_seconds']
+                            srt_spans = [(e['start_ms'] / 1000.0, e['end_ms'] / 1000.0)
+                                         for e in entries]
+                            violations = []
+                            for bs, be in black_intervals:
+                                for ss, se in srt_spans:
+                                    overlap = min(be, se) - max(bs, ss)
+                                    if overlap > max_ov:
+                                        violations.append((bs, be, ss, se, overlap))
+                            self.media_facts['black_intervals'] = [
+                                (round(bs, 2), round(be, 2))
+                                for bs, be in black_intervals]
+                            if violations and bf_rules.get('fail_on_violation', True):
+                                self._mark('no_black_frame_with_subtitle', gs.FAIL)
+                            elif violations:
+                                self._mark('no_black_frame_with_subtitle', gs.PASS,
+                                           "fail_on_violation=false，重叠仅预警")
                             else:
-                                self.warnings.append(msg)
+                                self._mark('no_black_frame_with_subtitle', gs.PASS)
+                            for bs, be, ss, se, overlap in violations:
+                                msg = (f"Black screen while subtitle showing: black "
+                                       f"{bs:.1f}-{be:.1f}s overlaps subtitle "
+                                       f"{ss:.1f}-{se:.1f}s by {overlap:.1f}s "
+                                       f"(threshold {max_ov}s) — 画面空档但音频/字幕持续")
+                                if bf_rules.get('fail_on_violation', True):
+                                    self.errors.append(msg)
+                                else:
+                                    self.warnings.append(msg)
+                    elif len(video_streams) == 0:
+                        self._mark('no_black_frame_with_subtitle', gs.UNTESTED,
+                                   "无视频流")
+                    else:
+                        self._mark('no_black_frame_with_subtitle', gs.UNTESTED,
+                                   "时长不可测")
 
-                    # 检查15：字幕单字跨行（排版孤字，严重破坏阅读体验）
+                    # 检查 no_single_char_subtitle_line：字幕单字跨行（排版孤字，严重破坏阅读体验）
                     # step5 均衡分行算法已从源头消除，此处是交付前复查：
                     # 拦截外部导入/手工编辑的 SRT。
                     _cjk_re = re.compile(r'^[\u4e00-\u9fff]$')
@@ -837,13 +986,14 @@ class MediaQAGate:
                         for ln in e['text'].split('\n'):
                             if _cjk_re.match(ln.strip()):
                                 orphan_lines.append((e['index'], ln.strip()))
-                    self.checks['no_single_char_subtitle_line'] = not orphan_lines
+                    self._mark('no_single_char_subtitle_line',
+                               gs.PASS if not orphan_lines else gs.FAIL)
                     for idx, ch in orphan_lines:
                         self.errors.append(
                             f"Single-character subtitle line: entry #{idx} "
                             f"has orphan char '{ch}' on its own line — 孤字跨行")
 
-                    # 检查16：字幕术语规范 lint（朗读层形态直通显示层）
+                    # 检查 subtitle_terms_normalized：字幕术语规范 lint（朗读层形态直通显示层）
                     # 词典单一权威源：subtitle_term_rules.json → lint_patterns。
                     term_hits = []
                     for pat in _load_term_lint_patterns():
@@ -856,13 +1006,14 @@ class MediaQAGate:
                                 term_hits.append(
                                     (e['index'], m_hit,
                                      pat.get('message', 'term lint hit')))
-                    self.checks['subtitle_terms_normalized'] = not term_hits
+                    self._mark('subtitle_terms_normalized',
+                               gs.PASS if not term_hits else gs.FAIL)
                     for idx, hit, msg in term_hits:
                         self.errors.append(
                             f"Subtitle term violation: entry #{idx} contains "
                             f"'{hit}' — {msg}（补充 subtitle_term_rules.json 词典后重跑 step5）")
-        
-        # 检查11：输出路径命名正确性（AGENTS.md 交付约束：禁止技术词命名）
+
+        # 检查 output_naming_valid：输出路径命名正确性（AGENTS.md 交付约束：禁止技术词命名）
         # 被验收视频/字幕文件名命中 final/v01/render/raw/tmp → 拒收，
         # 交付名须用业务描述性名称。清单集中定义：FORBIDDEN_NAME_TOKENS。
         naming_violations = []
@@ -872,13 +1023,13 @@ class MediaQAGate:
             hits = _FORBIDDEN_NAME_RE.findall(Path(p).stem.lower())
             if hits:
                 naming_violations.append((label, Path(p).name, sorted(set(hits))))
-        self.checks['output_naming_valid'] = not naming_violations
+        self._mark('output_naming_valid', gs.PASS if not naming_violations else gs.FAIL)
         for label, name, hits in naming_violations:
             self.errors.append(
                 f"Delivery naming violation: {label}文件名 '{name}' 含技术词 "
                 f"{'/'.join(hits)} — 交付名须为业务描述性名称（AGENTS.md 交付约束）")
-        
-        # 检查17：死区终检（阈值单一权威源：audio_sync_rules.json → dead_air 节）
+
+        # 检查 no_dead_air：死区终检（阈值单一权威源：audio_sync_rules.json → dead_air 节）
         # step7 的死区检查基于声明的场景窗口；此处对最终成品做物理测量兜底，
         # 拦截任何来源的超长连续静音（含 BGM 成片全轨无静音，自然通过）。
         # 场景感知：narration_required=false（cover/transition）窗内静音属设计
@@ -891,54 +1042,81 @@ class MediaQAGate:
                 noise_db=_load_alignment_rules().get('silence_db', -40),
                 min_silence=max_dead,
                 duration=duration)
-            narration_scenes = None
-            if narration_path:
-                cover_dur = 0.0
-                if config_path:
-                    _, cover_dur = _resolve_narration_from_config(config_path)
-                narration_scenes = _load_narration_scenes(narration_path, cover_dur)
-            elif config_path:
-                resolved_narration, cover_dur = _resolve_narration_from_config(config_path)
-                if resolved_narration:
-                    narration_scenes = _load_narration_scenes(resolved_narration, cover_dur)
-            if narration_scenes is None and long_silences:
-                self.warnings.append(
-                    "未提供场景数据（--narration 或 config 的 narration_source），"
-                    "死区终检降级为全片扫描，封面/转场静音可能误报")
-            violations = filter_dead_air_violations(
-                long_silences, narration_scenes, max_dead)
-            self.checks['no_dead_air'] = not violations
-            self.media_facts['dead_air_intervals'] = [
-                (round(st, 2), round(en, 2)) for st, en, _ in violations]
-            for st, en, dur_s in violations:
-                msg = (f"Dead air in final video: {st:.1f}-{en:.1f}s 连续静音 "
-                       f"计入 {dur_s:.1f}s > {max_dead}s（dead_air.max_seconds_per_scene，"
-                       f"已排除旁白非必需场景窗）" if narration_scenes is not None else
-                       f"Dead air in final video: {st:.1f}-{en:.1f}s 连续静音 "
-                       f"{dur_s:.1f}s > {max_dead}s（dead_air.max_seconds_per_scene）")
-                if da_rules.get('fail_on_violation', True):
-                    self.errors.append(msg)
+            if long_silences is None:
+                self._mark('no_dead_air', gs.UNTESTED, "silencedetect 死区扫描失败")
+                self.warnings.append("Dead-air scan failed (ffmpeg error)")
+            else:
+                narration_scenes = None
+                if narration_path:
+                    cover_dur = 0.0
+                    if config_path:
+                        _, cover_dur = _resolve_narration_from_config(config_path)
+                    narration_scenes = _load_narration_scenes(narration_path, cover_dur)
+                elif config_path:
+                    resolved_narration, cover_dur = _resolve_narration_from_config(config_path)
+                    if resolved_narration:
+                        narration_scenes = _load_narration_scenes(resolved_narration, cover_dur)
+                if narration_scenes is None and long_silences:
+                    self.warnings.append(
+                        "未提供场景数据（--narration 或 config 的 narration_source），"
+                        "死区终检降级为全片扫描，封面/转场静音可能误报")
+                violations = filter_dead_air_violations(
+                    long_silences, narration_scenes, max_dead)
+                self.media_facts['dead_air_intervals'] = [
+                    (round(st, 2), round(en, 2)) for st, en, _ in violations]
+                if violations and da_rules.get('fail_on_violation', True):
+                    self._mark('no_dead_air', gs.FAIL)
+                elif violations:
+                    self._mark('no_dead_air', gs.PASS,
+                               "fail_on_violation=false，超限仅预警")
                 else:
-                    self.warnings.append(msg)
-        
-        # 检查9：视觉边界检查状态
-        self.checks['visual_check_passed'] = visual_check_passed
-        if not visual_check_passed:
+                    self._mark('no_dead_air', gs.PASS)
+                for st, en, dur_s in violations:
+                    msg = (f"Dead air in final video: {st:.1f}-{en:.1f}s 连续静音 "
+                           f"计入 {dur_s:.1f}s > {max_dead}s（dead_air.max_seconds_per_scene，"
+                           f"已排除旁白非必需场景窗）" if narration_scenes is not None else
+                           f"Dead air in final video: {st:.1f}-{en:.1f}s 连续静音 "
+                           f"{dur_s:.1f}s > {max_dead}s（dead_air.max_seconds_per_scene）")
+                    if da_rules.get('fail_on_violation', True):
+                        self.errors.append(msg)
+                    else:
+                        self.warnings.append(msg)
+        elif len(audio_streams) == 0:
+            self._mark('no_dead_air', gs.UNTESTED, "无音频流，死区不可测")
+        else:
+            self._mark('no_dead_air', gs.UNTESTED, "时长不可测")
+
+        # 检查 visual_boundary_verified：视觉边界检查状态（上游 visual_boundary_check 的结论透传）
+        # "not_applicable"＝上游按声明合法跳过（quick-fix），不计通过也不判违规；
+        # False＝上游未确认（未跑/未过）＝未测，旧实现只发警告不留状态位。
+        if visual_check_passed == "not_applicable":
+            self._mark('visual_boundary_verified', gs.NOT_APPLICABLE,
+                       "上游视觉检查被声明性跳过（如 quick-fix）")
+        elif visual_check_passed:
+            self._mark('visual_boundary_verified', gs.PASS)
+        else:
+            self._mark('visual_boundary_verified', gs.UNTESTED,
+                       "视觉边界检查未确认（上游未通过或未回报）")
             self.warnings.append("Visual boundary check not passed or not verified")
-        
-        # 检查13：配置声明-实测一致性（fps / resolution）
+
+        # 检查 declared_matches_measured：配置声明-实测一致性（fps / resolution）
         # 背景：曾出现 config 声明 fps=30 但渲染器实际输出 25fps 的失效配置，
         # 声明与产物脱钩会污染输入指纹缓存判定，必须在交付前拦截。
-        if config_path and len(video_streams) > 0:
+        if not config_path:
+            self._mark('declared_matches_measured', gs.NOT_APPLICABLE,
+                       "未提供 config，声明-实测比对无对照面")
+        elif len(video_streams) > 0:
             self._check_declared_vs_measured(config_path, video_streams[0])
-        
-        # 总体判定
+        else:
+            self._mark('declared_matches_measured', gs.UNTESTED, "无视频流，实测值缺失")
+
+        # 总体判定：passed 保持旧语义（无 FAIL 违规）；四态总裁定见 verdict
         passed = len(self.errors) == 0
         return passed, self._result()
-    
+
     def _check_declared_vs_measured(self, config_path: str,
                                     video_stream: Dict[str, Any]) -> None:
-        """检查13：config 声明的 fps/resolution 必须与 ffprobe 实测一致。
+        """declared_matches_measured：config 声明的 fps/resolution 必须与 ffprobe 实测一致。
 
         实测值同时记录到 media_facts，供完工报告/交付说明直接引用，
         避免交付文档手工填写产生漂移。
@@ -947,9 +1125,10 @@ class MediaQAGate:
             with open(config_path, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
+            self._mark('declared_matches_measured', gs.UNTESTED, f"config 读取失败: {e}")
             self.warnings.append(f"Cannot read config for declared-vs-measured check: {e}")
             return
-        
+
         # 实测 fps（r_frame_rate 形如 "25/1"）
         measured_fps = None
         rate_str = video_stream.get('r_frame_rate', '')
@@ -961,16 +1140,18 @@ class MediaQAGate:
         self.media_facts['measured_fps'] = measured_fps
         self.media_facts['measured_resolution'] = (
             f"{measured_w}x{measured_h}" if measured_w and measured_h else None)
-        
+
         # 声明值（顶层优先，回退 project_info）
         declared_fps = cfg.get('fps', cfg.get('project_info', {}).get('fps'))
         declared_res = cfg.get('resolution',
                                cfg.get('project_info', {}).get('resolution'))
         self.media_facts['declared_fps'] = declared_fps
         self.media_facts['declared_resolution'] = declared_res
-        
+
+        compared = False
         ok = True
         if declared_fps is not None and measured_fps is not None:
+            compared = True
             if abs(float(declared_fps) - measured_fps) > 0.1:
                 ok = False
                 self.errors.append(
@@ -979,6 +1160,7 @@ class MediaQAGate:
                     f"— fix config or renderer, do not ship stale declarations"
                 )
         if declared_res and measured_w and measured_h:
+            compared = True
             rm = re.match(r'^(\d+)\s*[xX×]\s*(\d+)$', str(declared_res).strip())
             if rm and (int(rm.group(1)) != measured_w or int(rm.group(2)) != measured_h):
                 ok = False
@@ -986,20 +1168,110 @@ class MediaQAGate:
                     f"Declared-vs-measured resolution mismatch: config declares "
                     f"{declared_res} but ffprobe measures {measured_w}x{measured_h}"
                 )
-        self.checks['declared_matches_measured'] = ok
-    
+        if not compared:
+            self._mark('declared_matches_measured', gs.UNTESTED,
+                       "config 未声明 fps/resolution，无对照面")
+        else:
+            self._mark('declared_matches_measured', gs.PASS if ok else gs.FAIL)
+
     def _result(self) -> Dict[str, Any]:
-        """返回结构化结果"""
+        """返回结构化结果（四态报告：未测/不适用独立成清单，不并入通过数）。"""
+        untested = [
+            f"{k} — {self.status_notes.get(k, '未测')}"
+            for k, v in self.statuses.items() if v == gs.UNTESTED
+        ]
+        not_applicable = [
+            f"{k} — {self.status_notes.get(k, '合法不适用')}"
+            for k, v in self.statuses.items() if v == gs.NOT_APPLICABLE
+        ]
         return {
             'passed': len(self.errors) == 0,
+            'verdict': gs.verdict(self.errors, untested),
             'errors': self.errors,
             'warnings': self.warnings,
             'checks': self.checks,
+            'check_statuses': dict(self.statuses),
+            'status_counts': gs.count_statuses(
+                [{'status': s} for s in self.statuses.values()]),
+            'untested': untested,
+            'not_applicable': not_applicable,
             'alignment': self.alignment,
             'media_facts': self.media_facts,
-            'total_checks': len(self.checks),
-            'passed_checks': sum(1 for v in self.checks.values() if v)
+            'total_checks': len(self.statuses),
+            'passed_checks': sum(1 for v in self.statuses.values() if v == gs.PASS)
         }
+
+
+def adjudicate(result: Dict[str, Any], accept_untested: bool = False) -> Tuple[bool, str]:
+    """生产链接入点的统一裁定（2026-09-18 A04）。
+
+    返回 (放行与否, 原因)。规则：
+    - verdict=FAIL → 不放行，首条错误入原因；
+    - verdict=UNTESTED → "没跑成的检查"不得读成通过——默认不放行，
+      仅显式 accept_untested（操作者知情放行并留痕）时放行；
+    - verdict=PASS（NOT_APPLICABLE 不计违规也不计通过）→ 放行。
+    """
+    verdict = result.get('verdict')
+    if verdict == gs.FAIL:
+        errs = result.get('errors') or []
+        return False, f"Final media QA FAIL: {errs[0] if errs else 'see details'}"
+    if verdict == gs.UNTESTED:
+        untested = result.get('untested') or []
+        detail = untested[0] if untested else 'see details'
+        if accept_untested:
+            return True, (f"UNTESTED accepted via --accept-media-untested "
+                          f"({len(untested)} check(s)): {detail}")
+        return False, (f"Final media QA incomplete: {len(untested)} check(s) UNTESTED "
+                       f"— {detail}（UNTESTED 不是通过；修复测量环境后重跑，"
+                       f"或知情放行 --accept-media-untested 并留痕）")
+    return True, ""
+
+def print_report(result: Dict[str, Any]) -> None:
+    """人读报告行（从 main 拆出：报告文案属可断言的行为面，不靠 grep 源码锁）。"""
+    counts = result.get('status_counts', {})
+    print(f"[{result['verdict']}] Media QA Gate "
+          f"(PASS={counts.get(gs.PASS, 0)}, FAIL={counts.get(gs.FAIL, 0)}, "
+          f"UNTESTED={counts.get(gs.UNTESTED, 0)}, "
+          f"NOT_APPLICABLE={counts.get(gs.NOT_APPLICABLE, 0)}, "
+          f"total={result['total_checks']})")
+
+    align = result.get('alignment') or {}
+    if align.get('onsets_detected') is not None:
+        p95 = align.get('p95_deviation_seconds')
+        print(f"  Alignment: {align['onsets_detected']} onsets, "
+              f"p95={p95 if p95 is not None else 'n/a'}s "
+              f"(threshold {align.get('threshold_p95_seconds')}s)")
+        if p95 == 0:
+            # A08：归零口径最易被读成"逐句精确同步"，报告行当场点名语义边界
+            print("    note: p95=0 = 所有起口均落在某条字幕窗口内（窗口内归零口径），"
+                  "非逐句精确同步")
+
+    facts = result.get('media_facts') or {}
+    if facts.get('measured_fps') is not None:
+        print(f"  Media facts: measured {facts['measured_fps']:g}fps "
+              f"{facts.get('measured_resolution')} "
+              f"(declared {facts.get('declared_fps')}fps {facts.get('declared_resolution')})")
+
+    if result['errors']:
+        print(f"[FAIL — ERRORS]")
+        for err in result['errors']:
+            print(f"  - {err}")
+
+    if result['untested']:
+        print(f"[UNTESTED — 不得读成通过]")
+        for u in result['untested']:
+            print(f"  - {u}")
+
+    if result['not_applicable']:
+        print(f"[NOT_APPLICABLE — 不计违规也不计通过]")
+        for n in result['not_applicable']:
+            print(f"  - {n}")
+
+    if result['warnings']:
+        print(f"[WARNINGS]")
+        for warn in result['warnings']:
+            print(f"  - {warn}")
+
 
 def main():
     """命令行工具"""
@@ -1025,34 +1297,15 @@ def main():
         narration_path=args.narration
     )
     
-    print(f"[{'PASS' if passed else 'FAIL'}] Media QA Gate")
-    print(f"  Checks: {result['passed_checks']}/{result['total_checks']} passed")
-    
-    align = result.get('alignment') or {}
-    if align.get('onsets_detected') is not None:
-        p95 = align.get('p95_deviation_seconds')
-        print(f"  Alignment: {align['onsets_detected']} onsets, "
-              f"p95={p95 if p95 is not None else 'n/a'}s "
-              f"(threshold {align.get('threshold_p95_seconds')}s)")
-    
-    facts = result.get('media_facts') or {}
-    if facts.get('measured_fps') is not None:
-        print(f"  Media facts: measured {facts['measured_fps']:g}fps "
-              f"{facts.get('measured_resolution')} "
-              f"(declared {facts.get('declared_fps')}fps {facts.get('declared_resolution')})")
-    
-    if result['errors']:
-        print(f"[ERRORS]")
-        for err in result['errors']:
-            print(f"  - {err}")
-    
-    if result['warnings']:
-        print(f"[WARNINGS]")
-        for warn in result['warnings']:
-            print(f"  - {warn}")
-    
+    print_report(result)
+
     import sys
-    sys.exit(0 if passed else 1)
+    # 退出码词汇对齐 _gate_status：2＝未测（跑不成），1＝FAIL，0＝PASS
+    if not passed:
+        sys.exit(1)
+    if result['verdict'] == gs.UNTESTED:
+        sys.exit(2)
+    sys.exit(0)
 
 if __name__ == '__main__':
     main()

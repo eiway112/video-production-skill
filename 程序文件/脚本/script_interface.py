@@ -35,6 +35,35 @@ from typing import Any, Dict, List, Optional
 import hashlib
 
 
+# === 权威源落盘 ===
+def atomic_write_json(path, payload):
+    """JSON 落盘统一走"临时文件 + os.replace"（A10，2026-09-19）。
+
+    原地 `open(path,'w')` 先截断再序列化，进程在 dump 中途死掉即留下半截文件。
+    对可再生成的临时产物这只是一次重跑；对**不可再生的权威源**（narration.json、
+    项目 config、pipeline_state、交付登记表）则是数据丢失——旧状态读取侧那段
+    按右花括号到左花括号边界拼接的恢复补丁就是这段历史的化石。写临时名再原子
+    替换，读者要么看到
+    旧版本、要么看到新版本，永远看不到半截。
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # 半截临时名留着无用（下次写会重建并截断），且会在权威源目录里
+        # 长期驻留成噪声；目标文件从未被打开过，仍是上一版完整内容。
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 # === Exit Code 标准定义 ===
 class EXIT_CODE:
     """标准 exit code 定义"""

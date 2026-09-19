@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_line_time, resolve_script_times, parse_scene_map
 from _narration_lint import scan_srt_file as _lint_scan_srt, format_findings as _lint_format
 from _script_env import ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE
+import _forced_align as _fa  # 叶子模块（faster_whisper 仅在 load 时导入）；版本面消费 MODEL_SIZE
 
 import argparse
 
@@ -429,12 +430,36 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause):
     return True, sentences, total_inserted
 
 
+def _wave_sha256(wav_path):
+    """波形内容哈希（A08）：对齐缓存必须绑定实际音频字节而非文本派生键。
+
+    tts_hash 由旁白文本+引擎参数派生，但 hq 波形可被文本之外的因素改变
+    （_enforce_sentence_pauses 插静音、同参数重新合成）——只绑文本哈希
+    会让旧时间戳被误复用（与 A06"登记路径＝真实读取路径"同族）。
+    """
+    h = hashlib.sha256()
+    try:
+        with open(wav_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()[:16]
+
+
+# 对齐算法版本（A08）：分段逻辑（_split_text_to_segments）、对齐模型/
+# 后端（_forced_align）、时间戳语义变化时必须 bump；版本不符 → 缓存失效。
+ALIGN_ALGO_VERSION = "v1"
+
+
 def _build_timeline_manifest(temp_dir):
     """生成/刷新 _timeline_manifest.json —— 句级时间戳单一权威文件（P0-a）。
 
     架构原则：字幕时刻从音频物理波形派生（ASR 强制对齐），不再由
     字符数估算。每个场景记录：
       - tts_hash / tts_duration：产物真实性锚点（文本一改 hash 即失效）
+      - wave_sha256 / align_algo_ver：对齐结果的真实绑定（A08）——缓存复用
+        要求波形字节与算法版本双双一致，文本哈希一致但波形已变则重对齐。
       - sentences[]：每条字幕分段在音频内的 rel_start/rel_end（秒）。
         相对时刻对 adjust_timeline 的边界平移不变 —— 消费方用
         当前 SCENES 的 scene_start 锚定绝对位置，因此 tts → timeline →
@@ -460,6 +485,7 @@ def _build_timeline_manifest(temp_dir):
     scenes_out = []
     aligned = 0
     pause_min = float((_load_audio_sync_rules().get('sentence_pause') or {}).get('min_seconds', 0.4))
+    algo_ver = f"{ALIGN_ALGO_VERSION}|{_fa.MODEL_SIZE}|pause={pause_min:g}"
     for scene_id, start, end, text in SCENES:
         h = _tts_cache_key(text)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
@@ -467,6 +493,7 @@ def _build_timeline_manifest(temp_dir):
             print(f"  [WARN] timeline manifest: TTS missing for scene {scene_id}, skipped")
             continue
         tts_dur = get_duration(str(hq_file))
+        wave_sha = _wave_sha256(hq_file)
         entry = {
             'scene_id': scene_id,
             'start': round(float(start), 3),
@@ -474,11 +501,20 @@ def _build_timeline_manifest(temp_dir):
             'tts_hash': h,
             'tts_file': hq_file.name,
             'tts_duration': round(tts_dur, 3),
+            'wave_sha256': wave_sha,
+            'align_algo_ver': algo_ver,
         }
 
         prev = old_scenes.get(str(scene_id))
-        if (prev and prev.get('tts_hash') == h and prev.get('method') == 'asr_forced'
-                and prev.get('sentences')):
+        # 复用四条件（A08）：文本键一致 ∧ 记录的是同一个波形文件 ∧
+        # 波形字节实测未变 ∧ 算法版本未 bump。缺任一即重对齐——
+        # 旧实现只比 tts_hash，波形被插静音/重新合成后仍复用旧时间戳。
+        if (prev and prev.get('tts_hash') == h
+                and prev.get('tts_file') == hq_file.name
+                and prev.get('method') == 'asr_forced'
+                and prev.get('sentences')
+                and prev.get('wave_sha256') == wave_sha
+                and prev.get('align_algo_ver', algo_ver) == algo_ver):
             # 缓存命中：rel 时刻不变，只刷新绝对边界（不 continue，仍要过停顿强制复检）
             entry['method'] = 'asr_forced'
             entry['match_ratio'] = prev.get('match_ratio')
@@ -516,6 +552,9 @@ def _build_timeline_manifest(temp_dir):
                 entry['sentences'] = new_sents
                 entry['tts_duration'] = round(get_duration(str(hq_file)), 3)
                 entry['pause_inserted'] = round(ins, 3)
+                # 停顿强制改写了波形字节：记录面重绑到改写后的实测哈希，
+                # 否则下一轮"当前波形 vs 记录哈希"恒不等，缓存命中被永久击穿。
+                entry['wave_sha256'] = _wave_sha256(hq_file)
                 print(f"  Scene {scene_id}: sentence-pause enforced "
                       f"(+{ins:.2f}s silence → {entry['tts_duration']:.2f}s)")
         scenes_out.append(entry)
@@ -820,15 +859,23 @@ def get_paths(config_cfg=None):
         # 兼容两种配置写法：paths.subtitle_name 或 subtitle.file
         subtitle_name = p.get('subtitle_name', '') or config_cfg.get('subtitle', {}).get('file', '')
         temp_subdir = p.get('temp_subdir', 'crm_audio')
-        video_file = root / "成果文件" / "视频" / video_name
-        temp_dir = root / "过程产物" / "临时产物" / temp_subdir
-        output_file = video_file
         subtitle_file = root / "成果文件" / "字幕" / subtitle_name
     else:
-        video_file = root / "成果文件" / "视频" / "销售CRM系统工具开发_赋能个性化销售场景.mp4"
-        temp_dir = root / "过程产物" / "临时产物" / "crm_audio"
-        output_file = root / "成果文件" / "视频" / "销售CRM系统工具开发_赋能个性化销售场景.mp4"
+        video_name = "销售CRM系统工具开发_赋能个性化销售场景.mp4"
+        temp_subdir = "crm_audio"
         subtitle_file = root / "成果文件" / "字幕" / "销售CRM系统工具开发_赋能个性化销售场景.srt"
+
+    output_file = root / "成果文件" / "视频" / video_name
+    temp_dir = root / "过程产物" / "临时产物" / temp_subdir
+    # 输入源与交付槽位分离（2026-09-03）：后处理输入取纯净渲染 render_raw.mp4，
+    # 成果目录只在链路成功末端（step3 混音 / step6 烧字幕）被写入。
+    # 旧实现把槽位当输入（render 步先把无声裸片复制进去），两类后果实测发生过：
+    #   ① 后处理失败时裸片留在交付槽冒充成片（2026-09-02 WSI 批次 4 条）；
+    #   ② 重跑时把已混音、已烧字幕的成片当输入再处理一遍（字幕重复）。
+    # 无 render_raw 时回退槽位文件，保留"手工放一个视频进成果目录再单独调用
+    # 本脚本"的用法。
+    render_raw = temp_dir / "render_raw.mp4"
+    video_file = render_raw if render_raw.exists() else output_file
     return root, video_file, temp_dir, output_file, subtitle_file
 
 
@@ -2322,11 +2369,13 @@ def _parse_srt_time(t):
     return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-def _write_media_quality_result(temp_dir, passed, errors, warnings):
+def _write_media_quality_result(temp_dir, passed, errors, warnings, untested=None,
+                                not_applicable=None):
     """媒体质检结果落盘（供 pipeline_runner 合并进 pipeline_state 追溯）。
 
-    汇总 step7 的视频质检（_check_video_quality）、死区、字幕等全部错误/警告。
-    写入失败不抛异常，避免影响主流程。
+    汇总 step7 的视频质检（_check_video_quality）、死区、字幕等全部错误/警告，
+    并保留"未测/合法不适用"两个独立清单——passed=True 只表示无错误，不表示全部
+    检查项都完成了。写入失败不抛异常，避免影响主流程。
     """
     try:
         out_path = Path(temp_dir) / "media_quality_result.json"
@@ -2334,6 +2383,8 @@ def _write_media_quality_result(temp_dir, passed, errors, warnings):
             "passed": bool(passed),
             "errors": errors,
             "warnings": warnings,
+            "untested": untested or [],
+            "not_applicable": not_applicable or [],
             "checked_at": datetime.now().isoformat(),
         }
         with open(out_path, "w", encoding="utf-8") as f:
@@ -2342,13 +2393,23 @@ def _write_media_quality_result(temp_dir, passed, errors, warnings):
         pass
 
 
+# astats 的 RMS 行有两种拼写：本机 FFmpeg 打印 "RMS level dB: -52.41"，旧版与
+# 元数据导出为 "RMS_level=-52.41"。只认后者会让整项音量检查永不命中、静默跳过
+# （2026-09-18 审核 A07 实测复现）。两种拼写由同一条正则覆盖，测试亦复用此常量，
+# 保证"用真值喂正则"而不是另写一份字面量。
+_RMS_LEVEL_RE = re.compile(r'RMS[ _](?:level dB:\s*|level=)(-?\d+(?:\.\d+)?)')
+
+
 def _check_video_quality(video_path, expected_duration=None):
     """Check video for blank frames, low bitrate, duration mismatch, and audio inconsistency.
 
-    Returns (errors, warnings) lists.
+    Returns (errors, warnings, untested, not_applicable) lists — 四态分开落盘：
+    "没测到"不得写成通过，也不得与"按规则不适用"混用一个字段。
     """
     errors = []
     warnings = []
+    untested = []
+    not_applicable = []
 
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_format", "-show_streams", "-of", "json", str(video_path)],
@@ -2358,14 +2419,14 @@ def _check_video_quality(video_path, expected_duration=None):
         probe_data = json.loads(probe.stdout)
     except json.JSONDecodeError:
         errors.append("Cannot probe video file \u2014 ffprobe returned invalid JSON")
-        return errors, warnings
+        return errors, warnings, untested, not_applicable
 
     v_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
     a_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]
 
     if not v_streams:
         errors.append("No video stream found in output file")
-        return errors, warnings
+        return errors, warnings, untested, not_applicable
 
     vs = v_streams[0]
     v_bitrate = _parse_bitrate_value(vs.get("bit_rate"))
@@ -2443,6 +2504,11 @@ def _check_video_quality(video_path, expected_duration=None):
                     f"Video likely blank: all {len(frame_sizes)} sample frames < 15KB "
                     f"(sizes: {frame_sizes})"
                 )
+        else:
+            untested.append(
+                f"Blank-frame check: UNTESTED — 请求 {num_samples} 帧，ffmpeg 只产出 "
+                f"{len(frame_sizes)} 帧（{video_path}），无法裁定画面是否为空"
+            )
 
     # --- Audio level consistency check: RMS at multiple sample points ---
     if a_streams and v_dur > 10:
@@ -2455,7 +2521,7 @@ def _check_video_quality(video_path, expected_duration=None):
                  "-f", "null", "-"],
                 capture_output=True, text=True, encoding='utf-8', errors='replace'
             )
-            rms_matches = re.findall(r'RMS_level=([-\d.]+)', result.stderr)
+            rms_matches = _RMS_LEVEL_RE.findall(result.stderr)
             if rms_matches:
                 try:
                     rms_values.append(float(rms_matches[-1]))
@@ -2474,8 +2540,20 @@ def _check_video_quality(video_path, expected_duration=None):
                 warnings.append(
                     f"Audio level variation: RMS range={rms_range:.1f}dB ({rms_str})"
                 )
+        else:
+            # 2026-09-18 审核 A07：解析口径与 FFmpeg 实际输出分叉时，此项曾静默跳过，
+            # 表现为"音量检查存在但从未执行"。取不到值必须点名，不得留在隐式通过里。
+            untested.append(
+                f"Audio RMS consistency: UNTESTED — astats 取到 {len(rms_values)}/"
+                f"{len(sample_ts)} 个 RMS 测量值，无法裁定音量一致性"
+                "（检查 FFmpeg astats 输出拼写是否再次变化）"
+            )
+    else:
+        reason = ("无音频流" if not a_streams
+                  else f"时长 {v_dur:.1f}s ≤ 10s，多点 RMS 采样不适用")
+        not_applicable.append(f"Audio RMS consistency: NOT_APPLICABLE — {reason}")
 
-    return errors, warnings
+    return errors, warnings, untested, not_applicable
 
 
 def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=None):
@@ -2493,14 +2571,24 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
     print("=== Step 7: Validation Gate ===")
     errors = []
     warnings = []
+    untested = []
+    not_applicable = []
     tts_dir = temp_dir / "tts_44k"
     manifest = _load_tts_manifest(temp_dir)
 
     # --- 0. Video & Audio Quality Checks ---
     if video_path and video_path.exists():
-        v_errors, v_warnings = _check_video_quality(video_path, expected_duration)
+        v_errors, v_warnings, v_untested, v_na = _check_video_quality(
+            video_path, expected_duration)
         errors.extend(v_errors)
         warnings.extend(v_warnings)
+        untested.extend(v_untested)
+        not_applicable.extend(v_na)
+    else:
+        untested.append(
+            "Video quality checks: UNTESTED — 未拿到成片路径"
+            f"（video_path={video_path}），码率/空帧/时长/RMS 全部未执行"
+        )
 
     # --- 1. TTS Overflow Check (Adaptive Thresholds) ---
     # Tolerance scales with video duration — short videos need tighter sync
@@ -2591,6 +2679,8 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
     if not TTS_ENABLED:
         # 纯BGM路径：无旁白 → SRT 不是交付要求（类型化豁免，非放松门禁）
         print("  [INFO] Subtitle checks skipped: tts_enabled=false (no narration, SRT not required)")
+        not_applicable.append(
+            "Subtitle checks: NOT_APPLICABLE — tts_enabled=false，无旁白不要求 SRT")
     elif not subtitle_path.exists():
         errors.append(f"Subtitle file not found: {subtitle_path}")
     else:
@@ -2751,6 +2841,11 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
         print(f"  [FAIL] {len(errors)} error(s):")
         for e in errors:
             print(f"    ✗ {e}")
+    elif untested:
+        # 未测项存在时不得输出"全部检查通过"——这是"没发现问题＝检查完成"的旧形态
+        print(f"  [PASS-WITH-GAP] 无错误，但 {len(untested)} 项检查未完成（未测）：")
+        for u in untested:
+            print(f"    ? {u}")
     else:
         print(f"  [PASS] All critical checks passed")
 
@@ -2759,8 +2854,14 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
         for w in warnings:
             print(f"    ⚠ {w}")
 
+    if not_applicable:
+        print(f"  [N/A] {len(not_applicable)} 项按规则合法不适用（不计通过也不计失败）：")
+        for na in not_applicable:
+            print(f"    - {na}")
+
     # 媒体质检结果持久化：落盘供 pipeline_runner 合并进 pipeline_state（完工报告追溯）
-    _write_media_quality_result(temp_dir, len(errors) == 0, errors, warnings)
+    _write_media_quality_result(temp_dir, len(errors) == 0, errors, warnings,
+                                untested, not_applicable)
 
     return len(errors) == 0
 
@@ -2771,9 +2872,10 @@ async def main():
     parser.add_argument("--tts-only", action="store_true",
                         help="Only generate TTS audio, then exit (for pre-pass before rendering)")
     parser.add_argument("--quick-fix", action="store_true",
-                        help="Restore clean video from render_raw.mp4, "
-                             "re-run audio/subtitle/burn steps (saves ~5min render time; "
-                             "TTS step still runs — cache hits are instant, stale text regenerates)")
+                        help="Re-run audio/subtitle/burn steps from the clean render_raw.mp4 "
+                             "(saves ~5min render time; TTS step still runs — cache hits are "
+                             "instant, stale text regenerates). The delivery slot is written "
+                             "only when the merge succeeds.")
     args = parser.parse_args()
 
     config_cfg = None
@@ -2801,19 +2903,18 @@ async def main():
     else:
         print(f"Temp:   {temp_dir}\n")
 
-    # Quick-fix mode: restore clean video from render_raw.mp4, skip TTS
+    # Quick-fix 模式：输入必须是纯净渲染 render_raw.mp4（get_paths 已如此解析）。
+    # 旧实现在这里 unlink 成果槽位再把裸片复制进去——等于在后处理成功之前就把
+    # 无声裸片写进交付目录，还会直接删掉已交付成片。现在槽位只由 step3（混音）
+    # 与 step6（烧字幕）在成功路径上写入，中途失败则槽位保持原状。
     if args.quick_fix:
         render_raw = temp_dir / "render_raw.mp4"
         if not render_raw.exists():
             print(f"ERROR: render_raw.mp4 not found at {render_raw}")
             print("Quick-fix requires a previous render. Run full pipeline first.")
             sys.exit(1)
-        print("=== Quick-Fix: Restoring clean video from render_raw.mp4 ===")
-        import shutil
-        if output_file.exists():
-            output_file.unlink()
-        shutil.copy2(render_raw, output_file)
-        print(f"  Restored: {output_file}\n")
+        print(f"=== Quick-Fix: clean input = {render_raw.name}; "
+              f"delivery slot written only on success ===\n")
 
     # Pre-check: HTML template must have subtitle safe zones
     if not step0_validate_html_template():

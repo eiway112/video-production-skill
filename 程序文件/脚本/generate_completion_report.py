@@ -98,7 +98,7 @@ def run_delivery_audit(report: Dict[str, Any],
     背景：SKILL.md 旧版"自评量表"由执行者自评 5 维度，属 Generator 自证。
     本函数把 5 维度全部改为从真实数据推导，治具裁定，退出码说话：
       1. end_to_end_authenticity  ← 全步 passed + 音视频流真实存在
-      2. gate_integrity           ← verifications 全过 + 无 --force 绕过留痕
+      2. gate_integrity           ← verifications 全过 + 无未测项 + 无 --force 绕过留痕
       3. delivery_compliance      ← 交付文件名无技术词 + srt 与 mp4 同基名
       4. storyboard_fidelity      ← narration_source 指针可解析、场景指纹可追溯
       5. completion_integrity     ← 报告状态 VALIDATED + ffprobe 实测 + 产物一致性已执行
@@ -133,6 +133,16 @@ def run_delivery_audit(report: Dict[str, Any],
         d2_reasons.append("verifications not recorded in state (gate evidence missing)")
     elif not all(verif_checks.values()):
         d2_reasons.append(f"{sum(1 for v in verif_checks.values() if not v)} verification(s) failed")
+    # 未测＝门禁没跑完＝门禁不完整，不得因"无错误"记为通过（2026-09-18 审核根因一）
+    untested_by_verif = {
+        k[len("verification_"):-len("_untested")]: v
+        for k, v in validation.items()
+        if k.startswith("verification_") and k.endswith("_untested") and v
+    }
+    if untested_by_verif:
+        d2_reasons.append(
+            "verification(s) incomplete (UNTESTED is not a pass): "
+            + ", ".join(f"{k}={n}" for k, n in sorted(untested_by_verif.items())))
     forced_run = None
     if state_file and Path(state_file).exists():
         try:
@@ -342,7 +352,7 @@ def generate_report(
         video_streams = [s for s in streams if s.get("codec_type") == "video"]
         
         # 实测媒体事实（fps/分辨率/编码）：供交付说明直接引用，避免手工填写漂移；
-        # 与 config 声明值的一致性拦截由 media_qa_gate 检查13负责，报告只如实记录。
+        # 与 config 声明值的一致性拦截由 media_qa_gate 的 declared_matches_measured 负责，报告只如实记录。
         if video_streams:
             vs = video_streams[0]
             fps = None
@@ -504,11 +514,23 @@ def generate_report(
                 verifications = pipeline_state.get("verifications", {})
                 if verifications:
                     report["data_sources"]["verifications"] = {
-                        k: {"passed": v.get("passed")} for k, v in verifications.items()
+                        k: {"passed": v.get("passed"),
+                            "untested": len(v.get("untested") or []),
+                            "not_applicable": len(v.get("not_applicable") or [])}
+                        for k, v in verifications.items()
                     }
                     for vkey, vres in verifications.items():
                         v_passed = bool(vres.get("passed", False))
                         report["validation"][f"verification_{vkey}_passed"] = v_passed
+                        # 未测计数与 passed 并列透出：报告不得把"没跑完的检查"记成"通过"，
+                        # 也不得与"合法不适用"混算（后者是声明过的豁免）。
+                        v_untested = list(vres.get("untested") or [])
+                        report["validation"][f"verification_{vkey}_untested"] = len(v_untested)
+                        if v_untested:
+                            report["issues"].append(
+                                f"Verification '{vkey}' incomplete: {len(v_untested)} "
+                                f"check(s) UNTESTED — {v_untested[0]}"
+                            )
                         if not v_passed:
                             errs = vres.get("errors", [])
                             report["issues"].append(

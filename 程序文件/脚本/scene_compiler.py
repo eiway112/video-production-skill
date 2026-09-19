@@ -479,7 +479,11 @@ def anim_fade_up(selector, t, duration=0.8, stagger=0):
 
 
 def anim_count_up(selector, t, end_val, unit='%', duration=1.5):
-    """Count-up: 数字从0增长到目标值。"""
+    """Count-up: 数字从0增长到目标值。
+
+    小数精度（2026-09-18 A09）：目标值自带小数时按同位数递增/显示；
+    旧实现一律 snap:1 + Math.round，把 2.5mm 报成 3mm——专业参数失真。
+    """
     t_expr = _te(t)
     t_plus = f'{t_expr} + 0.3' if isinstance(t, str) else f'{t + 0.3:.1f}'
     return (
@@ -487,12 +491,35 @@ def anim_count_up(selector, t, end_val, unit='%', duration=1.5):
         f'    {{ opacity: 0, scale: 0.8 }},\n'
         f'    {{ opacity: 1, scale: 1, duration: 0.6, ease: "back.out(1.7)" }},\n'
         f'    {t_expr}\n  );\n'
+        + _count_up_tween(selector, t_plus, end_val, unit, duration)
+    )
+
+
+def _count_precision(end_val) -> int:
+    """目标值自带的小数位数（int/无小数 → 0）。"""
+    s = str(end_val)
+    return len(s.split('.')[1].rstrip('0')) if '.' in s else 0
+
+
+def _count_up_tween(selector, t_at, end_val, unit='', duration=1.5):
+    """数字递增 tween 的唯一生成点（anim_count_up 与 stats 场景共用）。
+
+    整数目标保持 snap:1 + Math.round；小数目标按精度 snap 并 toFixed(d)，
+    终帧文本与分镜声明值逐位一致。
+    """
+    prec = _count_precision(end_val)
+    snap = 1 if prec == 0 else (10 ** -prec)
+    snap_repr = str(snap) if prec == 0 else f'{snap:.{prec}f}'
+    expr = (f'Math.round(parseFloat(this.targets()[0].innerText)) + "{unit}"'
+            if prec == 0 else
+            f'parseFloat(this.targets()[0].innerText).toFixed({prec}) + "{unit}"')
+    return (
         f'  tl.to("{selector}", {{\n'
-        f'    innerText: {end_val}, duration: {duration}, snap: {{ innerText: 1 }},\n'
+        f'    innerText: {end_val}, duration: {duration}, snap: {{ innerText: {snap_repr} }},\n'
         f'    ease: "power2.out",\n'
         f'    onUpdate: function() {{\n'
-        f'      this.targets()[0].textContent = Math.round(parseFloat(this.targets()[0].innerText)) + "{unit}";\n'
-        f'    }}\n  }}, {t_plus});\n'
+        f'      this.targets()[0].textContent = {expr};\n'
+        f'    }}\n  }}, {t_at});\n'
     )
 
 
@@ -508,12 +535,15 @@ def anim_progressive_reveal(selectors, t_start, t_end, theme, t_ref=None):
         return ''
     n = len(selectors)
     available = _expr_offset(t_end) - _expr_offset(t_start) - 3  # Leave 3s buffer
+    # available < 1 不得返回 ''：模板 CSS 把待揭示元素初始 opacity:0，无入场语句
+    # 即永久不可见（A09②：结构注释卡 ≤3 条时 span-3<1 恒触发）。降级为紧凑入场。
     if available < 1:
-        return ''
+        base_off, interval = 0.2, 0.2
+    else:
+        base_off = 0.5  # offset from t_start for first element
+        interval = min(available / max(n, 1), 2.0)
 
     code = ''
-    interval = min(available / max(n, 1), 2.0)
-    base_off = 0.5  # offset from t_start for first element
 
     for i, sel in enumerate(selectors):
         offset = base_off + i * interval
@@ -974,13 +1004,7 @@ def gen_scene_stats(scene, idx, theme, t_start, t_end, analysis=None):
         unit = item.get('unit', '%')
         if isinstance(val, (int, float)):
             t_count = f'{t_ref} + {1.8 + i * 0.4:.1f}'
-            anim += (
-                f'  tl.to("#{sid}-s{i} .stat-number", {{\n'
-                f'    innerText: {val}, duration: 1.5, snap: {{ innerText: 1 }}, ease: "power2.out",\n'
-                f'    onUpdate: function() {{\n'
-                f'      this.targets()[0].textContent = Math.round(parseFloat(this.targets()[0].innerText)) + "{unit}";\n'
-                f'    }}\n  }}, {t_count});\n'
-            )
+            anim += _count_up_tween(f'#{sid}-s{i} .stat-number', t_count, val, unit, 1.5)
 
     return html, css, anim
 

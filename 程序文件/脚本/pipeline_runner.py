@@ -47,6 +47,7 @@ from pathlib import Path
 from _gsap_time_utils import parse_scene_map
 from pipeline_state_fingerprint import compute_inputs_fingerprint
 from _script_env import ROOT, VENV_PYTHON
+from script_interface import atomic_write_json
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -61,6 +62,11 @@ OUTPUT_DIR = ROOT / "成果文件" / "视频"
 # 本文件是交付态的权威登记，由 step_completion_report 成功后写入。
 DELIVERY_REGISTRY = ROOT / "成果文件" / "交付登记.json"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
+# 增量渲染（scene_patch_render.py）的两个数据面：基线指纹 sidecar 与裁定留痕。
+# 名称必须与 scene_patch_render.SIDECAR_NAME / VERDICT_NAME 一致。
+SCENE_PATCH_SIDECAR = "scene_fingerprints.json"
+SCENE_PATCH_VERDICT = "scene_patch_verdict.json"
+SCENE_PATCH_EXIT_FALLBACK = 3
 # P0 整改（2026-08-04 prefab 复盘）：子进程输出统一落盘——透明度是复盘得出的
 # 第一教训（当时 postprocess 失败无任何日志，排障只能靠状态文件反推）。
 LOG_DIR = ROOT / "过程产物" / "日志"
@@ -100,6 +106,10 @@ HARD_GATES = {
 }
 
 STEP_NAMES = [s[0] for s in STEPS]
+
+# 指纹登记项中由流水线自己写盘的运行时产物：路径写错即永久空转（见 _fingerprint）。
+# 与源文件（narration.json 等）区分——后者按项目形态可缺，缺失属正常。
+_RUNTIME_ARTIFACT_INPUTS = frozenset({"tts_manifest", "render_raw"})
 
 # 结构化错误码：mark_failed 的 error_code 取值集合。
 # 语义分类固定，供完工报告/排障工具按码路由，避免解析自由文本 error。
@@ -309,6 +319,15 @@ class PipelineState:
         self.path = Path(state_path)
         self.data = self._load()
 
+    @staticmethod
+    def _atomic_write(path, payload):
+        """状态/登记表落盘：临时文件 + os.replace（实现见 script_interface.atomic_write_json）。
+
+        原地 `open(path,'w')` 先截断再写，异常/断电时留下半截文件；交付登记表若被
+        截断，读侧会把损坏读成空表，交付物保护门禁静默 fail-open（A10，2026-09-19）。
+        """
+        atomic_write_json(path, payload)
+
     def _load(self):
         if self.path.exists():
             try:
@@ -339,8 +358,7 @@ class PipelineState:
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        self._atomic_write(self.path, self.data)
 
     def mark_started(self, step):
         self.data["steps"][step] = {
@@ -392,9 +410,25 @@ class PipelineState:
         self.save()
 
     def reset(self, reason=""):
-        """清空全部步骤状态（--fresh 真实重跑入口）。"""
+        """清空全部步骤状态（--fresh 真实重跑入口）。
+
+        `render_metrics` 是唯一跨 reset 保留的顶层节：它是累计渲染成本台账，
+        预算门禁（`render_budget.max_full_renders`）以 `full_render_attempts` 为
+        计数源。旧实现把 self.data 整表换成 4 键新 dict，等于 --fresh 顺带清账——
+        "fresh → 重渲 → fresh → 重渲"可无限绕开门禁，而 --fresh 恰是被推荐给
+        "怀疑状态不可信"一方的恢复路径（A10，2026-09-19）。其余顶层节
+        （verifications/duration_budget_check/scene_patch/…）属上一轮运行的证据，
+        全量重置后即为陈旧，随步骤状态一并作废。
+        """
+        ledger = self.data.get("render_metrics")
         self.data = {"steps": {}, "last_run": None, "reset_reason": reason,
                      "reset_at": datetime.now().isoformat()}
+        if isinstance(ledger, dict) and ledger:
+            self.data["render_metrics"] = ledger
+            print(f"  [STATE] Ledger carried across reset: full_render_attempts="
+                  f"{ledger.get('full_render_attempts', 0)}, "
+                  f"total={ledger.get('full_render_total_seconds', 0)}s "
+                  f"(render budget keeps counting through --fresh)")
         self.save()
 
     def is_passed(self, step):
@@ -505,7 +539,7 @@ def _load_render_rules():
 
 
 class PipelineRunner:
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -536,6 +570,8 @@ class PipelineRunner:
         self.temp_dir = TEMP_BASE / paths.get("temp_subdir", f"{self.html_project}_audio")
         self.tts_dir = self.temp_dir / "tts_44k"
         self.render_raw = self.temp_dir / "render_raw.mp4"
+        self.sidecar_path = self.temp_dir / SCENE_PATCH_SIDECAR
+        self.patch_verdict_path = self.temp_dir / SCENE_PATCH_VERDICT
 
         video_name = paths.get("video_name", f"{self.html_project}.mp4")
         self.output_file = OUTPUT_DIR / video_name
@@ -554,6 +590,8 @@ class PipelineRunner:
         self.accept_over_budget = accept_over_budget
         # 渲染成本预算 soft 超限的显式放行开关（2026-08-19，见 _render_budget_gate_ok）
         self.accept_over_render = accept_over_render
+        # 成片媒体终检 UNTESTED 的显式放行开关（2026-09-18 A04，见 _final_media_qa）
+        self.accept_media_untested = accept_media_untested
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
         self._current_step = None      # run() 循环每步前设置，日志命名用
@@ -575,9 +613,13 @@ class PipelineRunner:
                 "note": "--force bypassed gate cache/HARD_GATES for this run",
             }
             self.state.save()
-        # --scene-patch（opt-in）：render 步骤先尝试场景级增量渲染，白名单外
-        # 或任一自校验失败自动降级全量。verify/visual_check/postprocess 门禁照常。
-        self.scene_patch = scene_patch
+        # 增量渲染（2026-09-03 触发权内化）：基线齐备（render_raw + sidecar）即自动
+        # 尝试场景级增量渲染，PATCH/FULL 由 scene_patch_render 的白名单分类器裁定，
+        # 段渲染/拼接/像素自校验任一失败自动降级全量。verify/visual_check/postprocess
+        # 三道门禁照常执行。旧实现为 --scene-patch opt-in：跳过零成本且不留痕，
+        # 29 份 pipeline_state 实测 scene_patch_attempts 全为 0——能力在位却零投产。
+        # --no-scene-patch 为显式退出通道（怀疑增量路径时使用）。
+        self.no_scene_patch = no_scene_patch
         # Audio-sync policy: shrink oversized scene windows so TTS drives
         # the timeline. See AGENTS.md → 渲染纪律 → 音画同步.
         self.audio_sync_rules = _load_audio_sync_rules()
@@ -669,7 +711,7 @@ class PipelineRunner:
         教训：15:28 用 --fresh 全量重置替代定点修复，直接导致合格成片被后续
         裸渲染覆盖、3 次 40 分钟级重渲、9 小时失败收尾。现在：长视频或已有
         渲染/交付产物时，必须 --confirm-fresh 显式确认，否则打印破坏清单后
-        拒绝执行，并给出低成本替代路径（--resume / --quick-fix / --scene-patch）。
+        拒绝执行，并给出低成本替代路径（--resume / --quick-fix / 自动增量渲染）。
         """
         rules = _load_delivery_gate_rules().get("fresh_guard", {})
         min_dur = float(rules.get("confirm_required_min_duration_seconds", 300))
@@ -684,7 +726,7 @@ class PipelineRunner:
             inventory.append(f"  [FILE] {self.render_raw} "
                              f"({self.render_raw.stat().st_size / 1024 / 1024:.1f} MB) — 将被重新渲染覆盖")
         if self.output_file.exists() and self.output_file.stat().st_size > 0:
-            inventory.append(f"  [FILE] {self.output_file} — 成果目录现有文件将被新渲染覆盖")
+            inventory.append(f"  [FILE] {self.output_file} — 成果目录现有文件将在后处理成功时被新成片替换")
         if self.tts_dir.exists():
             inventory.append(f"  [DIR ] {self.tts_dir} — TTS 产物将重新生成")
         if self.temp_dir.exists():
@@ -711,7 +753,7 @@ class PipelineRunner:
         print("  低成本替代路径（按优先级）：")
         print("    1. --resume       从最早失效步续跑（指纹缓存跳过未变步骤）")
         print("    2. --quick-fix    仅音画/字幕问题时免重渲染定点修复")
-        print("    3. --scene-patch  仅场景 div 内容变化时场景级增量渲染")
+        print("    3. 场景级增量渲染  基线齐备时 render 步自动尝试（无需标志；--no-scene-patch 可退出）")
         print("  确需全量重置：追加 --confirm-fresh 重新运行。")
         sys.exit(1)
 
@@ -828,12 +870,29 @@ class PipelineRunner:
         """
         narration = self.source_dir / "narration.json"
         compiled = self.source_dir / "_compiled_scenes.json"
-        tts_manifest = self.tts_dir / "tts_manifest.json"
+        # tts_manifest 落盘位置是 temp 根，不是 temp/tts_44k/：写入方
+        # enhance_video_audio._save_tts_manifest、消费方 instant_preview:736 同源。
+        # 旧指纹登记指向 tts_44k 下的同名文件——全仓实测该路径 0 个存在
+        # （temp 根 31 个、tts_44k 内 0 个，2026-09-18 find 计数），
+        # compute_inputs_fingerprint 对不存在路径退化成常量 "notfound:<路径>"，
+        # 于是这项输入永久空转、旁白音频换了也不会让 timeline/postprocess 失效
+        # （A06-③，2026-09-18 审核）。
+        tts_manifest = self.temp_dir / "tts_manifest.json"
         quality_dir = CONFIG_DIR / "quality"
         audio_rules = quality_dir / "audio_sync_rules.json"
         enhance_script = SCRIPTS / "enhance_video_audio.py"
         inputs_map = {
-            "preflight":    {"config": self.config_path, "html": self.html_path},
+            # preflight 的结论同时取决于 gate_mode：audit 模式下 8 类
+            # RENDER_CRITICAL_CHECKS 降级为警告（preflight_check.py:60-69/98-100），
+            # 同一份 HTML 在 audit 里 passed 绝不等于在 render 里 passed。旧指纹不含
+            # gate_mode，故 audit 跑过的结果被严格模式直接复用（A06-②）。
+            # 非文件输入用 "mode:" 前缀字面量，与 completion_report 的 "digest:" 同一惯例。
+            "preflight":    {"config": self.config_path, "html": self.html_path,
+                             "narration": narration,
+                             "asset_signoff_sheet": self.source_dir / "素材确认单.json",
+                             "narration_digits_rules": quality_dir / "narration_digits_rules.json",
+                             "gate_mode": "mode:" + str(self.gate_mode),
+                             "script": SCRIPTS / "preflight_check.py"},
             "tts":          {"config": self.config_path, "narration": narration,
                              "compiled_scenes": compiled,
                              "script": enhance_script},
@@ -841,7 +900,12 @@ class PipelineRunner:
                              "tts_manifest": tts_manifest,
                              "audio_sync_rules": audio_rules,
                              "script": SCRIPTS / "adjust_timeline.py"},
-            "preview":      {"config": self.config_path, "html": self.html_path},
+            # preview 实测消费 HTML/config 之外还有 tts_manifest（instant_preview.py:736
+            # 按旁白时长决定各场采样时刻）与脚本自身；旧指纹只登记 config+html，
+            # 换 TTS 音频后预览缓存照常命中，安全区预检跑的是旧时长（A06-②）。
+            "preview":      {"config": self.config_path, "html": self.html_path,
+                             "tts_manifest": tts_manifest,
+                             "script": SCRIPTS / "instant_preview.py"},
             "render":       {"config": self.config_path, "html": self.html_path,
                              "render_rules": quality_dir / "render_rules.json"},
             "verify":       {"config": self.config_path, "html": self.html_path,
@@ -855,6 +919,11 @@ class PipelineRunner:
                              "subtitle_term_rules": quality_dir / "subtitle_term_rules.json",
                              "narration_digits_rules": quality_dir / "narration_digits_rules.json",
                              "video_quality_rules": quality_dir / "video_quality_rules.json",
+                             # 成片媒体终检（_final_media_qa）真实读取脚本本体与其
+                             # 阈值表（audio/video 规则已在上方登记）；quick-fix 与
+                             # full 的裁定面不同（视觉检查项 NA vs PASS），入指纹。
+                             "media_qa_script": SCRIPTS / "media_qa_gate.py",
+                             "mode": "mode:" + ("quick-fix" if self.quick_fix else "full"),
                              "script": enhance_script},
             "delivery":     {"config": self.config_path, "video": self._delivery_paths()[0],
                              "srt": self._delivery_paths()[1]},
@@ -869,8 +938,26 @@ class PipelineRunner:
         return {k: str(v) for k, v in inputs_map.get(step, {}).items()}
 
     def _fingerprint(self, step):
-        """计算步骤当前输入的联合指纹（步骤完成时记录用）。"""
-        return compute_inputs_fingerprint(self._step_inputs(step))
+        """计算步骤当前输入的联合指纹（步骤完成时记录用）。
+
+        流水线自产物的登记路径若不存在，点名打印。动机：
+        compute_inputs_fingerprint 对缺失路径退化为常量 "notfound:<路径>"——即该项
+        对指纹零贡献，与"登记了一个从不变化的输入"效果等同。A06-③ 的 tts_manifest
+        死路径正以此形态静默空转（无报错、无日志、缓存照命中）。
+
+        打印范围限定为流水线自己写盘的产物（_RUNTIME_ARTIFACT_INPUTS），不含源文件：
+        narration.json / 素材确认单.json 按项目形态本就可缺（实测 60 份 config 中
+        33 份的项目目录无 narration.json），全量点名会让每次运行都刷常驻警告——
+        信号疲劳会淹没真问题。源文件绑定的正确性由回归用例50 逐条锁定。
+        """
+        inputs = self._step_inputs(step)
+        missing = [f"{name}={path}" for name, path in sorted(inputs.items())
+                   if name in _RUNTIME_ARTIFACT_INPUTS
+                   and not Path(str(path)).exists()]
+        if missing:
+            print(f"  [FP-MISS] {step}: 登记的运行时产物不存在，对指纹零贡献 — "
+                  f"{', '.join(missing)}")
+        return compute_inputs_fingerprint(inputs)
 
     def _stable_state_digest(self):
         """state 内容的稳定摘要（completion_report 指纹专用）。
@@ -996,6 +1083,23 @@ class PipelineRunner:
             return True
         return (rec.get("status") == "skipped"
                 and str(rec.get("reason", "")).startswith("tts_disabled"))
+
+    def _prereq_stale_reason(self, step):
+        """--step 起跑的前置步有效性判定：None 表示该前置结论仍对应当前输入。
+
+        _gate_satisfied 只看 status，而历史 passed 可能属于已经变过的输入
+        （A06-①，2026-09-18 审核）：改完 HTML 直接 --step render 时，"preflight
+        曾通过"仍成立，于是那条本应校验新 HTML 的门禁被静默复用成免检。
+        --resume 路径有 _earliest_rerun_step 做全链指纹扫描，显式 --step 路径此前
+        没有等价校验。判定与 _step_dirty_reason 同源，不另立第二套指纹口径。
+        类型化跳过（status=skipped）无指纹语义，交由 _gate_satisfied 裁定。
+        """
+        if not self._gate_satisfied(step):
+            return "not-passed"
+        rec = self.state.data.get("steps", {}).get(step, {})
+        if rec.get("status") != "passed":
+            return None
+        return self._step_dirty_reason(step)
 
     def _can_skip(self, step):
         """指纹校验的跳步判定。命中缓存时打印状态日期，保证旧状态可见。"""
@@ -1268,6 +1372,57 @@ class PipelineRunner:
             self.state.data["render_metrics"] = metrics
         return metrics
 
+    def _scene_patch_route(self):
+        """增量渲染触发裁定 → (attempt, verdict, reason)。
+
+        2026-09-03 触发权内化：不再由 CLI opt-in 决定是否尝试。两条路径：
+          ATTEMPT — 基线齐备（render_raw + scene_fingerprints.json），交白名单
+                    分类器裁定 PATCH/FULL，失败自动降级全量；
+          SKIPPED — --no-scene-patch 显式退出，或基线不齐（首渲/基线被清理）。
+        SKIPPED 同样打印并写 state：旧实现跳过时零输出零留痕，于是"能力在位却
+        零投产"在 29 份 pipeline_state 里表现为无记录，既不能证真也不能证伪。
+        """
+        if getattr(self, "no_scene_patch", False):
+            return False, "SKIPPED", "opt-out(--no-scene-patch)"
+        missing = [p.name for p in (self.render_raw, self.sidecar_path) if not p.exists()]
+        if missing:
+            return False, "SKIPPED", f"no-baseline({'+'.join(missing)})"
+        return True, "ATTEMPT", "baseline-present"
+
+    def _read_patch_verdict(self):
+        """读取分类器写盘的裁定（scene_patch_verdict.json）。
+
+        以文件为数据源而非解析 stdout：调用前已删除旧文件，故在场即本次产物。
+        读不到（脚本早退/写盘失败）返回 None，调用方退回退出码语义。
+        """
+        try:
+            with open(self.patch_verdict_path, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+            return rec if isinstance(rec, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _record_scene_patch(self, verdict, reason, outcome=None):
+        """裁定留痕：state.scene_patch（本次）+ render_metrics 计数（累计）。
+
+        计数口径：attempts 仅在真实调用分类器时自增——SKIPPED 不计入，否则
+        "基线不齐"会把命中率稀释成无意义数字；hits 为 PATCH 成功落地次数。
+        FULL 不是失败：变更落在白名单外（改样式/改时间轴/改旁白）时全量渲染
+        才是正确裁定，故留痕的目的是让裁定分布可解释，而非追求命中率。
+        """
+        metrics = self._render_metrics()
+        record = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "verdict": verdict,
+            "reason": reason,
+            "outcome": outcome,
+            "attempts": int(metrics.get("scene_patch_attempts", 0)),
+            "hits": int(metrics.get("scene_patch_hits", 0)),
+        }
+        self.state.data["scene_patch"] = record
+        self.state.save()
+        return record
+
     def _pre_render_duration_consistent(self) -> bool:
         """渲染前时长一致性预检（2026-08-23，agent-wiki-promo 复盘 🟢）。
 
@@ -1351,7 +1506,7 @@ class PipelineRunner:
         print("  渲染次数超限通常意味着问题不在渲染本身——先定点诊断再决定：")
         print("    1. 诊断既往失败（日志见 过程产物/日志/，state 含 log_path）")
         print("    2. 确需继续 → 追加 --accept-over-render 重跑（决策留痕）")
-        print("    3. 局部修订 → 优先 --scene-patch / --quick-fix（不计入预算）")
+        print("    3. 局部修订 → 优先 --quick-fix（不计入预算）；场景 div 内容级修订由增量渲染自动承接（同样不计入预算）")
         self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
         return False
 
@@ -1444,17 +1599,7 @@ class PipelineRunner:
 
         # ── 交付物保护（P0 整改，prefab 复盘根因2）：渲染前拦截，绝不让 30-40 分钟
         #    渲染白跑后才发现要覆盖已交付成片（AGENTS.md：已交付文件不得覆盖）──
-        if (self.output_file.exists() and self.output_file.stat().st_size > 0
-                and self._output_was_delivered() and not self.force):
-            self.state.mark_started("render")
-            print(f"  BLOCKED: 交付目标已是上一轮成功交付的成片：{self.output_file}")
-            print("  AGENTS.md 交付纪律：已交付文件不得覆盖，需修订时加后缀。")
-            print(f"  处理：config paths.video_name 改为 '{self.output_file.stem}_修订01.mp4' 后重跑；")
-            print("        或将旧成片移出成果目录；紧急情况用 --force 越过（不推荐）。")
-            self.state.mark_failed(
-                "render",
-                f"Output {self.output_file.name} is a delivered artifact — use revision suffix",
-                error_code=VERIFY_FAILED)
+        if not self._delivery_slot_guard("render"):
             return False
 
         # ── 成果槽位无背书残留告警（agent-wiki-promo 复盘 2026-08-31）：槽位里有成片
@@ -1482,7 +1627,8 @@ class PipelineRunner:
             print(f"  [ORPHAN-SLOT] 成果槽位已存在文件，但无交付背书（既无登记表条目，"
                   f"也无 VALIDATED 完工报告）：{self.output_file.name}")
             print(f"    {_detail}")
-            print("    该文件将被本次渲染覆盖。若它其实是一份交付物（交付证据曾被清理/归档"
+            print("    本次运行若后处理成功，该文件会被新成片替换（旧文件由后处理备份进"
+                  " temp 的 .prev.mp4）。若它其实是一份交付物（交付证据曾被清理/归档"
                   "导致判据失效），请先移出成果目录或改用修订后缀，再继续。")
             self.state.data["orphan_slot_warning"] = {
                 "at": datetime.now().isoformat(timespec="seconds"),
@@ -1501,27 +1647,48 @@ class PipelineRunner:
         if not self._pre_render_duration_consistent():
             return False
 
-        # ── Scene-patch (opt-in): 分类器判 PATCH 则段渲染+拼接产出 render_raw，
-        #    任何白名单外变更/自校验失败 → exit 3 → 自动降级 FULL 全量渲染 ──
+        # ── 场景级增量渲染（2026-09-03 起默认尝试，--no-scene-patch 退出）：
+        #    基线齐备即交白名单分类器裁定；判 PATCH 则段渲染+拼接产出 render_raw，
+        #    白名单外变更/段渲染/拼接/像素自校验任一失败 → exit 3 → 降级 FULL ──
         patched = False
-        if self.scene_patch:
-            print("  [SCENE-PATCH] Trying scene-level incremental render...")
+        attempt, verdict, reason = self._scene_patch_route()
+        outcome = None
+        if attempt:
             _metrics = self._render_metrics()
             _metrics["scene_patch_attempts"] = int(_metrics.get("scene_patch_attempts", 0)) + 1
             self.state.save()
+            # 裁定留痕以文件为数据源：先删旧文件，在场即本次产物
+            try:
+                self.patch_verdict_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            print("  [SCENE-PATCH] Baseline present — trying scene-level incremental render...")
             rc = self._run(
                 [str(VENV_PYTHON), "scene_patch_render.py",
                  "--config", str(self.config_path), "--mode", "patch"],
                 cwd=str(SCRIPTS), env=self.env, desc="scene patch render"
             )
+            rec = self._read_patch_verdict() or {}
             if rc == 0:
                 patched = True
                 _metrics = self._render_metrics()
                 _metrics["scene_patch_hits"] = int(_metrics.get("scene_patch_hits", 0)) + 1
                 self.state.save()
-                print("  [SCENE-PATCH] Patch applied — full render skipped")
+                verdict = "PATCH"
+                outcome = rec.get("outcome") or "applied"
+                print(f"  [SCENE-PATCH] Patch applied — full render skipped "
+                      f"(changed: {', '.join(rec.get('changed_scenes') or [])}"
+                      f"{'; time witness: ' + str(rec['time_witness']) if rec.get('time_witness') else ''})")
             else:
-                print(f"  [SCENE-PATCH] Falling back to FULL render (rc={rc})")
+                verdict = "FULL"
+                reason = rec.get("reason") or (
+                    "classifier-fallback" if rc == SCENE_PATCH_EXIT_FALLBACK
+                    else f"patch-failed(rc={rc})")
+                outcome = rec.get("outcome") or f"rc={rc}"
+                print(f"  [SCENE-PATCH] Falling back to FULL render (rc={rc}, reason={reason})")
+        else:
+            print(f"  [SCENE-PATCH] Not attempted — {reason}")
+        self._record_scene_patch(verdict, reason, outcome)
 
         if not patched:
             # ── 渲染成本预算门禁（P1，2026-08-19）：全量渲染启动前拦截，
@@ -1600,19 +1767,17 @@ class PipelineRunner:
 
         size_mb = self.render_raw.stat().st_size / 1024 / 1024
         print(f"  Rendered: {self.render_raw} ({size_mb:.1f} MB)")
+        # 交付槽位不在此写入（2026-09-03 结构性修复）：render 产物只落 temp，
+        # 成果文件/视频/{name}.mp4 由 postprocess 的混音与烧字幕在成功路径上写。
+        # 旧实现这里 copy2(render_raw → 槽位)，一旦 postprocess 失败（如 BGM 未
+        # 落盘），无声裸片就留在交付目录冒充成片——2026-09-02 WSI 批次 4 条即此
+        # 形态，且 [ORPHAN-SLOT] 告警在 postprocess 之后才跑，拦不住。
+        # enhance_video_audio.get_paths 现直接以 render_raw.mp4 为输入源；槽位旧
+        # 文件的物理保护由 step3 的 {stem}.prev.mp4（落 temp）承担。
+        print(f"  Delivery slot untouched: {self.output_file.name} "
+              f"is written only by postprocess")
 
-        # Copy to output directory for post-processing
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        if self.output_file.exists() and self.output_file.stat().st_size > 0:
-            # 交付物保护第二道防线：已交付产物已在渲染前拦截；此处覆盖的是
-            # 非交付态旧产物（如上次失败运行残留），仍先备份保证物理不丢失。
-            pre_backup = self.temp_dir / f"{self.output_file.stem}.pre_render_backup.mp4"
-            shutil.copy2(self.output_file, pre_backup)
-            print(f"  Existing output backed up before overwrite: {pre_backup.name}")
-        shutil.copy2(self.render_raw, self.output_file)
-        print(f"  Copied to: {self.output_file}")
-
-        # 场景指纹 sidecar：供后续 --scene-patch 增量渲染做基线（尽力而为，
+        # 场景指纹 sidecar：下一次渲染自动尝试增量渲染时的比对基线（尽力而为，
         # 失败不阻塞交付；patch 成功路径已在脚本内部自行刷新 sidecar）
         if not patched:
             rc_sc = self._run(
@@ -1724,17 +1889,29 @@ class PipelineRunner:
         ]
 
         rc = self._run(cmd, cwd=str(SCRIPTS), desc="visual boundary check")
+        # 四态报告入 state：未测/合法不适用与"通过"分开留痕，追溯时不靠控制台
+        self._merge_verification_file(
+            "visual_boundary", self.temp_dir / "visual_boundary_report.json")
         if rc == 0:
             self.state.mark_completed("visual_check", self._fingerprint("visual_check"))
             return True
+        if rc == 2:
+            # 抽帧/测量未完成：无违规 ≠ 已检查，不得放行到烧字幕
+            self._fail("visual_check",
+                       "Visual check incomplete: frame extraction/measurement failed "
+                       "(UNTESTED is not a pass) — see visual_boundary_report.json",
+                       VERIFY_FAILED)
+            return False
         self._fail("visual_check", "Content overflows subtitle safety zone", VERIFY_FAILED)
         return False
 
+    REGISTRY_OK = "ok"
+    REGISTRY_MISSING = "missing"
+    REGISTRY_CORRUPT = "corrupt"
+
     @staticmethod
-    def _registry_read(registry_path=None):
-        """读取交付登记表；文件缺失/损坏时返回空登记表（登记缺失不致命，由调用方裁定）。"""
-        path = Path(registry_path) if registry_path else DELIVERY_REGISTRY
-        empty = {
+    def _registry_empty():
+        return {
             "$description": "已交付成片登记表——本仓唯一版本化的交付台账（mp4 成片不入 git）。"
                             "由 pipeline_runner 完工报告成功后自动写入，禁止手工编辑；"
                             "删除条目不会删除成片，但会让交付物保护门禁失去该成片的交付依据。"
@@ -1742,16 +1919,31 @@ class PipelineRunner:
                             "其交付判据回退至 VALIDATED 完工报告。",
             "deliveries": [],
         }
+
+    @classmethod
+    def _registry_load(cls, registry_path=None):
+        """→ (data, status)，status ∈ ok / missing / corrupt。
+
+        "缺失"与"读不动"必须可区分：登记表是本仓唯一版本化交付台账，损坏时按空表
+        返回会让 `_output_was_delivered` 把所有已交付成片读成未登记，交付物保护
+        门禁静默 fail-open（A10，2026-09-19）。
+        """
+        path = Path(registry_path) if registry_path else DELIVERY_REGISTRY
         if not path.exists():
-            return empty
+            return cls._registry_empty(), cls.REGISTRY_MISSING
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            return empty
+            return cls._registry_empty(), cls.REGISTRY_CORRUPT
         if not isinstance(data, dict) or not isinstance(data.get("deliveries"), list):
-            return empty
-        return data
+            return cls._registry_empty(), cls.REGISTRY_CORRUPT
+        return data, cls.REGISTRY_OK
+
+    @classmethod
+    def _registry_read(cls, registry_path=None):
+        """读取交付登记表；文件缺失/损坏时返回空登记表（登记缺失不致命，由调用方裁定）。"""
+        return cls._registry_load(registry_path)[0]
 
     def _registry_entry(self, video_name, registry_path=None):
         """按成片文件名查交付登记条目；未登记返回 None。"""
@@ -1777,7 +1969,13 @@ class PipelineRunner:
             "report_status": report_status,
             "delivered_at": datetime.now().isoformat(timespec="seconds"),
         }
-        data = self._registry_read()
+        data, status = self._registry_load()
+        if status == self.REGISTRY_CORRUPT:
+            # 读成空表再写回 = 用本轮 1 条覆盖整本台账。git 里有上一版可恢复，
+            # 但就地覆盖会让恢复动作从"git checkout"变成"记得去翻历史"。
+            raise RuntimeError(
+                f"{DELIVERY_REGISTRY.name} 无法解析，拒绝在损坏表上追加登记"
+                "（先 git checkout 恢复该文件再重跑）")
         # 同名成片按登记时间保留最新一条（修订版走 _修订NN 名，不产生同名覆盖）
         deliveries = [e for e in data["deliveries"]
                       if not (isinstance(e, dict) and e.get("video") == entry["video"])]
@@ -1785,18 +1983,30 @@ class PipelineRunner:
         deliveries.sort(key=lambda e: str(e.get("delivered_at") or ""))
         data["deliveries"] = deliveries
         DELIVERY_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
-        with open(DELIVERY_REGISTRY, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        PipelineState._atomic_write(DELIVERY_REGISTRY, data)
         return entry
 
     def _output_was_delivered(self):
         """判定 output_file 是否为上一轮成功交付的成片（交付物保护依据）。
 
-        判据优先级：①交付登记表命中（权威、git 追踪）；②temp_dir/completion_report.json
-        状态为 VALIDATED* 且报告引用的视频与当前目标同名——作为登记表启用前的历史回退。
+        判据优先级：①交付登记表命中（权威、git 追踪）；②登记表损坏时按"已交付"
+        裁定（fail-closed：无法证明未交付时不得放行覆盖，可用 --force 越过）；
+        ③temp_dir/completion_report.json 状态为 VALIDATED* 且报告引用的视频与当前
+        目标同名——作为登记表启用前的历史回退。
         prefab 复盘：上午已交付的合格成片被下午的裸渲染直接覆盖丢失——交付态必须
         可识别、可拦截。
         """
+        _, _reg_status = self._registry_load()
+        if _reg_status == self.REGISTRY_CORRUPT:
+            self.state.data["delivery_registry_unreadable"] = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "path": str(DELIVERY_REGISTRY),
+                "decision": "treated_as_delivered_fail_closed",
+            }
+            self.state.save()
+            print(f"  WARNING: 交付登记表无法解析（{DELIVERY_REGISTRY.name}），无法证明目标未交付 → "
+                  "按已交付拦截覆盖。恢复路径：git checkout 该文件，或确认要覆盖时用 --force。")
+            return True
         if self._registry_entry(self.output_file.name) is not None:
             return True
         report_path = self.temp_dir / "completion_report.json"
@@ -1812,6 +2022,31 @@ class PipelineRunner:
         rep_video = str(rep.get("data_sources", {}).get("video_file", {}).get("path", "") or "")
         # 报告未记录路径（旧格式）→ 保守视为已交付；记录了则必须同名才拦截
         return (not rep_video) or Path(rep_video).name == self.output_file.name
+
+    def _delivery_slot_guard(self, step_name):
+        """交付槽位保护（AGENTS.md：已交付文件不得覆盖）。放行返回 True。
+
+        2026-09-03 结构性修复后，槽位的真实写入点是 postprocess（step3 混音 /
+        step6 烧字幕），render 步不再往 成果文件/视频/ 复制任何东西。两处都要拦：
+        render 前置为省成本（别让 30-40 分钟渲染白跑），postprocess 前置为写入点
+        把关——quick-fix 模式整段跳过 render，只靠 render 前置的话，quick-fix 会
+        直接把已交付成片换掉。
+        """
+        if not (self.output_file.exists() and self.output_file.stat().st_size > 0):
+            return True
+        if self.force or not self._output_was_delivered():
+            return True
+        if self.state.data.get("steps", {}).get(step_name, {}).get("status") != "running":
+            self.state.mark_started(step_name)
+        print(f"  BLOCKED: 交付目标已是上一轮成功交付的成片：{self.output_file}")
+        print("  AGENTS.md 交付纪律：已交付文件不得覆盖，需修订时加后缀。")
+        print(f"  处理：config paths.video_name 改为 '{self.output_file.stem}_修订01.mp4' 后重跑；")
+        print("        或将旧成片移出成果目录；紧急情况用 --force 越过（不推荐）。")
+        self.state.mark_failed(
+            step_name,
+            f"Output {self.output_file.name} is a delivered artifact — use revision suffix",
+            error_code=VERIFY_FAILED)
+        return False
 
     def _probe_duration(self, path):
         """ffprobe 实测媒体时长；失败返回 None（调用方决定是否放行）。"""
@@ -1831,9 +2066,11 @@ class PipelineRunner:
         门禁（±1.0s）才暴露，白白消耗一轮 TTS/BGM 再生成 + 后续 40 分钟重渲染。
         现在在 runner 阶段早拒并给出定点修复指引。权威阈值：
         audio_sync_rules.duration_consistency.max_diff_seconds。
-        quick-fix 模式无 render_raw，检查对象为成果目录文件（enhance 的输入源）。
+        quick-fix 与全量两种模式的后处理输入都是 temp/render_raw.mp4（enhance 的
+        get_paths 如此解析），故检查对象同为它；仅在 render_raw 缺失（手工把视频
+        放进成果目录后单独调用）时回退检查槽位文件。
         """
-        target = self.output_file if self.quick_fix else self.render_raw
+        target = self.render_raw if self.render_raw.exists() else self.output_file
         if not target.exists():
             return True  # 产物缺失由后续步骤拦截，此处不重复报错
         actual = self._probe_duration(target)
@@ -1866,6 +2103,15 @@ class PipelineRunner:
 
         self.state.mark_started("postprocess")
 
+        # ── 交付槽位写入点把关（2026-09-03 结构性修复）：本步是 成果文件/视频/
+        #    {name}.mp4 的唯一写入者（enhance step3 混音 / step6 烧字幕）。
+        #    quick-fix 模式整段跳过 render，render 前置的已交付保护不会执行，
+        #    故同一判据在写入点再把关一次。──
+        if not self._delivery_slot_guard("postprocess"):
+            return False
+        # 槽位目录必须在 enhance 的 rename 之前存在（原先由 render 步的复制动作创建）
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
         # ── 早失败检查：长耗时后处理启动前先验证时长一致性（prefab 复盘根因4）──
         if not self._duration_consistency_ok():
             return False
@@ -1878,10 +2124,79 @@ class PipelineRunner:
         # 合并媒体质检结果（step7 落盘）→ pipeline_state，供完工报告追溯
         self._merge_verification_file("media_quality", self.temp_dir / "media_quality_result.json")
         if rc == 0:
+            # A04（2026-09-18 审核）：成片落槽后、步骤判完成前，过独立媒体终检。
+            # media_qa_gate 的全部物理检查（项名清单以该模块 docstring 为权威源）
+            # 此前只被自身 CLI 与回归调用，默认生产链从未挂载——成片可以在从未被
+            # 可播放性/死区/黑场/对齐度审过的情况下进交付。
+            if not self._final_media_qa():
+                return False
             self.state.mark_completed("postprocess", self._fingerprint("postprocess"))
             return True
         self._fail("postprocess", "Post-processing failed", SUBPROCESS_FAILED)
         return False
+
+    def _final_media_qa(self):
+        """成片媒体终检（postprocess 末端，2026-09-18 A04）。
+
+        裁定经 media_qa_gate.adjudicate()：任一 FAIL 阻断；UNTESTED（扫描
+        环境失败/样本不足）不是通过，须 --accept-media-untested 显式知情放行
+        并留痕 state.media_qa_untested_decision（对齐 --accept-over-budget 惯例）。
+        NOT_APPLICABLE 为声明性豁免（纯 BGM 无字幕、BGM 遮蔽起口、quick-fix
+        跳视觉检查），不计违规也不计通过。quick-fix 下物理测量照常执行。
+        结果落 temp/media_qa_final_result.json 并合并进 state.verifications
+        ["media_qa_final"]，完工报告据此把未测计入 issues。
+        """
+        from media_qa_gate import MediaQAGate, adjudicate
+
+        video_path, srt_path = self._delivery_paths()
+        if self.quick_fix:
+            visual = "not_applicable"
+        else:
+            visual = (self.state.data.get("steps", {})
+                      .get("visual_check", {}).get("status") == "passed")
+        qa = MediaQAGate()
+        try:
+            _passed, result = qa.validate(
+                str(video_path),
+                str(srt_path) if self.tts_enabled else None,
+                visual_check_passed=visual,
+                config_path=str(self.config_path))
+        except Exception as e:
+            self._fail("postprocess", f"Final media QA errored: {e}", VERIFY_FAILED)
+            return False
+
+        result["checked_at"] = datetime.now().isoformat()
+        result["mode"] = "quick-fix" if self.quick_fix else "full"
+        out_path = self.temp_dir / "media_qa_final_result.json"
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+        except OSError as e:
+            print(f"  WARNING: media_qa_final_result.json 写入失败: {e}")
+        self._merge_verification_file("media_qa_final", out_path)
+
+        counts = result.get("status_counts", {})
+        print(f"  [MEDIA-QA] verdict={result['verdict']} "
+              f"(PASS={counts.get('PASS', 0)}, FAIL={counts.get('FAIL', 0)}, "
+              f"UNTESTED={counts.get('UNTESTED', 0)}, "
+              f"NOT_APPLICABLE={counts.get('NOT_APPLICABLE', 0)}, "
+              f"total={result.get('total_checks')})")
+        allowed, reason = adjudicate(result,
+                                     accept_untested=self.accept_media_untested)
+        if result.get("verdict") == "UNTESTED" and self.accept_media_untested:
+            self.state.data["media_qa_untested_decision"] = {
+                "decision": "accepted_untested",
+                "reason": reason,
+                "untested": result.get("untested", []),
+                "at": datetime.now().isoformat(),
+            }
+            self.state.save()
+        if not allowed:
+            self._fail("postprocess", reason, VERIFY_FAILED)
+            return False
+        if reason:
+            print(f"  [MEDIA-QA] {reason}")
+        return True
 
     def step_delivery(self):
         """交付验收与清理审计（最终交付关卡）。
@@ -2026,13 +2341,22 @@ class PipelineRunner:
         # Prevent jumping to render/postprocess without prerequisite steps passing.
         if start_from and not self.force and not self.quick_fix:
             required = HARD_GATES.get(start_from, [])
-            missing = [s for s in required if not self._gate_satisfied(s)]
-            if missing:
+            prereqs = [(s, self._prereq_stale_reason(s)) for s in required]
+            missing = [s for s, r in prereqs if r == "not-passed"]
+            stale = [(s, r) for s, r in prereqs if r is not None and r != "not-passed"]
+            if missing or stale:
                 print(f"BLOCKED: Cannot start from '{start_from}'")
                 for m in missing:
                     label = dict(STEPS).get(m, m)
                     print(f"  Missing prerequisite: {m} ({label})")
-                print(f"\nRun prerequisites first, or use --force to override.")
+                for s, r in stale:
+                    label = dict(STEPS).get(s, s)
+                    rec = self.state.data.get("steps", {}).get(s, {})
+                    completed = (rec.get("completed") or "?")[:19]
+                    print(f"  Stale prerequisite: {s} ({label}) — {r} since {completed}"
+                          f"，该结论已不对应当前输入")
+                print(f"\nRun prerequisites first (drop --step to let --resume roll back"
+                      f" to the earliest stale step), or use --force to override.")
                 sys.exit(1)
 
         # Setup environment
@@ -2160,7 +2484,8 @@ Examples:
                         help="Explicit confirmation for a high-cost --fresh reset. Prints the "
                              "destruction inventory and proceeds. Without it, --fresh is refused "
                              "when existing artifacts or long renders would be destroyed, with "
-                             "low-cost alternatives suggested (--resume/--quick-fix/--scene-patch).")
+                             "low-cost alternatives suggested (--resume/--quick-fix/auto "
+                             "scene-patch).")
     parser.add_argument("--gate-mode", choices=["audit", "render"],
                         default="render",
                         help="Preflight gate mode: 'audit' (warn-only) or 'render' (hard-block). "
@@ -2168,11 +2493,17 @@ Examples:
     parser.add_argument("--engine", choices=["hyperframes", "openmontage"],
                         default=None,
                         help="Pipeline engine (auto-detected from config if omitted)")
+    parser.add_argument("--no-scene-patch", action="store_true",
+                        help="Opt OUT of scene-level incremental render. Since 2026-09-03 the "
+                             "render step always attempts it when a baseline exists "
+                             "(render_raw.mp4 + scene_fingerprints.json); the whitelist "
+                             "classifier decides PATCH vs FULL and any failure falls back to a "
+                             "full render. Use this flag when you suspect the incremental path "
+                             "itself and want a guaranteed full render.")
     parser.add_argument("--scene-patch", action="store_true",
-                        help="Opt-in scene-level incremental render: when only scene div "
-                             "content changed (whitelist classifier), re-render changed scenes "
-                             "only and stitch with the baseline render_raw. Any non-whitelisted "
-                             "change or self-check failure falls back to FULL render automatically.")
+                        help="DEPRECATED / no-op: incremental render is now the default "
+                             "behaviour. Kept so documented invocations do not fail; use "
+                             "--no-scene-patch to disable.")
     parser.add_argument("--no-shrink", action="store_true",
                         help="Disable auto-shrink of oversized scene windows. "
                              "By default, timeline adjustment collapses windows so TTS drives timing "
@@ -2189,6 +2520,13 @@ Examples:
                              "pipeline_state.render_budget_decision for audit. Without this flag "
                              "a full render is blocked once full-render attempts reach the limit — "
                              "diagnose first; scene-patch/quick-fix are never budgeted.")
+    parser.add_argument("--accept-media-untested", action="store_true",
+                        help="Explicitly accept a final video whose media QA gate could not "
+                             "complete some checks (verdict UNTESTED — scan tool failure or too "
+                             "few speech onsets). UNTESTED is never read as passed: without "
+                             "this flag postprocess fails; with it the decision is recorded in "
+                             "pipeline_state.media_qa_untested_decision for audit. Media QA "
+                             "FAIL (a measured violation) is never accepted by this flag.")
 
     args = parser.parse_args()
 
@@ -2208,12 +2546,16 @@ Examples:
     if not args.config:
         parser.error("Either --config or --sdl is required")
 
+    # Config path resolution is engine-independent: the openmontage branch below
+    # consumes config_path too, so it must not live inside the auto-detect branch
+    # (显式 --engine openmontage 曾因此 UnboundLocalError，2026-09-18 审核 A11)。
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = CONFIG_DIR / config_path
+
     # Auto-detect engine from config
     engine = args.engine
     if not engine:
-        config_path = Path(args.config)
-        if not config_path.is_absolute():
-            config_path = CONFIG_DIR / config_path
         if config_path.exists():
             with open(config_path, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
@@ -2240,6 +2582,10 @@ Examples:
         success = runner.run(start_from=start_from)
         sys.exit(0 if success else 1)
 
+    if args.scene_patch:
+        print("[NOTICE] --scene-patch 已失效：增量渲染自 2026-09-03 起为默认行为"
+              "（基线齐备即自动尝试，分类器裁定 PATCH/FULL）。如需强制全量渲染请用 --no-scene-patch。")
+
     runner = PipelineRunner(
         config_path=args.config,
         html_project=args.html,
@@ -2248,10 +2594,11 @@ Examples:
         gate_mode=args.gate_mode,
         shrink=(not args.no_shrink),
         fresh=args.fresh,
-        scene_patch=args.scene_patch,
+        no_scene_patch=args.no_scene_patch,
         confirm_fresh=args.confirm_fresh,
         accept_over_budget=args.accept_over_budget,
         accept_over_render=args.accept_over_render,
+        accept_media_untested=args.accept_media_untested,
     )
 
     if args.status:

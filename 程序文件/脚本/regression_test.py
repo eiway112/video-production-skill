@@ -521,7 +521,7 @@ def test_media_qa_gate_checks() -> RegressionTestCase:
     """用例10：媒体QA门禁检查项"""
     tc = RegressionTestCase(
         "media_qa_gate_checks",
-        "验证16项媒体质量检查都已实现（含黑场重叠/单字行/术语规范新门禁）"
+        "验证媒体QA门禁检查项齐备（黑场重叠/单字行/术语规范新门禁，项名见 media_qa_gate docstring）"
     )
     
     try:
@@ -544,16 +544,16 @@ def test_media_qa_gate_checks() -> RegressionTestCase:
         tc.assert_true("video_path" in sig.parameters, "validate has video_path param")
         tc.assert_true("subtitle_path" in sig.parameters, "validate has subtitle_path param")
         
-        # 新门禁（检查14/15/16）基础设施存在且规则可加载（单一权威源）
+        # 新门禁（黑场重叠/单字跨行/术语 lint）基础设施存在且规则可加载（单一权威源）
         tc.assert_true(callable(ffmpeg_detect_black_intervals),
-                      "check14: ffmpeg_detect_black_intervals exists")
+                      "no_black_frame_with_subtitle: ffmpeg_detect_black_intervals exists")
         bf_rules = _load_black_frame_rules()
         tc.assert_true("min_black_seconds" in bf_rules
                       and "max_overlap_with_narration_seconds" in bf_rules,
-                      "check14: black_frame rules loadable with required keys")
+                      "no_black_frame_with_subtitle: black_frame rules loadable with required keys")
         term_patterns = _load_term_lint_patterns()
         tc.assert_true(isinstance(term_patterns, list) and len(term_patterns) > 0,
-                      "check16: subtitle_term_rules lint_patterns loadable and non-empty")
+                      "subtitle_terms_normalized: subtitle_term_rules lint_patterns loadable and non-empty")
         
         # 新门禁对带孤字行/术语违规的 SRT 文本真实拦截（不需要视频文件）
         import re as _re
@@ -829,32 +829,38 @@ def test_pipeline_cache_fingerprint_wiring() -> RegressionTestCase:
     try:
         script_dir = Path(__file__).parent
         runner_content = (script_dir / "pipeline_runner.py").read_text(encoding='utf-8')
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
         
-        # 1. 主入口必须 import 指纹实现（单一哈希实现，禁止本地复制）
-        tc.assert_true("from pipeline_state_fingerprint import compute_inputs_fingerprint" in runner_content,
-                      "pipeline_runner imports fingerprint module (no longer built-but-unwired)")
+        # （原断言 1「源码含 import 指纹模块」/断言 2「源码含 def _can_skip」已删除：
+        #  二者只证明字符串在场，不证明缓存判定行为。同一判据的真实行为面由
+        #  用例50 逐条锁定（四态跳步判定 + 指纹失配自动失效），此处不做重复脚手架。
+        #  2026-09-19 审核 A12：源码字符串断言按"有无行为接缝"分级，不一刀切。）
         
-        # 2. 跳步判定必须走指纹校验入口
-        tc.assert_true("def _can_skip(" in runner_content,
-                      "Skip decision goes through _can_skip fingerprint check")
-        
-        # 3. 盲信跳步的旧模式必须清零（is_passed 直接决定跳步）
+        # 3. 盲信跳步的旧模式必须清零（is_passed 直接决定跳步）——全文件清扫，
+        #    无单一行为接缝可替代，保留源码面锁定
         tc.assert_true('self.state.is_passed("visual_check")' not in runner_content
                       and "[SKIPPED] Already passed" not in runner_content,
                       "No blind is_passed-only skip remains in step methods")
         
-        # 4. 缓存命中必须显式可见（打印状态日期+指纹）
+        # 4. 缓存命中必须显式可见（打印状态日期+指纹）——日志词汇锁，保留源码面
         tc.assert_true("[CACHED]" in runner_content and "[STALE]" in runner_content,
                       "Cache hit/stale states are explicitly printed")
         
-        # 5. 验证类运行的规定入口 --fresh 必须存在且传入 runner
+        # 5. 验证类运行的规定入口 --fresh 必须存在且传入 runner（其重置语义由
+        #    用例56 在行为面锁定）
         tc.assert_true('"--fresh"' in runner_content and "fresh=args.fresh" in runner_content,
                       "--fresh flag exists and is wired into PipelineRunner")
         
-        # 6. 完成时必须记录指纹（8步全部）
+        # 6. 完成时必须记录指纹——计数基准取运行时 STEPS，不抄字面 8
+        #    （2026-09-19 审核 A12：手抄阈值与权威清单脱钩即静默失去覆盖）
         fp_records = runner_content.count("self._fingerprint(")
-        tc.assert_true(fp_records >= 8,
-                      f"All steps record fingerprint on completion (found {fp_records}, need >=8)")
+        tc.assert_equal(len(_pr.STEPS), 10,
+                        "STEPS is the step-count authority (change this only with intent)")
+        tc.assert_true(fp_records >= len(_pr.STEPS),
+                       f"Every step records a fingerprint on completion "
+                       f"(found {fp_records}, need >=len(STEPS)={len(_pr.STEPS)})")
         
         tc.mark_passed()
         
@@ -1338,6 +1344,8 @@ def test_quality_config_fingerprint_invalidation() -> RegressionTestCase:
                 runner.tts_dir = tmpdir / "tts_44k"
                 runner.render_raw = tmpdir / "render_raw.mp4"
                 runner.output_file = tmpdir / "test_proj.mp4"
+                runner.gate_mode = "render"
+                runner.quick_fix = False
 
                 # 1. 指纹输入登记了质量配置与主执行脚本（克制原则：只登真实消费）
                 pp = runner._step_inputs("postprocess")
@@ -1630,7 +1638,7 @@ def test_silence_fallback_and_bitrate_na_tolerance() -> RegressionTestCase:
             saved_run = eva.subprocess.run
             eva.subprocess.run = lambda *a, **k: _FakeProbe()
             try:
-                errs, warns = eva._check_video_quality("fake.mp4")
+                errs, warns, untested_q, na_q = eva._check_video_quality("fake.mp4")
             finally:
                 eva.subprocess.run = saved_run
             tc.assert_true(not any("bitrate" in e.lower() for e in errs),
@@ -1638,7 +1646,7 @@ def test_silence_fallback_and_bitrate_na_tolerance() -> RegressionTestCase:
             tc.assert_true(any("已跳过码率门禁" in w for w in warns),
                            "N/A bitrate degrades to traceable skip-warning (eva)")
 
-            # (b3) media_qa_gate 检查18调用侧：bit_rate=N/A → 门禁降级 warning
+            # (b3) media_qa_gate video_bitrate_ok 调用侧：bit_rate=N/A → 门禁降级 warning
             dummy_video = tmpdir / "dummy.mp4"
             dummy_video.write_bytes(b"\x00" * 1024)
 
@@ -1864,22 +1872,30 @@ def test_visual_boundary_three_point_sampling() -> RegressionTestCase:
             _, sid, ptag = Path(image_path).stem.split("_")  # scene_1_p30
             return table[(sid, ptag[1:])]
 
+        def fake_coverage(image_path, subtitle_lines=2):
+            # 第二遍真空窗检查需要可读帧；夹具无真实图像，给固定覆盖率让
+            # 该维度真实跑完（否则本用例会被判 UNTESTED，掩盖三点采样的判定）
+            return 0.5
+
         saved_extract = vbc.extract_frame
         saved_measure = vbc.measure_content_bottom
+        saved_cov = vbc.measure_content_coverage
         try:
             vbc.extract_frame = fake_extract
             vbc.measure_content_bottom = fake_measure
+            vbc.measure_content_coverage = fake_coverage
             scenes = [
                 {"id": 1, "start": 0.0, "end": 10.0},
                 {"id": 2, "start": 10.0, "end": 20.0},
-                {"id": 3, "start": 20.0, "end": 21.5},  # dur<2 → SKIP
+                {"id": 3, "start": 20.0, "end": 21.5},  # dur<2 → NOT_APPLICABLE
             ]
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                passed, results = vbc.run_check("fake.mp4", scenes)
+                passed, results, summary = vbc.run_check("fake.mp4", scenes)
         finally:
             vbc.extract_frame = saved_extract
             vbc.measure_content_bottom = saved_measure
+            vbc.measure_content_coverage = saved_cov
 
         tc.assert_equal(passed, False, "check fails when any sample point overflows")
         r1, r2, r3 = results
@@ -1903,7 +1919,12 @@ def test_visual_boundary_three_point_sampling() -> RegressionTestCase:
             tc.assert_true({"scene", "status", "content_bottom", "safety_line",
                             "gap", "sample_time"} <= set(r),
                            f"scene {r['scene']} keeps all legacy result fields")
-        tc.assert_equal(r3["status"], "SKIP", "scene shorter than 2s skipped")
+        tc.assert_equal(r3["status"], "NOT_APPLICABLE",
+                        "scene shorter than 2s recorded as NOT_APPLICABLE (not PASS)")
+        tc.assert_equal(summary["untested"], [],
+                        "fully-measured run records zero untested items")
+        tc.assert_equal(summary["verdict"], "FAIL",
+                        "verdict follows violations, not absence of them")
 
         tc.mark_passed()
 
@@ -2160,6 +2181,8 @@ def test_completion_report_fingerprint_stability() -> RegressionTestCase:
             runner.tts_dir = tmpdir / "tts_44k"
             runner.render_raw = tmpdir / "render_raw.mp4"
             runner.output_file = tmpdir / "test_proj.mp4"
+            runner.gate_mode = "render"
+            runner.quick_fix = False
 
             # 接线检查：指纹输入已改用稳定摘要，不再含 state 文件路径
             inputs = runner._step_inputs("completion_report")
@@ -2373,18 +2396,18 @@ def test_preview_safety_zone_precheck() -> RegressionTestCase:
             sys.path.insert(0, str(script_dir))
         # instant_preview 模块顶层重绑 sys.stdout/stderr，需安全导入
         instant_preview = _safe_import_rebinding_module("instant_preview")
-        from visual_boundary_check import SUBTITLE_SAFETY_LINE
+        from visual_boundary_check import subtitle_safety_line
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
 
-            def _make_scene_png(path, band_y):
+            def _make_scene_png(path, band_y, size=(1920, 1080)):
                 """黑底 + 白色内容带（带底部位于 band_y），模拟场景截图。"""
-                img = Image.new("RGB", (1920, 1080), (0, 0, 0))
+                img = Image.new("RGB", size, (0, 0, 0))
                 px = img.load()
                 for y in range(band_y - 30, band_y + 1):
-                    for x in range(100, 1820):
+                    for x in range(100, size[0] - 100):
                         px[x, y] = (255, 255, 255)
                 img.save(path)
 
@@ -2402,10 +2425,29 @@ def test_preview_safety_zone_precheck() -> RegressionTestCase:
             v = violations[0]
             tc.assert_equal(v["scene"], "s1", "overflow scene identified")
             tc.assert_equal(v["content_bottom"], 890, "content_bottom measured")
-            tc.assert_equal(v["overflow_px"], 890 - SUBTITLE_SAFETY_LINE,
+            tc.assert_equal(v["overflow_px"], 890 - subtitle_safety_line(1080),
                             "overflow px relative to safety line")
             tc.assert_true(not any(x["scene"] == "s2" for x in violations),
                            "compliant scene not false-alarmed")
+
+            # ── 竖版：安全线随画布高度等比缩放，不得沿用横版 860 ──
+            tc.assert_equal(subtitle_safety_line(1080), 860,
+                            "1080 baseline reproduces legacy 860")
+            tc.assert_equal(subtitle_safety_line(1920), 1529,
+                            "1920 tall canvas scales the band proportionally")
+            _make_scene_png(tmp / "preview_s4_t0.png", 1560, (1080, 1920))
+            _make_scene_png(tmp / "preview_s5_t0.png", 1200, (1080, 1920))
+            portrait_manifest = [
+                {"sceneId": "s4", "time": 0, "file": "s4_t0.png"},
+                {"sceneId": "s5", "time": 0, "file": "s5_t0.png"},
+            ]
+            portrait_violations = instant_preview.check_preview_safety(
+                portrait_manifest, str(tmp))
+            tc.assert_equal([x["scene"] for x in portrait_violations], ["s4"],
+                            "portrait overflow uses the scaled safety line")
+            tc.assert_equal(portrait_violations[0]["overflow_px"],
+                            1560 - subtitle_safety_line(1920),
+                            "portrait overflow px measured against y=1529")
             tc.mark_passed()
 
     except Exception as e:
@@ -2640,7 +2682,7 @@ def test_delivery_audit_fixture_verdict() -> RegressionTestCase:
             # 1. 合规输入：5 维度全过
             audit = run_delivery_audit(_base_report(), str(video_ok), str(srt_ok),
                                        str(state_path), str(cfg_path))
-            tc.assert_true(audit["passed"], "compliant delivery passes all 5 dimensions")
+            tc.assert_true(audit["passed"], "compliant delivery passes every audit dimension")
             tc.assert_true("sha256=" in audit["dimensions"]["storyboard_fidelity"]["evidence"],
                            "narration fingerprint recorded for traceability")
 
@@ -2679,12 +2721,49 @@ def test_delivery_audit_fixture_verdict() -> RegressionTestCase:
             tc.assert_true(not audit["dimensions"]["gate_integrity"]["passed"],
                             "missing verifications fails gate_integrity")
 
-            # 6. narration 指针失效 → 分镜忠实度 FAIL（P0-03 硬报错语义延续）
+            # 6. 质检存在未测项（passed 仍为 True）→ 门禁完整性 FAIL
+            #    锁定"没跑完的检查"不能在审计里折算成通过（2026-09-18 审核根因一）
+            rpt = _base_report()
+            rpt["validation"]["verification_media_quality_untested"] = 2
+            audit = run_delivery_audit(rpt, str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(not audit["dimensions"]["gate_integrity"]["passed"],
+                           "UNTESTED checks fail gate_integrity even with no errors")
+            tc.assert_true("UNTESTED" in audit["dimensions"]["gate_integrity"]["evidence"],
+                           "audit evidence names the untested counts")
+            rpt_zero = _base_report()
+            rpt_zero["validation"]["verification_media_quality_untested"] = 0
+            audit = run_delivery_audit(rpt_zero, str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(audit["dimensions"]["gate_integrity"]["passed"],
+                           "zero untested keeps gate_integrity passing (no vacuous block)")
+
+            # 7. narration 指针失效 → 分镜忠实度 FAIL（P0-03 硬报错语义延续）
             narration.unlink()
             audit = run_delivery_audit(_base_report(), str(video_ok), str(srt_ok),
                                        str(state_path), str(cfg_path))
             tc.assert_true(not audit["dimensions"]["storyboard_fidelity"]["passed"],
                             "broken narration_source fails storyboard_fidelity")
+
+            # 8. 维度名以代码为权威源（A12）：AST 抓 dims["..."] ↔ 运行时键集一致。
+            #    文档侧的中文枚举（AGENTS.md 交付审计行）不参与机器比对，
+            #    新增/删除维度若忘了同步裁定逻辑，本处即红。
+            import ast as _ast
+            _rep_src = (Path(__file__).parent / "generate_completion_report.py"
+                        ).read_text(encoding='utf-8')
+            _declared = set()
+            for _node in _ast.walk(_ast.parse(_rep_src)):
+                if (isinstance(_node, _ast.Assign) and len(_node.targets) == 1
+                        and isinstance(_node.targets[0], _ast.Subscript)
+                        and isinstance(_node.targets[0].slice, _ast.Constant)
+                        and isinstance(_node.targets[0].slice.value, str)
+                        and isinstance(getattr(_node.targets[0].value, 'id', None), str)
+                        and _node.targets[0].value.id == 'dims'):
+                    _declared.add(_node.targets[0].slice.value)
+            tc.assert_true(len(_declared) >= 3,
+                           f"AST found {len(_declared)} audit dimensions (authority is not empty)")
+            tc.assert_equal(set(audit["dimensions"]), _declared,
+                            "the runtime audit reports exactly the dimensions the code declares")
 
             tc.mark_passed()
 
@@ -3114,6 +3193,2811 @@ def test_fresh_guard_requires_confirmation() -> RegressionTestCase:
 
     return tc
 
+
+def test_doc_to_markdown_picture_extraction_fallback() -> RegressionTestCase:
+    """用例42：PPT/Word 图片抽取对未注册图片部件的容错（2026-09-02 WSI 案例 PPT）
+
+    背景：doc_to_markdown.convert_pptx 原用 shape.image 取字节。python-pptx 只对
+    image_content_types 白名单内的部件返回 ImagePart，其余（本例为 4 个 webp 部件，
+    未在 [Content_Types].xml 注册）退化为通用 Part，shape.image 抛
+    AttributeError('Part' object has no attribute 'image')——一个坏部件即中断整场
+    转换，44 页 97 图在前 21 页后全部丢失。本用例锁定三条语义：字节改从关系取
+    （不触碰 shape.image）、非原生格式转 PNG、不可解码记为跳过而非抛异常。
+    """
+    tc = RegressionTestCase(
+        "doc_to_markdown_picture_fallback",
+        "验证文档转换图片抽取：通用 Part 取字节、webp 转 PNG、坏部件跳过不中断"
+    )
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        # doc_to_markdown 模块顶层重绑 sys.stdout/stderr，需安全导入
+        d2m = _safe_import_rebinding_module("doc_to_markdown")
+        from PIL import Image
+        import io
+
+        def _make_blob(fmt, size=(120, 80)):
+            img = Image.new("RGB", size, (10, 120, 200))
+            buf = io.BytesIO()
+            img.save(buf, fmt)
+            return buf.getvalue()
+
+        class _PictureShape:
+            """模拟 python-pptx PICTURE shape：image 属性按通用 Part 行为抛错。"""
+            def __init__(self, blob, blip_rId="rId9"):
+                self._blob = blob
+                self._rid = blip_rId
+
+            @property
+            def _element(self):
+                return type("E", (), {"blip_rId": self._rid})()
+
+            @property
+            def part(self):
+                blob = self._blob
+                return type("P", (), {
+                    "related_part": lambda s, rId: type("Rp", (), {"blob": blob})()
+                })()
+
+            @property
+            def image(self):
+                raise AttributeError("'Part' object has no attribute 'image'")
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            # (a) 通用 Part（shape.image 抛错）仍能取到字节 —— 原崩溃点
+            webp = _make_blob("WEBP")
+            got = d2m._picture_blob(_PictureShape(webp))
+            tc.assert_true(got == webp, "blob read via relationship, not shape.image")
+            tc.assert_true(d2m._picture_blob(_PictureShape(webp, blip_rId=None)) is None,
+                           "shape without embed rel yields None instead of raising")
+
+            # (b) webp → PNG：扩展名与内容都必须是 PNG 且尺寸保真
+            name = d2m._write_picture(webp, tmp, "slide22_img52")
+            tc.assert_equal(name, "slide22_img52.png", "webp renamed to .png")
+            with Image.open(tmp / name) as out:   # 不关闭会锁住文件致 Windows 临时目录清理失败
+                tc.assert_equal(out.format, "PNG", "webp bytes actually converted to PNG")
+                tc.assert_equal(out.size, (120, 80), "converted PNG keeps dimensions")
+
+            # (c) 原生格式不重编码：落盘字节必须与输入逐字节相同
+            png = _make_blob("PNG")
+            name = d2m._write_picture(png, tmp, "slide1_img1")
+            tc.assert_equal(name, "slide1_img1.png", "png keeps png extension")
+            tc.assert_true((tmp / name).read_bytes() == png,
+                           "native format written verbatim (no lossy re-encode)")
+            tc.assert_equal(d2m._write_picture(_make_blob("JPEG"), tmp, "s_j"), "s_j.jpg",
+                            "jpeg normalized to .jpg")
+
+            # (d) 不可解码字节 → 返回 None（记为跳过），且不留半成品文件、不抛异常
+            before = set(tmp.iterdir())
+            tc.assert_true(d2m._write_picture(b"\x00\x01not-an-image", tmp, "s_bad") is None,
+                           "undecodable bytes skipped instead of raising")
+            tc.assert_equal(set(tmp.iterdir()), before, "skip writes no partial file")
+            tc.assert_true(d2m._write_picture(b"", tmp, "s_empty") is None,
+                           "empty part skipped instead of raising")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_scene_patch_default_route_and_time_witness() -> RegressionTestCase:
+    """用例43：增量渲染默认尝试 + 时长三重见证（2026-09-03 D3 触发权内化）
+
+    背景：29 份 pipeline_state 实测 scene_patch_attempts 全为 0——能力在位却零投产。
+    两层原因：①触发权在外部 CLI（不加 --scene-patch 就不尝试，跳过零成本且零留痕，
+    事后既不能证真也不能证伪）；②时间源信任前提过窄（脚本无 `end:` 字面量即判"不可
+    信"→ sidecar scene_times=None → classify 永久 FULL），wsi-hotel-cases 真实基线
+    实测 scene_times_error=S-block-end-unverifiable 即此形态。本用例锁定重构后语义：
+    路由三态全部留痕、见证级别与其否决条件、白名单分类器裁定、裁定落盘为数据。
+    夹具经 monkeypatch HTML_BASE/TEMP_BASE 全部落在临时目录，不写入仓库。
+    """
+    tc = RegressionTestCase(
+        "scene_patch_default_route_and_time_witness",
+        "验证增量渲染默认尝试路由三态、时长三重见证与白名单分类器裁定"
+    )
+    try:
+        import inspect
+        import subprocess
+        import time as _time
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        sp = _safe_import_rebinding_module("scene_patch_render")
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        FPS, DUR = 25, 9.0
+        STARTS = {"s1": 0.0, "s2": 3.0, "s3": 6.0}
+        ORDER = ["s1", "s2", "s3"]
+
+        def build_html(bodies, ends=None, style=".card{color:#fff}"):
+            """合成 HyperFrames 项目：T-block + root data-duration（现行手写风格）。
+
+            ends 非空时额外写 S-block 数值 end 字面量（见证级别随之变化）。
+            """
+            t_items = ", ".join(f"{sid}: {STARTS[sid]}" for sid in ORDER)
+            s_block = ""
+            if ends:
+                rows = "\n".join(f"    {sid}: {{ start: T.{sid}, end: {ends[sid]} }},"
+                                 for sid in ORDER)
+                s_block = f"\n  var S = {{\n{rows}\n  }};"
+            scenes = "\n".join(
+                f'    <div data-scene-id="{sid}" data-scene-entry="gsap" '
+                f'data-scene-subtitle-safe="true">{bodies[sid]}</div>' for sid in ORDER)
+            return (
+                '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+                f'<style>{style}</style></head>\n<body>\n'
+                f'  <div data-composition-id="main" data-duration="{DUR}" '
+                'data-width="1080" data-height="1920">\n'
+                f'{scenes}\n  </div>\n'
+                '  <script src="gsap.min.js"></script>\n  <script>\n'
+                f'  var T = {{ {t_items} }};{s_block}\n'
+                '  var main = gsap.timeline();\n'
+                '  main.to(".card", { opacity: 1 }, 0);\n'
+                '  window.__timelines = { main: main };\n'
+                '  </script>\n</body></html>\n'
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            saved_bases = (sp.HTML_BASE, sp.TEMP_BASE)
+            sp.HTML_BASE = td / "hyperframes"
+            sp.TEMP_BASE = td / "临时产物"
+            try:
+                proj = "sp-fixture"
+                src_dir = sp.HTML_BASE / proj
+                tmp_dir = sp.TEMP_BASE / f"{proj}_audio"
+                src_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                cfg_path = td / "sp-fixture.json"
+                cfg_path.write_text(json.dumps({
+                    "fps": FPS, "video_duration": DUR, "resolution": "1080x1920",
+                    "paths": {"html_project": proj, "temp_subdir": f"{proj}_audio"},
+                }, ensure_ascii=False), encoding="utf-8")
+
+                pr = sp.PatchRenderer(cfg_path)
+                bodies1 = {"s1": "<p>医院项目案例</p>",
+                           "s2": "<p>酒店项目案例</p>",
+                           "s3": "<p>教育项目案例</p>"}
+                html1 = build_html(bodies1)
+                pr.html_path.write_text(html1, encoding="utf-8")
+                pr.render_raw.write_bytes(b"\x00" * 64)
+
+                # ── A 时长见证三态 ──
+                times1, err1 = sp.extract_scene_times(html1, pr.config)
+                tc.assert_true(err1 is None,
+                               f"A1 no end literals → times still computed (err={err1})")
+                tc.assert_equal(len(times1 or []), 3, "A1 three scene windows")
+                tc.assert_equal(times1[-1]["end"] if times1 else None, DUR,
+                                "A1 last window closes at root data-duration")
+                tc.assert_equal(sp.scene_time_witness(html1), "duration-cross-check",
+                                "A1 witness downgraded to cross-check, not rejected")
+
+                ok_ends = {"s1": 3.0, "s2": 6.0, "s3": 9.0}
+                html_s = build_html(bodies1, ends=ok_ends)
+                times_s, err_s = sp.extract_scene_times(html_s, pr.config)
+                tc.assert_true(err_s is None, f"A2 consistent end literals accepted (err={err_s})")
+                tc.assert_equal(sp.scene_time_witness(html_s), "s-block-end",
+                                "A2 witness is s-block-end when literals present")
+
+                html_bad = build_html(bodies1, ends={"s1": 3.0, "s2": 6.0, "s3": 12.0})
+                times_b, err_b = sp.extract_scene_times(html_bad, pr.config)
+                tc.assert_true(times_b is None and err_b.startswith("S-block-end("),
+                               f"A3 contradictory end literals still veto (err={err_b})")
+
+                cfg_off = dict(pr.config, video_duration=15.0)
+                times_c, err_c = sp.extract_scene_times(html1, cfg_off)
+                tc.assert_true(times_c is None and err_c.startswith("config video_duration("),
+                               f"A4 config/data-duration divergence vetoed (err={err_c})")
+
+                html_sub = html1.replace("s2: 3.0", "s2: 0.01")
+                times_d, err_d = sp.extract_scene_times(html_sub, pr.config)
+                tc.assert_true(times_d is None and err_d.startswith("scene-window-sub-frame("),
+                               f"A5 sub-frame window vetoed (err={err_d})")
+
+                # ── B 白名单分类器裁定 ──
+                def write_sidecar(html, **over):
+                    fp = sp.extract_fingerprints(html, pr.config,
+                                                 pr.source_dir / "narration.json")
+                    times, err = sp.extract_scene_times(html, pr.config)
+                    side = {"version": sp.SIDECAR_VERSION, "fps": FPS,
+                            "width": 1080, "height": 1920,
+                            "total_frames": int(round(DUR * FPS)), "has_audio": False,
+                            "scene_times": times, "scene_times_error": err,
+                            "scene_times_witness":
+                                sp.scene_time_witness(html) if times else None}
+                    side.update(fp)
+                    side.update(over)
+                    pr.sidecar_path.write_text(json.dumps(side, ensure_ascii=False),
+                                               encoding="utf-8")
+                    return side
+
+                write_sidecar(html1)
+                v, ch, r, _ = pr.classify()
+                tc.assert_equal((v, r), ("FULL", "no-scene-content-change"),
+                                "B1 identical html → FULL (patching nothing is not a hit)")
+
+                bodies2 = dict(bodies1, s2="<p>酒店项目案例（隔声 45dB）</p>")
+                html2 = build_html(bodies2)
+                pr.html_path.write_text(html2, encoding="utf-8")
+                v, ch, r, ctx = pr.classify()
+                tc.assert_equal((v, ch, r), ("PATCH", ["s2"], ""),
+                                "B2 one scene body changed → PATCH that scene only")
+                tc.assert_equal(ctx.get("witness"), "duration-cross-check",
+                                "B2 witness propagated into patch context")
+                tc.assert_equal(ctx.get("times"), times1, "B2 times taken from current html")
+                tc.assert_equal(pr._plan_segments(times1, ["s2"]),
+                                [("keep", 0, 75, ["s1"]),
+                                 ("render", 75, 150, ["s2"]),
+                                 ("keep", 150, 225, ["s3"])],
+                                "B2 segment plan is frame-aligned to scene bounds")
+
+                pr.html_path.write_text(build_html(bodies2, style=".card{color:#000}"),
+                                        encoding="utf-8")
+                v, ch, r, _ = pr.classify()
+                tc.assert_true(v == "FULL" and r in ("html-outside-scenes-changed",
+                                                     "style-changed"),
+                               f"B3 style edit outside whitelist → FULL (reason={r})")
+
+                pr.html_path.write_text(
+                    build_html(dict(bodies1, s1="<p>改一</p>", s3="<p>改三</p>")),
+                    encoding="utf-8")
+                v, ch, r, _ = pr.classify()
+                tc.assert_equal((v, r), ("FULL", "too-many-scenes-changed(2/3)"),
+                                "B4 >50% scenes changed → FULL")
+
+                pr.html_path.write_text(html_bad, encoding="utf-8")
+                write_sidecar(html1)
+                v, ch, r, _ = pr.classify()
+                tc.assert_true(v == "FULL" and r.startswith("time-source-untrusted(S-block-end("),
+                               f"B5 contradictory timings veto at classify (reason={r})")
+                pr.html_path.write_text(html2, encoding="utf-8")
+
+                write_sidecar(html1, scene_times=None,
+                              scene_times_error="S-block-end-unverifiable")
+                v, ch, r, _ = pr.classify()
+                tc.assert_true(v == "FULL" and
+                               r == "baseline-time-source-untrusted(S-block-end-unverifiable)",
+                               f"B6 untrusted baseline → FULL with the recorded cause (reason={r})")
+
+                write_sidecar(html1, has_audio=True)
+                tc.assert_equal(pr.classify()[2], "baseline-has-audio-stream",
+                                "B7 baseline with audio → FULL (patch is video-only)")
+
+                write_sidecar(html1, fps=30)
+                tc.assert_equal(pr.classify()[2], "fps-changed", "B8 fps change → FULL")
+
+                write_sidecar(html1, total_frames=200)
+                tc.assert_true(pr.classify()[2].startswith("frame-grid-mismatch("),
+                               f"B9 frame grid mismatch → FULL (reason={pr.classify()[2]})")
+
+                write_sidecar(html1, version=999)
+                tc.assert_equal(pr.classify()[2], "sidecar-version-mismatch",
+                                "B10 sidecar version mismatch → FULL")
+
+                pr.sidecar_path.unlink()
+                tc.assert_equal(pr.classify()[2], "no-sidecar-baseline",
+                                "B11 no sidecar → FULL")
+                write_sidecar(html1)
+                pr.render_raw.unlink()
+                tc.assert_equal(pr.classify()[2], "no-render_raw-baseline",
+                                "B12 no baseline video → FULL")
+                pr.render_raw.write_bytes(b"\x00" * 64)
+
+                # ── C 裁定落盘 + 残留 wrapper 清理 ──
+                pr._record_verdict("PATCH", "", ["s2"], "applied",
+                                   "duration-cross-check", _time.time())
+                disk = json.loads(pr.verdict_path.read_text(encoding="utf-8"))
+                tc.assert_equal(disk["outcome"], "applied", "C1 verdict artifact records outcome")
+                tc.assert_equal(disk["time_witness"], "duration-cross-check",
+                                "C1 verdict artifact records witness level")
+                tc.assert_equal(disk["changed_scenes"], ["s2"], "C1 verdict records changed scenes")
+
+                write_sidecar(html1)
+                (pr.source_dir / "_patch_seg_9.html").write_text("<html></html>",
+                                                                 encoding="utf-8")
+                pr._render_segment = lambda *a, **k: False
+                rc, outcome = pr._patch_execute(
+                    {"base": {"total_frames": int(round(DUR * FPS))}, "times": times1,
+                     "html": html2, "witness": "duration-cross-check"}, ["s2"], times1)
+                tc.assert_equal((rc, outcome), (sp.EXIT_FALLBACK, "segment-render-failed"),
+                                "C2 segment render failure → fallback exit code + outcome")
+                tc.assert_equal(list(pr.source_dir.glob("_patch_seg_*.html")), [],
+                                "C2 stale wrapper removed and no wrapper left behind")
+
+                # ── D 流水线路由三态（触发权内化）──
+                # 独立子目录：pr.temp_dir 里已有 render_raw.mp4，复用会让"基线缺失"失真
+                run_dir = tmp_dir / "runner"
+                run_dir.mkdir(parents=True, exist_ok=True)
+                state = PipelineState(run_dir / "pipeline_state.json")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.no_scene_patch = False
+                runner.render_raw = run_dir / "render_raw.mp4"
+                runner.sidecar_path = run_dir / "scene_fingerprints.json"
+                runner.patch_verdict_path = run_dir / "scene_patch_verdict.json"
+
+                tc.assert_equal(runner._scene_patch_route(),
+                                (False, "SKIPPED",
+                                 "no-baseline(render_raw.mp4+scene_fingerprints.json)"),
+                                "D1 missing baseline → SKIPPED naming both files")
+                runner.render_raw.write_bytes(b"\x00" * 8)
+                tc.assert_equal(runner._scene_patch_route()[2],
+                                "no-baseline(scene_fingerprints.json)",
+                                "D1 partial baseline names exactly what is missing")
+                runner.sidecar_path.write_text("{}", encoding="utf-8")
+                tc.assert_equal(runner._scene_patch_route(),
+                                (True, "ATTEMPT", "baseline-present"),
+                                "D2 baseline present → attempted without any CLI opt-in")
+                runner.no_scene_patch = True
+                tc.assert_equal(runner._scene_patch_route(),
+                                (False, "SKIPPED", "opt-out(--no-scene-patch)"),
+                                "D3 explicit opt-out is the only way to skip")
+                runner.no_scene_patch = False
+
+                tc.assert_true(runner._read_patch_verdict() is None,
+                               "D4 absent verdict file → None (caller falls back to rc)")
+                runner.patch_verdict_path.write_text('{"verdict":"PATCH","outcome":"applied"}',
+                                                     encoding="utf-8")
+                tc.assert_equal(runner._read_patch_verdict()["outcome"], "applied",
+                                "D4 verdict read as data, not parsed from stdout")
+                runner.patch_verdict_path.write_text("not json", encoding="utf-8")
+                tc.assert_true(runner._read_patch_verdict() is None, "D4 malformed verdict → None")
+                runner.patch_verdict_path.write_text("[1,2]", encoding="utf-8")
+                tc.assert_true(runner._read_patch_verdict() is None,
+                               "D4 non-object verdict → None")
+
+                metrics = runner._render_metrics()
+                metrics["scene_patch_attempts"] = 1
+                metrics["scene_patch_hits"] = 1
+                rec = runner._record_scene_patch("PATCH", "baseline-present", "applied")
+                tc.assert_equal((rec["attempts"], rec["hits"]), (1, 1),
+                                "D5 attempts count classifier invocations only")
+                tc.assert_equal(state.data["scene_patch"]["verdict"], "PATCH",
+                                "D5 verdict persisted into pipeline_state")
+                tc.assert_true(bool(state.data["scene_patch"]["at"]),
+                               "D5 record carries a timestamp")
+                rec2 = runner._record_scene_patch("SKIPPED", "no-baseline(render_raw.mp4)")
+                tc.assert_equal(rec2["attempts"], 1,
+                                "D6 SKIPPED does not inflate attempts (hit rate stays meaningful)")
+                tc.assert_true(state.data["scene_patch"]["outcome"] is None,
+                               "D6 SKIPPED has no outcome")
+                tc.assert_true((run_dir / "pipeline_state.json").exists(),
+                               "D6 record written to disk, so skipping leaves a trace")
+
+                # ── E 结构契约：默认尝试（opt-out），旧 opt-in 参数已移除 ──
+                sig = inspect.signature(PipelineRunner.__init__)
+                tc.assert_equal(sig.parameters["no_scene_patch"].default, False,
+                                "E1 default is attempt — opt-out, not opt-in")
+                tc.assert_true("scene_patch" not in sig.parameters,
+                               "E1 legacy opt-in parameter removed")
+                cli = subprocess.run(
+                    [sys.executable, str(script_dir / "pipeline_runner.py"), "--help"],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=180)
+                help_text = " ".join((cli.stdout or "").split())
+                tc.assert_true("--no-scene-patch" in help_text,
+                               "E2 CLI exposes the opt-out flag")
+                tc.assert_true("always attempts it when a baseline exists" in help_text,
+                               "E2 opt-out help states the baseline-present default")
+                tc.assert_true("DEPRECATED / no-op" in help_text,
+                               "E2 legacy --scene-patch documented as no-op, not silently dropped")
+
+                tc.mark_passed()
+            finally:
+                sp.HTML_BASE, sp.TEMP_BASE = saved_bases
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
+    """用例44：交付槽位只由成功链末端写入（2026-09-03 结构性修复）
+
+    背景：render 步曾无条件把无声裸片 copy2 进 成果文件/视频/{name}.mp4，于是
+    postprocess 失败（2026-09-02 WSI 批次 BGM 未落盘）时裸片留在交付槽冒充成片，
+    而 [ORPHAN-SLOT] 告警在 postprocess 之后才跑，拦不住；重跑时 enhance 又把槽位
+    当输入，等于拿已混音已烧字幕的成片再处理一遍。修复后：enhance 输入源为
+    temp/render_raw.mp4（缺失才回退槽位），槽位由 step3/step6 在成功路径写入，
+    已交付成片的覆盖拦截同时把守 render 前置（省成本）与 postprocess 写入点
+    （quick-fix 跳过 render，只有后者能拦）。夹具 monkeypatch WF_ROOT，不落仓库。
+    """
+    tc = RegressionTestCase(
+        "delivery_slot_written_only_by_postprocess",
+        "验证后处理输入源为纯净渲染、交付槽位保护在写入点生效"
+    )
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        ev = _safe_import_rebinding_module("enhance_video_audio")
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            saved_root = ev.WF_ROOT
+            ev.WF_ROOT = td
+            try:
+                # ── A 输入源解析：render_raw 优先，槽位回退 ──
+                cfg = {"paths": {"video_name": "_regress-slot.mp4",
+                                 "subtitle_name": "_regress-slot.srt",
+                                 "temp_subdir": "_regress-slot_audio"}}
+                tmp = td / "过程产物" / "临时产物" / "_regress-slot_audio"
+                slot = td / "成果文件" / "视频" / "_regress-slot.mp4"
+
+                _r, video_file, temp_dir, output_file, _s = ev.get_paths(cfg)
+                tc.assert_equal(output_file, slot, "A1 delivery slot path is unchanged")
+                tc.assert_equal(video_file, slot,
+                                "A2 no render_raw → slot fallback keeps manual invocation working")
+
+                tmp.mkdir(parents=True, exist_ok=True)
+                (tmp / "render_raw.mp4").write_bytes(b"\x00" * 32)
+                _r, video_file, _t, output_file, _s = ev.get_paths(cfg)
+                tc.assert_equal(video_file, tmp / "render_raw.mp4",
+                                "A3 clean render is the postprocess input")
+                tc.assert_equal(output_file, slot,
+                                "A3 input and output are no longer the same path")
+
+                crm_tmp = td / "过程产物" / "临时产物" / "crm_audio"
+                _r, vf0, _t, of0, _s = ev.get_paths(None)
+                tc.assert_equal(vf0, of0, "A4 legacy no-config branch: slot fallback")
+                crm_tmp.mkdir(parents=True, exist_ok=True)
+                (crm_tmp / "render_raw.mp4").write_bytes(b"\x00" * 32)
+                _r, vf1, _t, of1, _s = ev.get_paths(None)
+                tc.assert_equal(vf1, crm_tmp / "render_raw.mp4",
+                                "A4 legacy no-config branch obeys the same rule")
+                tc.assert_equal(of1, td / "成果文件" / "视频" / of1.name,
+                                "A4 legacy branch still outputs to the slot")
+
+                # ── B 交付槽位保护：放行 / 拦截 / force ──
+                run_dir = td / "run"
+                run_dir.mkdir(parents=True, exist_ok=True)
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = PipelineState(run_dir / "pipeline_state.json")
+                runner.force = False
+                runner.quick_fix = False
+                runner.output_file = slot
+                runner.temp_dir = run_dir
+
+                tc.assert_true(runner._delivery_slot_guard("postprocess"),
+                               "B1 empty slot passes")
+                slot.parent.mkdir(parents=True, exist_ok=True)
+                slot.write_bytes(b"\x00" * 64)
+                tc.assert_true(runner._delivery_slot_guard("postprocess"),
+                               "B2 unbacked slot file passes (overwriting residue is legal)")
+
+                (run_dir / "completion_report.json").write_text(json.dumps({
+                    "status": "VALIDATED",
+                    "data_sources": {"video_file": {"path": str(slot)}},
+                }, ensure_ascii=False), encoding="utf-8")
+                tc.assert_true(runner._output_was_delivered(),
+                               "B3 fixture recognized as a delivered artifact")
+                tc.assert_true(not runner._delivery_slot_guard("postprocess"),
+                               "B3 delivered artifact blocked at the write point")
+                tc.assert_equal(runner.state.data["steps"]["postprocess"]["status"], "failed",
+                                "B3 postprocess marked failed")
+                tc.assert_true("delivered artifact" in
+                               runner.state.data["steps"]["postprocess"]["error"],
+                               "B3 error names the cause")
+
+                runner.force = True
+                tc.assert_true(runner._delivery_slot_guard("postprocess"),
+                               "B4 --force bypasses (same semantics as HARD_GATES)")
+                runner.force = False
+
+                runner.state = PipelineState(run_dir / "state_render.json")
+                tc.assert_true(not runner._delivery_slot_guard("render"),
+                               "B5 same judgment before the expensive render")
+                tc.assert_equal(runner.state.data["steps"]["render"]["status"], "failed",
+                                "B5 render marked failed")
+
+                runner.state = PipelineState(run_dir / "state_running.json")
+                runner.state.mark_started("postprocess")
+                started = runner.state.data["steps"]["postprocess"]["started"]
+                runner._delivery_slot_guard("postprocess")
+                tc.assert_equal(runner.state.data["steps"]["postprocess"]["started"], started,
+                                "B6 guard does not reset a running step's started timestamp")
+
+                # ── C 时长一致性门禁检查的对象 = 后处理真实输入源 ──
+                runner.state = PipelineState(run_dir / "state_dur.json")
+                runner.render_raw = tmp / "render_raw.mp4"
+                runner.config = {"video_duration": 9.0}
+                runner.audio_sync_rules = {"duration_consistency": {"max_diff_seconds": 1.0}}
+                probed = []
+                runner._probe_duration = lambda p: (probed.append(Path(p)), 9.0)[1]
+
+                tc.assert_true(runner._duration_consistency_ok(), "C1 consistent duration passes")
+                tc.assert_equal(probed[-1], runner.render_raw,
+                                "C1 full-run mode probes the clean render")
+                runner.quick_fix = True   # 旧实现按模式切换检查对象
+                tc.assert_true(runner._duration_consistency_ok(), "C2 quick-fix passes")
+                tc.assert_equal(probed[-1], runner.render_raw,
+                                "C2 quick-fix probes render_raw too, not the slot")
+                runner.render_raw = tmp / "absent.mp4"
+                tc.assert_true(runner._duration_consistency_ok(),
+                               "C3 missing render_raw does not block here")
+                tc.assert_equal(probed[-1], runner.output_file,
+                                "C3 falls back to the slot when no clean render exists")
+
+                # ── D 写点接线：保护判据真的挂在 render 前置与 postprocess 写入点 ──
+                #    helper 单测（B 段）证明判据正确，本段证明判据在链路上被执行——
+                #    否则删掉任一调用点，B 段依然全绿。
+                def make_runner(state_name, work_dir):
+                    r = PipelineRunner.__new__(PipelineRunner)
+                    r.state = PipelineState(work_dir / state_name)
+                    r.force = False
+                    r.quick_fix = False
+                    r.output_file = slot
+                    r.temp_dir = work_dir
+                    r.render_raw = work_dir / "render_raw.mp4"
+                    r.sidecar_path = work_dir / "scene_fingerprints.json"
+                    r.patch_verdict_path = work_dir / "scene_patch_verdict.json"
+                    r.source_dir = work_dir
+                    r.config = {"video_duration": 9.0}
+                    r.config_path = work_dir / "cfg.json"
+                    r.env = {}
+                    r.render_rules = {}
+                    r.audio_sync_rules = {"duration_consistency": {"max_diff_seconds": 1.0}}
+                    r.accept_over_render = False
+                    # A04 末端终检的接线与裁定由用例53专门锁定；本夹具的槽位
+                    # 判据测试不驱动真实 MediaQAGate（假文件必然 FAIL）
+                    r._final_media_qa = lambda: True
+                    r._can_skip = lambda name: False
+                    r._gate_satisfied = lambda name: True
+                    r._fingerprint = lambda name: "fixture"
+                    return r
+
+                def validated_report(work_dir):
+                    (work_dir / "completion_report.json").write_text(json.dumps({
+                        "status": "VALIDATED",
+                        "data_sources": {"video_file": {"path": str(slot)}},
+                    }, ensure_ascii=False), encoding="utf-8")
+
+                # D1 已交付成片 → render 前置拦截，绝不启动昂贵渲染
+                slot.write_bytes(b"\x00" * 64)
+                d1_dir = td / "d1"
+                d1_dir.mkdir(parents=True, exist_ok=True)
+                validated_report(d1_dir)
+                rr = make_runner("state.json", d1_dir)
+                launched = []
+                rr._run = lambda cmd, **kw: (launched.append(cmd), 0)[1]
+                tc.assert_true(not rr.step_render(), "D1 step_render refuses a delivered slot")
+                tc.assert_equal(launched, [], "D1 no render/sidecar subprocess launched")
+                tc.assert_true("delivered artifact" in
+                               rr.state.data["steps"]["render"]["error"],
+                               "D1 render failure names the cause")
+
+                # D2 渲染成功也不写交付槽位（旧实现在此 copy2 裸片 → 冒充成片）
+                d2_dir = td / "d2"
+                d2_dir.mkdir(parents=True, exist_ok=True)
+                slot.unlink()
+                rr2 = make_runner("state.json", d2_dir)
+                rr2._probe_duration = lambda p: 9.0
+                rr2._run = lambda cmd, **kw: (
+                    rr2.render_raw.write_bytes(b"RENDER" * 16), 0)[1]
+                tc.assert_true(rr2.step_render(), "D2 render succeeds on the stubbed path")
+                tc.assert_true(rr2.render_raw.exists(), "D2 clean render landed in temp")
+                tc.assert_true(not slot.exists(),
+                               "D2 delivery slot untouched by a successful render")
+                tc.assert_equal(rr2.state.data["steps"]["render"]["status"], "passed",
+                                "D2 render step completed (assertion above is not vacuous)")
+                tc.assert_equal(rr2.state.data["render_metrics"]["full_render_attempts"], 1,
+                                "D2 the full-render path really executed")
+
+                # D3 已交付成片 → postprocess 写入点拦截（quick-fix 跳过 render 时唯一防线）
+                d3_dir = td / "d3"
+                d3_dir.mkdir(parents=True, exist_ok=True)
+                validated_report(d3_dir)
+                slot.write_bytes(b"\x00" * 64)
+                rp = make_runner("state.json", d3_dir)
+                launched3 = []
+                rp._run = lambda cmd, **kw: (launched3.append(cmd), 0)[1]
+                tc.assert_true(not rp.step_postprocess(),
+                               "D3 step_postprocess refuses a delivered slot")
+                tc.assert_equal(launched3, [], "D3 enhance_video_audio not launched")
+                tc.assert_equal(rp.state.data["steps"]["postprocess"]["status"], "failed",
+                                "D3 postprocess marked failed")
+
+                # D4 无背书残留 → 放行并真的调用 enhance（含 quick-fix 参数透传）
+                d4_dir = td / "d4"
+                d4_dir.mkdir(parents=True, exist_ok=True)
+                rp2 = make_runner("state.json", d4_dir)
+                launched4 = []
+                rp2._duration_consistency_ok = lambda: True
+                rp2._merge_verification_file = lambda *a, **k: None
+                rp2._run = lambda cmd, **kw: (launched4.append(cmd), 0)[1]
+                tc.assert_true(rp2.step_postprocess(), "D4 postprocess proceeds")
+                tc.assert_equal(len(launched4), 1, "D4 enhance invoked exactly once")
+                tc.assert_true(any("enhance_video_audio.py" in str(a) for a in launched4[0]),
+                               "D4 the postprocess subprocess is enhance_video_audio")
+                tc.assert_true(not any("--quick-fix" in str(a) for a in launched4[0]),
+                               "D4 full-run mode does not pass --quick-fix")
+                tc.assert_equal(rp2.state.data["steps"]["postprocess"]["status"], "passed",
+                                "D4 postprocess completed")
+
+                rp3 = make_runner("state_qf.json", d4_dir)
+                rp3.quick_fix = True
+                rp3._duration_consistency_ok = lambda: True
+                rp3._merge_verification_file = lambda *a, **k: None
+                launched5 = []
+                rp3._run = lambda cmd, **kw: (launched5.append(cmd), 0)[1]
+                tc.assert_true(rp3.step_postprocess(), "D4 quick-fix postprocess proceeds")
+                tc.assert_true(any("--quick-fix" in str(a) for a in launched5[0]),
+                               "D4 quick-fix mode passes --quick-fix through")
+
+                tc.mark_passed()
+            finally:
+                ev.WF_ROOT = saved_root
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_asset_signoff_gate() -> RegressionTestCase:
+    """用例45：位点1 素材确认单消费门禁 check_asset_signoff（2026-09-03 WSI 批次）
+
+    背景：上一批 4 条 WSI 竖版退回原因是"画面图片选择较差，不符合宣传的品质要求"
+    ——素材选择从未成为"人工可签认、机器可核验"的对象，改稿时也没有任何门禁能
+    发现屏显与签认分叉。本用例锁定判据的六个面与"存在即强制"的触发形态
+    （无 opt-in 开关、无项目名单，与 narration_source 指针同一判据形态），
+    使跳过位点1 的项目零影响、走过位点1 的项目分叉即阻断。
+
+    真实项目上的红绿双向由现场变异测试另行验证（7 组：pill/旁白/素材名/屏显数字/
+    S-block 类型/确认单自身无溯源/还原转绿），夹具在此锁定可重复执行面。
+    """
+    tc = RegressionTestCase(
+        "asset_signoff_gate",
+        "验证素材确认单存在即强制、六个判据面可红、通过路径留 OK 痕"
+    )
+    try:
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import preflight_check as pf
+
+        # 卡片 pill 含"9 月 1 日"且该场「数据点」无 9/1：公历日期豁免须成立，
+        # 否则基线绿态即红（把豁免做成通用判据而非逐项目特例的看门断言）。
+        BASE_HTML = """<!DOCTYPE html><html><body>
+<div id="root" data-width="1080" data-height="1920" data-duration="11" data-cover-duration="3">
+  <div id="scene0" class="scene" data-scene-id="s0" data-scene-entry="cover" data-scene-subtitle-safe="true"><h1>封面</h1></div>
+  <div id="scene1" class="scene" data-scene-id="s1" data-scene-entry="gsap" data-scene-subtitle-safe="true" data-scene-assets="1.jpg">
+    <img class="ph" src="assets/1.jpg">
+    <div class="ab name" id="s1name">医院A 门诊楼</div>
+    <div class="ab tags" id="s1tags" style="top:392px;left:60px;width:960px;"><div class="tag" id="s1t1">12 万㎡</div><div class="tag" id="s1t2">隔墙 5000㎡</div></div>
+  </div>
+  <div id="scene2" class="scene" data-scene-id="s2" data-scene-entry="gsap" data-scene-subtitle-safe="true" data-scene-assets="2.jpg">
+    <img class="ph" src="assets/2.jpg">
+    <div class="ab name" id="s2name">医院B 住院楼</div>
+    <div class="ab tags" id="s2tags" style="top:392px;left:60px;width:960px;"><div class="tag" id="s2t1">9 月 1 日</div><div class="tag" id="s2t2">8000㎡</div></div>
+  </div>
+</div>
+<script>
+var T = { s0: 0, s1: 3.0, s2: 7.0 };
+var S = [{"id": "s0", "start": 0, "end": 3.0, "dur": 3.0, "type": "cover", "cover": true},
+ {"id": "s1", "start": 3.0, "end": 7.0, "dur": 4.0, "type": "card"},
+ {"id": "s2", "start": 7.0, "end": 11.0, "dur": 4.0, "type": "card"}];
+</script>
+</body></html>"""
+
+        BASE_SHEET = {
+            "场景数": 2,
+            "场景": [
+                {"scene_id": 1, "场景类型": "card", "画面文案": "医院A 门诊楼",
+                 "量化标签": ["12 万㎡", "隔墙 5000㎡"], "旁白文案": "门诊楼隔墙 5000 平方米。",
+                 "选用素材": [{"display_target": "素材文件/图片/1.jpg"}],
+                 "数据点": [{"数值": "12 万㎡", "来源": "S20"}, {"数值": "5000", "来源": "S21"}]},
+                {"scene_id": 2, "场景类型": "card", "画面文案": "医院B 住院楼",
+                 "量化标签": ["9 月 1 日", "8000㎡"], "旁白文案": "住院楼 8000 平方米。",
+                 "选用素材": [{"display_target": "素材文件/图片/2.jpg"}],
+                 "数据点": [{"数值": "8000", "来源": "S25"}]},
+            ],
+        }
+        BASE_CFG = {"scenes": [{"scene_id": 1, "narration": "门诊楼隔墙 5000 平方米。"},
+                               {"scene_id": 2, "narration": "住院楼 8000 平方米。"}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            pdir = Path(td)
+            (pdir / "assets").mkdir()
+            for name in ("1.jpg", "2.jpg"):
+                (pdir / "assets" / name).write_bytes(b"\xff\xd8\xff\xe0fake")
+            html_path = pdir / "index.html"
+
+            def run(html_text=None, sheet=None, cfg=None, mode="render", write_sheet=True):
+                if html_text is not None:
+                    html_path.write_text(html_text, encoding="utf-8")
+                sp = pdir / "素材确认单.json"
+                if write_sheet:
+                    sp.write_text(json.dumps(sheet if sheet is not None else BASE_SHEET,
+                                             ensure_ascii=False), encoding="utf-8")
+                elif sp.exists():
+                    sp.unlink()
+                r = pf.PreflightResult(mode=mode)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pf.check_asset_signoff(pdir, cfg if cfg is not None else BASE_CFG,
+                                           html_path, r)
+                return r
+
+            def hits(r, needle, level="ERROR"):
+                return [e["message"] for e in r._log_entries
+                        if e["level"] == level and e["check_id"] == "asset_signoff"
+                        and needle in e["message"]]
+
+            # (a) 无确认单 → INFO 跳过，零 error 零 OK（存量项目零影响）
+            r = run(write_sheet=False)
+            tc.assert_true(not r.errors, "项目无确认单时不产生 error")
+            tc.assert_true(hits(r, "跳过", "INFO"), "跳过路径记 INFO 留痕（不做静默通过）")
+            tc.assert_true(not hits(r, "素材确认单一致性通过", "OK"),
+                           "跳过时不得伪造 OK 痕")
+
+            # (b) 一致 → 零 error + OK 痕（通过路径亦留痕，使"跑过"成为正证据）
+            r = run(BASE_HTML)
+            tc.assert_true(not r.errors, f"一致夹具应零 error，实际 {r.errors}")
+            tc.assert_true(hits(r, "素材确认单一致性通过", "OK"), "通过路径写 OK 痕")
+
+            # (c) pill 文本分叉（数字仍在溯源池，只能由屏显文本面捕获）
+            r = run(BASE_HTML.replace('<div class="tag" id="s1t1">12 万㎡</div>',
+                                      '<div class="tag" id="s1t1">12 万m²</div>'))
+            tc.assert_true(hits(r, "标签 pill"), "pill 与确认单分叉被拦")
+
+            # (d) data-scene-assets 与确认单选用素材分叉
+            r = run(BASE_HTML.replace('data-scene-assets="1.jpg"',
+                                      'data-scene-assets="2.jpg"'))
+            tc.assert_true(hits(r, "!= 确认单选用素材"), "素材声明与确认单分叉被拦")
+
+            # (e) 选用素材未落盘（确认单与 HTML 同指一个不存在的文件）
+            sheet_e = json.loads(json.dumps(BASE_SHEET, ensure_ascii=False))
+            sheet_e["场景"][0]["选用素材"] = [{"display_target": "素材文件/图片/9.jpg"}]
+            r = run(BASE_HTML.replace('data-scene-assets="1.jpg"', 'data-scene-assets="9.jpg"')
+                            .replace('src="assets/1.jpg"', 'src="assets/9.jpg"'),
+                    sheet=sheet_e)
+            tc.assert_true(hits(r, "选用素材未落盘"), "签认过的素材不在盘上被拦")
+
+            # (f) 旁白源与确认单分叉
+            r = run(BASE_HTML, cfg={"scenes": [
+                {"scene_id": 1, "narration": "门诊楼隔墙 5000 平方米"},
+                {"scene_id": 2, "narration": BASE_CFG["scenes"][1]["narration"]}]})
+            tc.assert_true(hits(r, "旁白源与确认单"), "旁白逐字分叉被拦")
+
+            # (g) HTML S-block type 与确认单「场景类型」分叉
+            r = run(BASE_HTML.replace('{"id": "s1", "start": 3.0, "end": 7.0, "dur": 4.0, "type": "card"}',
+                                      '{"id": "s1", "start": 3.0, "end": 7.0, "dur": 4.0, "type": "hero"}'))
+            tc.assert_true(hits(r, "!= S-block type"), "场景类型分叉被拦")
+
+            # (h) 屏显数字脱离本场「数据点」（改确认单自身，证明溯源面读的是签认数据）
+            sheet_h = json.loads(json.dumps(BASE_SHEET, ensure_ascii=False))
+            sheet_h["场景"][0]["量化标签"] = ["999999 万㎡", "隔墙 5000㎡"]
+            r = run(BASE_HTML.replace('<div class="tag" id="s1t1">12 万㎡</div>',
+                                      '<div class="tag" id="s1t1">999999 万㎡</div>'),
+                    sheet=sheet_h)
+            tc.assert_true(hits(r, "在本场「数据点」中无溯源"), "无溯源屏显数字被拦")
+
+            # (i) 场景覆盖分叉：HTML 多出确认单未签认的场景
+            r = run(BASE_HTML.replace(
+                '</div>\n<script>',
+                '  <div id="scene3" class="scene" data-scene-id="s3" data-scene-entry="gsap"'
+                ' data-scene-subtitle-safe="true" data-scene-assets="1.jpg"></div>\n</div>\n<script>'))
+            tc.assert_true(hits(r, "!= HTML 非 cover 场景"), "未经签认的新场景被拦")
+
+            # (j) audit 模式：同一分叉降为 WARN（锁 RENDER_CRITICAL_CHECKS 注册在位）
+            self_check = "asset_signoff" in pf.RENDER_CRITICAL_CHECKS
+            tc.assert_true(self_check, "asset_signoff 已注册为 render 级关键判据")
+            r = run(BASE_HTML.replace('<div class="tag" id="s1t1">12 万㎡</div>',
+                                      '<div class="tag" id="s1t1">12 万m²</div>'),
+                    mode="audit")
+            tc.assert_true(not r.errors and r.warnings,
+                           "audit 模式下分叉降为 WARN 不阻断")
+
+            # 收尾复位，避免后续用例复用同一 HTML 文本时残留
+            html_path.write_text(BASE_HTML, encoding="utf-8")
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_preview_coverage_gap() -> RegressionTestCase:
+    """用例46：预览截图覆盖率裁定（2026-09-03 WSI 位点2 首跑实证）
+
+    背景：instant_preview 对 wsi-commercial-cases 首跑时 Chrome 渲染进程在第 6 场
+    崩溃（Page.captureScreenshot: Target closed），manifest 只含 5/11 场，脚本仍打印
+    "[PASS] All scenes stay above subtitle safety line" 并退出 0——退出码 3 只覆盖
+    "零截图"，部分盲区被当成通过。位点2 要人看画面签核，"哪些场根本没成像"必须是
+    机器可判的事实，而不是需要人读日志才发现的读数。
+    """
+    tc = RegressionTestCase(
+        "preview_coverage_gap",
+        "验证部分截图缺失被判定为覆盖盲区，且以 png 在位而非 manifest 声明为准"
+    )
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import instant_preview as ip
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            node_scenes = [{"scene_id": 1}, {"scene_id": "s2"}, {"scene_id": 3}]
+
+            def entry(sid, fname):
+                return {"sceneId": sid, "file": fname, "time": 1.0, "frame": "start"}
+
+            # (a) 全覆盖 → 无缺口
+            for f in ("scene_1_start.png", "scene_s2_start.png", "scene_3_start.png"):
+                (tmp / f).write_bytes(b"png")
+            gap, covered, total = ip.compute_capture_gap(
+                node_scenes,
+                [entry(1, "scene_1_start.png"), entry("s2", "scene_s2_start.png"),
+                 entry(3, "scene_3_start.png")],
+                tmp)
+            tc.assert_equal(gap, [], "full coverage yields empty gap")
+            tc.assert_equal((covered, total), (3, 3), "counts reflect measured scenes")
+
+            # (b) Chrome 中途崩溃：manifest 少一场 → 点名缺失
+            gap, covered, total = ip.compute_capture_gap(
+                node_scenes,
+                [entry(1, "scene_1_start.png"), entry("s2", "scene_s2_start.png")],
+                tmp)
+            tc.assert_equal(gap, [3], "missing scene named in gap")
+            tc.assert_equal((covered, total), (2, 3), "partial coverage counted as partial")
+
+            # (c) manifest 声明了但 png 不在盘上 → 仍算缺口（声明不等于证据）
+            ghost = tmp / "scene_ghost.png"
+            gap, covered, total = ip.compute_capture_gap(
+                node_scenes,
+                [entry(1, "scene_1_start.png"), entry("s2", "scene_s2_start.png"),
+                 entry(3, "scene_ghost.png")],
+                tmp)
+            tc.assert_equal(gap, [3], "declared-but-absent png still counts as gap")
+            ghost.write_bytes(b"png")
+            gap2, _, _ = ip.compute_capture_gap(
+                node_scenes,
+                [entry(1, "scene_1_start.png"), entry("s2", "scene_s2_start.png"),
+                 entry(3, "scene_ghost.png")],
+                tmp)
+            tc.assert_equal(gap2, [], "same entry closes the gap once the file exists")
+
+            # (d) 零截图 → 全部为缺口（与既有退出码 3 语义一致）
+            gap, covered, total = ip.compute_capture_gap(node_scenes, [], tmp)
+            tc.assert_equal(gap, [1, 2, 3], "no screenshots means no coverage")
+            tc.assert_equal(covered, 0, "zero covered when nothing captured")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+# ============================================================================
+# 2026-09-18 审核报告整改（批次1）：四态裁定 / RMS 解析口径 / 显式引擎入口
+# ============================================================================
+
+def test_gate_four_state_untested_not_pass() -> RegressionTestCase:
+    """用例47：门禁四态裁定——未测不得计为通过（审核 A03，根因一）
+
+    背景：visual_boundary_check 某场景三点抽帧全部失败时，结果写成 status=ERROR
+    但不入 violations，而总判据是 len(violations)==0 → "检查根本没跑完"被解释成
+    "检查通过"，随后进入烧字幕与交付。修后 violations 与 untested 分列，裁定优先级
+    FAIL > UNTESTED > PASS；合法不适用（场景过短/时长不足）另列，不与未测混用。
+    """
+    tc = RegressionTestCase(
+        "gate_four_state_untested_not_pass",
+        "验证抽帧失败计为未测并阻断总裁定，合法不适用不阻断"
+    )
+    try:
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _gate_status as gs
+        import visual_boundary_check as vbc
+
+        # (a) 契约本体：违规优先于未测；仅有未测时整体为 UNTESTED；两者皆空才 PASS
+        tc.assert_equal(gs.verdict(["v"], ["u"]), gs.FAIL,
+                        "violations outrank untested in overall verdict")
+        tc.assert_equal(gs.verdict([], ["u"]), gs.UNTESTED,
+                        "untested alone never collapses to PASS")
+        tc.assert_equal(gs.verdict([], []), gs.PASS,
+                        "no violation and no untested means PASS")
+        counts = gs.count_statuses([{"status": gs.PASS}, {"status": gs.NOT_APPLICABLE},
+                                    {"status": gs.NOT_APPLICABLE}])
+        tc.assert_equal((counts[gs.PASS], counts[gs.NOT_APPLICABLE]), (1, 2),
+                        "count_statuses separates NA from PASS")
+
+        scenes = [
+            {"id": 1, "start": 0.0, "end": 10.0},
+            {"id": 2, "start": 10.0, "end": 20.0},
+            {"id": 3, "start": 20.0, "end": 21.5},  # dur<2 → NOT_APPLICABLE
+        ]
+
+        def cov_stub(image_path, subtitle_lines=2):
+            return 0.5
+
+        saved_cov = vbc.measure_content_coverage
+        saved_measure = vbc.measure_content_bottom
+        saved_extract = vbc.extract_frame
+        try:
+            vbc.measure_content_coverage = cov_stub
+
+            # (b) 全部抽帧失败 → UNTESTED，passed=False（旧实现此处 passed=True）
+            def extract_none(video_path, timestamp, output_path, ffmpeg_exe="ffmpeg"):
+                return False
+
+            vbc.extract_frame = extract_none
+            vbc.measure_content_bottom = lambda p: 500
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                passed, results, summary = vbc.run_check("fake.mp4", scenes)
+            tc.assert_equal(passed, False,
+                            "all-frames-failed must not report passed")
+            tc.assert_equal(summary["verdict"], gs.UNTESTED,
+                            "verdict is UNTESTED, not PASS, when nothing was measured")
+            tc.assert_equal([r["status"] for r in results[:2]],
+                            [gs.UNTESTED, gs.UNTESTED],
+                            "failed scenes carry UNTESTED status")
+            tc.assert_true(any(u["check"] == "content_boundary" for u in summary["untested"]),
+                           "untested entries name the failed check dimension")
+            tc.assert_equal(summary["counts"][gs.NOT_APPLICABLE], 1,
+                            "short scene stays NOT_APPLICABLE, not counted as untested")
+
+            # (c) 只有合法不适用 → 仍判通过（未测与不适用不得混为一谈）
+            vbc.extract_frame = lambda *a, **k: True
+            with contextlib.redirect_stdout(io.StringIO()):
+                passed_c, _, summary_c = vbc.run_check(
+                    "fake.mp4", [{"id": 9, "start": 0.0, "end": 1.0}])
+            tc.assert_equal(passed_c, True,
+                            "NOT_APPLICABLE-only run is not blocked as untested")
+            tc.assert_equal(summary_c["untested"], [],
+                            "NOT_APPLICABLE is not written into the untested list")
+
+            # (d) 采样点缺失（3 点只取到 1 点）→ 最坏值判据不完整，计未测
+            def extract_partial(video_path, timestamp, output_path, ffmpeg_exe="ffmpeg"):
+                keep = "_p30" in Path(output_path).name
+                if keep:
+                    Path(output_path).write_bytes(b"fake-frame")
+                return keep
+
+            vbc.extract_frame = extract_partial
+            with contextlib.redirect_stdout(io.StringIO()):
+                passed_d, _, summary_d = vbc.run_check("fake.mp4", scenes[:1])
+            tc.assert_equal(summary_d["verdict"], gs.UNTESTED,
+                            "partial sampling degrades verdict to UNTESTED")
+            tc.assert_true(any("1/3" in u["reason"] for u in summary_d["untested"]),
+                           "untested reason states how many samples were available")
+        finally:
+            vbc.extract_frame = saved_extract
+            vbc.measure_content_bottom = saved_measure
+            vbc.measure_content_coverage = saved_cov
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_audio_rms_parse_and_untested_trace() -> RegressionTestCase:
+    """用例48：astats RMS 解析口径与未测留痕（审核 A07，本机实测复现）
+
+    背景：_check_video_quality 用正则 RMS_level= 取音量值，而本机 FFmpeg 的
+    astats 实际打印 "RMS level dB: -52.409893" → rms_values 恒空、len>=2 永假，
+    整项音量一致性检查从未执行却在报告里算通过。修后两种拼写共用同一条模块级
+    正则（测试复用生产常量，避免"另写一份字面量"造成测试失明），且取不到测量值
+    时写入 untested 清单，不再静默。
+    """
+    tc = RegressionTestCase(
+        "audio_rms_parse_and_untested_trace",
+        "验证 RMS 正则吃真实 FFmpeg 输出，且解析不到时记未测而非静默通过"
+    )
+    try:
+        import io
+        import contextlib
+        import subprocess
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        # (a) 生产正则对本机真值与旧拼写都要命中
+        real_line = "[Parsed_astats_0 @ 0x560] RMS level dB: -52.409893"
+        legacy_line = "lavfi.astats.1.RMS_level=-16.300000"
+        tc.assert_equal(eva._RMS_LEVEL_RE.findall(real_line), ["-52.409893"],
+                        "regex parses this machine's real astats spelling")
+        tc.assert_equal(eva._RMS_LEVEL_RE.findall(legacy_line), ["-16.300000"],
+                        "regex still parses the legacy metadata spelling")
+        tc.assert_equal(eva._RMS_LEVEL_RE.findall("Peak level dB: -1.5"), [],
+                        "peak level line is not mistaken for RMS")
+
+        # (b) 真实 FFmpeg 端到端：同一命令取 stderr，正则必须拿得到值
+        ffmpeg_exe = shutil.which("ffmpeg")
+        tc.assert_true(bool(ffmpeg_exe), "ffmpeg available for the real-output check")
+        if ffmpeg_exe:
+            with tempfile.TemporaryDirectory() as td:
+                wav = Path(td) / "rms_probe.wav"
+                subprocess.run(
+                    [ffmpeg_exe, "-y", "-f", "lavfi",
+                     "-i", "sine=frequency=440:duration=12", "-ar", "44100", str(wav)],
+                    capture_output=True)
+                probe = subprocess.run(
+                    [ffmpeg_exe, "-ss", "1.0", "-t", "2", "-i", str(wav),
+                     "-af", "astats=metadata=1:reset=1", "-f", "null", "-"],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+                found = eva._RMS_LEVEL_RE.findall(probe.stderr)
+                tc.assert_true(len(found) >= 1,
+                               f"real FFmpeg stderr yields RMS values (got {found})")
+
+        # (c) 有音轨但取不到值 → untested 点名（旧实现此处零记录）
+        class _Out:
+            def __init__(self, stdout="", stderr=""):
+                self.stdout, self.stderr = stdout, stderr
+
+        probe_payload = json.dumps({"streams": [
+            {"codec_type": "video", "bit_rate": "5000000", "duration": "20.0"},
+            {"codec_type": "audio", "duration": "20.0"}]})
+
+        def fake_run_no_rms(argv, *a, **k):
+            if argv[0] == "ffprobe":
+                return _Out(stdout=probe_payload)
+            return _Out(stderr="nothing recognizable here")
+
+        saved_run = eva.subprocess.run
+        try:
+            eva.subprocess.run = fake_run_no_rms
+            with contextlib.redirect_stdout(io.StringIO()):
+                errs, warns, untested_q, na_q = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+        tc.assert_true(any("Audio RMS consistency" in u and "UNTESTED" in u
+                           for u in untested_q),
+                       "unparseable RMS is recorded as untested, not silently skipped")
+        tc.assert_true(any("Blank-frame check" in u for u in untested_q),
+                       "frame sampling that yields too few frames is also untested")
+        tc.assert_equal(errs, [], "measurement gaps alone raise no error")
+
+        # (d) 无音轨属合法不适用，不得计入未测
+        probe_no_audio = json.dumps({"streams": [
+            {"codec_type": "video", "bit_rate": "5000000", "duration": "20.0"}]})
+
+        def fake_run_no_audio(argv, *a, **k):
+            if argv[0] == "ffprobe":
+                return _Out(stdout=probe_no_audio)
+            return _Out(stderr="")
+
+        try:
+            eva.subprocess.run = fake_run_no_audio
+            with contextlib.redirect_stdout(io.StringIO()):
+                _, _, untested_d, na_d = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+        tc.assert_true(any("Audio RMS consistency" in x and "NOT_APPLICABLE" in x
+                           for x in na_d),
+                       "no-audio path is typed NOT_APPLICABLE")
+        tc.assert_true(not any("Audio RMS consistency" in u for u in untested_d),
+                       "NOT_APPLICABLE must not leak into the untested list")
+
+        # (e) 未测存在时结果落盘带 untested 字段（供 pipeline_state 追溯）
+        with tempfile.TemporaryDirectory() as td:
+            eva._write_media_quality_result(Path(td), True, [], [], ["u1"], ["n1"])
+            payload = json.loads((Path(td) / "media_quality_result.json")
+                                 .read_text(encoding="utf-8"))
+        tc.assert_equal((payload["passed"], payload["untested"], payload["not_applicable"]),
+                        (True, ["u1"], ["n1"]),
+                        "media_quality_result carries four-state lists for traceability")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_explicit_engine_binds_config_path() -> RegressionTestCase:
+    """用例49：显式 --engine openmontage 的 config_path 绑定（审核 A11）
+
+    背景：config_path 只在"未指定引擎→自动探测"分支内赋值，显式传 --engine
+    openmontage 时路由分支直接引用它 → UnboundLocalError，该入口完全不可用。
+    用哨兵类替换 OpenMontageRunner 捕获实参：既证明绑定成立，也不让真实流水线
+    在测试里被执行（夹具不触碰渲染与交付目录）。
+    """
+    tc = RegressionTestCase(
+        "explicit_engine_binds_config_path",
+        "验证显式指定引擎时 config_path 已绑定并原样传给对应 runner"
+    )
+    try:
+        import io
+        import types
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        pr = _safe_import_pipeline_runner()
+
+        class _SentinelStop(Exception):
+            pass
+
+        captured = {}
+
+        class _FakeRunner:
+            def __init__(self, config_path=None, force=False, **kwargs):
+                captured["config_path"] = config_path
+                raise _SentinelStop("stop before touching the real pipeline")
+
+        fake_module = types.ModuleType("openmontage_runner")
+        fake_module.OpenMontageRunner = _FakeRunner
+        saved_module = sys.modules.get("openmontage_runner")
+        saved_argv = list(sys.argv)
+        sys.modules["openmontage_runner"] = fake_module
+        sys.argv = ["pipeline_runner.py", "--config", "case49-engine-entry.json",
+                    "--engine", "openmontage"]
+        caught = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    pr.main()
+                except SystemExit as e:  # argparse 提前退出也要能被区分
+                    caught = e
+                except Exception as e:
+                    caught = e
+        finally:
+            if saved_module is not None:
+                sys.modules["openmontage_runner"] = saved_module
+            else:
+                sys.modules.pop("openmontage_runner", None)
+            sys.argv = saved_argv
+
+        tc.assert_true(not isinstance(caught, UnboundLocalError),
+                       "explicit --engine no longer raises UnboundLocalError")
+        tc.assert_true(isinstance(caught, _SentinelStop),
+                       "routing reached the engine runner with a bound config_path")
+        resolved = str(captured.get("config_path") or "")
+        tc.assert_true(resolved.endswith("case49-engine-entry.json"),
+                       "resolved config path is handed to the runner unchanged")
+        tc.assert_true(bool(resolved) and Path(resolved).is_absolute(),
+                       "relative --config is resolved against CONFIG_DIR for every engine")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_step_fingerprint_binds_real_inputs() -> RegressionTestCase:
+    """用例50：步骤指纹绑定真实输入（审核 A06 三缺口，2026-09-18）
+
+    背景：指纹机制在位，但三处登记与真实生效路径脱节，使"当前交付对应当前输入"
+    这一承诺失效：
+      ① 显式 --step 起跑只查 status（_gate_satisfied），不做指纹校验——改完 HTML
+         直接 --step render 时历史 passed 依旧成立，本应校验新 HTML 的门禁被免检；
+      ② preflight 指纹不含 gate_mode——audit 模式把 8 类 render-critical 检查降级
+         为警告后 passed，严格模式复用该结论；preview 指纹漏登其真实消费的
+         tts_manifest 与脚本自身；
+      ③ tts_manifest 指纹登记在 temp/tts_44k/ 下——该路径从不存在（全仓实测
+         temp 根 31 个、tts_44k 内 0 个），而 compute_inputs_fingerprint 对缺失路径
+         退化为常量 "notfound:<路径>"，于是这项输入永久空转。
+    每条断言都配负向对照，防止"恒真断言"式空跑。
+    """
+    tc = RegressionTestCase(
+        "step_fingerprint_binds_real_inputs",
+        "验证 tts_manifest 指纹绑定真实落盘路径、preflight 纳入 gate_mode、"
+        "--step 前置步做指纹有效性判定"
+    )
+
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+        runner_content = (script_dir / "pipeline_runner.py").read_text(encoding='utf-8')
+
+        saved_config_dir = _pr.CONFIG_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+                quality_dir = tmpdir / "quality"
+                quality_dir.mkdir(parents=True)
+                rules_files = {
+                    "audio_sync_rules.json": {"alignment": {"silence_db": -38}},
+                    "narration_digits_rules.json": {"whitelist": []},
+                    "video_quality_rules.json": {"min_video_bitrate_kbps_fail": 200},
+                    "subtitle_term_rules.json": {"terms": []},
+                    "render_rules.json": {"render_budget": {"max_full_renders": 3}},
+                }
+                for fname, payload in rules_files.items():
+                    (quality_dir / fname).write_text(
+                        json.dumps(payload), encoding='utf-8')
+                _pr.CONFIG_DIR = tmpdir
+
+                source_dir = tmpdir / "src"
+                source_dir.mkdir()
+                (source_dir / "index.html").write_text("<html>s1</html>", encoding='utf-8')
+                (source_dir / "narration.json").write_text(
+                    json.dumps({"scenes": [{"scene_id": "s1", "narration": "第一项"}]},
+                               ensure_ascii=False), encoding='utf-8')
+                signoff = source_dir / "素材确认单.json"
+                signoff.write_text(json.dumps({"场景": []}, ensure_ascii=False),
+                                   encoding='utf-8')
+
+                cfg_path = tmpdir / "cfg.json"
+                cfg_path.write_text("{}", encoding='utf-8')
+
+                temp_dir = tmpdir / "temp"
+                temp_dir.mkdir()
+                # 真实落盘点（enhance_video_audio._save_tts_manifest）与旧登记点各一份，
+                # 内容不同——只有前者变化才应使依赖它的步骤失效。
+                real_manifest = temp_dir / "tts_manifest.json"
+                real_manifest.write_text(json.dumps({"s1": 3.2}), encoding='utf-8')
+                decoy_dir = temp_dir / "tts_44k"
+                decoy_dir.mkdir()
+                decoy_manifest = decoy_dir / "tts_manifest.json"
+                decoy_manifest.write_text(json.dumps({"s1": 3.2}), encoding='utf-8')
+                # 真实形态下 postprocess/verify 跑在渲染之后，render_raw 必在盘；
+                # 夹具照此建空文件，使 [FP-MISS] 只在被注入的缺失场景出现
+                (temp_dir / "render_raw.mp4").write_bytes(b"")
+
+                state = PipelineState(temp_dir / "pipeline_state.json")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.force = False
+                runner.config = {}
+                runner.config_path = cfg_path
+                runner.html_project = "case50"
+                runner.source_dir = source_dir
+                runner.html_path = source_dir / "index.html"
+                runner.temp_dir = temp_dir
+                runner.tts_dir = decoy_dir
+                runner.render_raw = temp_dir / "render_raw.mp4"
+                runner.output_file = temp_dir / "case50.mp4"
+                runner.gate_mode = "render"
+                runner.video_type = ""
+                runner.quick_fix = False
+
+                # ── ③ 输入项必须绑定生产者真实写盘点 ──
+                for step in ("timeline", "preview", "postprocess"):
+                    declared = runner._step_inputs(step).get("tts_manifest", "")
+                    tc.assert_true(
+                        declared and not declared.startswith(str(decoy_dir)),
+                        f"{step} tts_manifest input is not the dead tts_44k path")
+                    tc.assert_equal(declared, str(real_manifest),
+                                    f"{step} tts_manifest input points at the temp root"
+                                    f" the producer writes to")
+
+                def _reset(*steps):
+                    for s in steps:
+                        state.mark_started(s)
+                        state.mark_completed(s, runner._fingerprint(s))
+                        tc.assert_equal(runner._step_dirty_reason(s), None,
+                                        f"{s} cache reusable right after completion")
+
+                # 改真实 manifest → 三个消费步全部失效
+                _reset("timeline", "preview", "postprocess")
+                real_manifest.write_text(json.dumps({"s1": 5.7}), encoding='utf-8')
+                for s in ("timeline", "preview", "postprocess"):
+                    tc.assert_equal(runner._step_dirty_reason(s), "inputs-changed",
+                                    f"{s} invalidated by the manifest it actually consumes")
+
+                # 负向对照：只改 tts_44k 里那份（流水线从不读它）→ 不得失效，
+                # 否则说明指纹登记面又漂回死路径
+                _reset("timeline", "preview", "postprocess")
+                real_manifest.write_text(json.dumps({"s1": 3.2}), encoding='utf-8')
+                _reset("timeline", "preview", "postprocess")
+                decoy_manifest.write_text(json.dumps({"s1": 9.9}), encoding='utf-8')
+                for s in ("timeline", "preview", "postprocess"):
+                    tc.assert_equal(runner._step_dirty_reason(s), None,
+                                    f"{s} unaffected by the never-consumed tts_44k manifest")
+                decoy_manifest.write_text(json.dumps({"s1": 3.2}), encoding='utf-8')
+
+                # ── ③ 附：运行时产物登记路径失效必须可见，不得静默退化成常量 ──
+                import io as _io
+                import contextlib as _cl
+                (temp_dir / "render_raw.mp4").unlink()   # 注入缺失（A06-③ 的同型形态）
+                buf = _io.StringIO()
+                with _cl.redirect_stdout(buf):
+                    runner._fingerprint("verify")
+                out = buf.getvalue()
+                tc.assert_true("[FP-MISS]" in out and "render_raw" in out,
+                               "a registered runtime artifact missing from disk is named,"
+                               " not silently hashed as a constant")
+                (temp_dir / "render_raw.mp4").write_bytes(b"")
+                buf2 = _io.StringIO()
+                with _cl.redirect_stdout(buf2):
+                    runner._fingerprint("verify")
+                tc.assert_true("[FP-MISS]" not in buf2.getvalue(),
+                               "same step prints nothing once the artifact is in place"
+                               " (防空跑恒真)")
+                # 源文件不入点名范围：按项目形态本就可缺，常驻警告会淹没真问题
+                signoff.unlink()
+                buf3 = _io.StringIO()
+                with _cl.redirect_stdout(buf3):
+                    runner._fingerprint("preflight")
+                tc.assert_true("[FP-MISS]" not in buf3.getvalue(),
+                               "optional source files (素材确认单) absent do not warn")
+                signoff.write_text(json.dumps({"场景": []}, ensure_ascii=False),
+                                   encoding='utf-8')
+
+                # ── ② preflight：gate_mode 与真实消费面入指纹 ──
+                _reset("preflight")
+                runner.gate_mode = "audit"
+                tc.assert_equal(runner._step_dirty_reason("preflight"), "inputs-changed",
+                                "audit-mode result is not reusable as a render-mode pass")
+                runner.gate_mode = "render"
+                _reset("preflight")
+                signoff.write_text(json.dumps({"场景": [{"scene_id": "s1"}]},
+                                               ensure_ascii=False), encoding='utf-8')
+                tc.assert_equal(runner._step_dirty_reason("preflight"), "inputs-changed",
+                                "素材确认单 change invalidates preflight (check 14 consumes it)")
+                signoff.write_text(json.dumps({"场景": []}, ensure_ascii=False),
+                                   encoding='utf-8')
+                _reset("preflight")
+                (quality_dir / "narration_digits_rules.json").write_text(
+                    json.dumps({"whitelist": ["三心二意"]}), encoding='utf-8')
+                tc.assert_equal(runner._step_dirty_reason("preflight"), "inputs-changed",
+                                "narration_digits_rules change invalidates preflight (check 13)")
+                (quality_dir / "narration_digits_rules.json").write_text(
+                    json.dumps({"whitelist": []}), encoding='utf-8')
+                tc.assert_true(
+                    runner._step_inputs("preflight").get("script", "").endswith("preflight_check.py"),
+                    "preflight inputs include preflight_check.py itself")
+                tc.assert_true(
+                    runner._step_inputs("preview").get("script", "").endswith("instant_preview.py"),
+                    "preview inputs include instant_preview.py itself")
+
+                # ── ① --step 前置步有效性判定四态 ──
+                state.data["steps"] = {}
+                tc.assert_equal(runner._prereq_stale_reason("preflight"), "not-passed",
+                                "unexecuted prerequisite is reported as not-passed")
+                _reset("preflight")
+                tc.assert_equal(runner._prereq_stale_reason("preflight"), None,
+                                "fresh prerequisite passes the --step check")
+                (source_dir / "index.html").write_text("<html>changed</html>",
+                                                       encoding='utf-8')
+                tc.assert_equal(runner._prereq_stale_reason("preflight"), "inputs-changed",
+                                "prerequisite passed against stale inputs blocks --step")
+                (source_dir / "index.html").write_text("<html>s1</html>", encoding='utf-8')
+                _reset("preflight")
+                del state.data["steps"]["preflight"]["input_fingerprint"]
+                tc.assert_equal(runner._prereq_stale_reason("preflight"), "no-fingerprint",
+                                "fingerprint-less history is not trusted for --step")
+                state.data["steps"]["tts"] = {
+                    "status": "skipped", "reason": runner._typed_skip_reason()}
+                tc.assert_equal(runner._prereq_stale_reason("tts"), None,
+                                "typed skip stays a legal prerequisite (no fingerprint semantics)")
+
+                # 接线：--step 分支必须真的调用该判定，且 missing/stale 两类都进 BLOCKED 出口
+                branch = runner_content.split(
+                    "if start_from and not self.force and not self.quick_fix:", 1)
+                tc.assert_true(len(branch) == 2,
+                               "--step prerequisite branch still exists in the runner")
+                body = branch[1].split("# Setup environment", 1)[0]
+                tc.assert_true("_prereq_stale_reason(" in body,
+                               "--step branch validates prerequisites by fingerprint")
+                tc.assert_true("Stale prerequisite" in body and "sys.exit(1)" in body,
+                               "stale prerequisites are printed and block the run")
+
+                tc.mark_passed()
+        finally:
+            _pr.CONFIG_DIR = saved_config_dir
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_narration_rich_fields_survive_timeline_writeback() -> RegressionTestCase:
+    """用例51：timeline 写回不得裁掉单一权威源字段（A05，2026-09-18 审核）
+
+    背景：narration.json 是场景定义的单一权威源（AGENTS.md 权威源表），而
+    adjust_timeline 的 update_config 产出正是写回该文件的载荷。旧实现用
+    start/end/narration/type 四个字面键重建场景 dict，且 _write_narration_scenes
+    以新表整表替换 data['scenes']——于是每跑一次 timeline：
+      ① title / narration_required / subtitle_required / assets / 项目自定义字段
+         从权威源上静默消失（无报错、无日志，下次读到的就是瘦身后 schema）；
+      ② cover 场景被顺手删除（入参来自 resolve_narration_scenes，它已滤掉 cover）；
+      ③ duration 不随新窗口重算，留下与 start/end 自相矛盾的派生量。
+    本用例锁定"只覆写时间字段 + 按 scene_id 就地合并"的新语义，并留出反向对照
+    （duration 必须被重算、cover 必须存活），使断言不是恒真。
+    """
+    tc = RegressionTestCase(
+        "narration_rich_fields_survive_timeline_writeback",
+        "验证 timeline 写回保留富字段、cover 场景，并重算 duration"
+    )
+    try:
+        at = _safe_import_rebinding_module("adjust_timeline")
+
+        rich_s1 = {
+            "scene_id": "s1", "type": "content",
+            "start": 0.0, "end": 8.0, "duration": 8.0,
+            "title": "痛点：墙面开裂反复返修",
+            "narration": "30 小时内完成治理。",
+            "narration_required": True,
+            "subtitle_required": True,
+            "assets": ["素材文件/图片/crack.png"],
+            "visual_note": {"layout": "split", "emphasis": 3},
+        }
+        cover_s0 = {
+            "scene_id": "s0", "type": "cover",
+            "start": 0.0, "end": 3.0, "duration": 3.0,
+            "title": "封面", "narration": "", "narration_required": False,
+        }
+        # 无 duration 的场景：写回不得凭空造字段
+        bare_s2 = {
+            "scene_id": "s2", "type": "content",
+            "start": 8.0, "end": 14.0, "narration": "第二处窗口。",
+        }
+        content_scenes = [json.loads(json.dumps(rich_s1)),
+                          json.loads(json.dumps(bare_s2))]
+
+        # ── update_config：increment 路径（boundaries=None）保留非时间字段 ──
+        cfg = {"video_duration": 14.0,
+               "scenes": [json.loads(json.dumps(rich_s1)),
+                          json.loads(json.dumps(bare_s2))]}
+        out = at.update_config(cfg, content_scenes,
+                               extensions=[2.0, 0.0], offsets=[0.0, 2.0],
+                               total_ext=2.0, cover_duration=3.0)
+        tc.assert_equal(sorted(out["scenes"][0].keys()),
+                        sorted(rich_s1.keys()),
+                        "update_config keeps every field of the source scene")
+        tc.assert_equal(out["scenes"][0]["title"], rich_s1["title"],
+                        "title survives the incremental-adjust path")
+        tc.assert_equal(out["scenes"][0]["assets"], rich_s1["assets"],
+                        "asset references survive")
+        tc.assert_equal(out["scenes"][0]["visual_note"], rich_s1["visual_note"],
+                        "project-defined fields survive")
+        tc.assert_equal(out["scenes"][0]["narration_required"], True,
+                        "narration_required survives")
+        tc.assert_equal(out["scenes"][0]["duration"],
+                        round(out["scenes"][0]["end"] - out["scenes"][0]["start"], 1),
+                        "duration is recomputed from the new window")
+        # 负向对照：窗口变了 2s，duration 不得停在旧值 8.0
+        tc.assert_true(out["scenes"][0]["duration"] != rich_s1["duration"],
+                       "stale duration would prove the recompute is a no-op")
+        tc.assert_true("duration" not in out["scenes"][1],
+                       "update_config does not invent a duration the source omitted")
+
+        # ── update_config：S-block 派生路径（boundaries 给定）同样保字段 ──
+        cfg2 = {"video_duration": 14.0,
+                "scenes": [json.loads(json.dumps(rich_s1)),
+                           json.loads(json.dumps(bare_s2))]}
+        out2 = at.update_config(cfg2, content_scenes,
+                                extensions=[1.0, 1.0], offsets=[0.0, 0.0],
+                                total_ext=2.0, cover_duration=3.0,
+                                boundaries=[(3.0, 12.0), (12.0, 19.0)])
+        tc.assert_equal(sorted(out2["scenes"][0].keys()), sorted(rich_s1.keys()),
+                        "the derive-from-S-block path keeps every field")
+        tc.assert_equal(out2["scenes"][0]["start"], 0.0,
+                        "boundaries are converted back to cover-relative time")
+        tc.assert_equal(out2["scenes"][0]["duration"], 10.0,
+                        "duration follows the derived window (12.0+1.0-3.0 - 0.0)")
+
+        # ── _write_narration_scenes：就地合并 ──
+        with tempfile.TemporaryDirectory() as td:
+            narr = Path(td) / "narration.json"
+            narr.write_text(json.dumps({
+                "version": "1.0",
+                "scenes": [json.loads(json.dumps(cover_s0)),
+                           json.loads(json.dumps(rich_s1)),
+                           json.loads(json.dumps(bare_s2)),
+                           {"scene_id": "s9", "type": "content", "start": 99.0,
+                            "end": 100.0, "title": "本轮未触及"}]
+            }, ensure_ascii=False), encoding='utf-8')
+
+            at._write_narration_scenes(narr, out["scenes"], cover_duration=3.0)
+            written = json.loads(narr.read_text(encoding='utf-8'))
+
+            ids = [s["scene_id"] for s in written["scenes"]]
+            tc.assert_equal(ids, ["s0", "s1", "s2", "s9"],
+                            "merge keeps cover, untouched scenes and original order")
+            tc.assert_true("s0" in ids, "cover scene is not deleted by the writeback")
+            s0 = next(s for s in written["scenes"] if s["scene_id"] == "s0")
+            tc.assert_equal(s0, cover_s0, "cover scene stays byte-identical")
+            s1 = next(s for s in written["scenes"] if s["scene_id"] == "s1")
+            tc.assert_equal(s1["title"], rich_s1["title"],
+                            "title survives the narration writeback")
+            tc.assert_equal(s1["subtitle_required"], True,
+                            "subtitle_required survives the writeback")
+            tc.assert_equal(s1["assets"], rich_s1["assets"],
+                            "assets survive the writeback")
+            tc.assert_equal(s1["start"], round(out["scenes"][0]["start"] + 3.0, 1),
+                            "writeback shifts to absolute time")
+            tc.assert_equal(s1["duration"],
+                            round(s1["end"] - s1["start"], 1),
+                            "absolute-window duration stays self-consistent")
+            s9 = next(s for s in written["scenes"] if s["scene_id"] == "s9")
+            tc.assert_equal(s9, {"scene_id": "s9", "type": "content", "start": 99.0,
+                                 "end": 100.0, "title": "本轮未触及"},
+                            "a scene absent from this round is preserved verbatim")
+            tc.assert_equal(written["version"], "1.0",
+                            "top-level keys outside scenes are untouched")
+
+            # 入参有、文件里没有的场景仍追加（不静默丢）
+            extra = json.loads(json.dumps(rich_s1))
+            extra["scene_id"] = "s7"
+            at._write_narration_scenes(narr, [extra], cover_duration=3.0)
+            ids2 = [s["scene_id"] for s in
+                    json.loads(narr.read_text(encoding='utf-8'))["scenes"]]
+            tc.assert_equal(ids2, ["s0", "s1", "s2", "s9", "s7"],
+                            "a new scene is appended rather than silently dropped")
+
+            # ── 原子写：narration.json 是不可再生权威源，中断不得留半截（A10）──
+            #     整表替换会丢字段（上面已锁），半截写入则整本作废——同一文件的
+            #     两类破坏，判据必须都在。
+            good_bytes = narr.read_bytes()
+            import script_interface as si
+            from types import SimpleNamespace as _NS
+            real_json = si.json
+
+            class _HalfDump:
+                @staticmethod
+                def dump(payload, f, **kw):
+                    f.write('{"scenes": [')
+                    raise RuntimeError("simulated interrupt mid-write")
+
+            try:
+                si.json = _NS(dump=_HalfDump.dump, loads=real_json.loads)
+                raised = False
+                try:
+                    at._write_narration_scenes(narr, out["scenes"], cover_duration=3.0)
+                except RuntimeError:
+                    raised = True
+            finally:
+                si.json = real_json
+            tc.assert_true(raised,
+                           "the injected mid-write failure propagated out of the narration "
+                           "writeback (proves the write really runs through atomic_write_json)")
+            tc.assert_equal(narr.read_bytes(), good_bytes,
+                            "an interrupted writeback leaves narration.json byte-identical "
+                            "(in-place open('w') would have truncated the authoritative source)")
+            tc.assert_equal([q.name for q in narr.parent.iterdir() if q.suffix == '.tmp'], [],
+                            "no stray .tmp sibling is left next to the authoritative source")
+
+        # ── 接线（源码面锁定，A12 分级）：main() → update_config → 写回 narration.json
+        #    这条链要跑完整 timeline（HTML + TTS 目录 + S-block）才有行为接缝，
+        #    秒级不可达，故保留调用存在性断言；写回语义本身（合并不重建、
+        #    富字段保活、原子落盘）已由上方行为断言覆盖，此处不再重复。
+        src = (Path(__file__).parent / "adjust_timeline.py").read_text(encoding='utf-8')
+        main_body = src.split("def main(", 1)[1]
+        tc.assert_true("update_config(" in main_body,
+                       "main() still routes through update_config")
+        tc.assert_true("_write_narration_scenes(" in main_body,
+                       "main() still writes the adjusted scenes back to narration.json")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_media_qa_gate_four_state_report() -> RegressionTestCase:
+    """用例52：media_qa_gate 四态报告与 adjudicate 裁定（审核 A04，2026-09-18）
+
+    背景：各项检查在"扫不成/样本不足/测不到"时旧实现压成 checks=True，
+    总报告呈"全部通过"假象（审核根因一）。本用例锁定：
+      - UNTESTED 独立成清单且 verdict 降为 UNTESTED，adjudicate 默认不放行；
+      - --accept-media-untested 只放行 UNTESTED，永不放行 FAIL（负向对照）；
+      - NOT_APPLICABLE（BGM 遮蔽、字幕豁免声明、quick-fix 跳视觉）
+        不计违规也不计通过；
+      - 物理扫描函数按模块级 stub——判定逻辑与 ffmpeg 可用性解耦。
+    """
+    tc = RegressionTestCase(
+        "media_qa_gate_four_state_report",
+        "验证媒体终检四态报告：UNTESTED 不得读成通过、FAIL 不可被放行、NA 双不计"
+    )
+
+    try:
+        import media_qa_gate as mq
+        import _gate_status as gs
+        from types import SimpleNamespace
+
+        _saved = {}
+
+        def _patch(name, fn):
+            _saved.setdefault(name, getattr(mq, name))
+            setattr(mq, name, fn)
+
+        def _restore():
+            for k, v in _saved.items():
+                setattr(mq, k, v)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                video = tmp / "案例成片.mp4"
+                video.write_bytes(b"fake-video-bytes")
+
+                rules = mq._load_alignment_rules()
+                bf_rules = mq._load_black_frame_rules()
+                m = float(bf_rules['max_overlap_with_narration_seconds'])
+                # 黑场夹具的超长区间假设阈值 ≤2s（实际配置 1.0s）；漂移时本用例
+                # 显式失败点名，而不是静默失去覆盖
+                tc.assert_true(m <= 2.0,
+                               f"black-frame fixture assumes max_overlap<=2s (actual {m}s)")
+                # 字幕窗口随阈值张开：entry1=[1, 3+2m]，黑场=[1, 2+2m]
+                # → 重叠恒为 1+2m > m，判定不依赖阈值具体取值
+                e1_end = 3.0 + 2.0 * m
+                e2_start, e2_end = e1_end + 1.0, e1_end + 3.0
+                srt = tmp / "案例成片.srt"
+                srt.write_text(
+                    f"1\n00:00:01,000 --> 00:00:{int(e1_end):02d},000\n第一段旁白\n\n"
+                    f"2\n00:00:{int(e2_start):02d},000 --> 00:00:{int(e2_end):02d},000\n第二段旁白\n",
+                    encoding='utf-8')
+                cfg = tmp / "cfg.json"
+                cfg.write_text(json.dumps({"fps": 25, "resolution": "1920x1080"}),
+                               encoding='utf-8')
+                cfg_bgm = tmp / "cfg_bgm.json"
+                cfg_bgm.write_text(json.dumps({"fps": 25, "resolution": "1920x1080",
+                                               "bgm_enabled": True}), encoding='utf-8')
+
+                def streams(bit_rate="1500000"):
+                    return [
+                        {"codec_type": "video", "codec_name": "h264",
+                         "bit_rate": bit_rate, "r_frame_rate": "25/1",
+                         "width": 1920, "height": 1080},
+                        {"codec_type": "audio", "codec_name": "aac",
+                         "bit_rate": "128000"},
+                    ]
+
+                scan = {"onsets": None, "black": [], "long_silences": []}
+                clean_onsets = [1.5, 2.5, e2_start, e2_start + 1.0]
+                clean_onsets += [1.5] * max(0, int(rules['min_onsets']) - len(clean_onsets))
+                scan["onsets"] = clean_onsets
+
+                _patch("ffprobe_get_streams", lambda p: streams())
+                _patch("ffprobe_get_duration", lambda p: 10.0)
+                _patch("ffmpeg_detect_silence", lambda p, d=None: 1.0)
+                _patch("subprocess", SimpleNamespace(
+                    run=lambda *a, **k: SimpleNamespace(
+                        returncode=0, stdout="", stderr="")))
+                _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: scan["onsets"])
+                _patch("ffmpeg_detect_black_intervals", lambda *a, **k: scan["black"])
+                _patch("ffmpeg_detect_long_silences", lambda *a, **k: scan["long_silences"])
+
+                def run_qa(subtitle=str(srt), visual=True, config=str(cfg)):
+                    qa = mq.MediaQAGate()
+                    return qa.validate(str(video), subtitle,
+                                       visual_check_passed=visual,
+                                       config_path=config)
+
+                # ── A. 全清洁测量 → PASS，每项都有状态位 ──
+                passed_a, res_a = run_qa()
+                tc.assert_equal(res_a['verdict'], gs.PASS,
+                                "clean measurement adjudicates PASS")
+                # 项数不手抄（A12）：清单与运行时的逐名一致由用例57 锁定，
+                # 这里只锁"报告自洽 + 没有塌成桩"，加检查项无需回来改本处。
+                tc.assert_equal(res_a['total_checks'], len(res_a['check_statuses']),
+                                "total_checks is the size of the status map, not a literal")
+                tc.assert_true(res_a['total_checks'] >= 15,
+                               f"the gate still runs a full battery, got {res_a['total_checks']}")
+                tc.assert_equal(res_a['passed_checks'], res_a['total_checks'],
+                                "PASS count equals total when nothing deviates")
+                tc.assert_equal(mq.adjudicate(res_a), (True, ""),
+                                "adjudicate releases a clean PASS with empty reason")
+                tc.assert_equal(res_a['check_statuses']['subtitle_audio_alignment'],
+                                gs.PASS, "alignment measured PASS for in-window onsets")
+                tc.assert_true('measure_semantics' in res_a['alignment']
+                               and 'NOT per-sentence' in res_a['alignment']['measure_semantics'],
+                               "the p95 semantics boundary rides on the machine-readable "
+                               "alignment record (A08) — behaviour, not a source-text claim")
+
+                # ── B. 起口扫描失败 → UNTESTED 不得压成通过 ──
+                scan["onsets"] = None
+                passed_b, res_b = run_qa()
+                tc.assert_true(passed_b,
+                               "passed keeps legacy semantics (no FAIL errors) — the "
+                               "exact shape of the old 'all green' illusion")
+                tc.assert_equal(res_b['verdict'], gs.UNTESTED,
+                                "a failed scan demotes the verdict to UNTESTED, not PASS")
+                tc.assert_equal(res_b['checks']['subtitle_audio_alignment'], False,
+                                "compat checks view marks UNTESTED as not-passed")
+                tc.assert_true(any('subtitle_audio_alignment' in u
+                                   for u in res_b['untested']),
+                               "untested list names the failing check")
+                ok_b, reason_b = mq.adjudicate(res_b)
+                tc.assert_true(not ok_b and 'UNTESTED' in reason_b,
+                               "adjudicate blocks UNTESTED by default")
+                ok_b2, reason_b2 = mq.adjudicate(res_b, accept_untested=True)
+                tc.assert_true(ok_b2 and '--accept-media-untested' in reason_b2,
+                               "explicit acceptance releases UNTESTED with a traceable reason")
+                scan["onsets"] = clean_onsets
+
+                # ── C. 起口样本不足 + config 声明 BGM → 合法不适用 ──
+                scan["onsets"] = []
+                _, res_c = run_qa(config=str(cfg_bgm))
+                tc.assert_equal(res_c['check_statuses']['subtitle_audio_alignment'],
+                                gs.NOT_APPLICABLE,
+                                "BGM-declared silence-based check is NOT_APPLICABLE")
+                tc.assert_equal(res_c['verdict'], gs.PASS,
+                                "NOT_APPLICABLE neither blocks nor counts as violation")
+                tc.assert_true(any('subtitle_audio_alignment' in n
+                                   for n in res_c['not_applicable']),
+                               "not_applicable list names the BGM-exempted check")
+                scan["onsets"] = clean_onsets
+
+                # ── D. 起口样本不足、无 BGM 声明 → UNTESTED（旧实现记通过＝原缺陷）──
+                scan["onsets"] = []
+                _, res_d = run_qa(config=str(cfg))
+                tc.assert_equal(res_d['check_statuses']['subtitle_audio_alignment'],
+                                gs.UNTESTED,
+                                "too-few onsets without a BGM declaration is UNTESTED, "
+                                "not the legacy checks=True")
+                tc.assert_equal(res_d['verdict'], gs.UNTESTED,
+                                "insufficient adjudication evidence demotes the verdict")
+                tc.assert_true(not mq.adjudicate(res_d)[0],
+                               "unadjudicated alignment blocks delivery by default")
+                scan["onsets"] = clean_onsets
+
+                # ── E. 黑场与字幕重叠 → FAIL，accept 不得放行 FAIL ──
+                scan["black"] = [(1.0, 2.0 + 2.0 * m)]
+                _, res_e = run_qa()
+                tc.assert_equal(res_e['check_statuses']['no_black_frame_with_subtitle'],
+                                gs.FAIL, "black screen overlapping subtitle is FAIL")
+                tc.assert_equal(res_e['verdict'], gs.FAIL,
+                                "any FAIL dominates the verdict")
+                ok_e, reason_e = mq.adjudicate(res_e, accept_untested=True)
+                tc.assert_true(not ok_e and 'FAIL' in reason_e,
+                               "--accept-media-untested must never release a FAIL")
+                scan["black"] = []
+
+                # ── F. 码率取不到 → UNTESTED（不得静默跳过）──
+                _patch("ffprobe_get_streams", lambda p: streams("N/A"))
+                _, res_f = run_qa()
+                tc.assert_equal(res_f['check_statuses']['video_bitrate_ok'],
+                                gs.UNTESTED,
+                                "unparseable ffprobe bit_rate is UNTESTED, not pass")
+                tc.assert_equal(res_f['verdict'], gs.UNTESTED,
+                                "an unrun bitrate gate demotes the verdict")
+                _patch("ffprobe_get_streams", lambda p: streams())
+
+                # ── G. 字幕声明豁免（纯 BGM 项目）→ 字幕组 8 项 NOT_APPLICABLE ──
+                _, res_g = run_qa(subtitle=None)
+                tc.assert_equal(res_g['status_counts'][gs.NOT_APPLICABLE], 8,
+                                "the whole subtitle check-group is NA under declared exemption")
+                tc.assert_equal(res_g['verdict'], gs.PASS,
+                                "declared exemption does not block the rest")
+                tc.assert_equal(res_g['passed_checks'], 11,
+                                "NA checks are not counted as passed")
+
+                # ── H. quick-fix 声明性跳视觉检查 → NA 而非 PASS/FAIL ──
+                _, res_h = run_qa(visual="not_applicable")
+                tc.assert_equal(res_h['check_statuses']['visual_boundary_verified'],
+                                gs.NOT_APPLICABLE,
+                                "declaratively skipped visual check is NOT_APPLICABLE")
+                tc.assert_equal(res_h['verdict'], gs.PASS,
+                                "NA visual does not block postprocess delivery")
+
+                # ── I. 声明了字幕却文件缺失 → FAIL + 组内 UNTESTED ──
+                _, res_i = run_qa(subtitle=str(tmp / "不存在.srt"))
+                tc.assert_equal(res_i['check_statuses']['subtitle_file_exists'],
+                                gs.FAIL, "declared-but-missing subtitle file is FAIL")
+                tc.assert_equal(res_i['verdict'], gs.FAIL,
+                                "a missing subtitle dominates the verdict")
+                tc.assert_true(not mq.adjudicate(res_i, accept_untested=True)[0],
+                               "FAIL from subtitle group is not acceptable")
+
+            tc.mark_passed()
+
+        finally:
+            _restore()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
+    """用例53：成片媒体终检挂载到 postprocess 末端（A04 接线段，2026-09-18）
+
+    背景：media_qa_gate 此前只被自身 CLI 与回归调用，默认生产链从未挂载——
+    成片可以在从未被可播放性/死区/黑场/对齐度审过的情况下进交付。本用例锁
+    接线行为（用 FakeQA 替换 MediaQAGate，裁定走真 adjudicate）：
+      - PASS 放行且结果合并进 state.verifications["media_qa_final"]；
+      - UNTESTED 默认阻断（postprocess failed + VERIFY_FAILED）；
+      - --accept-media-untested 放行并留痕 state.media_qa_untested_decision
+        （落盘可追溯），但 FAIL 永不被它放行；
+      - quick-fix 下视觉检查按声明记 not_applicable、mode 记 quick-fix；
+      - postprocess 指纹登记绑定 media_qa_gate.py 本体与 mode（A06 同族：
+        登记面＝真实读取面，quick-fix 结论不得被 full 复用）；
+      - step_postprocess 源码里终检在 mark_completed 之前（防"先记完成再审"
+        的接线漂移）。
+    """
+    tc = RegressionTestCase(
+        "final_media_qa_wired_into_postprocess",
+        "验证 _final_media_qa 阻断/放行/留痕/指纹绑定/接线时序五类行为"
+    )
+
+    try:
+        import re
+        import subprocess
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate as mq
+        import _gate_status as gs
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        saved_qa = mq.MediaQAGate
+        saved_config_dir = _pr.CONFIG_DIR
+        calls = []
+        holder = {"result": None, "raise": None}
+
+        class FakeQA:
+            def validate(self, video, subtitle=None, visual_check_passed=False,
+                         config_path=None, narration_path=None):
+                calls.append({"video": video, "subtitle": subtitle,
+                              "visual": visual_check_passed,
+                              "config": config_path})
+                if holder["raise"]:
+                    raise RuntimeError(holder["raise"])
+                r = holder["result"]
+                return r.get("passed", False), dict(r)
+
+        def _res(verdict, errors=None, untested=None):
+            errors = errors or []
+            untested = untested or []
+            return {
+                "verdict": verdict, "passed": not errors,
+                "errors": errors, "warnings": [],
+                "untested": untested, "not_applicable": [],
+                # 桩报告自洽计数：项数不手抄（A12）——真实清单由用例57 锁，
+                # 本夹具只喂 verdict/errors/untested 给 adjudicate，计数自拟即可。
+                "check_statuses": {},
+                "status_counts": {gs.PASS: 1,
+                                  gs.FAIL: len(errors),
+                                  gs.UNTESTED: len(untested),
+                                  gs.NOT_APPLICABLE: 0},
+                "total_checks": 1 + len(errors) + len(untested),
+                "alignment": {}, "media_facts": {},
+            }
+
+        try:
+            mq.MediaQAGate = FakeQA
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                quality = tmp / "quality"
+                quality.mkdir()
+                for fname, payload in {
+                    "audio_sync_rules.json": {"alignment": {"silence_db": -38}},
+                    "narration_digits_rules.json": {"whitelist": []},
+                    "video_quality_rules.json": {"min_video_bitrate_kbps_fail": 200},
+                    "subtitle_term_rules.json": {"terms": []},
+                    "render_rules.json": {"render_budget": {"max_full_renders": 3}},
+                }.items():
+                    (quality / fname).write_text(json.dumps(payload), encoding='utf-8')
+                _pr.CONFIG_DIR = tmp
+
+                source_dir = tmp / "src"
+                source_dir.mkdir()
+                (source_dir / "index.html").write_text("<html>s1</html>", encoding='utf-8')
+                (source_dir / "narration.json").write_text(
+                    json.dumps({"scenes": [{"scene_id": "s1", "narration": "第一项"}]},
+                               ensure_ascii=False), encoding='utf-8')
+                cfg_path = tmp / "cfg.json"
+                cfg_path.write_text("{}", encoding='utf-8')
+                temp_dir = tmp / "temp"
+                temp_dir.mkdir()
+                (temp_dir / "tts_manifest.json").write_text(
+                    json.dumps({"s1": 3.2}), encoding='utf-8')
+                (temp_dir / "render_raw.mp4").write_bytes(b"")
+
+                def build(scenario, quick_fix=False, tts_enabled=True, accept=False):
+                    state = PipelineState(temp_dir / f"state_{scenario}.json")
+                    runner = PipelineRunner.__new__(PipelineRunner)
+                    runner.state = state
+                    runner.force = False
+                    runner.config = {"delivery": {
+                        "video": str(tmp / "case53.mp4"),
+                        "subtitle": str(tmp / "case53.srt")}}
+                    runner.config_path = cfg_path
+                    runner.html_project = "case53"
+                    runner.source_dir = source_dir
+                    runner.html_path = source_dir / "index.html"
+                    runner.temp_dir = temp_dir
+                    runner.tts_dir = temp_dir / "tts"
+                    runner.render_raw = temp_dir / "render_raw.mp4"
+                    runner.output_file = tmp / "case53.mp4"
+                    runner.gate_mode = "render"
+                    runner.video_type = ""
+                    runner.quick_fix = quick_fix
+                    runner.tts_enabled = tts_enabled
+                    runner.accept_media_untested = accept
+                    # 真实形态下 _final_media_qa 在 step_postprocess 的
+                    # mark_started 之后被调用，mark_failed 依赖该记录存在
+                    state.mark_started("postprocess")
+                    return runner, state
+
+                # ── 1. PASS：放行 + 结果合并进 state.verifications ──
+                runner, state = build("pass")
+                state.mark_started("visual_check")
+                state.mark_completed("visual_check")
+                holder["result"] = _res(gs.PASS)
+                calls.clear()
+                tc.assert_true(runner._final_media_qa(),
+                               "PASS verdict releases postprocess")
+                tc.assert_equal(state.data["steps"]["postprocess"]["status"],
+                                "running",
+                                "a released QA does not mark postprocess failed")
+                merged = state.data.get("verifications", {}).get("media_qa_final")
+                tc.assert_true(merged is not None
+                               and merged.get("verdict") == gs.PASS,
+                               "final QA result is merged into state for traceability")
+                tc.assert_equal(merged.get("mode"), "full",
+                                "full-chain run records mode=full")
+                tc.assert_equal(calls[-1]["visual"], True,
+                                "visual PASS is forwarded from upstream state")
+                tc.assert_true(calls[-1]["subtitle"].endswith("case53.srt"),
+                               "tts-enabled projects pass the delivery subtitle")
+                tc.assert_true((temp_dir / "media_qa_final_result.json").exists(),
+                               "the four-state report is persisted as a file fact")
+
+                # ── 2. UNTESTED 默认阻断 ──
+                runner, state = build("untested")
+                holder["result"] = _res(gs.UNTESTED, untested=[
+                    "subtitle_audio_alignment — silencedetect 起口扫描失败"])
+                tc.assert_true(not runner._final_media_qa(),
+                               "UNTESTED blocks postprocess by default")
+                rec = state.data["steps"]["postprocess"]
+                tc.assert_equal(rec["status"], "failed",
+                                "the block is a real step failure, not a warning")
+                tc.assert_equal(rec["error_code"], _pr.VERIFY_FAILED,
+                                "failure carries VERIFY_FAILED error code")
+                tc.assert_true("UNTESTED" in (rec.get("error") or ""),
+                               "failure message names UNTESTED")
+                tc.assert_true("media_qa_untested_decision" not in state.data,
+                               "no acceptance was granted, so no acceptance trace")
+
+                # ── 3. UNTESTED + 知情放行：True 且留痕落盘 ──
+                runner, state = build("accept", accept=True)
+                holder["result"] = _res(gs.UNTESTED, untested=[
+                    "video_bitrate_ok — ffprobe bit_rate 为 N/A 或缺失，码率门禁未执行"])
+                tc.assert_true(runner._final_media_qa(),
+                               "explicit --accept-media-untested releases UNTESTED")
+                decision = state.data.get("media_qa_untested_decision")
+                tc.assert_true(decision is not None
+                               and decision.get("decision") == "accepted_untested",
+                               "acceptance writes an explicit decision record")
+                tc.assert_true("--accept-media-untested" in decision.get("reason", ""),
+                               "the trace names the flag that granted it")
+                on_disk = PipelineState(temp_dir / "state_accept.json").data
+                tc.assert_true("media_qa_untested_decision" in on_disk,
+                               "the acceptance survives the process (saved to state file)")
+
+                # ── 4. FAIL：accept 也救不了（负向对照）──
+                runner, state = build("fail", accept=True)
+                holder["result"] = _res(gs.FAIL,
+                                        errors=["Black screen while subtitle showing: ..."])
+                tc.assert_true(not runner._final_media_qa(),
+                               "FAIL blocks even with --accept-media-untested set")
+                tc.assert_equal(state.data["steps"]["postprocess"]["status"],
+                                "failed", "FAIL leaves postprocess failed")
+                tc.assert_true("media_qa_untested_decision" not in state.data,
+                               "acceptance trace is only for UNTESTED, never for FAIL")
+
+                # ── 5. quick-fix：视觉项按声明记 not_applicable，mode 留痕 ──
+                runner, state = build("qf", quick_fix=True)
+                holder["result"] = _res(gs.PASS)
+                calls.clear()
+                tc.assert_true(runner._final_media_qa(),
+                               "quick-fix still runs the physical measurements")
+                tc.assert_equal(calls[-1]["visual"], "not_applicable",
+                                "quick-fix forwards visual check as NOT_APPLICABLE, "
+                                "not a fabricated True")
+                written = json.loads((temp_dir / "media_qa_final_result.json")
+                                     .read_text(encoding='utf-8'))
+                tc.assert_equal(written.get("mode"), "quick-fix",
+                                "the persisted report records the quick-fix mode")
+
+                # ── 6. 纯 BGM 项目：不传字幕 ──
+                runner, state = build("bgm", tts_enabled=False)
+                holder["result"] = _res(gs.PASS)
+                calls.clear()
+                tc.assert_true(runner._final_media_qa(), "BGM-only project passes")
+                tc.assert_equal(calls[-1]["subtitle"], None,
+                                "tts-disabled projects declare subtitle exemption (None)")
+
+                # ── 7. 质检本身炸了 = 失败，不得静默放行 ──
+                runner, state = build("boom")
+                holder["raise"] = "ffprobe exploded"
+                tc.assert_true(not runner._final_media_qa(),
+                               "an exception in media QA is a failure, not a skip")
+                tc.assert_true("Final media QA errored" in
+                               (state.data["steps"]["postprocess"].get("error") or ""),
+                               "the failure message attributes the QA crash")
+                holder["raise"] = None
+
+                # ── 8. 指纹登记绑定门禁脚本本体与 mode（A06 同族）──
+                runner, state = build("fp")
+                inputs = runner._step_inputs("postprocess")
+                tc.assert_true(str(inputs.get("media_qa_script", "")).endswith(
+                    "media_qa_gate.py"),
+                    "postprocess registers the gate script it really executes")
+                tc.assert_true(Path(inputs["media_qa_script"]).exists(),
+                               "the registered fingerprint path exists on disk")
+                tc.assert_equal(inputs.get("mode"), "mode:full",
+                                "full mode is a fingerprint input")
+                fp_full = runner._fingerprint("postprocess")
+                runner.quick_fix = True
+                tc.assert_equal(runner._step_inputs("postprocess").get("mode"),
+                                "mode:quick-fix",
+                                "toggling mode changes the declared input")
+                tc.assert_true(fp_full != runner._fingerprint("postprocess"),
+                               "a quick-fix PASS cannot be reused as a full-run PASS")
+                runner.quick_fix = False
+
+                # ── 9. 接线时序：终检在 mark_completed 之前、成功分支之内 ──
+                #    （step_postprocess 需真实渲染才能跑，无秒级行为接缝，保留源码面锁定）
+                src = (script_dir / "pipeline_runner.py").read_text(encoding='utf-8')
+                body = src.split("def step_postprocess", 1)[1].split(
+                    "def _final_media_qa", 1)[0]
+                tc.assert_true(
+                    body.index("if rc == 0:")
+                    < body.index("if not self._final_media_qa():")
+                    < body.index('mark_completed("postprocess"'),
+                    "final QA runs inside the rc==0 branch, before the step is "
+                    "marked completed (a completion must certify an adjudicated product)")
+                # CLI 暴露面按行为断言：跑真实 --help，不查源码字符串（A12）
+                _help = subprocess.run(
+                    [sys.executable, str(script_dir / "pipeline_runner.py"), "--help"],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    cwd=str(script_dir))
+                tc.assert_equal(_help.returncode, 0, "pipeline_runner --help runs")
+                _help_txt = _help.stdout or ""
+                for _flag in ("--accept-media-untested", "--accept-over-render",
+                              "--accept-over-budget", "--confirm-fresh"):
+                    tc.assert_true(
+                        bool(re.search(re.escape(_flag) + r'(?![\w-])', _help_txt)),
+                        f"the informed-release flag {_flag} is exposed by the real CLI "
+                        f"(help output) as a whole token, not merely present in the "
+                        f"source text — a substring match would let a renamed flag "
+                        f"pass")
+                tc.assert_true(
+                    "accept_media_untested=args.accept_media_untested" in src,
+                    "the flag is wired into the runner construction (wiring has no "
+                    "behavioural seam without a full pipeline run)")
+
+            tc.mark_passed()
+
+        finally:
+            mq.MediaQAGate = saved_qa
+            _pr.CONFIG_DIR = saved_config_dir
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_count_up_precision_and_reveal_entrance() -> RegressionTestCase:
+    """用例54：数值动画精度吸附 + 短窗入场不得静默跳过（A09，2026-09-18）
+
+    缺陷①：count-up 双处生成（anim_count_up 与 stats 场景内联）一律
+    snap:1 + Math.round，把 2.5 报成 3——专业参数失真；内联副本另使
+    "唯一生成点"名存实亡。缺陷②：anim_progressive_reveal 在
+    available < 1 时 return ''，而模板 CSS 把注释卡/层卡初始
+    opacity:0——无入场语句即永久不可见（结构场景注释 ≤3 条恒触发）。
+    """
+    tc = RegressionTestCase(
+        "count_up_precision_and_reveal_entrance",
+        "验证 count-up 按目标精度吸附且唯一生成，短窗渐进揭示降级为紧凑入场"
+    )
+
+    try:
+        import scene_compiler as sc
+
+        # ── A. 精度判定 ──
+        tc.assert_equal(sc._count_precision(3), 0, "int target -> precision 0")
+        tc.assert_equal(sc._count_precision(2.5), 1, "2.5 -> 1")
+        tc.assert_equal(sc._count_precision(0.25), 2, "0.25 -> 2")
+        tc.assert_equal(sc._count_precision(3.0), 0, "trailing .0 must not claim 1 decimal")
+
+        # ── B. 整数目标：保持旧行为 snap:1 + Math.round ──
+        code_int = sc._count_up_tween('.sel', '1.0', 40, '%', 1.5)
+        tc.assert_true('snap: { innerText: 1 }' in code_int,
+                       "integer target keeps snap 1")
+        tc.assert_true('Math.round' in code_int,
+                       "integer target keeps Math.round formatter")
+        tc.assert_true('toFixed' not in code_int,
+                       "integer target must not gain toFixed")
+
+        # ── C. 小数目标：按位吸附 + toFixed，杜绝取整路径 ──
+        code_dec = sc._count_up_tween('.sel', '1.0', 2.5, 'mm', 1.5)
+        tc.assert_true('snap: { innerText: 0.1 }' in code_dec,
+                       "decimal target snaps at its own precision (binary-float 0.30000000004 would leak)")
+        tc.assert_true('.toFixed(1)' in code_dec,
+                       "display formatter keeps the declared decimal digit")
+        tc.assert_true('Math.round' not in code_dec,
+                       "decimal target must never be rounded")
+        tc.assert_true('innerText: 2.5' in code_dec,
+                       "tween terminal value equals declared value")
+
+        # ── D. 两位小数 ──
+        code_2 = sc._count_up_tween('.sel', '1.0', 0.25, '', 1.5)
+        tc.assert_true('snap: { innerText: 0.01 }' in code_2
+                       and '.toFixed(2)' in code_2,
+                       "2-decimal target: snap 0.01 + toFixed(2)")
+
+        # ── E. anim_count_up 委托同一生成点，入口入场保留 ──
+        full = sc.anim_count_up('.num', 'T.s2', 2.5, 'mm')
+        tc.assert_true('back.out(1.7)' in full,
+                       "anim_count_up still emits its entrance fromTo")
+        tc.assert_true('parseFloat(this.targets()[0].innerText).toFixed(1)' in full,
+                       "anim_count_up delegates to the precision-aware tween")
+        tc.assert_true('T.s2 + 0.3' in full,
+                       "absolute-position 0.3s after T-ref entrance")
+        full_abs = sc.anim_count_up('.num', 10.0, 40, '%')
+        tc.assert_true('10.3' in full_abs, "float t renders absolute position")
+
+        # ── F. 唯一生成点：count-up tween 只从 _count_up_tween 输出一处 ──
+        #     optimize=2 编译剥除全部 docstring，只统计真正会执行的字符串常量
+        src = (Path(__file__).resolve().parent / "scene_compiler.py").read_text(encoding='utf-8')
+        body_consts = []
+        def _walk_consts(obj):
+            for c in getattr(obj, 'co_consts', ()):
+                if isinstance(c, str):
+                    body_consts.append(c)
+                elif hasattr(c, 'co_consts'):
+                    _walk_consts(c)
+        _walk_consts(compile(src, 'scene_compiler.py', 'exec', optimize=2))
+        joined = '\n'.join(body_consts)
+        tc.assert_equal(joined.count('Math.round(parseFloat('), 1,
+                        "integer formatter emitted from exactly one place "
+                        "(the shared helper; a second call site means the "
+                        "inlined duplicate is back)")
+        tc.assert_equal(joined.count('.innerText).toFixed('), 1,
+                        "decimal formatter emitted from exactly one place")
+
+        # ── G. 短窗渐进揭示：紧凑入场覆盖每个 selector，禁止 return '' ──
+        theme = sc.THEMES['dark-tech']
+        sels = ['#s7-a0', '#s7-a1', '#s7-a2']
+        short = sc.anim_progressive_reveal(
+            sels, 'T.s7 + 4.9', 'T.s7 + 8.5', theme, t_ref='T.s7')
+        tc.assert_true('fromTo' in short,
+                       "available<1 must degrade to a compact entrance, not return '' "
+                       "(CSS opacity:0 items without an entrance stay invisible forever)")
+        for s in sels:
+            tc.assert_true(short.count(f'fromTo("{s}"') == 1,
+                           f"every selector gets exactly one {s} entrance")
+        tc.assert_true('opacity: 0, y: 30' in short and 'opacity: 1, y: 0' in short,
+                       "entrance is a real 0->1 fade-up")
+        tc.assert_true('T.s7 + 0.2' in short, "first compact element enters at 0.2")
+        # 期望串与生成器同用 ':.1f' 格式化；每个元素各自绑定其位置
+        for i, s in enumerate(sels):
+            exp = f'T.s7 + {0.2 + i * 0.2:.1f}'
+            tc.assert_true(short.count(exp) >= 1,
+                           f"selector {s} entrance positioned at {exp}")
+        # 紧凑入场不得越过场景尾（末元素 0.6+0.6=1.2 << span-0.9=2.7）
+        tc.assert_true(0.2 + (len(sels) - 1) * 0.2 + 0.6
+                       < sc._expr_offset('T.s7 + 8.5')
+                       - sc._expr_offset('T.s7 + 4.9') - 0.9,
+                       "compact entrance finishes before the scene tail")
+        tc.assert_true('scale: 1.02' not in short,
+                       "sweep decoration stays gated on available>4")
+
+        # ── H. 充足窗口：分布行为不变（首元素 0.5、间隔 min(available/n, 2.0)）──
+        sels5 = [f'#s1-b{i}' for i in range(5)]
+        long_code = sc.anim_progressive_reveal(
+            sels5, 'T.s1 + 0.8', 'T.s1 + 20.8', theme, t_ref='T.s1')
+        # 运行时独立推导：available=17 → interval=min(17/5,2)=2.0 → 首 0.5、第 3 元素 4.5；
+        # 若 cap 失效 interval=3.4 → 第 3 元素位置 7.3 不存在 → 红
+        exp_first = f'T.s1 + {0.5:.1f}'
+        exp_third = f'T.s1 + {0.5 + 2 * min(17 / 5, 2.0):.1f}'
+        tc.assert_true(long_code.count(exp_first) >= 1
+                       and long_code.count(exp_third) >= 1
+                       and 'T.s1 + 7.3' not in long_code,
+                       "normal spacing preserved: interval capped at 2.0")
+
+        # ── I. stats 场景真实路径：小数项产出精度吸附，整数项行为不变 ──
+        scene = {'heading': '参数', 'items': [
+            {'value': 2.5, 'unit': 'mm', 'label': '偏差'},
+            {'value': 40, 'unit': '%', 'label': '降幅'}]}
+        _html, _css, anim = sc.gen_scene_stats(scene, 3, theme, 0.0, 20.0)
+        tc.assert_true('.toFixed(1)' in anim and 'snap: { innerText: 0.1 }' in anim,
+                       "decimal stat number passes through the precision-aware helper")
+        tc.assert_true('innerText: 40' in anim,
+                       "integer stat number still tweens to declared value")
+        # JSON 字符串目标（compile 场景 value 可能来自字符串解析）：走内插原样，不误入 toFixed
+        tc.assert_true('innerText: 3' in sc._count_up_tween('.s', '1.0', '3', ''),
+                       "numeric-string target emits its literal")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_alignment_cache_binds_real_waveform() -> RegressionTestCase:
+    """用例55：对齐缓存绑定实际波形与算法版本（A08，2026-09-18）
+
+    旧实现 _build_timeline_manifest 的复用判定只比 tts_hash（旁白文本派生
+    键）——波形被 _enforce_sentence_pauses 插静音、同参数重新合成、或对齐
+    算法升级后，旧句级时间戳仍被当作有效结果复用（与 A06"登记面必须绑定
+    真实读取路径"同族缺陷）。现复用四条件：文本键 ∧ 波形文件名 ∧ 波形字节
+    实测哈希 ∧ 算法版本，缺一即重对齐。
+    """
+    tc = RegressionTestCase(
+        "alignment_cache_binds_real_waveform",
+        "验证句级对齐缓存按实际波形哈希+算法版本失效，停顿改写后重绑，p95 语义随记录面下发"
+    )
+
+    try:
+        import hashlib
+        import wave as _wave
+        import enhance_video_audio as eva
+        import _forced_align as fa
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            tts_dir = tmpdir / "tts_44k"
+            tts_dir.mkdir()
+
+            TEXT = "第一句测试旁白。第二句继续朗读。"
+            h = eva._tts_cache_key(TEXT)
+            hq = tts_dir / f"tts_{h}_hq.wav"
+
+            def _make_wav(path, seconds=1.0, sr=44100):
+                with _wave.open(str(path), 'wb') as wf:
+                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+                    wf.writeframes(b'\x00\x00' * int(sr * seconds))
+
+            _make_wav(hq)
+            SENTS = [{'rel_start': 0.0, 'rel_end': 2.0}, {'rel_start': 2.2, 'rel_end': 5.0}]
+
+            # ── stubs：模型/停顿强制/时长/规则全部替身，波形哈希走真实计算 ──
+            saved = {}
+            align_calls = {'n': 0}
+
+            def _stub(name, value):
+                saved[name] = getattr(eva, name)
+                setattr(eva, name, value)
+
+            def _fake_align_scene(wav, text, segments, model=None):
+                align_calls['n'] += 1
+                return {'method': 'asr_forced', 'match_ratio': 0.97,
+                        'sentences': [dict(s) for s in SENTS]}
+
+            _stub('SCENES', [(1, 0.0, 6.0, TEXT)])
+            _stub('COVER_DURATION', 0.0)
+            _stub('VIDEO_DURATION', 6.0)
+            _stub('get_duration', lambda p: 5.0)
+            _stub('_load_audio_sync_rules', lambda: {'sentence_pause': {'min_seconds': 0.4}})
+            _stub('_enforce_sentence_pauses',
+                  lambda f, s, m: (False, s, 0.0))
+            _stub('_split_text_to_segments', lambda t: ['第一句测试旁白。', '第二句继续朗读。'])
+            saved_fa_load = fa.load_align_model
+            saved_fa_align = fa.align_scene
+            fa.load_align_model = lambda: object()
+            fa.align_scene = _fake_align_scene
+
+            def _manifest():
+                with open(tmpdir / "_timeline_manifest.json", encoding='utf-8') as f:
+                    return json.load(f)
+
+            def _entry():
+                return _manifest()['scenes'][0]
+
+            try:
+                algo = f"{eva.ALIGN_ALGO_VERSION}|{fa.MODEL_SIZE}|pause=0.4"
+                cur_sha = eva._wave_sha256(hq)
+
+                # ── A. 首轮无旧 manifest → 真实对齐，记录面含波形绑定 ──
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], 1, "first run aligns")
+                e = _entry()
+                tc.assert_equal(e.get('wave_sha256'), cur_sha,
+                                "recorded wave hash equals real bytes of the hq wav")
+                tc.assert_equal(e.get('align_algo_ver'), algo,
+                                "recorded algo version = ALIGN_ALGO_VERSION|MODEL_SIZE|pause")
+                first_sents = e['sentences']
+
+                # ── B. 波形/版本全一致 → 缓存命中，零重对齐 ──
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], 1,
+                                "identical waveform + algo version must reuse the cache")
+                tc.assert_equal(_entry()['sentences'], first_sents,
+                                "cached rel timestamps carried over unchanged")
+
+                # ── C. 同文本但波形字节变了（重新合成/插静音）→ 必须重对齐 ──
+                _make_wav(hq, seconds=1.5)   # 字节变、文件名与文本哈希不变
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], 2,
+                                "waveform bytes changed under the same text key → "
+                                "stale alignment MUST NOT be reused (A08 core)")
+                tc.assert_equal(_entry()['wave_sha256'], eva._wave_sha256(hq),
+                                "record re-binds to the new waveform bytes")
+
+                # ── D. 算法版本 bump → 失效重对齐 ──
+                eva._build_timeline_manifest(tmpdir)   # 收敛回命中态
+                n_before = align_calls['n']
+                mp = tmpdir / "_timeline_manifest.json"
+                data = _manifest()
+                data['scenes'][0]['align_algo_ver'] = 'v0|small|pause=0.4'
+                mp.write_text(json.dumps(data), encoding='utf-8')
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], n_before + 1,
+                                "algo version mismatch → re-align")
+
+                # ── D2. 旧格式缺 align_algo_ver 字段但波形哈希已绑定 → 兼容命中
+                #     （默认值分支有真实语义：不把 A08 前的合法记录一刀切失效）──
+                eva._build_timeline_manifest(tmpdir)   # 收敛回命中态
+                n_before = align_calls['n']
+                data = _manifest()
+                del data['scenes'][0]['align_algo_ver']
+                mp.write_text(json.dumps(data), encoding='utf-8')
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], n_before,
+                                "record missing align_algo_ver but wave-bound: legacy "
+                                "default applies, reuse stands (the default is load-bearing)")
+
+                # ── E. 旧格式记录（无 wave_sha256 字段）→ 保守视为未绑定 → 重对齐 ──
+                eva._build_timeline_manifest(tmpdir)
+                n_before = align_calls['n']
+                data = _manifest()
+                del data['scenes'][0]['wave_sha256']
+                mp.write_text(json.dumps(data), encoding='utf-8')
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], n_before + 1,
+                                "legacy record without a wave binding cannot certify reuse")
+
+                # ── F. tts_file 指向不同波形文件 → 即使哈希字段相同也失效 ──
+                eva._build_timeline_manifest(tmpdir)
+                n_before = align_calls['n']
+                data = _manifest()
+                data['scenes'][0]['tts_file'] = 'tts_deadbeef00_hq.wav'
+                mp.write_text(json.dumps(data), encoding='utf-8')
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], n_before + 1,
+                                "record bound to a different wav file → re-align")
+
+                # ── G. 停顿强制改写波形的当轮：记录必须重绑改写后的实测哈希 ──
+                _make_wav(hq, seconds=1.0)   # 新字节
+                def _enforce_modifying(f, s, m):
+                    with open(f, 'ab') as fp:      # 模拟插静音：追加字节
+                        fp.write(b'\x01\x02' * 441)
+                    return True, [dict(x) for x in s], 0.2
+                eva._enforce_sentence_pauses = _enforce_modifying
+                eva._build_timeline_manifest(tmpdir)
+                e = _entry()
+                tc.assert_true(e.get('pause_inserted') == 0.2,
+                               "pause insertion recorded")
+                tc.assert_equal(e['wave_sha256'], eva._wave_sha256(hq),
+                                "record re-binds AFTER enforcement rewrote the wave, "
+                                "otherwise every next run would thrash the cache")
+                # 下一轮（停顿已达标 no-op）应命中
+                eva._enforce_sentence_pauses = lambda f, s, m: (False, s, 0.0)
+                n_before = align_calls['n']
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(align_calls['n'], n_before,
+                                "post-enforcement stable wave hits the cache next run")
+
+                # ── H. 文本一改即失效（旧契约不回退）：新 hash 无文件 → 跳过并告警 ──
+                eva.SCENES = [(1, 0.0, 6.0, TEXT + "补一句。")]  # saved 中已有原值，finally 统一还原
+                eva._build_timeline_manifest(tmpdir)
+                tc.assert_equal(_manifest()['scenes'], [],
+                                "changed text key resolves to a new wav path; missing "
+                                "file skips the scene instead of reusing old alignment")
+
+                # ── I. p95 语义澄清（media_qa_gate subtitle_audio_alignment）：原为两处
+                #     "源码含某字符串"断言（'measure_semantics' / 中文报告行），只证明
+                #     文案在场、不证明消费面拿到它——改由行为面锁定：记录面见用例52 A 段
+                #     对真实 validate() 产出的 alignment.measure_semantics 断言，
+                #     报告面见用例57 E 段（捕获 print_report 输出 + p95≠0 负向对照）。──
+
+            finally:
+                for name, val in saved.items():
+                    setattr(eva, name, val)
+                fa.load_align_model = saved_fa_load
+                fa.align_scene = saved_fa_align
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_state_writes_atomic_and_ledger_survives_fresh() -> RegressionTestCase:
+    """用例56（2026-09-19 审核 A10）：状态落盘的中断安全 + 成本台账跨 --fresh 保活
+
+    两个缺口（均为源码确认，非推测）：
+    ①`PipelineState.save()` 与交付登记表写入都是 `open(path,'w')` 原地截断写——进程
+      在 json.dump 中途死掉即留下半截文件。`_load` 里 `}\\n{` 的恢复分支正是为这种
+      损坏打的现场补丁，而登记表损坏会被读侧当成空表 → 交付物保护门禁静默 fail-open。
+    ②`reset()`（--fresh 入口）把 self.data 整表换成 4 键新 dict，连带清掉
+      `render_metrics` 累计成本台账 → 预算门禁计数源归零，"fresh→重渲→fresh"
+      可无限绕开 max_full_renders。
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    tc = RegressionTestCase(
+        "state_writes_atomic_and_ledger_survives_fresh",
+        "验证状态/交付登记表原子落盘、--fresh 保留渲染成本台账、损坏登记表 fail-closed"
+    )
+
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineState = _pr.PipelineState
+        PipelineRunner = _pr.PipelineRunner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            spath = tmp / "pipeline_state.json"
+            ledger = {"full_render_attempts": 3, "full_render_total_seconds": 120.0,
+                      "scene_patch_attempts": 0, "scene_patch_hits": 0, "watchdog_kills": 0}
+
+            # ── A. 正常保存走原子替换：目录里不留 .tmp 兄弟文件 ──
+            st = PipelineState(spath)
+            st.data["verifications"] = {"media_qa_final": {"verdict": "PASS"}}
+            st.save()
+            tc.assert_equal(sorted(p.name for p in tmp.iterdir()), ["pipeline_state.json"],
+                            "save() renames the temp file into place (no stray .tmp sibling)")
+            tc.assert_equal(json.loads(spath.read_text(encoding='utf-8'))["verifications"],
+                            {"media_qa_final": {"verdict": "PASS"}},
+                            "the renamed file carries the new content")
+
+            # ── A2. 未知顶层节往返保真（A05 同族：写回权威源不得裁掉未消费字段）──
+            #      state 文件是单一权威源，本仓只消费自己认识的节；按"已知键集合"
+            #      重建 dict 等于每次保存都在削源（旧 reset() 即此形态）。
+            rtpath = tmp / "state_roundtrip.json"
+            rtpath.write_text(json.dumps({
+                "steps": {"render": {"status": "passed", "an_upstream_field": 7}},
+                "last_run": "2026-01-01T00:00:00",
+                "a_section_this_repo_never_reads": {"keep": True},
+            }), encoding='utf-8')
+            st_rt = PipelineState(rtpath)
+            st_rt.mark_completed("render", input_fingerprint="fp-rt")
+            rt = json.loads(rtpath.read_text(encoding='utf-8'))
+            tc.assert_equal(rt.get("a_section_this_repo_never_reads"), {"keep": True},
+                            "save() writes back what it loaded — an unconsumed top-level "
+                            "section survives the round trip")
+            tc.assert_equal(rt["steps"]["render"].get("an_upstream_field"), 7,
+                            "per-step fields this repo does not read are preserved, not "
+                            "rebuilt from the known-key set")
+            tc.assert_equal(rt["steps"]["render"]["status"], "passed",
+                            "the consumed field still updates normally (merge, not freeze)")
+
+            # ── B. 写入中途失败：目标文件保持上一版完整（原子性本体）──
+            import script_interface as si
+
+            prev_bytes = spath.read_bytes()
+            real_json, real_si_json = _pr.json, si.json
+
+            class _HalfDump:
+                @staticmethod
+                def dump(payload, f, **kw):
+                    f.write('{"steps": {')
+                    raise RuntimeError("simulated interrupt mid-write")
+
+            # 注入点＝真正执行 json.dump 的那个模块名。状态写盘已委托给
+            # script_interface.atomic_write_json（唯一实现，防两处漂移），
+            # 因此两处同绑；只绑一处会让注入静默失效。
+            _fake = SimpleNamespace(dump=_HalfDump.dump, loads=real_json.loads)
+            try:
+                _pr.json = _fake
+                si.json = _fake
+                st.data["steps"]["render"] = {"status": "passed"}
+                raised = False
+                try:
+                    st.save()
+                except RuntimeError:
+                    raised = True
+            finally:
+                _pr.json, si.json = real_json, real_si_json
+            tc.assert_true(raised,
+                           "the injected mid-write failure really propagated out of save() "
+                           "(otherwise this scenario proves nothing)")
+            tc.assert_equal(spath.read_bytes(), prev_bytes,
+                            "a failed write leaves the previous state file byte-identical "
+                            "(in-place open('w') would have truncated it to the half JSON)")
+
+            # ── C. --fresh 保活成本台账、作废上一轮证据 ──
+            st.data["render_metrics"] = dict(ledger)
+            st.data["duration_budget_check"] = {"decision": "within_budget"}
+            st.data["steps"]["render"] = {"status": "passed"}
+            st.reset("--fresh (previous last_run: test)")
+            tc.assert_equal(st.data["steps"], {},
+                            "--fresh still voids step status (that is its purpose)")
+            tc.assert_equal(st.data.get("render_metrics", {}).get("full_render_attempts"), 3,
+                            "the cumulative render-cost ledger survives --fresh")
+            tc.assert_true("duration_budget_check" not in st.data,
+                           "per-run adjudications are previous-run evidence — dropped, not carried")
+            tc.assert_true("verifications" not in st.data,
+                           "previous-run verification records are dropped by reset")
+            tc.assert_equal(json.loads(spath.read_text(encoding='utf-8'))
+                             ["render_metrics"]["full_render_attempts"], 3,
+                            "the surviving ledger is on disk, not only in memory")
+
+            # ── D. 预算门禁在 reset 之后仍然武装（封堵真实绕开门禁路径）──
+            def make_runner():
+                r = PipelineRunner.__new__(PipelineRunner)
+                r.state = st
+                r.force = False
+                r.accept_over_render = False
+                r.render_rules = {"render_budget": {"max_full_renders": 3,
+                                                    "enforcement": "soft"}}
+                return r
+
+            runner = make_runner()
+            st.mark_started("render")
+            tc.assert_true(not runner._render_budget_gate_ok(),
+                           "attempts==max_full_renders blocks before a full render starts")
+            st.reset("--fresh again (budget escape attempt)")
+            st.mark_started("render")
+            tc.assert_true(not runner._render_budget_gate_ok(),
+                           "reset() no longer re-arms the budget gate by wiping the ledger")
+
+            # ── E. 登记表三态：缺失 / 损坏 / 正常必须可区分 ──
+            reg = tmp / "交付登记.json"
+            _, status = PipelineRunner._registry_load(reg)
+            tc.assert_equal(status, PipelineRunner.REGISTRY_MISSING,
+                            "an absent ledger is 'missing' (a fresh repo must not be blocked)")
+            reg.write_text('{"deliveries": [', encoding='utf-8')
+            _, status = PipelineRunner._registry_load(reg)
+            tc.assert_equal(status, PipelineRunner.REGISTRY_CORRUPT,
+                            "a truncated ledger is 'corrupt', never an empty table")
+            reg.write_text('{"deliveries": {}}', encoding='utf-8')
+            _, status = PipelineRunner._registry_load(reg)
+            tc.assert_equal(status, PipelineRunner.REGISTRY_CORRUPT,
+                            "a structurally invalid ledger is also 'corrupt'")
+
+            # ── F. 损坏登记表 fail-closed：无法证明未交付时不得放行覆盖 ──
+            saved_registry = _pr.DELIVERY_REGISTRY
+            try:
+                _pr.DELIVERY_REGISTRY = reg
+                out = tmp / "案例成片.mp4"
+                out.write_bytes(b"delivered-film")
+                st2 = PipelineState(tmp / "state2.json")
+                r2 = make_runner()
+                r2.state = st2
+                r2.output_file = out
+                r2.temp_dir = tmp / "temp2"
+                r2.temp_dir.mkdir()
+                reg.write_text('{"deliveries": [', encoding='utf-8')
+                tc.assert_true(r2._output_was_delivered(),
+                               "corrupt ledger adjudicates as delivered (fail-closed): "
+                               "the old code read it as empty and allowed overwriting "
+                               "every delivered film")
+                tc.assert_equal(
+                    st2.data.get("delivery_registry_unreadable", {}).get("decision"),
+                    "treated_as_delivered_fail_closed",
+                    "the fail-closed adjudication is traceable in state")
+                reg.unlink()
+                tc.assert_true(not r2._output_was_delivered(),
+                               "a missing ledger with no VALIDATED report stays 'not delivered' "
+                               "(corrupt handling must not block new projects)")
+
+                # ── G. 拒绝在损坏表上追加登记（不就地覆盖整本台账）──
+                reg.write_text('{"deliveries": [', encoding='utf-8')
+                corrupt_bytes = reg.read_bytes()
+                r3 = make_runner()
+                r3.state = PipelineState(tmp / "state3.json")
+                r3.html_project = "case56"
+                r3.config_path = tmp / "cfg.json"
+                r3._probe_duration = lambda p: 10.0
+                refused = False
+                try:
+                    r3._record_delivery(out, None, "VALIDATED")
+                except RuntimeError:
+                    refused = True
+                tc.assert_true(refused,
+                               "appending onto a corrupt ledger is refused, not silently "
+                               "rebuilt from one entry")
+                tc.assert_equal(reg.read_bytes(), corrupt_bytes,
+                                "the corrupt file is left untouched (git can still restore it)")
+
+                # ── H. 正常追加：既有条目原样保留 + 原子写无残留 ──
+                reg.write_text(json.dumps({"deliveries": [
+                    {"video": "另一项目_成片.mp4", "bytes": 1, "delivered_at": "2026-09-01T00:00:00"}
+                ]}, ensure_ascii=False), encoding='utf-8')
+                entry = r3._record_delivery(out, None, "VALIDATED")
+                table = json.loads(reg.read_text(encoding='utf-8'))
+                tc.assert_equal([d["video"] for d in table["deliveries"]],
+                                ["另一项目_成片.mp4", entry["video"]],
+                                "an append preserves existing deliveries (read-modify-write "
+                                "must not rebuild the table)")
+                tc.assert_equal(table["deliveries"][0]["bytes"], 1,
+                                "untouched entries keep every original field")
+                tc.assert_equal(sorted(p.name for p in tmp.iterdir()
+                                        if p.name.endswith(".tmp")), [],
+                                "registry writes are atomic too (no .tmp sibling left behind)")
+            finally:
+                _pr.DELIVERY_REGISTRY = saved_registry
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_check_registry_names_are_single_source() -> RegressionTestCase:
+    """用例57（2026-09-19 审核 A12）：检查项清单只允许一处权威源，文档与注释不得手抄项数/编号
+
+    改动前的实测漂移面（三处手抄各自跑偏）：
+    - `media_qa_gate` docstring 自称"检查项目（18项）"，运行时 `total_checks` 为 19；
+    - docstring 列有"音频响度检测"，但全库零消费者的 `ffmpeg_get_loudness` 从未产出状态；
+    - 代码注释的"检查N"编号里 9 号被用了两次（时间单调性 / 视觉边界），AGENTS.md 另写"11项"。
+    本用例把清单一致性变成可执行判据：AST 抓 `_mark` 登记名 ↔ docstring 目录 ↔ 运行时
+    check_statuses 三向一致；并锁死文档面不得再出现项数与"检查N"号。
+    """
+    import ast
+    import io as _io
+    import json
+    import re
+    import tempfile
+    from contextlib import redirect_stdout
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    tc = RegressionTestCase(
+        "check_registry_names_are_single_source",
+        "验证 media_qa_gate 检查项名三向一致（AST/docstring/运行时）且文档不再手抄项数与编号"
+    )
+
+    try:
+        script_dir = Path(__file__).parent
+        gate_path = script_dir / "media_qa_gate.py"
+        src = gate_path.read_text(encoding='utf-8')
+        tree = ast.parse(src)
+
+        # ── A. 权威源：AST 抓 _mark 登记名（真实发射点，不是清单副本）──
+        emitted = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_mark" and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                emitted.add(node.args[0].value)
+        tc.assert_true(len(emitted) >= 10,
+                       f"AST extraction found {len(emitted)} check names (registry is not empty)")
+        tc.assert_true('ffmpeg_get_loudness' not in src,
+                       "the loudness helper that no check ever consumed has been removed "
+                       "rather than left advertised")
+
+        # ── B. docstring 目录与 AST 双向一致 ──
+        doc = ast.get_docstring(tree) or ""
+        catalog = set()
+        for line in doc.splitlines():
+            stripped = line.strip()
+            m = re.match(r'^([a-z][a-z0-9_]+)\s{2,}\S', stripped)
+            if m:
+                catalog.add(m.group(1))
+        tc.assert_true(catalog == emitted,
+                       f"docstring catalog and emitted check names must match exactly "
+                       f"(doc-only={sorted(catalog - emitted)}, code-only={sorted(emitted - catalog)})")
+
+        # ── C. 文档面禁止手抄计数与"检查N"编号 ──
+        tc.assert_true(not re.search(r'检查\s?\d+', src),
+                       "code comments address checks by name, not by a hand-maintained number")
+        tc.assert_true(not re.search(r'（\d+项）', doc),
+                       "the module docstring carries no item count")
+        agents_md = (script_dir / ".." / ".." / "AGENTS.md").resolve().read_text(encoding='utf-8')
+        tc.assert_true(not re.search(r'媒体文件\d+项', agents_md),
+                       "AGENTS.md must not hand-copy the media_qa check count")
+        tc.assert_true(not re.search(r'\d+ ?项检查全部', agents_md),
+                       "the A04 row references the registry, not a count")
+
+        # ── D. 运行时一致：真实 validate() 的 check_statuses 键集 == 权威源 ──
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate as mq
+        import _gate_status as gs
+
+        _saved = {}
+
+        def _patch(name, fn):
+            _saved.setdefault(name, getattr(mq, name))
+            setattr(mq, name, fn)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                video = tmp / "案例成片.mp4"
+                video.write_bytes(b"fake-video-bytes")
+                srt = tmp / "案例成片.srt"
+                srt.write_text("1\n00:00:01,000 --> 00:00:04,000\n第一段旁白\n\n"
+                               "2\n00:00:05,000 --> 00:00:08,000\n第二段旁白\n",
+                               encoding='utf-8')
+                cfg = tmp / "cfg.json"
+                cfg.write_text(json.dumps({"fps": 25, "resolution": "1920x1080"}),
+                               encoding='utf-8')
+                _patch("ffprobe_get_streams", lambda p: [
+                    {"codec_type": "video", "codec_name": "h264", "bit_rate": "1500000",
+                     "r_frame_rate": "25/1", "width": 1920, "height": 1080},
+                    {"codec_type": "audio", "codec_name": "aac", "bit_rate": "128000"}])
+                _patch("ffprobe_get_duration", lambda p: 10.0)
+                _patch("ffmpeg_detect_silence", lambda p, d=None: 1.0)
+                _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: [1.5, 2.5, 5.5, 6.5, 8.5])
+                _patch("ffmpeg_detect_black_intervals", lambda *a, **k: [])
+                _patch("ffmpeg_detect_long_silences", lambda *a, **k: [])
+                _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                    returncode=0, stdout="", stderr="")))
+
+                qa = mq.MediaQAGate()
+                _, res = qa.validate(str(video), str(srt), visual_check_passed=True,
+                                     config_path=str(cfg))
+                tc.assert_equal(set(res["check_statuses"]), emitted,
+                                "the runtime four-state registry emits exactly the names "
+                                "the source declares (a check that never runs cannot hide)")
+                tc.assert_equal(res["total_checks"], len(emitted),
+                                "the count the report prints is derived at runtime")
+                tc.assert_true('measure_semantics' in res["alignment"],
+                               "the p95 semantics boundary rides on the machine-readable record")
+
+                # ── E. 报告行按行为断言（用例55-I 原为源码字符串断言）：
+                #     p95=0 的免责说明只在 p95 真的归零时出现 ──
+                def _render(result):
+                    buf = _io.StringIO()
+                    with redirect_stdout(buf):
+                        mq.print_report(result)
+                    return buf.getvalue()
+
+                base = {"verdict": gs.PASS, "status_counts": {gs.PASS: len(emitted)},
+                        "total_checks": len(emitted), "errors": [], "untested": [],
+                        "not_applicable": [], "warnings": [], "alignment": {},
+                        "media_facts": {}}
+                zero = _render(dict(base, alignment={"onsets_detected": 5,
+                                                     "p95_deviation_seconds": 0,
+                                                     "threshold_p95_seconds": 0.5}))
+                tc.assert_true("非逐句精确同步" in zero,
+                               "the report names the misreading it forbids when p95=0")
+                nonzero = _render(dict(base, alignment={"onsets_detected": 5,
+                                                        "p95_deviation_seconds": 0.4,
+                                                        "threshold_p95_seconds": 0.5}))
+                tc.assert_true("非逐句精确同步" not in nonzero,
+                               "the disclaimer is conditional on p95=0, not printed unconditionally "
+                               "(a load-bearing assertion: an always-true report line would pass E-1)")
+                tc.assert_true(f"total={len(emitted)}" in zero,
+                               "the printed count equals the runtime registry size")
+                untested_line = _render(dict(base, verdict=gs.UNTESTED,
+                                             untested=["audio_not_silent: silencedetect 失败"]))
+                tc.assert_true("UNTESTED — 不得读成通过" in untested_line,
+                               "the untested section is labelled as not-a-pass in the human report")
+        finally:
+            for k, v in _saved.items():
+                setattr(mq, k, v)
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -3164,6 +6048,22 @@ class RegressionTestRunner:
             test_delivery_registry_backing,
             test_config_single_source_timeline_rejected,
             test_fresh_guard_requires_confirmation,
+            test_doc_to_markdown_picture_extraction_fallback,
+            test_scene_patch_default_route_and_time_witness,
+            test_delivery_slot_written_only_by_postprocess,
+            test_asset_signoff_gate,
+            test_preview_coverage_gap,
+            test_gate_four_state_untested_not_pass,
+            test_audio_rms_parse_and_untested_trace,
+            test_explicit_engine_binds_config_path,
+            test_step_fingerprint_binds_real_inputs,
+            test_narration_rich_fields_survive_timeline_writeback,
+            test_media_qa_gate_four_state_report,
+            test_final_media_qa_wired_into_postprocess,
+            test_count_up_precision_and_reveal_entrance,
+            test_alignment_cache_binds_real_waveform,
+            test_state_writes_atomic_and_ledger_survives_fresh,
+            test_check_registry_names_are_single_source,
         ]
         self.results = []
     

@@ -252,31 +252,84 @@ def check_preview_safety(manifest_entries, temp_dir):
     Returns:
         violations: [{scene, content_bottom, overflow_px, time}]，每场景取最差样本。
     """
-    from visual_boundary_check import measure_content_bottom, SUBTITLE_SAFETY_LINE
+    from visual_boundary_check import (
+        measure_content_bottom, frame_height, subtitle_safety_line)
 
     worst_per_scene = {}
+    safety_line = None
     for entry in manifest_entries:
         dst = Path(temp_dir) / f"preview_{entry['file']}"
         if not dst.exists():
             continue
         bottom = measure_content_bottom(str(dst))
+        if safety_line is None:
+            # 安全区随画布高度等比缩放，沿用横版数值会误判竖版溢出
+            safety_line = subtitle_safety_line(frame_height(str(dst)))
         sid = entry["sceneId"]
         if sid not in worst_per_scene or bottom > worst_per_scene[sid][0]:
             worst_per_scene[sid] = (bottom, entry.get("time", 0))
 
-    print(f"\n  [Safety Zone Pre-check] safety line y={SUBTITLE_SAFETY_LINE}")
+    if not worst_per_scene:
+        print("\n  [Safety Zone Pre-check] 无可用预览截图，跳过")
+        return []
+
+    print(f"\n  [Safety Zone Pre-check] safety line y={safety_line}")
     violations = []
     for sid, (bottom, t) in sorted(worst_per_scene.items(), key=lambda kv: str(kv[0])):
-        if bottom > SUBTITLE_SAFETY_LINE:
-            overflow = bottom - SUBTITLE_SAFETY_LINE
+        if bottom > safety_line:
+            overflow = bottom - safety_line
             print(f"    \u2717 Scene {sid}: content_bottom=y{bottom} "
                   f"OVERFLOW {overflow}px @{t:.0f}s")
             violations.append({"scene": sid, "content_bottom": bottom,
                                "overflow_px": overflow, "time": t})
         else:
             print(f"    \u2713 Scene {sid}: content_bottom=y{bottom} "
-                  f"gap={SUBTITLE_SAFETY_LINE - bottom}px @{t:.0f}s")
+                  f"gap={safety_line - bottom}px @{t:.0f}s")
     return violations
+
+
+def _numeric_scene_ids(items, key="scene_id"):
+    """场景条目 → 数字 id 集合（兼容 scene_id 为 3 或 "s3" 两种写法）。"""
+    ids = set()
+    for it in items or []:
+        raw = it.get(key)
+        if raw is None:
+            continue
+        m = re.search(r'\d+', str(raw))
+        if m:
+            ids.add(int(m.group(0)))
+    return ids
+
+
+def compute_capture_gap(node_scenes, manifest_entries, capture_dir):
+    """预览截图覆盖率裁定（2026-09-03）。
+
+    Chrome 渲染进程中途崩溃时 capture manifest 只含部分场景，而脚本此前照旧打印
+    [PASS] 且退出码 0——"没查"被读成"查了没问题"，与仓库已登记的
+    "无记录既不能证真也不能证伪"同一缺陷形态。此处把覆盖缺口显式化。
+
+    计"可实测"以 png 文件真正在位为准（instant_preview 复制到 temp_dir 的前置条件
+    同源），而非 manifest 声明的 sceneId 条数。
+
+    Returns: (gap_ids, covered_count, expected_count)
+    """
+    expected_ids = _numeric_scene_ids(node_scenes)
+    measurable = [e for e in manifest_entries or []
+                  if (Path(capture_dir) / e["file"]).exists()]
+    captured_ids = _numeric_scene_ids(measurable, "sceneId")
+    covered = captured_ids & expected_ids
+    return sorted(expected_ids - covered), len(covered), len(expected_ids)
+
+
+def _thumb_size(png_bytes):
+    """按截图实测宽高比选缩略图尺寸（竖版 1080×1920 压成 480×270 会失真到不可用）。"""
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as img:
+            w, h = img.size
+    except Exception:
+        w, h = 16, 9
+    return (270, 480) if h > w else (480, 270)
 
 
 def generate_grid(screenshots, scene_info, output_path, cols=4):
@@ -290,7 +343,7 @@ def generate_grid(screenshots, scene_info, output_path, cols=4):
     """
     from PIL import Image, ImageDraw, ImageFont
 
-    thumb_w, thumb_h = 480, 270  # 16:9 thumbnail
+    thumb_w, thumb_h = _thumb_size(screenshots[0][0]) if screenshots else (480, 270)
     label_h = 36  # label height
     cell_h = thumb_h + label_h
     padding = 10
@@ -323,9 +376,9 @@ def generate_grid(screenshots, scene_info, output_path, cols=4):
 
         # Paste thumbnail
         try:
-            img = Image.open(io.BytesIO(png_bytes))
-            img = img.resize((thumb_w, thumb_h), Image.LANCZOS)
-            grid.paste(img, (x, y + label_h))
+            with Image.open(io.BytesIO(png_bytes)) as img:
+                img = img.resize((thumb_w, thumb_h), Image.LANCZOS)
+                grid.paste(img, (x, y + label_h))
         except Exception as e:
             # Draw placeholder
             draw.rectangle([x, y + label_h, x + thumb_w, y + cell_h],
@@ -509,6 +562,8 @@ def main():
 
     # --- Phase 2: Chrome Screenshots via puppeteer-core (unless --density-only) ---
     safety_violations = []
+    capture_count = 0
+    capture_gap = []
     if not args.density_only:
         print("\n--- Phase 2: Chrome Screenshots (puppeteer-core) ---")
 
@@ -554,11 +609,28 @@ def main():
         chrome_user_data.mkdir(parents=True, exist_ok=True)
         node_env['CHROME_USER_DATA_DIR'] = str(chrome_user_data)
 
+        # preview_capture.js 读的是磁盘上的 config；指针模式下那份 config 有意不含
+        # scenes（单一权威源：场景在 narration.json）。给它一份"指针已解析"的快照，
+        # 否则它数到 0 个场景、一张图都不截，安全区预检便在没有像素证据的情况下判 PASS。
+        node_config = dict(config)
+        if ptr_path is not None:
+            # 解析器输出的是绝对时间，node 内部还会再 +cover_duration，
+            # 故此处平移回它期望的相对语义。
+            node_config["scenes"] = [
+                {**s,
+                 "start": round(float(s["start"]) - cover_duration, 3),
+                 "end": round(float(s["end"]) - cover_duration, 3)}
+                for s in scenes
+            ]
+        node_config_path = temp_dir / "preview_config_resolved.json"
+        node_config_path.write_text(
+            json.dumps(node_config, ensure_ascii=False, indent=2), encoding='utf-8')
+
         try:
             # Run Node.js capture script
             cmd = [
                 'node', str(capture_script),
-                str(html_path), str(config_path), str(capture_dir)
+                str(html_path), str(node_config_path), str(capture_dir)
             ]
             print(f"  Running: {' '.join(cmd[:3])} ...")
             result = subprocess.run(
@@ -581,6 +653,19 @@ def main():
                 manifest_path = capture_dir / "capture_manifest.json"
                 if manifest_path.exists():
                     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                    capture_count = len(manifest.get("scenes", []))
+                    for err in manifest.get("errors", []):
+                        print(f"    capture error: scene {err.get('sceneId')}: {err.get('error')}")
+
+                    # 覆盖率裁定：Chrome 渲染进程中途崩溃时 manifest 只含部分场景
+                    # （2026-09-03 实测 wsi-commercial 截到 5/11 后 Target closed），
+                    # 脚本此前照样打印 [PASS] 并退出 0——盲区必须成为机器可判的事实。
+                    capture_gap, covered_scenes, expected_scenes = compute_capture_gap(
+                        node_config.get("scenes", []), manifest.get("scenes", []), capture_dir)
+                    print(f"\n  [COVERAGE] 安全区可实测覆盖 {covered_scenes}"
+                          f"/{expected_scenes} 场"
+                          + (f"，缺: {capture_gap}" if capture_gap else "（完整）"))
+
                     screenshots = []
                     for entry in manifest.get("scenes", []):
                         png_path = capture_dir / entry["file"]
@@ -710,7 +795,15 @@ def main():
                 f"overflow {v['overflow_px']}px @{v['time']:.0f}s")
         report_lines.append("         -> reduce content height / tighten padding-bottom, then re-preview")
     elif not args.density_only:
-        report_lines.append("  [PASS] All scenes stay above subtitle safety line")
+        if capture_gap:
+            report_lines.append(
+                f"  [FAIL] {len(capture_gap)} 场无预览像素（缺: {capture_gap}），"
+                f"安全区预检对这些场无证据 —— 不得判 PASS")
+        elif capture_count:
+            report_lines.append("  [PASS] All scenes stay above subtitle safety line")
+        else:
+            report_lines.append(
+                "  [FAIL] 未截到任何场景截图，安全区预检无像素证据 —— 不得判 PASS")
     total_deserts = len(desert_windows)
     total_sparse = len(sparse_windows)
     if total_deserts == 0 and total_sparse <= 1:
@@ -735,6 +828,17 @@ def main():
         print(f"\nPREVIEW FAILED: {len(safety_violations)} scene(s) overflow the subtitle "
               f"safety zone — fix layout before rendering.")
         return 2
+    # 退出码 2 = 真实溢出；3 = 预检存在盲区（零截图或部分场景未截到）。
+    # 两者都不得当作 PASS 放行——盲区里溢出多少张图都不会被看见。
+    if not args.density_only and capture_count == 0:
+        print("\nPREVIEW FAILED: 零截图，字幕安全区未被实测 —— "
+              "检查场景发现/Chrome/捕获链路后重跑，禁止带此盲区进入全量渲染。")
+        return 3
+    if not args.density_only and capture_gap:
+        print(f"\nPREVIEW FAILED: {len(capture_gap)} 场未截到预览图（缺: {capture_gap}），"
+              "字幕安全区对这些场无证据 —— 常见成因是 Chrome 渲染进程中途崩溃，"
+              "重跑预览至覆盖完整后再进入全量渲染。")
+        return 3
     return 0
 
 

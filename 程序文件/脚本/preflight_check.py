@@ -65,6 +65,7 @@ RENDER_CRITICAL_CHECKS = {
     "scene_contract",     # check 0:  contract declaration mismatch
     "design_rules",       # check 8:  independent timeline, missing opacity:0
     "narration_digits",   # check 13: Chinese numerals for quantitative values in narration
+    "asset_signoff",      # check 14: 屏显/旁白与位点1 素材确认单分叉
 }
 
 
@@ -1203,7 +1204,7 @@ def check_narration_digits(cfg: dict, r: PreflightResult):
     Runs on the parsed config dict — before render, before TTS. Any hit fails
     the render-mode gate; audit mode downgrades to a warning.
     """
-    print("\n[13/13] Narration Digit Normalization (Arabic digits for quantities)")
+    print("\n[13/14] Narration Digit Normalization (Arabic digits for quantities)")
     if not cfg:
         r.warn("Skipped — no config loaded", check_id="narration_digits")
         return
@@ -1219,6 +1220,223 @@ def check_narration_digits(cfg: dict, r: PreflightResult):
             f"{f.scope}: 命中 “{f.matched}” — 上下文 “…{f.context}…” — {f.suggestion}",
             check_id="narration_digits",
         )
+
+
+def _div_block(content: str, open_tag: str) -> str:
+    """返回从 open_tag 起、按 &lt;div&gt;/&lt;/div&gt; 配平闭合的整段 HTML（找不到返回 ""）。
+
+    嵌套子 div（如 .tags 内的 .tag）会让 `.*?</div>` 非贪婪匹配在第一个子元素处截断，
+    凡需读取"容器 + 全部子元素"的判据都必须走这里。
+    """
+    start = content.find(open_tag)
+    if start < 0:
+        return ""
+    depth, pos = 0, start
+    while pos < len(content):
+        nxt_open = content.find("<div", pos)
+        nxt_close = content.find("</div>", pos)
+        if nxt_close < 0:
+            return ""
+        if 0 <= nxt_open < nxt_close:
+            depth += 1
+            pos = nxt_open + 4
+        else:
+            depth -= 1
+            pos = nxt_close + 6
+            if depth == 0:
+                return content[start:pos]
+    return ""
+
+
+def _num_tokens(text: str) -> set:
+    """屏显/溯源文本中的阿拉伯数字串（含小数）。"""
+    return set(re.findall(r'\d+(?:\.\d+)?', text or ""))
+
+
+def _quant_tokens(text: str) -> set:
+    """需要溯源的数字：剔除公历日期（"9 月 1 日"/"3 号"属日历引用而非量化指标）。"""
+    t = re.sub(r'\d+(?:\.\d+)?\s*(?=[月日号])', '', text or "")
+    return _num_tokens(t)
+
+
+def check_asset_signoff(project_dir: Path, cfg: dict, html_path: Path, r: PreflightResult):
+    """位点1（素材/文案人工签认单）消费门禁。
+
+    判据源是项目目录下的 `素材确认单.json`：人工在位点1 逐场确认的图片选用、屏显文案、
+    量化标签与数据溯源。该文件一旦存在即视为权威——屏显与旁白必须与它逐字一致，
+    否则签认失效（"确认过的东西"和"最终播出的东西"分叉）。
+
+    触发设计：无该文件的项目记 INFO 跳过（不是所有项目都走位点1），不做 opt-in 开关、
+    不硬编码项目名单——存在即强制，与 narration_source 指针同一判据形态。
+
+    核验面：
+      1 场景覆盖：确认单场景 == HTML 场景（cover scene0 除外）
+      2 素材：选用素材 display_target == data-scene-assets 且逐个在盘
+      3 旁白：narration_source 解析出的 narration == 确认单「旁白文案」（逐字）
+      4 类型：确认单「场景类型」== HTML S-block 同场 type
+      5 溯源：屏显数字（量化标签 + 画面文案）逐个可在本场「数据点」中找到；公历日期豁免
+      6 屏显文本：卡片名称行/标签 pill、hero 标题与行条、stats 数字、收尾品牌带
+        —— 按元素在位与否自适应（模板无关），在位即逐字比对
+    """
+    print("\n[14/14] Asset sign-off (素材确认单) — 位点1 签认一致性")
+    sheet_path = project_dir / "素材确认单.json"
+    if not sheet_path.exists():
+        r.info("无 素材确认单.json — 该项目未走位点1 签认，跳过", check_id="asset_signoff")
+        return
+    if not html_path.exists():
+        r.error(f"素材确认单在位但 HTML 缺失：{html_path}", check_id="asset_signoff")
+        return
+
+    try:
+        sheet = json.loads(sheet_path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, ValueError) as e:
+        r.error(f"素材确认单.json 解析失败: {e}", check_id="asset_signoff")
+        return
+    scenes = sheet.get("场景")
+    if not isinstance(scenes, list) or not scenes:
+        r.error("素材确认单.json 无有效 '场景' 列表", check_id="asset_signoff")
+        return
+
+    content = html_path.read_text(encoding='utf-8')
+    nar_scenes = {}
+    if cfg and cfg.get("scenes"):
+        nar_scenes = {s.get("scene_id"): s for s in cfg["scenes"]}
+
+    sblock = {}
+    smap = _parse_scene_map(content)
+    for s in smap.get("scenes", []):
+        try:
+            sblock[int(str(s["id"]).lstrip("s"))] = s
+        except (KeyError, ValueError):
+            continue
+
+    errs_before = len(r.errors)
+    html_ids = sorted(int(m) for m in re.findall(r'id="scene(\d+)"', content))
+    html_content_ids = [i for i in html_ids if i != 0]
+    sheet_ids = [sc.get("scene_id") for sc in scenes]
+    if sorted(sheet_ids) != html_content_ids:
+        r.error(f"确认单场景 {sorted(sheet_ids)} != HTML 非 cover 场景 {html_content_ids}",
+                check_id="asset_signoff")
+    declared_count = sheet.get("场景数")
+    if declared_count is not None and int(declared_count) != len(scenes):
+        r.error(f"确认单「场景数」{declared_count} != 实际场景条目 {len(scenes)}",
+                check_id="asset_signoff")
+
+    REQUIRED = ("scene_id", "场景类型", "画面文案", "量化标签", "旁白文案", "选用素材", "数据点")
+    checked_text = 0
+    for sc in scenes:
+        sid = sc.get("scene_id")
+        where = f"s{sid}"
+        for k in REQUIRED:
+            if k not in sc:
+                r.error(f"{where}: 确认单缺必填字段「{k}」", check_id="asset_signoff")
+        if any(k not in sc for k in REQUIRED):
+            continue
+
+        open_m = re.search(rf'<div id="scene{sid}" class="scene"[^>]*>', content)
+        if not open_m:
+            r.error(f"{where}: 确认单场景在 HTML 中不存在", check_id="asset_signoff")
+            continue
+        open_tag = open_m.group(0)
+        blk = _div_block(content, open_tag)
+
+        # --- 2 素材 ---
+        picks = sc["选用素材"]
+        if not picks:
+            r.error(f"{where}: 确认单无选用素材", check_id="asset_signoff")
+            bases = []
+        else:
+            bases = [str(p.get("display_target", "")).split("/")[-1] for p in picks]
+        am = re.search(r'data-scene-assets="([^"]*)"', open_tag)
+        declared = [a.strip() for a in am.group(1).split(",")] if am and am.group(1).strip() else []
+        if declared != bases:
+            r.error(f"{where}: data-scene-assets {declared} != 确认单选用素材 {bases}",
+                    check_id="asset_signoff")
+        for b in bases:
+            if not b:
+                r.error(f"{where}: 选用素材缺 display_target", check_id="asset_signoff")
+            elif not (project_dir / "assets" / b).exists():
+                r.error(f"{where}: 选用素材未落盘 assets/{b}", check_id="asset_signoff")
+            elif b not in blk:
+                r.error(f"{where}: assets/{b} 已声明但场景 HTML 未引用", check_id="asset_signoff")
+
+        # --- 3 旁白 ---
+        if nar_scenes:
+            ns = nar_scenes.get(sid)
+            if ns is None:
+                r.error(f"{where}: 确认单场景在 narration_source 中缺失", check_id="asset_signoff")
+            elif (ns.get("narration") or "") != sc["旁白文案"]:
+                r.error(f"{where}: 旁白源与确认单「旁白文案」不一致", check_id="asset_signoff")
+
+        # --- 4 场景类型 ---
+        stype = sc["场景类型"]
+        if sblock and sid in sblock and sblock[sid].get("type") != stype:
+            r.error(f"{where}: 确认单场景类型 {stype} != S-block type {sblock[sid].get('type')}",
+                    check_id="asset_signoff")
+
+        # --- 5 数字溯源 ---
+        dp_tokens = set()
+        for e in sc["数据点"]:
+            dp_tokens |= _num_tokens(str(e.get("数值", "")))
+        for src_label, src_text in (
+            [("量化标签[%d]" % i, t) for i, t in enumerate(sc["量化标签"])]
+            + [("画面文案", sc["画面文案"])]
+        ):
+            for tok in sorted(_quant_tokens(src_text) - dp_tokens):
+                r.error(f"{where}: 屏显数字 {tok}（{src_label}）在本场「数据点」中无溯源",
+                        check_id="asset_signoff")
+
+        # --- 6 屏显文本（元素在位才比对）---
+        tags = sc["量化标签"]
+        if stype == "card":
+            mn = re.search(rf'<div class="ab name" id="s{sid}name"[^>]*>([^<]*)</div>', content)
+            if mn:
+                checked_text += 1
+                if mn.group(1) != sc["画面文案"]:
+                    r.error(f"{where}: 名称行 {mn.group(1)!r} != 确认单画面文案 {sc['画面文案']!r}",
+                            check_id="asset_signoff")
+            mt = re.search(rf'<div class="ab tags" id="s{sid}tags"', content)
+            if mt:
+                checked_text += 1
+                shown = re.findall(rf'<div class="tag" id="s{sid}t\d+">([^<]*)</div>',
+                                   _div_block(content, mt.group(0)))
+                if shown != tags:
+                    r.error(f"{where}: 标签 pill {shown} != 确认单量化标签 {tags}",
+                            check_id="asset_signoff")
+        elif stype == "hero":
+            m1 = re.search(rf'id="h{sid}l1"[^>]*>([^<]*)</div>', content)
+            m2 = re.search(rf'id="h{sid}l2"[^>]*>([^<]*)</div>', content)
+            if m1:
+                checked_text += 1
+                title = m1.group(1) + ("，" + m2.group(1) if m2 else "")
+                if title != sc["画面文案"]:
+                    r.error(f"{where}: hero 标题 {title!r} != 确认单画面文案 {sc['画面文案']!r}",
+                            check_id="asset_signoff")
+            rows = re.findall(rf'id="h{sid}s\d"[^>]*><div class="vbar"[^>]*></div><div>([^<]*)</div>',
+                              content)
+            if rows:
+                checked_text += 1
+                if rows != tags:
+                    r.error(f"{where}: hero 行条 {rows} != 确认单量化标签 {tags}",
+                            check_id="asset_signoff")
+        elif stype == "stats":
+            for t in tags:
+                for tok in sorted(_quant_tokens(t)):
+                    if tok not in blk:
+                        r.error(f"{where}: stats 标签数字 {tok}（{t}）未出现在场景 HTML",
+                                check_id="asset_signoff")
+        elif stype == "closing":
+            ml = re.search(rf'<img id="s{sid}logo" src="assets/([^"]+)"', content)
+            if ml:
+                checked_text += 1
+                if bases and ml.group(1) != bases[0]:
+                    r.error(f"{where}: 品牌带 {ml.group(1)} != 确认单选用素材 {bases[0]}",
+                            check_id="asset_signoff")
+
+    if len(r.errors) == errs_before:
+        r.ok(f"素材确认单一致性通过：{len(scenes)} 场（素材/旁白/类型/数字溯源"
+             f"{' + 屏显文本 ' + str(checked_text) + ' 处' if checked_text else ''}）",
+             check_id="asset_signoff")
 
 
 def check_output_dir_cleanliness(output_dir: Path, r: PreflightResult):
@@ -1435,6 +1653,7 @@ def main():
     check_image_clarity(html_path, r)  # NEW: Check critical images for clarity
     check_subtitle_safe_zone(html_path, r)
     check_narration_digits(cfg or pre_cfg, r)
+    check_asset_signoff(project_dir, cfg or pre_cfg, html_path, r)
     check_output_dir_cleanliness(output_dir, r)
 
     # Structured log

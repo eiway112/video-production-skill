@@ -30,7 +30,7 @@
     "pixel_threshold": 0.10,
     "max_overlap_with_narration_seconds": 1.0,
     "fail_on_violation": true,
-    "description": "黑场-音频重叠门禁（media_qa_gate 检查14）：blackdetect 扫描成片，任一黑场区间与字幕展示窗口重叠超过 max_overlap_with_narration_seconds → 拒收（画面空档但音频持续播放）。测量对象是物理帧，不依赖任何声明值。"
+    "description": "黑场-音频重叠门禁（media_qa_gate no_black_frame_with_subtitle）：blackdetect 扫描成片，任一黑场区间与字幕展示窗口重叠超过 max_overlap_with_narration_seconds → 拒收（画面空档但音频持续播放）。测量对象是物理帧，不依赖任何声明值。"
   },
   "mix": {
     "tts_volume": 1.5,
@@ -50,6 +50,6 @@
     "silence_db": -38,
     "min_silence_seconds": 0.5,
     "fail_on_violation": true,
-    "description": "字幕-语音对齐度门禁（media_qa_gate 检查12）：silencedetect 提取成片音轨语音起口，与最近字幕条目起点比对，偏差 p95 超过 p95_max_seconds 则拒收。起口数 < min_onsets（如含 BGM 无静音段）降级为警告。"
+    "description": "字幕-语音对齐度门禁（media_qa_gate subtitle_audio_alignment）：silencedetect 提取成片音轨语音起口，与最近字幕条目起点比对，偏差 p95 超过 p95_max_seconds 则拒收。起口数 < min_onsets（如含 BGM 无静音段）降级为警告。"
   }
 }

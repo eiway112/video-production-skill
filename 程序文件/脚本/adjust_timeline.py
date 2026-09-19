@@ -31,7 +31,7 @@ import shutil
 import argparse
 import time
 from pathlib import Path
-from script_interface import Config, Result, Logger, EXIT_CODE
+from script_interface import Config, Result, Logger, EXIT_CODE, atomic_write_json
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -358,12 +358,19 @@ def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, b
         else:
             new_start = float(s['start']) + offsets[i]
             new_end = float(s['end']) + offsets[i] + extensions[i]
-        new_scenes.append({
-            'scene_id': s['scene_id'],
-            'start': round(new_start, 1),
-            'end': round(new_end, 1),
-            'narration': s['narration']
-        })
+        # 只覆写时间字段，其余字段原样带过（A05，2026-09-18 审核）。本函数的产出
+        # 会被 _write_narration_scenes 写回 narration.json —— 而 narration.json 是
+        # 场景定义的单一权威源（AGENTS.md 权威源表）。旧实现用四个字面键重建场景
+        # dict，等于每跑一次 timeline 就把 title/type/duration/narration_required/
+        # subtitle_required/assets 从权威源上裁掉（富字段实例见
+        # 程序文件/源码/hyperframes/eiway-122-wall/narration.json 的 10 字段 schema）。
+        updated = dict(s)
+        updated['start'] = round(new_start, 1)
+        updated['end'] = round(new_end, 1)
+        if 'duration' in updated:
+            # duration 是 start/end 的派生量：不同步就是自相矛盾的权威源
+            updated['duration'] = round(updated['end'] - updated['start'], 1)
+        new_scenes.append(updated)
 
     cfg['scenes'] = new_scenes
     if boundaries is not None:
@@ -402,14 +409,32 @@ def _write_narration_scenes(narration_path, scenes, cover_duration):
     config 不内嵌 scenes，narration.json 保持唯一权威源，避免双源分叉。
     update_config 产出的是 cover 相对时间，这里统一平移回绝对时间，
     与 HTML S-block / visual_boundary_check.py 的时间坐标系一致。
+
+    按 scene_id 就地合并，不整表替换（A05，2026-09-18 审核）：入参 scenes 来自
+    resolve_narration_scenes，它已滤掉 cover 场景；旧实现 data['scenes'] = 新表
+    等于每次写回顺手删除 cover，并把入参未携带的字段一并丢掉。合并保留原顺序与
+    未被本轮触及的场景；入参里有而文件里没有的场景仍追加（不静默丢）。
     """
     with open(narration_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    data['scenes'] = [dict(s, start=round(float(s['start']) + cover_duration, 1),
-                           end=round(float(s['end']) + cover_duration, 1))
-                      for s in scenes]
-    with open(narration_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    shifted = {}
+    for s in scenes:
+        m = dict(s)
+        m['start'] = round(float(s['start']) + cover_duration, 1)
+        m['end'] = round(float(s['end']) + cover_duration, 1)
+        if 'duration' in m:
+            m['duration'] = round(m['end'] - m['start'], 1)
+        shifted[str(s.get('scene_id'))] = m
+    existing = data.get('scenes') or []
+    seen = set()
+    merged = []
+    for s in existing:
+        sid = str(s.get('scene_id'))
+        seen.add(sid)
+        merged.append(shifted.get(sid, s))
+    merged.extend(m for sid, m in shifted.items() if sid not in seen)
+    data['scenes'] = merged
+    atomic_write_json(narration_path, data)
     print(f"  Updated narration_source: {narration_path}")
 
 
@@ -640,8 +665,7 @@ def main():
                 cfg = synced
                 if narration_path is not None:
                     _write_narration_scenes(narration_path, cfg.pop('scenes'), cover_duration)
-                with open(config_path, 'w', encoding='utf-8') as f:
-                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                atomic_write_json(config_path, cfg)
                 # Current state IS the baseline (nothing was applied on top),
                 # so refresh backup + hash to keep restore idempotent.
                 shutil.copy2(config_path, config_bak)
@@ -688,8 +712,7 @@ def main():
                         boundaries=boundaries if (s_map or narration_path is not None) else None)
     if narration_path is not None:
         _write_narration_scenes(narration_path, cfg.pop('scenes'), cover_duration)
-    with open(config_path, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    atomic_write_json(config_path, cfg)
     _write_hash(config_hash_path, config_path.read_text(encoding='utf-8'))
     print(f"  Updated config: {config_path}")
     print(f"  New video_duration: {cfg['video_duration']:.1f}s")
