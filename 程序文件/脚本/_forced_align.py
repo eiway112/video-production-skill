@@ -15,6 +15,9 @@
     未匹配区间线性插值，误差仍被锚点封在亚秒级。
   - match_ratio < MIN_MATCH_RATIO 视为对齐不可靠 → 返回 None，
     调用方回落到 silencedetect gap 对齐 / 字符比例估算（保底链不变）。
+  - match_ratio 是全局聚合量，抓不住局部灾难：ASR 整段漏识别首句时，
+    其余区间仍可把匹配率抬过线，而首句时间戳全由插值造出。故另设分段面
+    守卫——首句零匹配字符、任意句子时长塌缩（<10ms）均判不可靠 → None。
   - 模型加载一次复用（module-level cache）；HF_HUB_OFFLINE=1 强制离线，
     模型缓存缺失时优雅降级而不是卡在网络下载。
 
@@ -40,6 +43,8 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODEL_SIZE = "small"          # 已验证本地缓存存在；中文句界对齐精度足够
 MIN_MATCH_RATIO = 0.5         # 识别字符与原文匹配率低于此值 → 对齐不可信
 _MODEL = None                 # 进程级模型缓存
+# WhisperModel(“small”) 实际解析到的 HF 仓库；缓存目录名由它派生，不另写一份
+MODEL_REPO_ID = f"Systran/faster-whisper-{MODEL_SIZE}"
 
 
 def load_align_model():
@@ -54,6 +59,36 @@ def load_align_model():
     except Exception as e:
         print(f"  [WARN] forced-align model unavailable ({e}) — fallback to gap detection")
         return None
+
+
+def align_model_cache_root():
+    """HF hub 缓存根目录（与 huggingface_hub 的环境变量优先级同序，不引新依赖）。"""
+    env = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.environ.get("HF_HUB_CACHE")
+    if env:
+        return Path(env)
+    hf_home = os.environ.get("HF_HOME")
+    base = Path(hf_home) if hf_home else Path.home() / ".cache" / "huggingface"
+    return Path(base) / "hub"
+
+
+def align_model_cache_ready():
+    """离线可加载性探测：HF_HUB_OFFLINE=1 下只认本地快照。返回 (就位?, 说明)。
+
+    判据取 snapshots/*/model.bin 非空——权重缺位时 WhisperModel 抛
+    "Cannot find an appropriate cached snapshot folder"，调用方
+    （_build_timeline_manifest）会把**整项目**字幕时间戳落到 punct-gap 一级
+    降级（合法但非主路径）。2026-09-18 那次交付即此形态，且当轮终检零告警，
+    故把"缓存是否就位"提前到渲染前数十分钟暴露（preflight 只告警不阻断）。
+    """
+    root = align_model_cache_root()
+    repo_dir = root / f"models--{MODEL_REPO_ID.replace('/', '--')}"
+    if not repo_dir.exists():
+        return False, f"{repo_dir} 不存在"
+    weights = [p for p in sorted(repo_dir.glob("snapshots/*/model.bin"))
+               if p.stat().st_size > 0]
+    if not weights:
+        return False, f"{repo_dir} 下无有效 model.bin 快照（HF_HUB_OFFLINE=1 不可加载）"
+    return True, str(weights[0])
 
 
 # 归一化：对齐只看"发音承载字符"（汉字/字母/数字），标点与空白剔除
@@ -111,13 +146,15 @@ def _align_char_times(ref_norm, hyp_stream):
     """SequenceMatcher 对齐 → 每个 ref 归一化字符的 (start, end)。
 
     未匹配 ref 字符（ASR 误读/数字改写区间）在相邻匹配锚点之间线性插值。
-    返回 (starts, ends, match_ratio)；无任何匹配时返回 (None, None, 0.0)。
+    返回 (starts, ends, match_ratio, matched_flags)；无任何匹配时
+    matched_flags 为 None。
     """
     hyp_norm = ''.join(c for c, _, _ in hyp_stream)
     sm = SequenceMatcher(None, ref_norm, hyp_norm, autojunk=False)
     n_ref = len(ref_norm)
     starts = [None] * n_ref
     ends = [None] * n_ref
+    matched_flags = [False] * n_ref
     matched = 0
     for block in sm.get_matching_blocks():
         for k in range(block.size):
@@ -125,9 +162,10 @@ def _align_char_times(ref_norm, hyp_stream):
             hi = block.b + k
             starts[ri] = hyp_stream[hi][1]
             ends[ri] = hyp_stream[hi][2]
+            matched_flags[ri] = True
         matched += block.size
     if matched == 0:
-        return None, None, 0.0
+        return None, None, 0.0, None
 
     # 未匹配区间：在左右锚点之间按字符数线性插值
     i = 0
@@ -153,7 +191,7 @@ def _align_char_times(ref_norm, hyp_stream):
             starts[k] = starts[k - 1]
         if ends[k] < starts[k]:
             ends[k] = starts[k]
-    return starts, ends, matched / n_ref
+    return starts, ends, matched / n_ref, matched_flags
 
 
 def align_scene(wav_path, text, segments, model=None):
@@ -169,7 +207,8 @@ def align_scene(wav_path, text, segments, model=None):
     Returns:
         {"sentences": [{"text", "rel_start", "rel_end"}, ...],
          "match_ratio": float, "method": "asr_forced"}
-        或 None（模型不可用 / 匹配率过低 → 调用方降级）
+        或 None（模型不可用 / 匹配率过低 / 首句零匹配 / 存在塌缩零长句
+        → 调用方降级）
     """
     if model is None:
         model = load_align_model()
@@ -193,13 +232,14 @@ def align_scene(wav_path, text, segments, model=None):
     if not hyp_stream:
         return None
 
-    starts, ends, ratio = _align_char_times(ref_norm, hyp_stream)
+    starts, ends, ratio, matched_flags = _align_char_times(ref_norm, hyp_stream)
     if starts is None or ratio < MIN_MATCH_RATIO:
         print(f"  [WARN] forced-align match ratio {ratio:.2f} < {MIN_MATCH_RATIO} "
               f"({Path(wav_path).name}) — unreliable, fallback")
         return None
 
     sentences = []
+    seg_matched_counts = []
     norm_cursor = 0
     for seg, seg_norm in zip(segments, seg_norms):
         n = len(seg_norm)
@@ -207,9 +247,11 @@ def align_scene(wav_path, text, segments, model=None):
             # 纯标点/空白分段（理论不出现）：沿用上一段结束时刻
             prev_end = sentences[-1]["rel_end"] if sentences else 0.0
             sentences.append({"text": seg, "rel_start": prev_end, "rel_end": prev_end})
+            seg_matched_counts.append(0)
             continue
         rel_start = starts[norm_cursor]
         rel_end = ends[norm_cursor + n - 1]
+        seg_matched_counts.append(sum(matched_flags[norm_cursor:norm_cursor + n]))
         norm_cursor += n
         sentences.append({
             "text": seg,
@@ -217,12 +259,31 @@ def align_scene(wav_path, text, segments, model=None):
             "rel_end": round(max(rel_end, rel_start), 3),
         })
 
-    # 分段间单调性校验
+    # 可靠性守卫（2026-09-19 修订01 复盘）：match_ratio 是全局聚合量，
+    # ASR 整段漏识别局部灾难时仍可过线，须按分段面裁定。
+
+    # 前缀整段未匹配：第一句发音字符零匹配 → ASR 把开头整段吞了
+    # （场景 4 实证：转写从 5.94s 才起口，首句词流缺失），其时间戳全部
+    # 由"0 → 首个锚点"线性插值造出，字幕窗口与语音起口无关。
+    if seg_norms and seg_norms[0] and seg_matched_counts and seg_matched_counts[0] == 0:
+        print(f"  [WARN] forced-align first segment has zero matched chars "
+              f"({Path(wav_path).name}) — ASR dropped prefix, unreliable, fallback")
+        return None
+
+    # 分段间单调性 + 逐句时长校验（2026-09-19 修订01 复盘补强）
     for k in range(1, len(sentences)):
         if sentences[k]["rel_start"] < sentences[k - 1]["rel_end"] - 0.5:
             # 时间大幅倒退 → 对齐内部矛盾，判为不可靠
             print(f"  [WARN] forced-align non-monotonic segment times "
                   f"({Path(wav_path).name}) — unreliable, fallback")
+            return None
+    for s in sentences:
+        # 塌缩零长句：正常语音任意字符 ≥50ms，中文字幕分段最短亦 >0.3s，
+        # 亚 10ms 只可能是"两端都插值到同一个锚点"的失败信号，不可能是合法边界。
+        if s["rel_end"] - s["rel_start"] < 0.01:
+            print(f"  [WARN] forced-align zero-length sentence "
+                  f"({Path(wav_path).name}) @ {s['rel_start']:.2f}s — "
+                  f"unreliable, fallback")
             return None
 
     return {"sentences": sentences, "match_ratio": round(ratio, 3), "method": "asr_forced"}

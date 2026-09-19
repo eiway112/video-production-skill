@@ -49,7 +49,9 @@
     "min_onsets": 5,
     "silence_db": -38,
     "min_silence_seconds": 0.5,
+    "min_asr_forced_ratio": 0.8,
     "fail_on_violation": true,
-    "description": "字幕-语音对齐度门禁（media_qa_gate subtitle_audio_alignment）：silencedetect 提取成片音轨语音起口，与最近字幕条目起点比对，偏差 p95 超过 p95_max_seconds 则拒收。起口数 < min_onsets（如含 BGM 无静音段）降级为警告。"
+    "description": "字幕-语音对齐度门禁（media_qa_gate subtitle_audio_alignment）：silencedetect 提取成片音轨语音起口，与最近字幕条目起点比对，偏差 p95 超过 p95_max_seconds 则拒收。起口数 < min_onsets（如含 BGM 无静音段）降级为警告。",
+    "$min_asr_forced_ratio": "主路径命中率门禁（media_qa_gate subtitle_timestamp_source，2026-09-19 普查裁定，方案 A）：asr_forced 场景数 / 有字幕场景总数 低于本值 → 判 UNTESTED（不是 FAIL——punct-gap 是设计内一级链路，成片并非不合格），默认阻断、--accept-media-untested 放行并留痕。取数面＝step5 逐场实际消费链（temp/_subtitle_timestamp_source.json），非 manifest 声明面。定值依据（7 份已交付成片实测分布，逐条终态表以 AI视频制作工作流模板/操作日志.md 的 [2026-09-19] docs 普查条目为唯一权威源，本字段不重抄派生副本）：5 份全场景 asr_forced（场景数 7-11 不等）、_修订01 9/10（1 场由对齐守卫按设计主动降级）、09-18 原版 0/10（HF 模型缓存未就位 → 整项目一级降级）。0.8 容忍个别场景守卫降级、拦住环境级失效；粒度随场景数变粗（3 场项目 1 场降级＝0.667 即触发），触发后可知情放行。"
   }
 }

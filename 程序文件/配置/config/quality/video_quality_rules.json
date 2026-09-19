@@ -1,6 +1,8 @@
 {
   "$schema": "Video output quality rules for enhance_video_audio + media_qa_gate",
-  "$description": "视频产物码率门禁（单一权威源，双档制）。ffprobe 实测视频流码率 < min_video_bitrate_kbps_fail → 判定渲染失败/内容缺失（视频疑似空白，HTML 场景未渲染），enhance_video_audio.step7 与 media_qa_gate 交付前终检均阻断；介于 fail~warn 之间 → 低码率预警不阻断（合法纯文字动画实测 239-343kbps：2026-07 短动画片 336-343kbps，2026-08 wp 批次 4 集长片 239-270kbps，可能视觉内容不足，需人工复核画面）。阈值只在此声明一处，两侧脚本读不到时回退 fail=200/warn=500 并打印告警；旧单档键 min_video_bitrate_kbps 仍兼容（按单档阻断并提示升级）。",
+  "$description": "视频产物码率门禁（单一权威源，双档制）。ffprobe 实测视频流码率 < min_video_bitrate_kbps_fail → 判定渲染失败/内容缺失（视频疑似空白，HTML 场景未渲染），enhance_video_audio.step7 与 media_qa_gate 交付前终检均阻断；介于 fail~warn 之间 → 低码率预警不阻断（合法纯文字动画实测 239-343kbps：2026-07 短动画片 336-343kbps，2026-08 wp 批次 4 集长片 239-270kbps，可能视觉内容不足，需人工复核画面）。阈值只在此声明一处，两侧脚本读不到时回退 fail=200/warn=500 并打印告警；旧单档键 min_video_bitrate_kbps 仍兼容（按单档阻断并提示升级）。本文件另声明 RMS 音量一致性检查的停顿分界，见 $rms_window_silence_floor_db_note。",
   "min_video_bitrate_kbps_fail": 200,
-  "min_video_bitrate_kbps_warn": 500
+  "min_video_bitrate_kbps_warn": 500,
+  "rms_window_silence_floor_db": -60,
+  "$rms_window_silence_floor_db_note": "enhance_video_audio._check_video_quality 多点 RMS 采样中，2s 窗口的聚合 RMS 低于此分界即视为整窗落在句间停顿/静音段，不进入音量一致性比较样本（仅 RMS 数值口径，与 audio_sync_rules.alignment.silence_db 的 silencedetect 采样级噪声门是两种量，不得互相替代）。分界实测依据 2026-09-19：语音窗口 -17~-27dB，整窗落在 2.1s 停顿 -67.3dB，数字静音 -inf。读不到本键时脚本回退 -60dB。"
 }

@@ -519,6 +519,14 @@ def generate_report(
                             "not_applicable": len(v.get("not_applicable") or [])}
                         for k, v in verifications.items()
                     }
+                    # 字幕时间戳来源分布透传到报告：交付说明 md 的实测值以本报告为
+                    # 抄写面（temp 下的终检 JSON 不入 git，2026-09-19 普查裁定）。
+                    for vres in verifications.values():
+                        _src = (vres.get("media_facts") or {}).get(
+                            "subtitle_timestamp_source")
+                        if _src:
+                            report["data_sources"]["subtitle_timestamp_source"] = _src
+                            break
                     for vkey, vres in verifications.items():
                         v_passed = bool(vres.get("passed", False))
                         report["validation"][f"verification_{vkey}_passed"] = v_passed

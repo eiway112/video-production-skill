@@ -2097,6 +2097,22 @@ class PipelineRunner:
         self.state.mark_failed("postprocess", msg, error_code=VERIFY_FAILED)
         return False
 
+    def _subtitle_source_note_line(self):
+        """终检实测的字幕时间戳来源分布 → 交付说明可直接引用的一行（无记录返回 None）。
+
+        为什么由这里喊：过程产物/ 整目录不入 git，temp 下的终检结果与 postprocess
+        日志都不是版本化交付面；占比若只留日志行，交付后仍要人去翻日志才能回答
+        "这一版字幕走的是主路径还是降级链"（2026-09-19 普查的取证成本即此）。
+        文案生成点在 media_qa_gate.format_subtitle_source_line，与终检报告行同源。
+        """
+        facts = ((self.state.data.get("verifications", {})
+                  .get("media_qa_final") or {})
+                 .get("media_facts") or {}).get("subtitle_timestamp_source")
+        if not facts:
+            return None
+        from media_qa_gate import format_subtitle_source_line
+        return format_subtitle_source_line(facts)
+
     def step_postprocess(self):
         if self._can_skip("postprocess"):
             return True
@@ -2160,7 +2176,8 @@ class PipelineRunner:
                 str(video_path),
                 str(srt_path) if self.tts_enabled else None,
                 visual_check_passed=visual,
-                config_path=str(self.config_path))
+                config_path=str(self.config_path),
+                subtitle_source_path=str(self.temp_dir / "_subtitle_timestamp_source.json"))
         except Exception as e:
             self._fail("postprocess", f"Final media QA errored: {e}", VERIFY_FAILED)
             return False
@@ -2435,6 +2452,9 @@ class PipelineRunner:
             print("REMINDER: Create delivery notes")
             print(f"  Template: AI视频制作工作流模板/templates_07_交付说明模板.md")
             print(f"  Output:   成果文件/交付说明_{video_name}.md")
+            src_line = self._subtitle_source_note_line()
+            if src_line:
+                print(f"  必填「字幕时间戳来源」一节（终检实测，直接粘贴）: {src_line}")
             print("-" * 60)
 
 

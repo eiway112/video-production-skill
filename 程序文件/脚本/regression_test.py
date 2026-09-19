@@ -4874,11 +4874,23 @@ def test_media_qa_gate_four_state_report() -> RegressionTestCase:
                 _patch("ffmpeg_detect_black_intervals", lambda *a, **k: scan["black"])
                 _patch("ffmpeg_detect_long_silences", lambda *a, **k: scan["long_silences"])
 
-                def run_qa(subtitle=str(srt), visual=True, config=str(cfg)):
+                # step5 逐场时间戳来源记录夹具（subtitle_timestamp_source 的取数面）。
+                # 条目数取自被测字幕的真实解析结果，不手抄（A12）。
+                src_rec = tmp / "_subtitle_timestamp_source.json"
+                src_rec.write_text(json.dumps({
+                    'subtitle_file': srt.name,
+                    'srt_entries': len(mq.parse_srt(str(srt))),
+                    'scenes': [{'scene_id': 's1', 'source': 'asr_forced', 'segments': 1},
+                               {'scene_id': 's2', 'source': 'asr_forced', 'segments': 1}],
+                }, ensure_ascii=False), encoding='utf-8')
+
+                def run_qa(subtitle=str(srt), visual=True, config=str(cfg),
+                           source=str(src_rec)):
                     qa = mq.MediaQAGate()
                     return qa.validate(str(video), subtitle,
                                        visual_check_passed=visual,
-                                       config_path=config)
+                                       config_path=config,
+                                       subtitle_source_path=source)
 
                 # ── A. 全清洁测量 → PASS，每项都有状态位 ──
                 passed_a, res_a = run_qa()
@@ -4896,6 +4908,9 @@ def test_media_qa_gate_four_state_report() -> RegressionTestCase:
                                 "adjudicate releases a clean PASS with empty reason")
                 tc.assert_equal(res_a['check_statuses']['subtitle_audio_alignment'],
                                 gs.PASS, "alignment measured PASS for in-window onsets")
+                tc.assert_equal(res_a['check_statuses']['subtitle_timestamp_source'],
+                                gs.PASS,
+                                "a matching all-asr_forced source record does not false-block")
                 tc.assert_true('measure_semantics' in res_a['alignment']
                                and 'NOT per-sentence' in res_a['alignment']['measure_semantics'],
                                "the p95 semantics boundary rides on the machine-readable "
@@ -4970,13 +4985,15 @@ def test_media_qa_gate_four_state_report() -> RegressionTestCase:
                                 "an unrun bitrate gate demotes the verdict")
                 _patch("ffprobe_get_streams", lambda p: streams())
 
-                # ── G. 字幕声明豁免（纯 BGM 项目）→ 字幕组 8 项 NOT_APPLICABLE ──
+                # ── G. 字幕声明豁免（纯 BGM 项目）→ 字幕组整组 NOT_APPLICABLE ──
                 _, res_g = run_qa(subtitle=None)
-                tc.assert_equal(res_g['status_counts'][gs.NOT_APPLICABLE], 8,
+                tc.assert_equal(res_g['status_counts'][gs.NOT_APPLICABLE],
+                                len(mq.SUBTITLE_CHECK_KEYS),
                                 "the whole subtitle check-group is NA under declared exemption")
                 tc.assert_equal(res_g['verdict'], gs.PASS,
                                 "declared exemption does not block the rest")
-                tc.assert_equal(res_g['passed_checks'], 11,
+                tc.assert_equal(res_g['passed_checks'],
+                                res_g['total_checks'] - res_g['status_counts'][gs.NOT_APPLICABLE],
                                 "NA checks are not counted as passed")
 
                 # ── H. quick-fix 声明性跳视觉检查 → NA 而非 PASS/FAIL ──
@@ -5047,10 +5064,12 @@ def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
 
         class FakeQA:
             def validate(self, video, subtitle=None, visual_check_passed=False,
-                         config_path=None, narration_path=None):
+                         config_path=None, narration_path=None,
+                         subtitle_source_path=None):
                 calls.append({"video": video, "subtitle": subtitle,
                               "visual": visual_check_passed,
-                              "config": config_path})
+                              "config": config_path,
+                              "subtitle_source": subtitle_source_path})
                 if holder["raise"]:
                     raise RuntimeError(holder["raise"])
                 r = holder["result"]
@@ -5151,6 +5170,10 @@ def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
                                 "visual PASS is forwarded from upstream state")
                 tc.assert_true(calls[-1]["subtitle"].endswith("case53.srt"),
                                "tts-enabled projects pass the delivery subtitle")
+                tc.assert_true(
+                    calls[-1]["subtitle_source"] ==
+                    str(temp_dir / "_subtitle_timestamp_source.json"),
+                    "step5 的逐场时间戳来源记录是终检的唯一取数面，接线不得断")
                 tc.assert_true((temp_dir / "media_qa_final_result.json").exists(),
                                "the four-state report is persisted as a file fact")
 
@@ -5904,7 +5927,11 @@ def test_check_registry_names_are_single_source() -> RegressionTestCase:
                        "code comments address checks by name, not by a hand-maintained number")
         tc.assert_true(not re.search(r'（\d+项）', doc),
                        "the module docstring carries no item count")
-        agents_md = (script_dir / ".." / ".." / "AGENTS.md").resolve().read_text(encoding='utf-8')
+        # 文件名按大小写不敏感定位：仓内实际是 agents.md，Linux CI 上写死 "AGENTS.md"
+        # 会 FileNotFoundError 把本用例判成红（Windows 大小写不敏感掩盖了这点）
+        _root = (script_dir / ".." / "..").resolve()
+        agents_md = next(p for p in _root.iterdir()
+                         if p.name.lower() == "agents.md").read_text(encoding='utf-8')
         tc.assert_true(not re.search(r'媒体文件\d+项', agents_md),
                        "AGENTS.md must not hand-copy the media_qa check count")
         tc.assert_true(not re.search(r'\d+ ?项检查全部', agents_md),
@@ -5999,6 +6026,698 @@ def test_check_registry_names_are_single_source() -> RegressionTestCase:
 
 
 # ============================================================================
+# 2026-09-19 审核 A07 后续：Audio RMS 采样口径（窗口聚合量 + 停顿/无样本分桶）
+# ============================================================================
+
+def test_audio_rms_window_aggregate_measure() -> RegressionTestCase:
+    """用例58：Audio RMS 一致性改取窗口聚合量，句间停顿不得冒充"检查未跑"或"音量异常"
+
+    背景：_check_video_quality 的多点电平检查曾用 `astats=metadata=1:reset=1` 后取
+    rms_matches[-1]。reset=1 使统计块按音频帧重置，打印的是该时段**最后一帧（≈14ms）**
+    的统计；帧落在句间静音时 RMS=-inf，_RMS_LEVEL_RE 要求数字 → 该窗口零贡献。成片
+    句间静音常达 2s，与 2s 采样窗等长，33.1s 已交付成片实测 4/4 窗口全落 → 整项恒
+    0/4 UNTESTED（批次5-④ 实证）。旧文案把归因写成"检查 FFmpeg astats 输出拼写是否
+    再次变化"，而两种拼写早已由同一条正则覆盖并被用例48 锁定——归因指向错误方向。
+    修后：①取不带 reset 的窗口聚合 RMS（与 volumedetect mean_volume 实测逐点吻合）；
+    ②"落在停顿/静音段"（-inf 或低于 video_quality_rules.rms_window_silence_floor_db）
+    与"FFmpeg 未输出任何 RMS 行"（无音频样本/解码失败）分成两桶各自点名；
+    ③停顿窗口不进入 dB 极差，否则会把 2s 停顿判成"音量严重不一致"（医疗养老成片
+    26.7s 窗口实测 -67.3dB，按聚合量直算极差 47.5dB 即此形态）。
+    """
+    tc = RegressionTestCase(
+        "audio_rms_window_aggregate_measure",
+        "验证 RMS 取窗口聚合量、停顿与无样本分桶、归因文案指向真实失效模式"
+    )
+    try:
+        import io as _io
+        import contextlib
+        import subprocess
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        # 生产正则把 "RMS level dB: <值>" 全部吃下，故按真实块序拼 stderr：
+        # 分声道块在前、Overall 块在最后（本机 FFmpeg 实测顺序）。
+        def _astats_stderr(overall, channels=None):
+            chans = [overall] if channels is None else list(channels)
+            lines = [f"[Parsed_astats_0 @ 0x1] RMS level dB: {c:.6f}" for c in chans]
+            lines.append("[Parsed_astats_0 @ 0x1] Overall")
+            lines.append(f"[Parsed_astats_0 @ 0x1] RMS level dB: {overall:.6f}")
+            return "\n".join(lines)
+
+        class _Out:
+            def __init__(self, stdout="", stderr=""):
+                self.stdout, self.stderr = stdout, stderr
+
+        probe_payload = json.dumps({"streams": [
+            {"codec_type": "video", "bit_rate": "5000000", "duration": "20.0"},
+            {"codec_type": "audio", "duration": "20.0"}]})
+
+        # ── A. 真实 FFmpeg 夹具：20s 音频，每个 2s 采样窗（3/8/13/18 起）末尾落在静音，
+        #      第 4 窗整窗静音 ──
+        ffmpeg_exe = shutil.which("ffmpeg")
+        tc.assert_true(bool(ffmpeg_exe), "ffmpeg available for the real-output checks")
+        if ffmpeg_exe:
+            with tempfile.TemporaryDirectory() as td:
+                wav = Path(td) / "pause_aligned.wav"
+                subprocess.run(
+                    [ffmpeg_exe, "-y", "-loglevel", "error",
+                     "-f", "lavfi", "-i", "sine=duration=4.9:sample_rate=44100",
+                     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=0.15",
+                     "-f", "lavfi", "-i", "sine=duration=4.85:sample_rate=44100",
+                     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=0.15",
+                     "-f", "lavfi", "-i", "sine=duration=4.85:sample_rate=44100",
+                     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=0.15",
+                     "-f", "lavfi", "-i", "sine=duration=0.9:sample_rate=44100",
+                     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=4.05",
+                     "-filter_complex", "concat=n=8:v=0:a=1", str(wav)],
+                    capture_output=True)
+                tc.assert_true(wav.exists(), "fixture built by lavfi concat")
+
+                # A-负向对照：旧口径在同一夹具上逐窗取末帧统计 → 4/4 空，复现"恒未测"。
+                # 没有这条对照，A-正 可能只是"随便测到了值"（空跑）。
+                old_windows = []
+                for t in (3.0, 8.0, 13.0, 18.0):
+                    probe = subprocess.run(
+                        [ffmpeg_exe, "-ss", f"{t:.1f}", "-t", "2", "-i", str(wav),
+                         "-af", "astats=metadata=1:reset=1", "-f", "null", "-"],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace')
+                    old_windows.append(eva._RMS_LEVEL_RE.findall(probe.stderr))
+                tc.assert_equal([len(m) for m in old_windows], [0, 0, 0, 0],
+                                "the fixture reproduces the old last-frame failure mode (0/4)")
+
+                # A-正：新口径同一夹具拿到 3 个语音 dB 值，第 4 窗归入静音桶而非"取不到"
+                vals, silent, unreadable = eva._sample_windows_rms(
+                    str(wav), [3.0, 8.0, 13.0, 18.0], -60.0)
+                tc.assert_equal(len(vals), 3,
+                                "aggregate RMS yields one value per voiced window")
+                tc.assert_equal((silent, unreadable), (1, 0),
+                                "a fully-silent window is bucketed as pause/silence, not as unmeasurable")
+                tc.assert_true(vals and max(vals) - min(vals) < 2.0,
+                               f"identical tone across windows must not read as level inconsistency (got {vals})")
+
+                # B. 采样口径锁：生产命令不得带 reset/metadata（退回末帧口径即红）
+                calls = []
+
+                def _spy(argv, *a, **k):
+                    calls.append(list(argv))
+                    return _Out(stderr=_astats_stderr(-22.5))
+
+                saved_run = eva.subprocess.run
+                try:
+                    eva.subprocess.run = _spy
+                    eva._sample_windows_rms("fake.wav", [1.0, 2.0], -60.0)
+                finally:
+                    eva.subprocess.run = saved_run
+                tc.assert_equal(len(calls), 2, "one ffmpeg pass per sample window")
+                af_args = [c[c.index("-af") + 1] for c in calls if "-af" in c]
+                tc.assert_equal(af_args, ["astats", "astats"],
+                                "RMS sampling uses the aggregate astats form (no reset=1)")
+
+        # 只把 stderr 喂给 RMS 采样调用（-af astats），其余 ffmpeg 调用（空帧抽帧等）
+        # 返回空输出——否则帧采样会消耗掉序列条目，RMS 侧读到的是错位的窗口。
+        def _make_run(stderrs):
+            state = {"i": 0}
+
+            def _run(argv, *a, **k):
+                if argv[0] == "ffprobe":
+                    return _Out(stdout=probe_payload)
+                if "astats" not in argv:
+                    return _Out(stderr="")
+                s = stderrs[min(state["i"], len(stderrs) - 1)]
+                state["i"] += 1
+                return _Out(stderr=s)
+            return _run
+
+        # ── C. 取的是 Overall 块，不是第一个声道块（[-1] 而非 [0]）──
+        # 声道块 -70dB（低于分界）/ Overall -15 与 -50：误取声道块 → 两窗都归静音 →
+        # 整项 UNTESTED；正确取 Overall → 极差 35dB → 报"严重不一致"。
+        stderr_seq = [_astats_stderr(-15.0, channels=(-70.0,)),
+                      _astats_stderr(-50.0, channels=(-70.0,)),
+                      _astats_stderr(-50.0, channels=(-70.0,)),
+                      _astats_stderr(-15.0, channels=(-70.0,))]
+
+        saved_run = eva.subprocess.run
+        try:
+            eva.subprocess.run = _make_run(stderr_seq)
+            with contextlib.redirect_stdout(_io.StringIO()):
+                errs_c, _, untested_c, _ = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+        tc.assert_true(any("Audio level severely inconsistent" in e and "-15.0dB" in e
+                           and "-50.0dB" in e for e in errs_c),
+                       "the per-window value is the Overall block, not the first channel block")
+        tc.assert_true(not any("Audio RMS consistency" in u for u in untested_c),
+                       "an adjudicated RMS check must not also be reported as untested")
+
+        # ── D. 停顿桶 / 无样本桶分别点名，且不再指向"输出拼写"──
+        voiced = _astats_stderr(-21.0)
+        inf_stderr = _astats_stderr(float("-inf"))
+        sub_floor_stderr = _astats_stderr(-67.3)
+        no_rms_stderr = "size=N/A time=00:00:02.00 bitrate=N/A speed=18x"
+
+        # D-1：1 窗有值 + 3 窗 -inf → UNTESTED，计数写成"3 个落在停顿/静音段"
+        try:
+            eva.subprocess.run = _make_run([voiced, inf_stderr, inf_stderr, inf_stderr])
+            with contextlib.redirect_stdout(_io.StringIO()):
+                _, _, untested_d1, _ = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+        rms_u1 = [u for u in untested_d1 if "Audio RMS consistency" in u]
+        tc.assert_equal(len(rms_u1), 1, "one usable sample cannot adjudicate → named as untested")
+        tc.assert_true("UNTESTED" in rms_u1[0]
+                       and "1 个取到可比 dB 值" in rms_u1[0]
+                       and "3 个落在停顿/静音段" in rms_u1[0]
+                       and "0 个 FFmpeg 未输出任何 RMS 行" in rms_u1[0],
+                       f"pause windows counted as pause, not as measurement gap (got: {rms_u1[0]})")
+
+        # D-2：低于分界的数值窗同样归静音桶（-67.3dB 有 RMS 行但不含语音电平）
+        try:
+            eva.subprocess.run = _make_run([voiced, sub_floor_stderr, sub_floor_stderr,
+                                            sub_floor_stderr])
+            with contextlib.redirect_stdout(_io.StringIO()):
+                _, _, untested_d2, _ = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+        tc.assert_true(any("3 个落在停顿/静音段" in u
+                           for u in untested_d2 if "Audio RMS consistency" in u),
+                       "sub-floor aggregate RMS counts as a pause window, not a voiced sample")
+
+        # D-3：完全没有 RMS 行 → 归"无样本/解码失败"桶，且不得再写"拼写是否再次变化"
+        try:
+            eva.subprocess.run = _make_run([no_rms_stderr] * 4)
+            with contextlib.redirect_stdout(_io.StringIO()):
+                _, _, untested_d3, _ = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+        rms_u3 = [u for u in untested_d3 if "Audio RMS consistency" in u]
+        tc.assert_true(any("4 个 FFmpeg 未输出任何 RMS 行" in u and "拼写漂移" in u
+                           and "是否再次变化" not in u for u in rms_u3),
+                       "the untested note points at no-audio-sample/decode failure, "
+                       "not at the (already-locked) astats spelling")
+
+        # ── E. 停顿分界来自 video_quality_rules.json，不是调用点硬编码 ──
+        declared_floor = eva._load_video_quality_rules().get("rms_window_silence_floor_db")
+        tc.assert_true(isinstance(declared_floor, (int, float)),
+                       "the silence floor is declared in the authoritative rules file")
+        all_sub = [sub_floor_stderr] * 4
+        saved_loader = eva._load_video_quality_rules
+        try:
+            # 分界降到 -70dB 后，同样四个 -67.3dB 窗口即为可比样本 → 整项裁定、无未测
+            eva._load_video_quality_rules = lambda *a, **k: {
+                "min_video_bitrate_kbps_fail": 200, "min_video_bitrate_kbps_warn": 500,
+                "rms_window_silence_floor_db": -70}
+            eva.subprocess.run = _make_run(all_sub)
+            with contextlib.redirect_stdout(_io.StringIO()):
+                _, _, untested_e, na_e = eva._check_video_quality("fake.mp4")
+        finally:
+            eva.subprocess.run = saved_run
+            eva._load_video_quality_rules = saved_loader
+        tc.assert_true(not any("Audio RMS consistency" in u for u in untested_e)
+                       and not any("Audio RMS consistency" in x for x in na_e),
+                       "raising the floor to -70dB makes -67.3dB windows comparable "
+                       "(the config value, not a hardcoded literal, drives the bucketing)")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+# ============================================================================
+# 2026-09-19 修订01：ASR 强制对齐的分段面守卫（首句零匹配 / 塌缩零长句）
+# ============================================================================
+
+def test_forced_align_segment_face_guards() -> RegressionTestCase:
+    """用例59：match_ratio 是全局聚合量，守卫必须落在分段面
+
+    背景（agent-wiki-promo-v2 _修订01 实证）：场景 4 TTS 音频正常（首句
+    mean -26.1dB、静音分布正常），但 whisper 把第一句整段漏识别（转写从
+    5.94s 才起口）→ 首句锚定失败、时间戳全由"0→首个锚点"线性插值造出，
+    塌缩为零长句（rel_start==rel_end==5.54）；match_ratio 0.516 勉强过
+    0.5 线，既有单调性守卫（只抓倒退 >0.5s）抓不住零长句 → 垃圾时间戳
+    直通 SRT，终检 subtitle_audio_alignment p95=3.575s FAIL（2 个语音
+    起口落在字幕窗口外，dev 4.52/3.57s）。独立复跑逐位一致（确定性）。
+    修后：align_scene 在 ratio 线之外加两道分段面守卫——①首句发音字符
+    零匹配（ASR 吞前缀）→ None；②任意句子时长 <10ms（锚定区间塌缩）
+    → None。任一命中即落调用方既有 punct-gap 降级链。ALIGN_ALGO_VERSION
+    v1→v2 bump 使存量 v1 的 asr_forced 缓存记录全部重对齐（复用失效由
+    用例55 D 段按行为锁定，此处不注数字防漂移）。
+    """
+    tc = RegressionTestCase(
+        "forced_align_segment_face_guards",
+        "ASR 漏转写首句/锚定塌缩时 align_scene 必须判不可靠并降级，正常词流不得误杀"
+    )
+
+    try:
+        import sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _forced_align as fa
+
+        def _run_with_words(words, segments):
+            saved = fa._transcribe_words
+            fa._transcribe_words = lambda wav, model, initial_prompt=None: list(words)
+            try:
+                return fa.align_scene("fake_scene.wav", "".join(segments),
+                                      segments, model=object())
+            finally:
+                fa._transcribe_words = saved
+
+        def _words(text, t0, step=0.09):
+            """把字符流摊成词：从 t0 起，每字 step 秒（步长留隙避免伪塌缩）。"""
+            return [(ch, t0 + step * i, t0 + step * i + step * 0.9)
+                    for i, ch in enumerate(text)]
+
+        # ── A. 负向对照（修复前即从此处漏网）：ASR 吞掉第一句 ──
+        # 原文两句各 7 发音字符，转写词流只含第二句且从 6.0s 起口 →
+        # 首句零匹配、时间戳全由"0→首个锚点"插值造出并塌缩为零长。
+        # ratio 7/14=0.5 刻意压在 MIN_MATCH_RATIO 线上（判据为严格小于，
+        # 故旧线放行）——摘掉新守卫后此支必须转绿失败（防恒真）。
+        r = _run_with_words(_words('第二句话在这里', 6.0),
+                            ['第一句话在这里。', '第二句话在这里。'])
+        tc.assert_true(r is None,
+                       "ASR dropped the first sentence (first segment has zero "
+                       "matched chars, ratio still at/above MIN_MATCH_RATIO) → "
+                       "align_scene must judge unreliable → None")
+
+        # ── B. 负向对照：ASR 只转写出第一句 → 其后字符全未匹配，右锚缺失使
+        #      插值退化为"左锚→左锚"，末句塌缩为零长。──
+        r = _run_with_words(_words('第一句话在这里', 0.1),
+                            ['第一句话在这里。', '第二句话在。'])
+        tc.assert_true(r is None,
+                       "ASR kept only the first sentence → tail clamps left and the "
+                       "last window collapses to zero length; must be rejected")
+
+        # ── C. 边界记录：中段整句未匹配但被左右锚点包住（时间上有真实间隙）
+        #      → 窗口张开、不塌缩，既有守卫按设计放行。零长守卫只拦"塌缩"
+        #      这一确定失败信号，不对"局部漏识别"一刀切（防过拟合误杀）。──
+        r = _run_with_words(_words('第一句话在这里', 0.1) + _words('第三句话在这里', 5.0),
+                            ['第一句话在这里。', '第二句话在这里。', '第三句话在这里。'])
+        tc.assert_true(r is not None and len(r['sentences']) == 3,
+                       "a sandwiched unmatched sentence widens between real anchors "
+                       "(no collapse) — existing guards intentionally let it through")
+
+        # ── D. 正常完整词流：不得误杀（守卫摘除前后此支都必须 PASS，
+        #      否则 A-C 的拦截可能只是普遍失效的副产品）──
+        r = _run_with_words(
+            [('第', 0.10, 0.30), ('一', 0.30, 0.50), ('句', 0.50, 0.70),
+             ('旁', 0.70, 0.90), ('白', 0.90, 1.10),
+             ('第', 1.60, 1.80), ('二', 1.80, 2.00), ('句', 2.00, 2.20),
+             ('旁', 2.20, 2.40), ('白', 2.40, 2.60)],
+            ['第一句旁白。', '第二句旁白。'])
+        tc.assert_true(r is not None, "healthy word stream must still align")
+        if r is not None:
+            tc.assert_equal(r.get('method'), 'asr_forced',
+                            "healthy path keeps method asr_forced")
+            sents = r['sentences']
+            tc.assert_equal(len(sents), 2, "both sentences emitted")
+            tc.assert_true(sents[0]['rel_start'] < 1.2
+                           and sents[0]['rel_end'] - sents[0]['rel_start'] > 0.5
+                           and sents[1]['rel_start'] > 1.2,
+                           "sentence windows track the real word timings, "
+                           "not interpolation from a blank prefix")
+
+        # ── E. 前缀守卫的独有判据（零长守卫抓不到的形态）：ASR 漏掉首句，
+        #      但在词流最前面吐了一个幻觉字符 → 首句未匹配区间被"幻觉字符
+        #      起点 → 首个真实锚点"这段 5.8s 的空档线性摊开，窗口张开而不塌缩，
+        #      单调性也照样成立。此时只有"首句零匹配字符"这一条能拦。──
+        r = _run_with_words([('嗯', 0.2, 0.5)] + _words('第二句话在这里', 6.0),
+                            ['第一句话在这里。', '第二句话在这里。'])
+        tc.assert_true(r is None,
+                       "ASR dropped the prefix but emitted a leading hallucinated token: "
+                       "the fabricated window widens (no collapse) and monotonicity holds, "
+                       "so only the zero-matched-first-segment guard can catch it")
+
+        # ── E2. 中段塌缩（逐句零长检查的独有判据，循环体不必再依赖"前一条"
+        #      写法）：ASR 漏掉整句"第二句"的"第二"二字，第三句紧贴第一句
+        #      的结束时刻起口 → 中间句首尾字符各自插值到同一个锚点，
+        #      rel_start == rel_end == 0.73。首句有真实匹配（前缀守卫不命中）、
+        #      末句窗口张开（0.73→1.36），只有逐句零长检查能拦这一形态。──
+        r = _run_with_words(
+            _words('第一句话在这里', 0.1)
+            + _words('三句话在这里', 0.1 + 0.09 * 6 + 0.09 * 0.9),   # 紧贴首句末字符的结束时刻
+            ['第一句话在这里。', '第二句话在这里。', '第三句话在这里。'])
+        tc.assert_true(r is None,
+                       "a MIDDLE sentence collapses (head matched, tail widened) — "
+                       "only the per-sentence zero-length check catches this shape")
+
+        # ── F. 纯标点分段（n==0 理论分支）冒烟：首段归一化为空时前缀守卫
+        #      必须跳过（seg_matched_counts[0]==0 恒真会误杀合法对齐）。本支
+        #      仅锁"不抛异常"，落哪条出口不作断言（ratio 线本身也会拒绝）──
+        r = _run_with_words(
+            [('一', 0.1, 0.5)],
+            ['。', '一二三。'])
+        tc.assert_true(r is None or isinstance(r, dict),
+                       "pure-punct first segment must not raise")
+
+        # ── G. _align_char_times 返回 arity 与调用点一致（四元组），
+        #      无匹配时 matched_flags 为 None ──
+        starts, ends, ratio, flags = fa._align_char_times(
+            'abc', [('x', 0.0, 1.0), ('y', 1.0, 2.0)])
+        tc.assert_true(starts is None and ratio == 0.0 and flags is None,
+                       "no-match returns (None, None, 0.0, None)")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+# ============================================================================
+# 2026-09-19 普查裁定（方案 A）：字幕时间戳主路径命中率
+# ============================================================================
+
+def test_subtitle_timestamp_source_hit_rate_gate() -> RegressionTestCase:
+    """用例60：media_qa_gate.subtitle_timestamp_source 主路径命中率裁定
+
+    背景（2026-09-19 7 份已交付成片普查）：subtitle_audio_alignment 量的是"语音起口
+    落在哪条字幕窗口内"，punct-gap 一级降级同样由真实静音驱动，7 份现场重跑一律
+    p95=0.0s（阈值 0.6s）——整项目对齐全降级（09-18 那版交付）在终检报告上与主路径
+    **零区分度**。本项读 step5 逐场实测来源记录（temp/_subtitle_timestamp_source.json），
+    asr_forced 占比低于 audio_sync_rules.json → alignment.min_asr_forced_ratio 即判
+    UNTESTED，**不判 FAIL**（punct-gap 是设计内一级链路，判成缺陷属篡改既有取舍），
+    走四态语义：默认阻断、--accept-media-untested 可知情放行。锁定面：
+      - 负向注入：全 punct-gap 记录 → 本项 UNTESTED 且 subtitle_audio_alignment 同时
+        PASS（"两条链可区分"这一动因本身成为断言）；
+      - 正向对照：全 asr_forced → PASS，不误杀已交付形态；占比恰等于阈值判过；
+      - 阈值真被消费：改配置权威源为 0.5 后 50% 即放行（非代码常量）；
+      - 代次绑定：记录文件名/条目数与被测字幕不符 → UNTESTED，旧记录不得裁定新成片；
+      - 取数面缺失/损坏 → UNTESTED 且报告行印"无从裁定"（不印 0/0 让人读成 0%）；
+      - 纯 BGM 声明豁免 → 整组 NOT_APPLICABLE；
+      - 生成侧 writer 与消费端字段兼容，记录只存逐场归属（单一 Primitive）；
+      - preflight 模型缓存缺位只 warn 不 error（离线走降级合法），tts 禁用不置警。
+    """
+    tc = RegressionTestCase(
+        "subtitle_timestamp_source_hit_rate_gate",
+        "验证主路径命中率裁定：占比不足判未测不判违规、阈值取配置权威源、记录代次绑定"
+    )
+
+    try:
+        import io
+        import contextlib
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate as mq
+        import _gate_status as gs
+        from types import SimpleNamespace
+
+        _saved = {}
+
+        def _patch(name, fn):
+            _saved.setdefault(name, getattr(mq, name))
+            setattr(mq, name, fn)
+
+        def _restore():
+            for k, v in _saved.items():
+                setattr(mq, k, v)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                video = tmp / "案例成片.mp4"
+                video.write_bytes(b"fake-video-bytes")
+                srt = tmp / "案例成片.srt"
+                srt.write_text("1\n00:00:01,000 --> 00:00:04,000\n第一段旁白\n\n"
+                               "2\n00:00:05,000 --> 00:00:08,000\n第二段旁白\n",
+                               encoding='utf-8')
+                n_entries = len(mq.parse_srt(str(srt)))
+                cfg = tmp / "cfg.json"
+                cfg.write_text(json.dumps({"fps": 25, "resolution": "1920x1080"}),
+                               encoding='utf-8')
+
+                # 除被测项以外的检查全部喂清洁测量值（与用例52/57 同法，物理扫描按
+                # 模块级 stub 解耦 ffmpeg）；起口样本按 min_onsets 补齐，不假设阈值
+                rules = mq._load_alignment_rules()
+                onsets = [1.5, 2.5, 5.5, 6.5, 7.5]      # 全部落在两条字幕窗口内 → p95=0
+                onsets += [1.5] * max(0, int(rules['min_onsets']) - len(onsets))
+                _patch("ffprobe_get_streams", lambda p: [
+                    {"codec_type": "video", "codec_name": "h264", "bit_rate": "1500000",
+                     "r_frame_rate": "25/1", "width": 1920, "height": 1080},
+                    {"codec_type": "audio", "codec_name": "aac", "bit_rate": "128000"}])
+                _patch("ffprobe_get_duration", lambda p: 10.0)
+                _patch("ffmpeg_detect_silence", lambda p, d=None: 1.0)
+                _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: onsets)
+                _patch("ffmpeg_detect_black_intervals", lambda *a, **k: [])
+                _patch("ffmpeg_detect_long_silences", lambda *a, **k: [])
+                _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                    returncode=0, stdout="", stderr="")))
+
+                _rec_n = [0]
+
+                def make_record(sources, subtitle_file=None, srt_entries=None):
+                    """按 step5 记录的字段形态落一份来源记录（逐场归属是唯一 Primitive）。"""
+                    _rec_n[0] += 1
+                    p = tmp / f"src_{_rec_n[0]}.json"
+                    p.write_text(json.dumps({
+                        '$schema': 'subtitle-timestamp-source v1',
+                        'subtitle_file': subtitle_file or srt.name,
+                        'srt_entries': (n_entries if srt_entries is None else srt_entries),
+                        'scenes': [{'scene_id': f's{i}', 'source': s, 'segments': 1}
+                                   for i, s in enumerate(sources)],
+                    }, ensure_ascii=False), encoding='utf-8')
+                    return str(p)
+
+                def run_qa(source=None, subtitle=str(srt)):
+                    qa = mq.MediaQAGate()
+                    return qa.validate(str(video), subtitle, visual_check_passed=True,
+                                       config_path=str(cfg), subtitle_source_path=source)
+
+                def _status(res):
+                    return res['check_statuses']['subtitle_timestamp_source']
+
+                def _render(result):
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        mq.print_report(result)
+                    return buf.getvalue()
+
+                # ── 1. 正向对照：全主路径不得误杀 ──
+                _, r_forced = run_qa(make_record(['asr_forced'] * 10))
+                tc.assert_equal(_status(r_forced), gs.PASS,
+                                "all-asr_forced record adjudicates PASS (已交付主流形态)")
+                tc.assert_equal(r_forced['verdict'], gs.PASS,
+                                "the new check does not block a clean full-chain delivery")
+                f_forced = r_forced['media_facts']['subtitle_timestamp_source']
+                tc.assert_equal(f_forced['asr_forced_ratio'], 1.0,
+                                "ratio is computed from the per-scene list at consume time")
+                tc.assert_equal(f_forced['scenes_total'], 10,
+                                "the record's scene count rides into the report facts")
+
+                # ── 2. 负向注入：整项目一级降级必须可见，且判未测不判违规 ──
+                passed_bad, r_bad = run_qa(make_record(['punct_gap'] * 10))
+                tc.assert_equal(_status(r_bad), gs.UNTESTED,
+                                "a fully punct-gap project is UNTESTED, not silently green")
+                tc.assert_equal(r_bad['check_statuses']['subtitle_audio_alignment'],
+                                gs.PASS,
+                                "alignment still PASSes on the same clip — that zero "
+                                "discrimination is exactly why this check exists")
+                tc.assert_equal(r_bad['verdict'], gs.UNTESTED,
+                                "the demoted verdict is visible at the top level")
+                tc.assert_equal(r_bad['errors'], [],
+                                "a designed-in fallback chain produces no FAIL entry")
+                tc.assert_true(passed_bad,
+                               "legacy 'passed' keeps its meaning (no violation was found)")
+                ok_bad, reason_bad = mq.adjudicate(r_bad)
+                tc.assert_true(not ok_bad and 'UNTESTED' in reason_bad,
+                               "untested hit-rate blocks delivery by default")
+                ok_ok, reason_ok = mq.adjudicate(r_bad, accept_untested=True)
+                tc.assert_true(ok_ok and '--accept-media-untested' in reason_ok,
+                               "informed acceptance releases it with a traceable reason")
+                tc.assert_true(any('min_asr_forced_ratio' in u for u in r_bad['untested']
+                                   if u.startswith('subtitle_timestamp_source')),
+                               "the untested note names the threshold authority so the "
+                               "operator can see what to raise or re-run")
+
+                # ── 3. 阈值边界：ratio 恰等于阈值判过（严格小于才阻断），短项目一场降级即触发 ──
+                th = float(rules['min_asr_forced_ratio'])
+                at_n = int(th * 10)
+                _, r_at = run_qa(make_record(['asr_forced'] * at_n
+                                             + ['punct_gap'] * (10 - at_n)))
+                tc.assert_equal(_status(r_at), gs.PASS,
+                                f"exactly {at_n}/10 ＝ 阈值 {th:g} releases (comparison is <)")
+                just_below = int(th * 20) - 1
+                _, r_under = run_qa(make_record(['asr_forced'] * just_below
+                                                + ['punct_gap'] * (20 - just_below)))
+                tc.assert_equal(_status(r_under), gs.UNTESTED,
+                                f"{just_below}/20 刚低于阈值 {th:g} 即判未测")
+                _, r_gran = run_qa(make_record(['asr_forced'] * 3 + ['punct_gap']))
+                tc.assert_equal(_status(r_gran), gs.UNTESTED,
+                                "3 场项目 1 场降级（75%）即触发 —— 短项目粒度提醒的行为面")
+
+                # ── 4. 阈值消费的是配置文件，不是代码常量 ──
+                disk = json.loads((script_dir / ".." / "配置" / "config" / "quality" /
+                                   "audio_sync_rules.json").resolve()
+                                  .read_text(encoding='utf-8'))
+                tc.assert_equal(th, float(disk['alignment']['min_asr_forced_ratio']),
+                                "the effective threshold equals the config authority "
+                                "(single source, no code literal)")
+                saved_rules = mq._load_alignment_rules
+                try:
+                    mq._load_alignment_rules = lambda *a, **k: dict(
+                        rules, min_asr_forced_ratio=0.5)
+                    _, r_loose = run_qa(make_record(['asr_forced'] * 5 + ['punct_gap'] * 5))
+                    tc.assert_equal(_status(r_loose), gs.PASS,
+                                    "raising the config to 0.5 releases a 50% project — "
+                                    "the gate really reads the rule file")
+                    tc.assert_equal(r_loose['media_facts']
+                                    ['subtitle_timestamp_source']['threshold_ratio'], 0.5,
+                                    "the reported threshold is the consumed one")
+                finally:
+                    mq._load_alignment_rules = saved_rules
+
+                # ── 5. 代次绑定：旧记录/异名字幕不得裁定新成片 ──
+                _, r_stale_name = run_qa(make_record(['asr_forced'] * 10,
+                                                     subtitle_file="上一版成片.srt"))
+                tc.assert_equal(_status(r_stale_name), gs.UNTESTED,
+                                "a record naming another subtitle file is not evidence")
+                tc.assert_true(r_stale_name['media_facts']
+                               ['subtitle_timestamp_source']['stale_record'],
+                               "staleness is machine-readable for the delivery doc")
+                _, r_stale_n = run_qa(make_record(['asr_forced'] * 10,
+                                                  srt_entries=n_entries + 1))
+                tc.assert_equal(_status(r_stale_n), gs.UNTESTED,
+                                "entry-count mismatch means another SRT generation")
+                tc.assert_true(any('不同代' in u for u in r_stale_n['untested']
+                                   if u.startswith('subtitle_timestamp_source')),
+                               "the stale reason is spelled out, not a bare untested")
+
+                # ── 6. 取数面缺失/损坏 → 未测，且报告行不得印成 0/0 ──
+                for label, src in (("no path", None),
+                                   ("absent", str(tmp / "不存在.json")),
+                                   ("corrupt", None)):
+                    if label == "corrupt":
+                        p = tmp / "broken.json"
+                        p.write_text("{ not json", encoding='utf-8')
+                        src = str(p)
+                    _, r = run_qa(src)
+                    tc.assert_equal(_status(r), gs.UNTESTED,
+                                    f"unusable source record ({label}) is UNTESTED, never guessed")
+                    line = mq.format_subtitle_source_line(
+                        r['media_facts']['subtitle_timestamp_source'])
+                    tc.assert_true('无从裁定' in line,
+                                   f"the report line states 无从裁定 instead of a fake 0% ({label})")
+                p_nokey = tmp / "nokey.json"
+                p_nokey.write_text(json.dumps({'subtitle_file': srt.name,
+                                               'srt_entries': n_entries}), encoding='utf-8')
+                tc.assert_equal(_status(run_qa(str(p_nokey))[1]), gs.UNTESTED,
+                                "a record without the per-scene list cannot adjudicate")
+
+                # ── 7. 纯 BGM 声明豁免 → 整组 NOT_APPLICABLE ──
+                _, r_bgm = run_qa(make_record(['asr_forced'] * 10), subtitle=None)
+                tc.assert_equal(r_bgm['check_statuses']['subtitle_timestamp_source'],
+                                gs.NOT_APPLICABLE,
+                                "no narration means no timestamp chain to adjudicate")
+                tc.assert_equal(r_bgm['status_counts'][gs.NOT_APPLICABLE],
+                                len(mq.SUBTITLE_CHECK_KEYS),
+                                "the whole subtitle group is exempted together")
+
+                # ── 8. 文案单一生成点：报告行与交付说明提示同源 ──
+                tc.assert_true(mq.format_subtitle_source_line(f_forced) in _render(r_forced),
+                               "print_report renders the shared line, its own copy is forbidden")
+
+                # ── 9. 生成侧 writer 与消费端字段兼容（跨模块契约） ──
+                import enhance_video_audio as eva
+                written = eva._write_subtitle_timestamp_source(
+                    tmp, srt,
+                    [{'scene_id': 's0', 'source': 'asr_forced', 'segments': 2},
+                     {'scene_id': 's1', 'source': 'punct_gap', 'segments': 1}],
+                    n_entries)
+                tc.assert_true(written is not None and Path(written).exists(),
+                               "step5 persists the per-scene source record")
+                data = json.loads(Path(written).read_text(encoding='utf-8'))
+                tc.assert_equal(data['subtitle_file'], srt.name,
+                                "the record binds itself to the SRT it describes")
+                tc.assert_equal(data['srt_entries'], n_entries,
+                                "entry count rides along for generation binding")
+                tc.assert_true('sources' not in data,
+                               "only the per-scene primitive is stored; a second derived "
+                               "count in the same file would be free to drift")
+                _, r_round = run_qa(str(written))
+                tc.assert_equal(_status(r_round), gs.UNTESTED,
+                                "writer output feeds the gate directly (50% < threshold)")
+                tc.assert_equal(r_round['media_facts']['subtitle_timestamp_source']
+                                ['asr_forced'], 1,
+                                "the consumer recount from the writer's scenes matches")
+                tc.assert_equal(r_round['media_facts']['subtitle_timestamp_source']
+                                ['punct_gap'], 1,
+                                "fallback scenes are counted into the same distribution")
+
+                # ── 10. 配置缺键时回退默认并点名（阈值不得静默消失） ──
+                sparse = tmp / "audio_sync_rules_sparse.json"
+                sparse.write_text(json.dumps({"alignment": {"silence_db": -38}}),
+                                  encoding='utf-8')
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    loaded = mq._load_alignment_rules(str(sparse))
+                tc.assert_true('min_asr_forced_ratio' in loaded,
+                               "the key survives a config that omits it (defaulted)")
+                tc.assert_true('min_asr_forced_ratio' in buf.getvalue(),
+                               "the fallback is announced, not silent")
+
+                # ── 11. 接线位点（行为接缝需整条流水线，秒级不可达 → 调用存在性） ──
+                eva_src = (script_dir / "enhance_video_audio.py").read_text(encoding='utf-8')
+                step5_body = (eva_src.split("def step5_generate_subtitles(", 1)[1]
+                              .split("\ndef ", 1)[0])
+                tc.assert_true("_write_subtitle_timestamp_source(" in step5_body,
+                               "step5 still writes the record (quick-fix included)")
+                runner_src = (script_dir / "pipeline_runner.py").read_text(encoding='utf-8')
+                tc.assert_true("subtitle_source_path=" in runner_src,
+                               "_final_media_qa still hands the record to the gate")
+        finally:
+            _restore()
+
+        # ── 12. preflight：模型缓存缺位只告警，不阻断（离线降级合法） ──
+        import preflight_check as pf
+        import _forced_align as fa
+        saved_ready = fa.align_model_cache_ready
+        try:
+            fa.align_model_cache_ready = lambda: (False, "snapshots/ 下无有效 model.bin")
+            r_miss = pf.PreflightResult(mode="render")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_alignment_model_cache({"tts_enabled": True}, r_miss)
+            tc.assert_equal(r_miss.errors, [],
+                            "a missing whisper cache must never block rendering")
+            tc.assert_true(r_miss.passed, "warn-only by design")
+            tc.assert_true(any("punct-gap" in w for w in r_miss.warnings),
+                           "the warning names the chain this run will take")
+            tc.assert_true(any("accept-media-untested" in w for w in r_miss.warnings),
+                           "and points at the downstream gate/escape so the two agree")
+            fa.align_model_cache_ready = lambda: (True, "snapshots/abc/model.bin")
+            r_ready = pf.PreflightResult(mode="render")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_alignment_model_cache({"tts_enabled": True}, r_ready)
+            tc.assert_equal(r_ready.warnings, [],
+                            "a ready cache produces no noise (a permanent warning is dead weight)")
+            r_bgm_pf = pf.PreflightResult(mode="render")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.check_alignment_model_cache({"tts_enabled": False}, r_bgm_pf)
+            tc.assert_equal(r_bgm_pf.warnings, [],
+                            "pure-BGM projects have no sentence alignment to warn about")
+            pf_src = (script_dir / "preflight_check.py").read_text(encoding='utf-8')
+            tc.assert_true("check_alignment_model_cache(" in
+                           pf_src.split("def main(", 1)[1],
+                           "main() still runs the model-cache probe")
+        finally:
+            fa.align_model_cache_ready = saved_ready
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+# ============================================================================
 # 测试运行器
 # ============================================================================
 
@@ -6064,6 +6783,9 @@ class RegressionTestRunner:
             test_alignment_cache_binds_real_waveform,
             test_state_writes_atomic_and_ledger_survives_fresh,
             test_check_registry_names_are_single_source,
+            test_audio_rms_window_aggregate_measure,
+            test_forced_align_segment_face_guards,
+            test_subtitle_timestamp_source_hit_rate_gate,
         ]
         self.results = []
     

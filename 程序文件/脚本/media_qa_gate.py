@@ -26,6 +26,8 @@
   subtitle_not_overflow          字幕不越过视频结尾
   subtitle_audio_alignment       字幕-语音对齐度（P0-b：silencedetect 起口 ↔ SRT 起点，p95 门禁；
                                BGM 遮蔽→合法不适用，纯旁白样本不足→未测不得记通过）
+  subtitle_timestamp_source      字幕时间戳主路径命中率（step5 逐场实测来源分布，asr_forced
+                               占比低于阈值→未测而非违规：punct-gap 是设计内一级链路）
   no_black_frame_with_subtitle   黑场-字幕重叠（blackdetect 物理测量：画面空档而音频持续）
   no_single_char_subtitle_line   字幕单字跨行（单个 CJK 汉字独占一行＝排版孤字）
   subtitle_terms_normalized      字幕术语规范（朗读层形态直通显示层，如『点Json』应为『.json』）
@@ -161,6 +163,7 @@ def _load_alignment_rules(rules_path=None) -> Dict[str, Any]:
         "min_onsets": 5,
         "silence_db": -40.0,
         "min_silence_seconds": 0.5,
+        "min_asr_forced_ratio": 0.8,
         "fail_on_violation": True,
     }
     if rules_path is None:
@@ -180,6 +183,9 @@ def _load_alignment_rules(rules_path=None) -> Dict[str, Any]:
                 defaults[k] = v
         if "silence_db" not in alignment:
             print(f"  [WARN] {rules_path.name} 的 alignment 节缺少 silence_db，回退默认 -40dB")
+        if "min_asr_forced_ratio" not in alignment:
+            print(f"  [WARN] {rules_path.name} 的 alignment 节缺少 "
+                  f"min_asr_forced_ratio，回退默认 {defaults['min_asr_forced_ratio']:g}")
         return defaults
     except (json.JSONDecodeError, OSError):
         print(f"  [WARN] 无法读取 {rules_path.name} 的 alignment.silence_db，回退默认 -40dB")
@@ -595,6 +601,65 @@ def parse_srt(srt_path: str) -> List[Dict[str, Any]]:
     
     return entries
 
+
+def _load_subtitle_timestamp_source(source_path):
+    """读取 step5 落盘的逐场时间戳来源记录（temp/_subtitle_timestamp_source.json）。
+
+    返回 (data 或 None, 不可裁定原因 或 None)。消费方是 subtitle_timestamp_source：
+    该记录是"本版 SRT 的每条时间戳由哪条链产出"的实测面，缺失/损坏/不同代都判未测，
+    不得用旧记录或 manifest 声明面顶替（A06 同族：登记面须＝真实读取路径）。
+    """
+    if not source_path:
+        return None, "未提供时间戳来源记录路径（step5 落盘的 _subtitle_timestamp_source.json）"
+    p = Path(source_path)
+    if not p.exists():
+        return None, f"时间戳来源记录不存在: {p.name}（step5 未产出或 temp 已清理）"
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return None, f"时间戳来源记录不可读: {p.name} — {e}"
+    if not isinstance(data.get('scenes'), list):
+        return None, f"时间戳来源记录缺少 scenes 清单: {p.name}"
+    return data, None
+
+
+def format_subtitle_source_line(facts: Dict[str, Any]) -> str:
+    """字幕时间戳来源分布的人读行 — 唯一生成点。
+
+    print_report 与 pipeline_runner 的交付说明提示共用本函数，终检报告行与交付
+    文档里的数字不得各写一份（A12 同源纪律；交付说明 md 是该项唯一的 git 可追溯面）。
+    """
+    total = facts.get('scenes_total') or 0
+    forced = facts.get('asr_forced') or 0
+    ratio = facts.get('asr_forced_ratio')
+    th = facts.get('threshold_ratio')
+    if facts.get('adjudicable') is False:
+        # 取数面缺失/损坏：报告与交付文档必须显式写"无从裁定"，不得印 0/0 让人读成 0%
+        return ("Subtitle timestamp source: 无从裁定 — " + str(facts.get('reason') or '')
+                + (f"（阈值 ≥{th:.0%}，未测默认阻断）"
+                   if isinstance(th, (int, float)) else "（未测默认阻断）"))
+    line = (f"Subtitle timestamp source: asr_forced {forced}/{total}"
+            + (f" ({ratio:.0%})" if isinstance(ratio, (int, float)) else "")
+            + f" | punct_gap {facts.get('punct_gap', 0)}"
+            f" | char_prop {facts.get('char_prop', 0)}"
+            + (f" — 阈值 ≥{th:.0%}" if isinstance(th, (int, float)) else ""))
+    if facts.get('stale_record'):
+        line += " [记录与被测字幕不同代，未裁定]"
+    return line
+
+
+# 字幕组检查项清单（单一权威源）：字幕缺失/声明豁免时整组一并裁定，
+# 新增字幕类检查项只改这里与 docstring 目录，不再抄第二份清单（A12）。
+SUBTITLE_CHECK_KEYS = ('subtitle_file_exists', 'subtitle_not_empty',
+                       'subtitle_times_ordered', 'subtitle_not_overflow',
+                       'subtitle_audio_alignment',
+                       'subtitle_timestamp_source',
+                       'no_black_frame_with_subtitle',
+                       'no_single_char_subtitle_line',
+                       'subtitle_terms_normalized')
+
+
 class MediaQAGate:
     """最终媒体质量验收门禁（四态报告，2026-09-18 A04）。
 
@@ -627,7 +692,8 @@ class MediaQAGate:
                  subtitle_path: str = None,
                  visual_check_passed=False,
                  config_path: str = None,
-                 narration_path: str = None) -> Tuple[bool, Dict[str, Any]]:
+                 narration_path: str = None,
+                 subtitle_source_path: str = None) -> Tuple[bool, Dict[str, Any]]:
         """执行完整的媒体质量验收
 
         参数：
@@ -638,6 +704,8 @@ class MediaQAGate:
           config_path: pipeline 配置文件路径（可选，提供后执行 declared_matches_measured：声明-实测一致性；
                        同时用于解析 narration_source 供 no_dead_air 场景感知排除）
           narration_path: 项目 narration.json 路径（可选，显式指定优先于 config 指针解析）
+          subtitle_source_path: step5 落盘的 _subtitle_timestamp_source.json 路径（可选，
+                       subtitle_timestamp_source 的唯一取数面；缺失即未测，不猜）
 
         返回：
           (无 FAIL 违规, 详细检查结果；含 verdict/check_statuses/untested/not_applicable)
@@ -758,16 +826,10 @@ class MediaQAGate:
             self._mark('playable', gs.UNTESTED, f"可播放性探测异常: {e}")
             self.warnings.append(f"Could not verify playability: {e}")
 
-        # 字幕相关检查
-        _SUBTITLE_CHECK_KEYS = ('subtitle_file_exists', 'subtitle_not_empty',
-                                'subtitle_times_ordered', 'subtitle_not_overflow',
-                                'subtitle_audio_alignment',
-                                'no_black_frame_with_subtitle',
-                                'no_single_char_subtitle_line',
-                                'subtitle_terms_normalized')
+        # 字幕相关检查（组清单见模块级 SUBTITLE_CHECK_KEYS，单一权威源）
         if subtitle_path is None:
             # 声明性豁免（如纯 BGM 项目）：字幕组检查合法不适用，不计违规也不计通过
-            for _k in _SUBTITLE_CHECK_KEYS:
+            for _k in SUBTITLE_CHECK_KEYS:
                 self._mark(_k, gs.NOT_APPLICABLE, "未提供字幕（项目声明豁免）")
         else:
             subtitle_path = Path(subtitle_path)
@@ -776,8 +838,8 @@ class MediaQAGate:
             if not subtitle_path.exists():
                 self._mark('subtitle_file_exists', gs.FAIL, str(subtitle_path))
                 self.errors.append(f"Subtitle file not found: {subtitle_path}")
-                for _k in _SUBTITLE_CHECK_KEYS:
-                    if _k != 'subtitle_file_exists':
+                for _k in SUBTITLE_CHECK_KEYS:
+                    if _k not in self.statuses:
                         self._mark(_k, gs.UNTESTED, "字幕文件缺失，无法测量")
             else:
                 self._mark('subtitle_file_exists', gs.PASS)
@@ -790,12 +852,10 @@ class MediaQAGate:
                 else:
                     self._mark('subtitle_not_empty', gs.FAIL)
                     self.errors.append("Subtitle file is empty or malformed")
-                    for _k in ('subtitle_times_ordered', 'subtitle_not_overflow',
-                               'subtitle_audio_alignment',
-                               'no_black_frame_with_subtitle',
-                               'no_single_char_subtitle_line',
-                               'subtitle_terms_normalized'):
-                        self._mark(_k, gs.UNTESTED, "字幕解析 0 条，无法测量")
+                    for _k in SUBTITLE_CHECK_KEYS:
+                        # 未测的是"还没跑过"的那几项——已裁定项（存在性/空文件）不覆写
+                        if _k not in self.statuses:
+                            self._mark(_k, gs.UNTESTED, "字幕解析 0 条，无法测量")
                     entries = None
 
                 if entries is not None:
@@ -925,6 +985,81 @@ class MediaQAGate:
                     else:
                         self._mark('subtitle_audio_alignment', gs.UNTESTED,
                                    "时长不可测")
+
+                    # 检查 subtitle_timestamp_source：字幕时间戳主路径命中率
+                    # （2026-09-19 普查裁定，方案 A）。动因：subtitle_audio_alignment
+                    # 量的是"语音起口 ↔ 最近字幕窗口"，punct-gap 一级降级同样由真实
+                    # 静音驱动，两条链在该口径下 7 份成片一律 p95=0.0s——整项目对齐全
+                    # 降级在终检报告里与主路径不可区分（09-18 那次即此形态）。本项读
+                    # step5 逐场实测来源记录，占比不足即判 UNTESTED。
+                    # 不判 FAIL：punct-gap 是设计内一级链路（离线环境合法路径），
+                    # 把它判成缺陷属篡改既有取舍；未测按四态规则默认阻断、可知情放行。
+                    # 阈值单一权威源：audio_sync_rules.json → alignment.min_asr_forced_ratio。
+                    src_data, src_err = _load_subtitle_timestamp_source(subtitle_source_path)
+                    min_ratio = float(_load_alignment_rules()['min_asr_forced_ratio'])
+                    src_facts = None
+                    if src_err:
+                        self._mark('subtitle_timestamp_source', gs.UNTESTED, src_err)
+                        self.warnings.append(
+                            f"Subtitle timestamp source UNTESTED: {src_err} — 主路径命中率"
+                            f"无从裁定（不得读成主路径已跑成）")
+                        # 未测也要有事实位：交付说明的必填节要能写出"为何无从裁定"，
+                        # 而不是因为取不到数就在交付面上留白（要求3：不得只留日志行）。
+                        src_facts = {'scenes_total': 0, 'asr_forced': 0,
+                                     'punct_gap': 0, 'char_prop': 0,
+                                     'adjudicable': False, 'reason': src_err,
+                                     'threshold_ratio': min_ratio}
+                    else:
+                        s_list = src_data.get('scenes') or []
+                        cnt = {k: sum(1 for s in s_list if s.get('source') == k)
+                               for k in ('asr_forced', 'punct_gap', 'char_prop')}
+                        total = len(s_list)
+                        ratio = (cnt['asr_forced'] / total) if total else None
+                        # 代次绑定：记录必须描述被测的这份 SRT。_timeline_manifest 同族
+                        # 教训——交付后磁盘现存的记录可能属于后一版成片，旧记录不得裁定。
+                        stale = (str(src_data.get('subtitle_file') or '') != subtitle_path.name
+                                 or src_data.get('srt_entries') != len(entries))
+                        src_facts = {
+                            'asr_forced': cnt['asr_forced'],
+                            'punct_gap': cnt['punct_gap'],
+                            'char_prop': cnt['char_prop'],
+                            'scenes_total': total,
+                            'asr_forced_ratio': (round(ratio, 3)
+                                                 if ratio is not None else None),
+                            'threshold_ratio': min_ratio,
+                            'source_record': Path(subtitle_source_path).name,
+                            'record_subtitle_file': src_data.get('subtitle_file'),
+                            'record_srt_entries': src_data.get('srt_entries'),
+                            'stale_record': bool(stale),
+                        }
+                        if stale:
+                            self._mark('subtitle_timestamp_source', gs.UNTESTED,
+                                       f"来源记录属 {src_data.get('subtitle_file')} "
+                                       f"({src_data.get('srt_entries')} 条)，被测字幕为 "
+                                       f"{subtitle_path.name} ({len(entries)} 条) — 不同代")
+                            self.warnings.append(
+                                "Subtitle timestamp source UNTESTED: 来源记录与被测字幕"
+                                "不同代（文件名或条目数不符），占比不作裁定")
+                        elif total == 0:
+                            self._mark('subtitle_timestamp_source', gs.UNTESTED,
+                                       "来源记录 0 场景，占比无从裁定")
+                            self.warnings.append(
+                                "Subtitle timestamp source UNTESTED: 来源记录无逐场归属")
+                        elif ratio < min_ratio:
+                            self._mark('subtitle_timestamp_source', gs.UNTESTED,
+                                       f"主路径 asr_forced {cnt['asr_forced']}/{total}"
+                                       f"＝{ratio:.0%} < min_asr_forced_ratio "
+                                       f"{min_ratio:g}（punct_gap {cnt['punct_gap']} / "
+                                       f"char_prop {cnt['char_prop']}）")
+                            self.warnings.append(
+                                f"Subtitle timestamp source UNTESTED: asr_forced "
+                                f"{cnt['asr_forced']}/{total}＝{ratio:.0%} 低于阈值 "
+                                f"{min_ratio:g} — 降级是设计内链路故不判违规，但主路径"
+                                f"未跑成须经知情放行 --accept-media-untested 并留痕")
+                        else:
+                            self._mark('subtitle_timestamp_source', gs.PASS)
+                    if src_facts:
+                        self.media_facts['subtitle_timestamp_source'] = src_facts
 
                     # 检查 no_black_frame_with_subtitle：黑场-字幕重叠（物理测量，直接回答"观众看到什么"）
                     # 背景：曾出现 end-fade 声明与场景窗口脱钩，尾部 ~5s 黑场
@@ -1252,6 +1387,12 @@ def print_report(result: Dict[str, Any]) -> None:
               f"{facts.get('measured_resolution')} "
               f"(declared {facts.get('declared_fps')}fps {facts.get('declared_resolution')})")
 
+    src = facts.get('subtitle_timestamp_source')
+    if src:
+        # 交付说明 md 里"字幕时间戳来源"一节以此行为准（同一生成点，见
+        # format_subtitle_source_line）——占比与分布不得散落在日志行里
+        print(f"  {format_subtitle_source_line(src)}")
+
     if result['errors']:
         print(f"[FAIL — ERRORS]")
         for err in result['errors']:
@@ -1285,6 +1426,9 @@ def main():
     parser.add_argument('--config', help='Pipeline config for declared-vs-measured check')
     parser.add_argument('--narration', help='Project narration.json for scene-aware dead-air check '
                                             '(缺省从 --config 的 narration_source 指针解析)')
+    parser.add_argument('--subtitle-source',
+                        help='step5 落盘的 _subtitle_timestamp_source.json（项目 temp 目录内），'
+                             'subtitle_timestamp_source 检查项的唯一取数面；不提供即判未测')
     
     args = parser.parse_args()
     
@@ -1294,7 +1438,8 @@ def main():
         subtitle_path=args.subtitle,
         visual_check_passed=args.visual_check_passed,
         config_path=args.config,
-        narration_path=args.narration
+        narration_path=args.narration,
+        subtitle_source_path=args.subtitle_source
     )
     
     print_report(result)

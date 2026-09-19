@@ -449,7 +449,9 @@ def _wave_sha256(wav_path):
 
 # 对齐算法版本（A08）：分段逻辑（_split_text_to_segments）、对齐模型/
 # 后端（_forced_align）、时间戳语义变化时必须 bump；版本不符 → 缓存失效。
-ALIGN_ALGO_VERSION = "v1"
+# v2（2026-09-19）：_forced_align 加分段面守卫（首句零匹配/塌缩零长句 → 降级），
+# 存量 v1 的 asr_forced 记录须全部重对齐。
+ALIGN_ALGO_VERSION = "v2"
 
 
 def _build_timeline_manifest(temp_dir):
@@ -2011,6 +2013,45 @@ def _format_srt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _write_subtitle_timestamp_source(temp_dir, subtitle_path, scenes, srt_entries):
+    """落盘"本版 SRT 的每条时间戳由哪条链产出"（step5 实测记录）。
+
+    消费方：media_qa_gate 的 subtitle_timestamp_source —— asr_forced 场景占比低于
+    audio_sync_rules.json → alignment.min_asr_forced_ratio 时判 UNTESTED（默认阻断、
+    --accept-media-untested 放行留痕）。
+
+    为什么记 step5 的实际消费面而不是 _timeline_manifest.json 的 method：后者是声明面，
+    tts_hash 变化（STALE）时 manifest 仍写着 asr_forced、本场字幕却已落 punct-gap，
+    与 A06"登记面必须＝真实读取路径"同族。条目数与字幕文件名随记录落盘，供消费方做
+    代次绑定——旧记录不得裁定新成片。
+
+    背景（2026-09-19 普查）：punct-gap 一级降级本身也由真实静音驱动，终检的
+    subtitle_audio_alignment（起口↔字幕窗）对两条链量出同一个 p95=0，整项目降级
+    在门禁报告上与主路径不可区分；temp 下文件不入 git，交付后唯一取证面是日志行。
+    """
+    data = {
+        '$schema': 'subtitle-timestamp-source v1 — 本版 SRT 时间戳的实际产出链（step5 实测）',
+        'written_by': 'enhance_video_audio.step5_generate_subtitles',
+        'subtitle_file': Path(subtitle_path).name,
+        'srt_entries': int(srt_entries),
+        # 逐场归属是唯一 Primitive；占比由消费方现算，不另存一份派生计数
+        'scenes': scenes,
+    }
+    out_path = Path(temp_dir) / "_subtitle_timestamp_source.json"
+    try:
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        # 记录面写不出去只影响终检能否裁定（该检查项会判 UNTESTED），不影响成片
+        print(f"  [WARN] 字幕时间戳来源记录写入失败: {e}")
+        return None
+    _cnt = {k: sum(1 for s in scenes if s['source'] == k)
+            for k in ('asr_forced', 'punct_gap', 'char_prop')}
+    print(f"  Subtitle timestamp source: "
+          + ", ".join(f"{k}={v}" for k, v in _cnt.items()) + f" → {out_path.name}")
+    return out_path
+
+
 def step5_generate_subtitles(subtitle_path, temp_dir):
     """Generate SRT subtitle file from scene text and TTS durations.
 
@@ -2018,6 +2059,8 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
       1. _timeline_manifest.json 句级强制对齐时间戳（asr_forced，主路径）
       2. silencedetect 标点-gap 对齐（修订02 遗留，一级降级）
       3. 字符数比例估算（二级降级，仅在前两者都不可用时触发）
+    三条链的逐场归属另记一份到 temp/_subtitle_timestamp_source.json，成片终检据此
+    裁定主路径命中率（见 _write_subtitle_timestamp_source）。
 
     Scale-invariant parameters:
       - start_offset, end_shrink: decrease for longer videos to prevent
@@ -2051,6 +2094,8 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
     entries = []
     idx = 1
     gap = 0.15
+    # 逐场时间戳来源登记（终检 subtitle_timestamp_source 的取数面）
+    source_stats = []
     # Strip non-terminal trailing punctuation only.
     # Keep sentence-ending marks (。？！) — they carry semantic closure.
     # Only strip commas, enumeration pauses, colons, ellipsis, dashes, whitespace.
@@ -2197,6 +2242,15 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
                         durs = durs[:keep - 1] + [merged_dur]
             seg_starts_abs = None  # 用旧 cursor 累加逻辑
 
+        # 本场时间戳由哪条链产出——在分支全部走完、segments/durs 已定型处取，
+        # 取的是"本场字幕实际用了什么"，不是 manifest 的声明（STALE 时二者分歧）。
+        source_stats.append({
+            'scene_id': scene_id,
+            'source': ('asr_forced' if use_timed else
+                       'punct_gap' if use_gap_aligned else 'char_prop'),
+            'segments': len(segments),
+        })
+
         # --- build entries ---
         for i, seg in enumerate(segments):
             seg_dur = durs[i]
@@ -2264,6 +2318,11 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
             print(f"    ✗ {iss}")
     else:
         print(f"  ✓ Subtitle self-check passed")
+
+    # 时间戳来源记录随本版 SRT 同批落盘（每次 step5 重写，quick-fix 也不例外——
+    # step5 在任何模式下都不跳过），供成片终检裁定主路径命中率。
+    _write_subtitle_timestamp_source(temp_dir, subtitle_path, source_stats,
+                                     len(entries))
 
     print(f"  Output: {subtitle_path}\n")
     return True
@@ -2399,6 +2458,59 @@ def _write_media_quality_result(temp_dir, passed, errors, warnings, untested=Non
 # 保证"用真值喂正则"而不是另写一份字面量。
 _RMS_LEVEL_RE = re.compile(r'RMS[ _](?:level dB:\s*|level=)(-?\d+(?:\.\d+)?)')
 
+# RMS 行可解析但值为 -inf：该窗口是**数字静音**（无振幅样本可比较），属真实测量
+# 结果而非解析口径分叉。它与"取不到 RMS 行"必须分开计数，否则静音窗口会被写成
+# "解析不到"，把归因指向错误的方向（2026-09-19 口径修复）。
+_RMS_SILENCE_RE = re.compile(r'RMS[ _](?:level dB:\s*|level=)-inf')
+
+# 窗口聚合 RMS 低于此分界即视为"落在句间停顿/静音段"，不进入一致性比较样本。
+# 实测分界依据（2026-09-19，装配式隔墙项目案例_医疗养老.mp4）：语音窗口 -17~-27dB，
+# 整窗落在 2.1s 句间停顿时 -67.3dB（peak -32dB，含 10ms 语音尾巴），数字静音 -inf。
+# 权威值声明于 config/quality/video_quality_rules.json，此处仅为读不到时的回退。
+# 全轨静音/长死区不属本项职责，由 media_qa_gate 的 audio_not_silent / no_dead_air 裁定。
+_RMS_WINDOW_SILENCE_FLOOR_DB_DEFAULT = -60.0
+
+
+def _sample_windows_rms(media_path, sample_ts, floor_db):
+    """逐窗口取 2s 时段的**聚合** RMS，返回 (可比 dB 值, 停顿/静音窗口数, 无 RMS 输出窗口数)。
+
+    astats 不带 reset/metadata：默认口径在窗口音频全部处理完后打印 Overall 块，
+    其 RMS 是该时段的聚合值（与 volumedetect mean_volume 实测逐点吻合）。旧口径
+    astats=metadata=1:reset=1 打印的是最后一个音频帧（≈14ms）的统计，帧落在句间
+    静音时 RMS=-inf、正则不匹配 → 该窗口零贡献，四点全落即整项 UNTESTED
+    （2026-09-19 修复，33.1s 成片 4/4 窗口恒零实证）。
+    分桶：低于 floor_db 或 -inf 的窗口是"落在停顿/静音"（真实测量结果），
+    完全没有 RMS 行的窗口才是"取不到测量"（无音频样本/解码失败）。
+    """
+    values = []
+    silent = 0
+    unreadable = 0
+    for ts in sample_ts:
+        result = subprocess.run(
+            ["ffmpeg", "-ss", f"{ts:.1f}", "-t", "2", "-i", str(media_path),
+             "-af", "astats",
+             "-f", "null", "-"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace'
+        )
+        # astats 按声道分块打印、Overall 块在最后，故 [-1] 即窗口聚合值
+        rms_matches = _RMS_LEVEL_RE.findall(result.stderr)
+        if not rms_matches:
+            if _RMS_SILENCE_RE.search(result.stderr):
+                silent += 1
+            else:
+                unreadable += 1
+            continue
+        try:
+            window_rms = float(rms_matches[-1])
+        except ValueError:
+            unreadable += 1
+            continue
+        if window_rms <= floor_db:
+            silent += 1
+        else:
+            values.append(window_rms)
+    return values, silent, unreadable
+
 
 def _check_video_quality(video_path, expected_duration=None):
     """Check video for blank frames, low bitrate, duration mismatch, and audio inconsistency.
@@ -2511,22 +2623,19 @@ def _check_video_quality(video_path, expected_duration=None):
             )
 
     # --- Audio level consistency check: RMS at multiple sample points ---
+    # 每点取 2s 窗口的**聚合** RMS（astats 不带 reset/metadata → 窗口结束后打印
+    # Overall 块）。旧口径 astats=metadata=1:reset=1 是逐帧重置的末帧测量：33.1s
+    # 成片实测 4/4 窗口末帧 RMS=-inf（约 14ms 的单帧落在句间静音），四点全落 →
+    # 整项恒 UNTESTED；同窗口聚合 RMS 与 volumedetect mean_volume 逐点吻合，证非音量问题。
+    # 聚合值仍低于语音分界（rms_window_silence_floor_db）的窗口按"落在句间停顿"剔除：
+    # 成片句间静音常达 2s，与 2s 采样窗等长，整窗可能只含停顿，否则会把停顿误判成
+    # "音量严重不一致"（医疗养老成片 26.7s 窗口实测 -67.3dB 即此形态）。
     if a_streams and v_dur > 10:
         sample_ts = [v_dur * frac for frac in (0.15, 0.40, 0.65, 0.90)]
-        rms_values = []
-        for ts in sample_ts:
-            result = subprocess.run(
-                ["ffmpeg", "-ss", f"{ts:.1f}", "-t", "2", "-i", str(video_path),
-                 "-af", "astats=metadata=1:reset=1",
-                 "-f", "null", "-"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace'
-            )
-            rms_matches = _RMS_LEVEL_RE.findall(result.stderr)
-            if rms_matches:
-                try:
-                    rms_values.append(float(rms_matches[-1]))
-                except ValueError:
-                    pass
+        rms_floor_db = float(_load_video_quality_rules().get(
+            "rms_window_silence_floor_db", _RMS_WINDOW_SILENCE_FLOOR_DB_DEFAULT))
+        rms_values, silent_windows, unreadable_windows = _sample_windows_rms(
+            video_path, sample_ts, rms_floor_db)
 
         if len(rms_values) >= 2:
             rms_range = max(rms_values) - min(rms_values)
@@ -2543,10 +2652,16 @@ def _check_video_quality(video_path, expected_duration=None):
         else:
             # 2026-09-18 审核 A07：解析口径与 FFmpeg 实际输出分叉时，此项曾静默跳过，
             # 表现为"音量检查存在但从未执行"。取不到值必须点名，不得留在隐式通过里。
+            # 2026-09-19 归因修正：本项恒 0/4 的真实失效模式曾是"末帧采样落在静音段"
+            # 而非文案所称的"astats 输出拼写变化"（两种拼写由模块级正则同时覆盖，
+            # 用例48 已锁）。改取窗口聚合量后仍取不到值，指向的是采样窗口内没有可
+            # 解码的音频样本，故按静音/无样本两类分别点名，不再指向拼写。
             untested.append(
-                f"Audio RMS consistency: UNTESTED — astats 取到 {len(rms_values)}/"
-                f"{len(sample_ts)} 个 RMS 测量值，无法裁定音量一致性"
-                "（检查 FFmpeg astats 输出拼写是否再次变化）"
+                f"Audio RMS consistency: UNTESTED — {len(sample_ts)} 个 2s 采样窗口中 "
+                f"{len(rms_values)} 个取到可比 dB 值、{silent_windows} 个落在停顿/静音段"
+                f"（聚合 RMS ≤ {rms_floor_db:.0f}dB 或 -inf）、{unreadable_windows} 个 FFmpeg "
+                "未输出任何 RMS 行（该窗口无音频样本或解码失败，非 astats 输出拼写漂移），"
+                "无法裁定音量一致性"
             )
     else:
         reason = ("无音频流" if not a_streams

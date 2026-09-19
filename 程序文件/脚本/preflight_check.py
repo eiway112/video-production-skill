@@ -1259,6 +1259,37 @@ def _quant_tokens(text: str) -> set:
     return _num_tokens(t)
 
 
+def check_alignment_model_cache(cfg: dict, r: PreflightResult):
+    """ASR 强制对齐模型缓存预检 —— **只告警，绝不阻断**。
+
+    为什么值得在渲染前喊一声：HF_HUB_OFFLINE=1 下缓存缺位时 load_align_model 返回
+    None，_build_timeline_manifest 会把**整项目**句级时间戳落到 punct-gap 一级降级链，
+    当轮只有一行 WARN 且终检照常通过（2026-09-18 那版交付即在交付后普查时才归因）。
+    降级本身是离线环境的合法路径、成片并非不合格，所以这里不 error()——拦渲染等于
+    把设计内链路判成缺陷；但让操作者在数十分钟渲染**之前**就知道本轮走哪条链，
+    交付侧的机器裁定见 media_qa_gate.subtitle_timestamp_source。
+    """
+    print("\nAlignment Model Cache (faster-whisper 强制对齐可用性预检)")
+    if str(cfg.get("tts_enabled", "true")).strip().lower() in ("false", "0", "no"):
+        r.info("tts_enabled=false（纯 BGM 无旁白）— 不涉句级对齐，跳过",
+               check_id="align_model_cache")
+        return
+    try:
+        from _forced_align import align_model_cache_ready, MODEL_REPO_ID
+    except ImportError as e:
+        r.warn(f"无法导入 _forced_align 探测模型缓存: {e}", check_id="align_model_cache")
+        return
+    ready, detail = align_model_cache_ready()
+    if ready:
+        r.ok(f"强制对齐模型缓存就位（{MODEL_REPO_ID}）", check_id="align_model_cache")
+    else:
+        r.warn(f"强制对齐模型缓存缺失（{MODEL_REPO_ID}：{detail}）→ 本轮 TTS 步骤的 "
+               f"load_align_model 必失败，整项目字幕时间戳将走 punct-gap 一级降级链"
+               f"（设计内合法路径，不阻断渲染；成片终检 subtitle_timestamp_source 会判 "
+               f"UNTESTED，需 --accept-media-untested 知情放行并留痕）",
+               check_id="align_model_cache")
+
+
 def check_asset_signoff(project_dir: Path, cfg: dict, html_path: Path, r: PreflightResult):
     """位点1（素材/文案人工签认单）消费门禁。
 
@@ -1653,6 +1684,7 @@ def main():
     check_image_clarity(html_path, r)  # NEW: Check critical images for clarity
     check_subtitle_safe_zone(html_path, r)
     check_narration_digits(cfg or pre_cfg, r)
+    check_alignment_model_cache(cfg or pre_cfg, r)
     check_asset_signoff(project_dir, cfg or pre_cfg, html_path, r)
     check_output_dir_cleanliness(output_dir, r)
 
