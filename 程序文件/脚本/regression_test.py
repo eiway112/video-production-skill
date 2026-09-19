@@ -6718,10 +6718,192 @@ def test_subtitle_timestamp_source_hit_rate_gate() -> RegressionTestCase:
 
 
 # ============================================================================
+# 2026-09-19 方案 B：交付说明「字幕时间戳来源」节自动写入 + --audit 一致性维
+# ============================================================================
+
+def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
+    """用例61：交付说明本节的结构唯一生成点、就地替换幂等、落点推导、审计一致性维
+
+    背景（操作日志 [2026-09-19] ③ 裁定）：该节的数字唯一来源是终检 media_facts，而
+    temp/ 与日志不入 git——靠收尾提示让人粘贴，交付后"这一版走主路径还是 punct-gap
+    降级"仍无从追溯（09-19 普查的取证成本即此）。方案 B 把写入者收归流水线，并配
+    --audit 第 6 维裁定一致性。锁定面：
+      - 结构唯一生成点：节正文只含一行实测行（同一分布不抄两份），模板标题与
+        media_qa_gate.DELIVERY_NOTES_SECTION_TITLE 逐字一致；
+      - 落点推导：md 在 成果文件/ 层而非 成果文件/视频/（旧实现按 output_file.parent
+        算错一层，使"说明已创建"对全仓 16 份真实 md 恒判为假）；
+      - splice 三态：无节追加、有节整节就地替换且不吃掉相邻节、内容一致 changed=False
+        且字节不变（幂等——否则每次重跑刷新已交付说明的 mtime）；
+      - 写入端：md 不存在不代创建、终检无事实不写、有事实才写；写盘失败（注入
+        os.replace 报错）时 md 保持上一版字节且不留半截临时名（A10 同一实现）；
+      - 审计维四态：报告无 facts → 不适用（不得印成 PASS，存量交付因此零误杀）；
+        facts 齐且节正确 → 通过；节缺失或被手改数字 → FAIL（负面注入，防恒真断言）。
+    """
+    tc = RegressionTestCase(
+        "delivery_notes_subtitle_source_section",
+        "验证交付说明字幕时间戳来源节的唯一生成点、落点、幂等替换与审计一致性维"
+    )
+
+    try:
+        import re
+        from types import SimpleNamespace
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate as mq
+        import pipeline_runner as pr
+        import generate_completion_report as gcr
+
+        facts = {'scenes_total': 10, 'asr_forced': 9, 'punct_gap': 1, 'char_prop': 0,
+                 'asr_forced_ratio': 0.9, 'threshold_ratio': 0.8, 'adjudicable': True}
+        line = mq.format_subtitle_source_line(facts)
+        section = mq.format_subtitle_source_section(line)
+
+        # ── 1. 结构唯一生成点 ──
+        tc.assert_true(line in section, "节正文复用 format_subtitle_source_line 的唯一产出")
+        tc.assert_equal(section.count("asr_forced"), 1,
+                        "同一分布在一节内只出现一次（表格副本已废除）")
+        tpl_path = (script_dir.parent.parent / "AI视频制作工作流模板"
+                    / "templates_07_交付说明模板.md")
+        tpl = tpl_path.read_text(encoding='utf-8')
+        tc.assert_true(f"## {mq.DELIVERY_NOTES_SECTION_TITLE}\n" in tpl,
+                       "模板标题与结构常量逐字一致（否则写入端找不到要替换的节）")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_dir = root / "成果文件"
+            (out_dir / "视频").mkdir(parents=True)
+            video = out_dir / "视频" / "案例成片.mp4"
+            video.write_bytes(b"fake-video")
+
+            # ── 2. 落点推导 ──
+            notes = mq.delivery_notes_path(video)
+            tc.assert_equal(notes.name, "交付说明_案例成片.md",
+                            "md 名由成片基名派生")
+            tc.assert_equal(notes.parent, out_dir,
+                            "md 与 mp4 不同层（旧实现算进 成果文件/视频/，判据恒假）")
+
+            # ── 3. splice 三态 ──
+            md_old = ("## 基本信息\n\n内容A\n\n"
+                      "## 已清理的过程文件\n\n- [ ] render_raw.mp4\n")
+            appended, ch_app = mq.splice_subtitle_source_section(md_old, section)
+            tc.assert_true(ch_app and line in appended,
+                           "无本节时追加，且追加的是实测行")
+            tc.assert_equal(appended.count("## "), 3,
+                            "追加只新增一节，相邻两节结构不变")
+
+            facts2 = dict(facts, asr_forced=7, punct_gap=3, asr_forced_ratio=0.7)
+            line2 = mq.format_subtitle_source_line(facts2)
+            section2 = mq.format_subtitle_source_section(line2)
+            md_mid = ("## 基本信息\n\n内容A\n\n" + section +
+                      "\n## 已清理的过程文件\n\n- [ ] render_raw.mp4\n")
+            replaced, ch_rep = mq.splice_subtitle_source_section(md_mid, section2)
+            tc.assert_true(ch_rep and line2 in replaced, "有本节时整节就地替换")
+            tc.assert_true(line not in replaced,
+                           "旧实测值不留残影（两行并存会让人抄到过期分布）")
+            tc.assert_true("内容A" in replaced and "- [ ] render_raw.mp4" in replaced,
+                           "替换射程仅限本节，不吃相邻内容")
+            tc.assert_equal(replaced.count(f"## {mq.DELIVERY_NOTES_SECTION_TITLE}"), 1,
+                            "替换不产生重复节")
+            again, ch_idem = mq.splice_subtitle_source_section(replaced, section2)
+            tc.assert_equal(ch_idem, False, "内容一致时 changed=False")
+            tc.assert_equal(again, replaced, "内容一致时字节不变（幂等）")
+
+            # ── 4. 写入端行为 ──
+            fake = SimpleNamespace(output_file=video,
+                                   _subtitle_source_note_line=lambda: line)
+            msg_absent = pr.PipelineRunner._sync_subtitle_source_section(fake)
+            tc.assert_true("跳过" in msg_absent and not notes.exists(),
+                           "交付说明不存在时不代创建（创建属人工收尾）")
+            notes.write_text(md_old, encoding='utf-8')
+            msg_write = pr.PipelineRunner._sync_subtitle_source_section(fake)
+            tc.assert_true("已写入" in msg_write and line in notes.read_text(encoding='utf-8'),
+                           "有实测事实且 md 在场 → 落盘")
+            tc.assert_equal(sorted(p.name for p in out_dir.iterdir()),
+                            ["交付说明_案例成片.md", "视频"],
+                            "写盘走原子替换，成果目录不留半截临时名")
+            mtime_before = notes.stat().st_mtime_ns
+            msg_again = pr.PipelineRunner._sync_subtitle_source_section(fake)
+            tc.assert_true("已是最新" in msg_again, "重复执行走幂等分支")
+            tc.assert_equal(notes.stat().st_mtime_ns, mtime_before,
+                            "幂等分支不刷新已交付说明的 mtime")
+            notes.write_text(md_old, encoding='utf-8')
+            fake_nofacts = SimpleNamespace(output_file=video,
+                                           _subtitle_source_note_line=lambda: None)
+            msg_nofacts = pr.PipelineRunner._sync_subtitle_source_section(fake_nofacts)
+            tc.assert_true("跳过" in msg_nofacts and line not in notes.read_text(encoding='utf-8'),
+                           "终检无事实时不写（不得凭空造节）")
+            notes.write_text(md_old, encoding='utf-8')
+
+            # ── 5. md 写盘必须是原子替换（原地截断写会留下半截交付说明）──
+            import script_interface as si
+            from unittest import mock
+            md_before = notes.read_bytes()
+            with mock.patch.object(si, "os",
+                                   SimpleNamespace(fsync=si.os.fsync,
+                                                   replace=lambda *a: (_ for _ in ()).throw(
+                                                       OSError("simulated replace failure")))):
+                raised = False
+                try:
+                    pr.PipelineRunner._sync_subtitle_source_section(fake)
+                except OSError:
+                    raised = True
+            tc.assert_true(raised, "注入的替换失败确实传出了写入点（否则本场景无从证明）")
+            tc.assert_equal(notes.read_bytes(), md_before,
+                            "写盘失败时交付说明保持上一版字节（原地截断写会把它变成半截）")
+            tc.assert_true("交付说明_案例成片.md.tmp" not in
+                           [p.name for p in out_dir.iterdir()],
+                           "失败路径清掉半截临时名")
+
+            # ── 6. 审计第 6 维 ──
+            cfg = root / "cfg.json"
+            cfg.write_text(json.dumps({"delivery": {"prohibited_terms": ["final"]}}),
+                           encoding='utf-8')
+
+            def d6(report_facts):
+                report = {"status": "VALIDATED", "validation": {},
+                          "data_sources": ({"subtitle_timestamp_source": report_facts}
+                                           if report_facts else {})}
+                res = gcr.run_delivery_audit(report, str(video), None, str(cfg), str(cfg))
+                return res["dimensions"]["delivery_notes_consistency"]
+
+            d6_none = d6(None)
+            tc.assert_equal(d6_none.get("applicable"), False,
+                            "报告无实测分布 → 不适用（存量交付零误杀）")
+            tc.assert_true(d6_none["passed"], "不适用不翻转审计总结论")
+            d6_missing = d6(facts)
+            tc.assert_equal(d6_missing["passed"], False,
+                            "facts 齐而 md 无本节 → FAIL（缺留痕就是不一致）")
+            notes.write_text(replaced.replace(line2, line), encoding='utf-8')
+            tc.assert_true(d6(facts)["passed"],
+                           "本节与报告实测同源 → PASS")
+            tampered = notes.read_text(encoding='utf-8').replace("asr_forced 9/10",
+                                                                 "asr_forced 10/10")
+            notes.write_text(tampered, encoding='utf-8')
+            tc.assert_equal(d6(facts)["passed"], False,
+                            "手改本节数字 → FAIL（一致性维不是恒真回执）")
+
+        # ── 7. 不适用维度在打印面不得显示为 PASS ──
+        gcr_src = (script_dir / "generate_completion_report.py").read_text(encoding='utf-8')
+        tc.assert_true(re.search(r'if res\.get\("applicable",\s*True\) is False:\s*\n\s*mark = "N/A"',
+                                 gcr_src),
+                       "审计打印按 applicable 分档，未裁定项不得印成 PASS")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+# ============================================================================
 # 测试运行器
 # ============================================================================
 
 class RegressionTestRunner:
+
     """回归测试运行器"""
     
     def __init__(self):
@@ -6786,6 +6968,7 @@ class RegressionTestRunner:
             test_audio_rms_window_aggregate_measure,
             test_forced_align_segment_face_guards,
             test_subtitle_timestamp_source_hit_rate_gate,
+            test_delivery_notes_subtitle_source_section,
         ]
         self.results = []
     

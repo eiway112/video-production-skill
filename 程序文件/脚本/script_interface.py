@@ -36,21 +36,17 @@ import hashlib
 
 
 # === 权威源落盘 ===
-def atomic_write_json(path, payload):
-    """JSON 落盘统一走"临时文件 + os.replace"（A10，2026-09-19）。
+def _atomic_write_via(path, write_fn):
+    """temp 名 + os.replace 的唯一实现；write_fn(f) 负责将内容写入句柄。
 
-    原地 `open(path,'w')` 先截断再序列化，进程在 dump 中途死掉即留下半截文件。
-    对可再生成的临时产物这只是一次重跑；对**不可再生的权威源**（narration.json、
-    项目 config、pipeline_state、交付登记表）则是数据丢失——旧状态读取侧那段
-    按右花括号到左花括号边界拼接的恢复补丁就是这段历史的化石。写临时名再原子
-    替换，读者要么看到
-    旧版本、要么看到新版本，永远看不到半截。
+    序列化刻意留在调用方的 `write_fn` 内（不在进入本函数前完成）：注入失败时
+    temp 里已有半截内容，才验得出"半截永不顶替目标"（用例56 的注入缝在此）。
     """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     try:
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        with open(tmp, 'w', encoding='utf-8', newline='') as f:
+            write_fn(f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -62,6 +58,29 @@ def atomic_write_json(path, payload):
         except OSError:
             pass
         raise
+
+
+def atomic_write_json(path, payload):
+    """JSON 落盘统一走"临时文件 + os.replace"（A10，2026-09-19）。
+
+    原地 `open(path,'w')` 先截断再序列化，进程在 dump 中途死掉即留下半截文件。
+    对可再生成的临时产物这只是一次重跑；对**不可再生的权威源**（narration.json、
+    项目 config、pipeline_state、交付登记表）则是数据丢失——旧状态读取侧那段
+    按右花括号到左花括号边界拼接的恢复补丁就是这段历史的化石。写临时名再原子
+    替换，读者要么看到
+    旧版本、要么看到新版本，永远看不到半截。
+    """
+    _atomic_write_via(path,
+                      lambda f: json.dump(payload, f, ensure_ascii=False, indent=2))
+
+
+def atomic_write_text(path, text):
+    """文本落盘，与 atomic_write_json 共用同一原子实现（防两处漂移）。
+
+    交付说明 md 是成果目录里唯一由流水线写入的文本权威源，半截 md 会被
+    `--audit` 一致性维读成"本节不存在"，故同样不许原地截断写。
+    """
+    _atomic_write_via(path, lambda f: f.write(text))
 
 
 # === Exit Code 标准定义 ===

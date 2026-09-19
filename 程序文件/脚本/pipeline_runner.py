@@ -49,6 +49,10 @@ from pipeline_state_fingerprint import compute_inputs_fingerprint
 from _script_env import ROOT, VENV_PYTHON
 from script_interface import atomic_write_json
 
+# 换包装时必须持住旧流对象：旧 TextIOWrapper 一旦被 GC，其析构会关掉共享的底层
+# buffer，宿主进程（import 本模块的测试/工具）之后任何打印都报 "I/O operation on
+# closed file"。CLI 独立运行时这两个引用无副作用。
+_std_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -2113,6 +2117,32 @@ class PipelineRunner:
         from media_qa_gate import format_subtitle_source_line
         return format_subtitle_source_line(facts)
 
+    def _sync_subtitle_source_section(self) -> str:
+        """把终检实测的字幕时间戳来源写进项目已有的交付说明 md（方案 B，2026-09-19）。
+
+        为什么由流水线写：该节数字的唯一来源是终检 media_facts，而 temp/ 与日志不入
+        git——靠提示让人粘贴，交付后"这一版走主路径还是降级链"又回到无从追溯。
+        md 不存在时**不创建**：本节是交付说明的一节，不是交付说明本身，创建属人工
+        收尾（模板 templates_07 照常提示）。返回一句状态供调用点打印，幂等由
+        splice 的"无变化不落盘"保证。
+        """
+        from media_qa_gate import (delivery_notes_path, format_subtitle_source_section,
+                                   splice_subtitle_source_section)
+        from script_interface import atomic_write_text
+
+        line = self._subtitle_source_note_line()
+        notes = delivery_notes_path(self.output_file)
+        if not line:
+            return f"跳过（终检未记录来源分布）: {notes.name}"
+        if not notes.exists():
+            return f"跳过（交付说明尚未创建）: {notes.name}"
+        new_text, changed = splice_subtitle_source_section(
+            notes.read_text(encoding='utf-8'), format_subtitle_source_section(line))
+        if not changed:
+            return f"已是最新: {notes.name}"
+        atomic_write_text(notes, new_text)
+        return f"已写入: {notes}"
+
     def step_postprocess(self):
         if self._can_skip("postprocess"):
             return True
@@ -2336,6 +2366,12 @@ class PipelineRunner:
                       f"({entry['duration_seconds']}s, {entry['bytes']} bytes)")
             except OSError as e:
                 print(f"  WARNING: 交付登记写入失败（交付物保护门禁将退回完工报告判据）: {e}")
+            # 交付说明的「字幕时间戳来源」节同样只在 VALIDATED 后写：报告未过就
+            # 写字节进成果目录，等于把未过门的结论放进人读的那一份。
+            try:
+                print(f"  [DELIVERY-NOTES] {self._sync_subtitle_source_section()}")
+            except OSError as e:
+                print(f"  WARNING: 交付说明节写入失败（--audit 一致性维会判 FAIL）: {e}")
         return True
 
     def run(self, start_from=None):
@@ -2446,7 +2482,8 @@ class PipelineRunner:
 
         # Delivery notes reminder
         video_name = self.output_file.stem
-        notes_path = self.output_file.parent / f"交付说明_{video_name}.md"
+        from media_qa_gate import delivery_notes_path
+        notes_path = delivery_notes_path(self.output_file)
         if not notes_path.exists():
             print("-" * 60)
             print("REMINDER: Create delivery notes")

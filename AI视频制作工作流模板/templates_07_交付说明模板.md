@@ -30,17 +30,18 @@
 
 ## 字幕时间戳来源（必填，主路径命中率）
 
-| 项目 | 实测值 |
-|---|---|
-| asr_forced（主路径：音频实测句界） | {n}/{N} 场（{xx%}） |
-| punct_gap（一级降级：标点 gap） | {n} 场 |
-| char_prop（二级降级：字符比例估算） | {n} 场 |
-| 阈值 / 终检裁定 | 阈值取 `audio_sync_rules.json → alignment.min_asr_forced_ratio` / {PASS 或 UNTESTED（经 --accept-media-untested 放行）} |
+Subtitle timestamp source: asr_forced {n}/{N} ({xx%}) | punct_gap {n} | char_prop {n} — 阈值 ≥{th%}
 
 数据源：`media_qa_gate` 检查项 `subtitle_timestamp_source`（终检报告行
 `Subtitle timestamp source:` 与完工报告 `data_sources.subtitle_timestamp_source` 同源，
-取数面是 step5 逐场实测落盘的 `temp/_subtitle_timestamp_source.json`）。本节是该结论的
-**唯一版本化留痕面**——`过程产物/` 与项目 temp 不入 git，日志行在交付后不可追溯。
+取数面是 step5 逐场实测落盘的 `temp/_subtitle_timestamp_source.json`）。本节由
+`pipeline_runner` 在完工报告 VALIDATED 后自动写入，是该结论的**唯一版本化留痕面**——
+`过程产物/` 与项目 temp 不入 git，日志行在交付后不可追溯。
+
+> 本节正文与标题结构以 `media_qa_gate.DELIVERY_NOTES_SECTION_TITLE` 为唯一生成点，
+> 模板不另设表格形态（避免同一分布抄两份）；阈值数值取
+> `audio_sync_rules.json → alignment.min_asr_forced_ratio`，此处只写指针不写死。
+> 手工新建交付说明时保留标题、正文留空即可，流水线会在下一次 VALIDATED 时填充。
 
 ## 已清理的过程文件
 

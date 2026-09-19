@@ -649,6 +649,68 @@ def format_subtitle_source_line(facts: Dict[str, Any]) -> str:
     return line
 
 
+# ── 交付说明 md 的「字幕时间戳来源」节：结构唯一生成点（方案 B，2026-09-19）──
+# 写入方（pipeline_runner 收尾）与裁定方（generate_completion_report --audit）共用
+# 本节语法；标题/页脚若在两侧各抄一份即造出 A12 同族的第二事实源。
+DELIVERY_NOTES_SECTION_TITLE = "字幕时间戳来源（必填，主路径命中率）"
+
+_DELIVERY_NOTES_FOOTER = (
+    "数据源：`media_qa_gate` 检查项 `subtitle_timestamp_source`（终检报告行 "
+    "`Subtitle timestamp source:` 与完工报告 `data_sources.subtitle_timestamp_source` "
+    "同源，取数面是 step5 逐场实测落盘的 `temp/_subtitle_timestamp_source.json`）。"
+    "本节由 `pipeline_runner` 在完工报告 VALIDATED 后自动写入，是该结论的唯一版本化"
+    "留痕面——`过程产物/` 与项目 temp 不入 git，日志行在交付后不可追溯。"
+)
+
+
+def delivery_notes_path(video_path) -> Path:
+    """成片 → 交付说明 md 路径（唯一推导点）。
+
+    槽位布局 成果文件/视频/{name}.mp4 → 成果文件/交付说明_{name}.md。旧实现按
+    output_file.parent 推导，落点算成 成果文件/视频/，与全仓 16 份真实 md 所在层
+    不一致（2026-09-19 实测），使"说明已创建"恒判为假。
+    """
+    p = Path(video_path)
+    return p.parents[1] / f"交付说明_{p.stem}.md"
+
+
+def format_subtitle_source_section(line: str) -> str:
+    """实测行 → 交付说明整节（标题 + 行 + 数据源页脚）。行本身来自唯一生成点。"""
+    return (f"## {DELIVERY_NOTES_SECTION_TITLE}\n\n"
+            f"{line}\n\n"
+            f"{_DELIVERY_NOTES_FOOTER}\n")
+
+
+def extract_subtitle_source_section(md_text: str) -> Optional[str]:
+    """取交付说明中的本节（含标题，到下一个二级标题或文件末尾）；无本节返回 None。"""
+    lines = md_text.splitlines()
+    header = f"## {DELIVERY_NOTES_SECTION_TITLE}"
+    try:
+        start = lines.index(header)
+    except ValueError:
+        return None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("## "):
+            end = i
+            break
+    return "\n".join(lines[start:end]).rstrip('\n')
+
+
+def splice_subtitle_source_section(md_text: str, section: str) -> Tuple[str, bool]:
+    """把本节写入 md：已有则整节就地替换，没有则追加到末尾。
+
+    返回 (新文本, 是否变化)。"无变化"必须返回 False 且调用方不落盘——否则每次
+    重跑都刷新已交付说明的 mtime，产物-状态一致性门禁会把它读成"交付后被改过"。
+    """
+    existing = extract_subtitle_source_section(md_text)
+    if existing is None:
+        return md_text.rstrip('\n') + "\n\n" + section, True
+    if existing.rstrip('\n') == section.rstrip('\n'):
+        return md_text, False
+    return md_text.replace(existing, section.rstrip('\n'), 1), True
+
+
 # 字幕组检查项清单（单一权威源）：字幕缺失/声明豁免时整组一并裁定，
 # 新增字幕类检查项只改这里与 docstring 目录，不再抄第二份清单（A12）。
 SUBTITLE_CHECK_KEYS = ('subtitle_file_exists', 'subtitle_not_empty',

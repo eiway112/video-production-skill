@@ -36,6 +36,8 @@ from typing import Dict, Any, Optional
 import sys
 import io
 
+# 持住旧流对象，理由同 pipeline_runner（旧包装被 GC 会关掉底层 buffer）
+_stdout_prev = sys.stdout
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 # 交付门禁自适应参数表（单一权威源：config/quality/delivery_gate_rules.json）
@@ -96,12 +98,13 @@ def run_delivery_audit(report: Dict[str, Any],
     """交付审计（agent-wiki 角色分离落地：模型不得给自己打分）。
 
     背景：SKILL.md 旧版"自评量表"由执行者自评 5 维度，属 Generator 自证。
-    本函数把 5 维度全部改为从真实数据推导，治具裁定，退出码说话：
+    本函数把 6 维度全部改为从真实数据推导，治具裁定，退出码说话：
       1. end_to_end_authenticity  ← 全步 passed + 音视频流真实存在
       2. gate_integrity           ← verifications 全过 + 无未测项 + 无 --force 绕过留痕
       3. delivery_compliance      ← 交付文件名无技术词 + srt 与 mp4 同基名
       4. storyboard_fidelity      ← narration_source 指针可解析、场景指纹可追溯
       5. completion_integrity     ← 报告状态 VALIDATED + ffprobe 实测 + 产物一致性已执行
+      6. delivery_notes_consistency ← 交付说明的本节存在且等于报告实测分布（无实测事实时不适用）
 
     参数 config_file 为项目流水线配置（审计模式下必填，供 prohibited_terms 与
     narration_source 解析）。返回 {"dimensions": {...}, "passed": bool}。
@@ -227,9 +230,42 @@ def run_delivery_audit(report: Dict[str, Any],
                     else "status VALIDATED, ffprobe measured, mtime consistency passed",
     }
 
+    # ── 维度6：交付说明一致性（字幕时间戳来源节，方案 B，2026-09-19）──
+    # 只裁定"实测过且报告里有分布"的交付：无 facts（纯 BGM、或终检早于 A13 落盘面）
+    # 时本节无从要求，记为不适用而非通过——存量 16 份交付说明因此不会被新维误杀。
+    d6_reasons = []
+    d6_applicable = True
+    facts = report.get("data_sources", {}).get("subtitle_timestamp_source")
+    notes = None
+    if not facts:
+        d6_applicable = False
+        d6_evidence = ("no subtitle_timestamp_source facts in report "
+                       "(纯 BGM 或终检未记录该事实) — 本节不适用")
+    else:
+        from media_qa_gate import (delivery_notes_path, extract_subtitle_source_section,
+                                   format_subtitle_source_line)
+        notes = delivery_notes_path(video_file)
+        if not notes.exists():
+            d6_reasons.append(f"交付说明未创建: {notes}")
+        else:
+            section = extract_subtitle_source_section(notes.read_text(encoding='utf-8'))
+            expected = format_subtitle_source_line(facts)
+            if section is None:
+                d6_reasons.append(f"交付说明缺「字幕时间戳来源」一节: {notes.name}")
+            elif expected not in section:
+                d6_reasons.append(
+                    f"本节与完工报告实测不一致，应为: {expected}")
+        d6_evidence = (f"notes={notes.name}, 与完工报告 data_sources."
+                       f"subtitle_timestamp_source 同源")
+    dims["delivery_notes_consistency"] = {
+        "passed": not d6_reasons,
+        "applicable": d6_applicable,
+        "evidence": "; ".join(d6_reasons) if d6_reasons else d6_evidence,
+    }
+
     passed = all(d["passed"] for d in dims.values())
     return {"dimensions": dims, "passed": passed,
-            "basis": "agent-wiki 角色分离：5 维度全部由真实数据推导，治具裁定，禁止自证"}
+            "basis": "agent-wiki 角色分离：6 维度全部由真实数据推导，治具裁定，禁止自证"}
 
 
 def ffprobe_get_metadata(video_path: str) -> Dict[str, Any]:
@@ -659,7 +695,11 @@ def main():
     if audit:
         print(f"\n[DELIVERY AUDIT] {'PASSED' if audit['passed'] else 'FAILED'}")
         for dim, res in audit["dimensions"].items():
-            mark = "PASS" if res["passed"] else "FAIL"
+            # 不适用不得印成 PASS（四态纪律：无实测事实的维度不参与裁定）
+            if res.get("applicable", True) is False:
+                mark = "N/A"
+            else:
+                mark = "PASS" if res["passed"] else "FAIL"
             print(f"  [{mark}] {dim}: {res['evidence']}")
     
     # 保存报告文件
