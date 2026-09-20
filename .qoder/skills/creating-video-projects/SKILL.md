@@ -62,7 +62,7 @@ python config_manager.py
 产出物落在 `程序文件/源码/hyperframes/<项目名>/`（项目名用英文短横线风格）：
 
 1. `narration.json` — 场景单一权威源。结构参照现有成功项目（如 `quickstart-demo/narration.json`）。必填字段：`scene_id`（整数）、`start`、`end`、`narration`（旁白文本）；可选字段：`type`（cover|content，缺省视为 content）、`title`、`narration_required`。编译后的 `_compiled_scenes.json` 由 `compile_narration_to_scenes.py` 自动补全 duration 等派生字段（完整契约见 `config/schema/compiled_scenes_schema.json`）。
-2. 流水线配置 JSON → `程序文件/配置/config/<项目名>.json`（也可放入 `config/pipelines/` 子目录，runner 自动搜索）。参照 `config/quickstart-demo.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（qwen 引擎音色如 `longanling_v3`；禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen 引擎，TTS 步会报错拒收）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。渲染器固定输出 25fps/1920x1080，配置无需声明。
+2. 流水线配置 JSON → `程序文件/配置/config/<项目名>.json`（也可放入 `config/pipelines/` 子目录，runner 自动搜索）。参照 `config/quickstart-demo.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（qwen 引擎音色如 `longanling_v3`，默认即 qwen 无需声明 tts_engine；禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen 引擎，TTS 步会报错拒收；需要情感起伏时用 Instruct 音色 longanyang/longanhuan + `tts_instruction`，见 AGENTS.md TTS 引擎纪律）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 的 declared_matches_measured 检查会实测回比）。
 3. `index.html` — 手写 HTML+GSAP。**完成后逐项核对踩坑清单"阶段C检查表"全部条目**（占位符、subtitle-safe 高度、装饰层 opacity、字号分层、无 >3s 静止、动画必须挂在主 timeline `tl` 上等），并对照 HTML 模板参考基准。
 4. 场景 div 必须声明 `data-scene-id` / `data-scene-entry` / `data-scene-subtitle-safe`（AGENTS.md HTML 契约）。
 
@@ -75,12 +75,12 @@ python config_manager.py
    门禁自动继承：preflight → tts → timeline → preview（硬阻断）→ render → verify → visual_check → postprocess。**禁止用 --force 绕过门禁**。
    - TTS 生成并发数由 `程序文件/配置/config/system/hyperframes_config.json` 的 `tts_concurrency` 控制（默认 3，硬上限 5，设 1 为串行；读取失败回退 3 并告警）；并发仅作用于 TTS 网络生成阶段，失败场景自动串行兜底重试一次。
    - 渲染期间的 `[RENDER]` 前缀进度/心跳日志来自旁路观察者线程，纯观测输出，不改变渲染控制流与退出码。
-2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。渲染成本受预算门禁治理：全量渲染尝试次数达到 `render_rules.json render_budget.max_full_renders`（默认 3）后自动阻断——超限通常意味着问题不在渲染本身，先定点诊断；确需继续用 `--accept-over-render` 显式放行留痕；局部修订优先 `--scene-patch`/`--quick-fix`（不计入预算）。
+2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。渲染成本受预算门禁治理：全量渲染尝试次数达到 `render_rules.json render_budget.max_full_renders`（默认 3）后自动阻断——超限通常意味着问题不在渲染本身，先定点诊断；确需继续用 `--accept-over-render` 显式放行留痕。**增量渲染不需要显式开启**（2026-09-03 起）：只要存在基线 `render_raw.mp4` + `scene_fingerprints.json`，render 步自动调用分类器裁定 PATCH/FULL，`--scene-patch` 已废弃为空操作，`--no-scene-patch` 才是退出开关；PATCH 成功落地与 `--quick-fix` 均不计入预算，裁定结果留痕 `state.scene_patch` + `scene_patch_verdict.json`。已登记交付的成片不得被任何模式覆盖（拦截点：render 前置 + postprocess 写入点），修订须改 `_修订NN` 文件名，确需覆盖用 `--force`。
 3. 交付验收：
    ```
    python generate_completion_report.py（按脚本 --help 传参，交付验收必须追加 --audit --config-file <项目配置>）
    ```
-   报告数据必须源自 ffprobe/pipeline_state/SRT 真实测量。`--audit` 执行交付审计：5 维度全部由真实数据推导、治具裁定，任一维度失败退出码 4，禁止声明交付。
+   报告数据必须源自 ffprobe/pipeline_state/SRT 真实测量。`--audit` 执行交付审计：6 维度全部由真实数据推导、治具裁定（端到端真实性/门禁完整性/交付合规/分镜忠实度/收尾完成度/交付说明一致性），任一维度失败退出码 4，禁止声明交付。
 4. 收尾：确认 `成果文件/视频/`、`成果文件/字幕/` 产物就位（路径前置展示给用户）→ `project_cleanup.py --execute` 清理中间产物。已交付文件永不覆盖，修订加 `_修订NN` 后缀。
 
 ## 交付审计（阶段D强制，退出码 0 才可声明完成）
@@ -94,6 +94,7 @@ python config_manager.py
 | 交付合规 | 文件名无禁用技术词（config `prohibited_terms`）+ srt/mp4 同基名 |
 | 分镜忠实度 | `narration_source` 指针可解析 + 场景指纹（sha256）留档 |
 | 收尾完成度 | 报告状态 VALIDATED + ffprobe 实测 + 产物 mtime 一致性已执行 |
+| 交付说明一致性 | 交付说明 md 的「字幕时间戳来源」节由流水线写入并等于终检实测分布（终检无 facts 时判不适用，不阻断） |
 
 审计失败 → 修复对应维度后重跑，禁止手工改 state 或报告绕过。
 
