@@ -2030,8 +2030,10 @@ class PipelineRunner:
     def _delivery_slot_guard(self, step_name):
         """交付槽位保护（AGENTS.md：已交付文件不得覆盖）。放行返回 True。
 
-        2026-09-03 结构性修复后，槽位的真实写入点是 postprocess（step3 混音 /
-        step6 烧字幕），render 步不再往 成果文件/视频/ 复制任何东西。两处都要拦：
+        2026-09-03 结构性修复后，槽位的真实写入点在 postprocess 内部，render 步
+        不再往 成果文件/视频/ 复制任何东西；2026-09-20 时序修复后该写入点收归
+        enhance_video_audio._commit_delivery_slot()（全部下游门禁通过后的单次
+        原子落槽）。两处都要拦：
         render 前置为省成本（别让 30-40 分钟渲染白跑），postprocess 前置为写入点
         把关——quick-fix 模式整段跳过 render，只靠 render 前置的话，quick-fix 会
         直接把已交付成片换掉。

@@ -6898,6 +6898,317 @@ def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
     return tc
 
 
+def test_delivery_slot_committed_only_after_all_gates() -> RegressionTestCase:
+    """用例62：交付槽位只在全部下游门禁通过后单次落槽（2026-09-20 时序修复）
+
+    背景：enhance 的 step3（混音）与 step6（烧字幕）曾把产物直接 rename 进
+    成果文件/视频/{name}.mp4，而 step4（码率/音轨核验）与 step7（综合门禁）在其
+    之后才跑——"该步自身成功"不等于 AGENTS.md 要求的"成功链末端"。实测后果
+    （2026-09-20 发布仓 quickstart-demo 复验，操作日志 [2026-09-20] verify 发现 3）：
+    同一路径产生 4 次无背书占槽（1 份因终检 UNTESTED 失败、3 份因码率门禁 FAIL）。
+    修复：产物全程留 temp，_commit_delivery_slot() 成为槽位唯一写入者。
+
+    夹具 monkeypatch WF_ROOT 到临时目录，不落仓库；ffmpeg 由 run_ffmpeg 桩替代，
+    零真实编码。
+    """
+    tc = RegressionTestCase(
+        "delivery_slot_committed_only_after_all_gates",
+        "验证后处理门禁失败时交付槽位字节不变、成功路径槽位与 temp 产物同源"
+    )
+    import asyncio
+    import hashlib
+    import inspect
+    import io
+
+    def _sha(p):
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+    def _slot_snapshot(slot_dir):
+        if not slot_dir.exists():
+            return {}
+        return {f.name: (f.stat().st_size, _sha(f))
+                for f in sorted(slot_dir.glob("*.mp4"))}
+
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        # ── 1. 结构前提：step3 的写出目标不再是交付槽位 ──
+        sig = inspect.signature(eva.step3_merge_all)
+        tc.assert_equal(list(sig.parameters), ["video_path", "temp_dir"],
+                        "1a step3 参数表只剩输入源 + temp，槽位不再是它的写出目标")
+        tc.assert_true(callable(getattr(eva, "_commit_delivery_slot", None)),
+                       "1b 槽位写入点由独立函数承担")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            saved_root = eva.WF_ROOT
+            eva.WF_ROOT = td
+            slot_dir = td / "成果文件" / "视频"
+            slot_dir.mkdir(parents=True, exist_ok=True)
+            cfg = {"paths": {"video_name": "_regress-slotcommit.mp4",
+                             "subtitle_name": "_regress-slotcommit.srt",
+                             "temp_subdir": "_regress-slotcommit_audio"}}
+            _root, _vin, temp_dir, slot, _srt = eva.get_paths(cfg)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            working = temp_dir / "final_output.mp4"
+
+            ffmpeg_outs = []
+
+            def _fake_ffmpeg(cmd, desc=""):
+                out = Path(cmd[-1])
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(b"ART-" + desc.encode("utf-8"))
+                ffmpeg_outs.append(out)
+                return True
+
+            saved = {}
+            for name in ("run_ffmpeg", "get_duration", "step0_validate_html_template",
+                         "step1_generate_tts", "step2_generate_bgm", "step3_merge_all",
+                         "step5_generate_subtitles", "step6_burn_subtitles",
+                         "step4_verify", "step7_validate"):
+                saved[name] = getattr(eva, name)
+            globals_saved = (eva.TTS_ENABLED, eva.BGM_ENABLED, eva.VIDEO_DURATION,
+                             eva.SCENES)
+            # 被测脚本的 print 走的是测试进程 stdout（GBK 控制台），门禁文案含
+            # 非 ASCII 符号会炸编码——整段收进内存，末尾再据其非空性自证"真跑过"
+            console_out = sys.stdout
+            captured = io.StringIO()
+            sys.stdout = captured
+            try:
+                eva.run_ffmpeg = _fake_ffmpeg
+                eva.get_duration = lambda p: 10.0
+                eva.step0_validate_html_template = lambda: True
+                eva.VIDEO_DURATION = 10.0
+                eva.SCENES = []
+
+                async def _fake_tts(_temp_dir):
+                    return True
+                eva.step1_generate_tts = _fake_tts
+                eva.step2_generate_bgm = lambda _td: True
+
+                # ── 2. 真实 step3 在门禁前不得触碰槽位 ──
+                (temp_dir / "render_raw.mp4").write_bytes(b"RAW" * 32)
+                _r, video_file, _t, _o, _s = eva.get_paths(cfg)
+                old_slot_bytes = b"PREVIOUS-DELIVERED"
+                slot.write_bytes(old_slot_bytes)
+                before = _slot_snapshot(slot_dir)
+                eva.TTS_ENABLED = False
+                eva.BGM_ENABLED = False
+                tc.assert_true(eva.step3_merge_all(video_file, temp_dir),
+                               "2a 真实 step3 在纯BGM夹具下成功")
+                tc.assert_true(working.exists(),
+                               "2b step3 产物落在 temp/final_output.mp4")
+                tc.assert_equal([str(p) for p in ffmpeg_outs], [str(working)],
+                                "2c step3 只让 ffmpeg 往 temp 写，没有第二个输出点")
+                tc.assert_equal(_slot_snapshot(slot_dir), before,
+                                "2d step3 跑完后槽位字节与文件集合逐位不变")
+
+                # ── 3. 真实 step6 同理（写回 temp 产物，不碰槽位）──
+                srt = td / "成果文件" / "字幕" / "_regress-slotcommit.srt"
+                srt.parent.mkdir(parents=True, exist_ok=True)
+                srt.write_bytes(b"1\n00:00:00,000 --> 00:00:01,000\nx\n")
+                ffmpeg_outs.clear()
+                tc.assert_true(eva.step6_burn_subtitles(working, srt, temp_dir),
+                               "3a 真实 step6 成功")
+                tc.assert_equal([str(p) for p in ffmpeg_outs],
+                                [str(temp_dir / "final_with_subs.mp4")],
+                                "3b 烧录中间产物落在 temp，不在成果目录")
+                tc.assert_equal(slot.read_bytes(), old_slot_bytes,
+                                "3c step6 之后槽位仍是旧字节（新产物未落槽）")
+                tc.assert_equal(_slot_snapshot(slot_dir), before,
+                                "3d step6 之后成果目录无新增文件（含 .prev/.noaudio 类残留）")
+                tc.assert_equal(working.read_bytes(), b"ART-subtitle burn-in",
+                                "3e step6 把烧录结果顶回 temp 工作产物")
+
+                # ── 4. 提交点本身：成功落槽＝同一次 rename，缺产物/缺目录拒绝 ──
+                tc.assert_true(eva._commit_delivery_slot(working, slot, temp_dir),
+                               "4a 门禁全过后落槽成功")
+                tc.assert_equal(_sha(slot),
+                                hashlib.sha256(b"ART-subtitle burn-in").hexdigest(),
+                               "4b 槽位内容＝落槽前 temp 产物的逐位内容（同一次 rename，非二次生成）")
+                tc.assert_true(not working.exists(),
+                               "4c 落槽是同卷 rename：temp 不留第二份副本（磁盘峰值不翻倍）")
+                tc.assert_equal(_slot_snapshot(slot_dir),
+                                {slot.name: (len(b"ART-subtitle burn-in"), _sha(slot))},
+                                "4d 落槽后成果目录只有成片一个文件")
+                tc.assert_equal((temp_dir / "_regress-slotcommit.prev.mp4").read_bytes(),
+                                old_slot_bytes,
+                                "4e 被替换的旧成片落 temp 的 .prev.mp4")
+                sentinel_prev = temp_dir / "_regress-slotcommit.prev.mp4"
+                sentinel_prev.write_bytes(b"PREV-SENTINEL")
+                tc.assert_true(not eva._commit_delivery_slot(temp_dir / "absent.mp4",
+                                                            slot, temp_dir),
+                               "4f 产物缺失时拒绝落槽（不凭空搬走槽位里的旧成片）")
+                tc.assert_equal(slot.read_bytes(), b"ART-subtitle burn-in",
+                                "4g 拒绝落槽时槽位内容逐位不变")
+                tc.assert_equal(sentinel_prev.read_bytes(), b"PREV-SENTINEL",
+                                '4g2 拒绝发生在动槽位之前：上一版 .prev 备份不得被无谓覆盖')
+                working.write_bytes(b"ART-retry")
+                tc.assert_true(not eva._commit_delivery_slot(
+                    working, td / "no-such-dir" / "x.mp4", temp_dir),
+                    "4h 成果目录不存在 → 落槽失败（os.replace 自身报错，不代建目录）")
+                tc.assert_true(working.exists(),
+                               "4i 落槽失败时产物仍在 temp（未被半途搬走消失）")
+
+                # ── 4j. 落槽改名失败（跨卷 EXDEV 形态）→ 槽位必须回滚，产物留 temp ──
+                real_os = eva.os
+                slot_bytes_before = slot.read_bytes()
+
+                class _OsStub:
+                    def __getattr__(self, k):
+                        return getattr(real_os, k)
+
+                    def replace(self, _src, _dst):
+                        raise OSError(18, "Invalid cross-device link")
+
+                eva.os = _OsStub()
+                try:
+                    working.write_bytes(b"NEW-TAKE-2")
+                    ok_i = eva._commit_delivery_slot(working, slot, temp_dir)
+                finally:
+                    eva.os = real_os
+                tc.assert_true(not ok_i, "4k 落槽改名失败必须返回 False（不得当成成功）")
+                tc.assert_equal(slot.read_bytes(), slot_bytes_before,
+                                "4l 失败后槽位回滚为原文件（交付目录不得出现空槽/半成品）")
+                tc.assert_equal(working.read_bytes(), b"NEW-TAKE-2",
+                                "4m 失败后新产物仍留在 temp，可复跑而不必重渲染")
+
+                # ── 5. 端到端时序：step7 FAIL 时槽位必须保持原状 ──
+                working.write_bytes(b"MERGED-NEW")
+                slot.write_bytes(b"ALREADY-DELIVERED")
+                before5 = _slot_snapshot(slot_dir)
+                gate_calls = []
+
+                def _fake_step4(p):
+                    gate_calls.append(("step4", Path(p)))
+                    return True
+
+                def _fake_step7(subtitle_path, _temp_dir, video_path=None, _dur=None):
+                    gate_calls.append(("step7", Path(video_path)))
+                    return False
+
+                def _fake_step3(_video_path, _temp_dir):
+                    Path(_temp_dir / "final_output.mp4").write_bytes(b"MERGED-NEW")
+                    return True
+
+                def _fake_step6(vpath, _srt, _td):
+                    Path(vpath).write_bytes(b"MERGED-NEW")
+                    return True
+
+                eva.step3_merge_all = _fake_step3
+                eva.step6_burn_subtitles = _fake_step6
+                eva.TTS_ENABLED = True
+                eva.step5_generate_subtitles = lambda _p, _td: True
+                eva.step4_verify = _fake_step4
+                eva.step7_validate = _fake_step7
+
+                main_logs = []
+                cfg_path = td / "cfg.json"
+
+                def _write_cfg(tts_enabled):
+                    cfg_path.write_text(json.dumps({
+                        "video_duration": 10.0,
+                        "tts_enabled": tts_enabled,
+                        "bgm_enabled": True,
+                        "scenes": [{"scene_id": "s1", "start": 0, "end": 10,
+                                    "narration": "测试旁白"}],
+                        "paths": {"video_name": slot.name,
+                                  "subtitle_name": srt.name,
+                                  "temp_subdir": temp_dir.name},
+                    }, ensure_ascii=False), encoding="utf-8")
+
+                def _run_main(tts_enabled=True):
+                    """跑 enhance.main() 真身（load_config 亦真身，会按 cfg 重设
+                    TTS_ENABLED 等模块全局），输出留在内存（测试进程控制台是 GBK，
+                    门禁失败文案含非 ASCII 符号，直接打印会炸编码）。"""
+                    _write_cfg(tts_enabled)
+                    argv = sys.argv
+                    out, err = sys.stdout, sys.stderr
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    sys.argv = ["enhance_video_audio.py", "--config", str(cfg_path)]
+                    sys.stdout, sys.stderr = buf_out, buf_err
+                    rc = None
+                    try:
+                        asyncio.run(eva.main())
+                    except SystemExit as e:
+                        rc = e.code
+                    finally:
+                        sys.stdout, sys.stderr = out, err
+                        sys.argv = argv
+                    text = buf_out.getvalue() + buf_err.getvalue()
+                    main_logs.append(text)
+                    return rc, text
+
+                rc, log5 = _run_main()
+                tc.assert_equal(rc, 1, "5b step7 门禁失败 → 退出码 1")
+                tc.assert_true("VALIDATION GATE FAILED" in log5,
+                               "5c 失败确实来自 step7（非提前 return 造成的假阴性）")
+                tc.assert_equal(_slot_snapshot(slot_dir), before5,
+                                "5d 门禁失败后交付槽位字节不变、且不新增文件（本用例主命题）")
+                tc.assert_equal([c[0] for c in gate_calls], ["step4", "step7"],
+                                "5e 两道门禁都在链路里跑过，顺序为 step4 → step7")
+                tc.assert_true(bool(gate_calls) and all(p == working for _, p in gate_calls),
+                               "5f 门禁检查的对象是 temp 产物，不是交付槽位")
+                tc.assert_true(working.exists(),
+                               "5g 门禁失败时新产物留在 temp（供 --quick-fix 复跑）")
+
+                # ── 6. 同一链路把 step7 改判通过 → 槽位才被写入 ──
+                gate_calls.clear()
+                eva.step7_validate = (
+                    lambda subtitle_path, _td, video_path=None, _d=None:
+                    (gate_calls.append(("step7", Path(video_path))), True)[1])
+                rc2, log6 = _run_main()
+                tc.assert_equal(rc2, None, "6a 全部门禁通过 → 正常退出（无 SystemExit）")
+                tc.assert_true("All checks passed" in log6,
+                               "6b 成功路径确实走完门禁（与 5c 同法对照）")
+                tc.assert_equal(slot.read_bytes(), b"MERGED-NEW",
+                                "6c 槽位此时才拿到新产物")
+                prev = temp_dir / f"{slot.stem}.prev.mp4"
+                tc.assert_equal(prev.read_bytes(), b"ALREADY-DELIVERED",
+                                "6d 旧成片在提交一刻才搬去 temp（备份时机随写入点）")
+                tc.assert_equal(_slot_snapshot(slot_dir), {slot.name: (10, _sha(slot))},
+                                "6e 成功路径成果目录仍只有成片一个文件")
+
+                # ── 7. 纯BGM路径（config tts_enabled=false，无 step5/6）同样只在门禁后落槽 ──
+                step5_calls, step6_calls = [], []
+                eva.step5_generate_subtitles = lambda _p, _td: step5_calls.append(1) or True
+                eva.step6_burn_subtitles = lambda v, _s, _td: step6_calls.append(v) or True
+                slot.write_bytes(b"BGM-OLD")
+                before7 = _slot_snapshot(slot_dir)
+                eva.step7_validate = lambda *_a, **_k: False
+                rc3, _log7 = _run_main(tts_enabled=False)
+                tc.assert_equal(rc3, 1, "7a 纯BGM路径门禁失败 → 退出码 1")
+                tc.assert_equal((len(step5_calls), len(step6_calls)), (0, 0),
+                                "7b 纯BGM路径按类型化豁免跳过字幕两步（不是被本用例桩掉）")
+                tc.assert_equal(_slot_snapshot(slot_dir), before7,
+                                "7c 纯BGM路径同样不得在门禁前写槽位")
+            finally:
+                sys.stdout = console_out
+                for name, fn in saved.items():
+                    setattr(eva, name, fn)
+                (eva.TTS_ENABLED, eva.BGM_ENABLED, eva.VIDEO_DURATION,
+                 eva.SCENES) = globals_saved
+                eva.WF_ROOT = saved_root
+
+            all_text = captured.getvalue() + "\n".join(main_logs)
+            tc.assert_true("Merged (temp working artifact)" in all_text
+                           and "Delivery slot written" in all_text
+                           and "VALIDATION GATE FAILED" in all_text,
+                           "8 本用例确实驱动过真实 step3 落 temp、落槽、门禁失败三条路径（日志自证）")
+            tc.assert_equal(len(list(slot_dir.glob("*.mp4"))), 1,
+                            "9 全程结束后成果目录只剩一个 mp4，无裸片/备份残留")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -6969,6 +7280,7 @@ class RegressionTestRunner:
             test_forced_align_segment_face_guards,
             test_subtitle_timestamp_source_hit_rate_gate,
             test_delivery_notes_subtitle_source_section,
+            test_delivery_slot_committed_only_after_all_gates,
         ]
         self.results = []
     

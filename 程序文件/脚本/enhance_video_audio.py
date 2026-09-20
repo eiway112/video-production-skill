@@ -869,13 +869,11 @@ def get_paths(config_cfg=None):
 
     output_file = root / "成果文件" / "视频" / video_name
     temp_dir = root / "过程产物" / "临时产物" / temp_subdir
-    # 输入源与交付槽位分离（2026-09-03）：后处理输入取纯净渲染 render_raw.mp4，
-    # 成果目录只在链路成功末端（step3 混音 / step6 烧字幕）被写入。
-    # 旧实现把槽位当输入（render 步先把无声裸片复制进去），两类后果实测发生过：
-    #   ① 后处理失败时裸片留在交付槽冒充成片（2026-09-02 WSI 批次 4 条）；
-    #   ② 重跑时把已混音、已烧字幕的成片当输入再处理一遍（字幕重复）。
+    # 输入源与交付槽位分离（2026-09-03）：后处理输入取纯净渲染 render_raw.mp4。
     # 无 render_raw 时回退槽位文件，保留"手工放一个视频进成果目录再单独调用
-    # 本脚本"的用法。
+    # 本脚本"的用法——回退时 step3 会把它整体搬进 temp 作为工作产物，槽位即时
+    # 腾空，由 _commit_delivery_slot 在全部门禁通过后单次落回（2026-09-20 时序
+    # 修复，见该函数）。
     render_raw = temp_dir / "render_raw.mp4"
     video_file = render_raw if render_raw.exists() else output_file
     return root, video_file, temp_dir, output_file, subtitle_file
@@ -1558,7 +1556,7 @@ def step2_generate_bgm(temp_dir):
     return ok
 
 
-def step3_merge_all(video_path, temp_dir, output_path):
+def step3_merge_all(video_path, temp_dir):
     """Merge: video + TTS narration (louder) + BGM (softer)
 
     Audio chain:
@@ -1570,6 +1568,9 @@ def step3_merge_all(video_path, temp_dir, output_path):
       5. loudnorm → EBU R128 loudness standardization (-16 LUFS)
          This ensures consistent volume across all produced videos and
          matches platform requirements (Douyin, Bilibili, WeChat).
+
+    Writes temp/final_output.mp4 only — the delivery slot is written by
+    _commit_delivery_slot() after every downstream gate has passed.
     """
     print("=== Step 3: Merge Video + Narration + BGM ===")
 
@@ -1589,6 +1590,8 @@ def step3_merge_all(video_path, temp_dir, output_path):
 
     tts_dir = temp_dir / "tts_44k"
     bgm_file = temp_dir / "bgm.wav"
+    # 产物只落 temp（2026-09-20 时序修复）：混音结果不再 rename 进交付槽位，
+    # 由 main() 在 step4/step7 全过后经 _commit_delivery_slot 单次原子落槽。
     temp_output = temp_dir / "final_output.mp4"
     manifest = _load_tts_manifest(temp_dir)
 
@@ -1687,19 +1690,60 @@ def step3_merge_all(video_path, temp_dir, output_path):
     if not ok:
         return False
 
-    # Replace output file. Previous version is backed up into temp_dir —
-    # NEVER into the delivery directory: a stale "*.noaudio.mp4" (which
-    # actually contained audio + old burned subtitles) once sat next to the
-    # real deliverable and was mistaken for a final product.
+    print(f"  Merged (temp working artifact): {temp_output}\n")
+    return True
+
+
+def _commit_delivery_slot(artifact_path, output_path, temp_dir):
+    """交付槽位的唯一写入点（2026-09-20 时序修复）。
+
+    背景：step3（混音）与 step6（烧字幕）曾各自把产物 rename 进
+    成果文件/视频/{name}.mp4，而 step4（码率/音轨核验）与 step7（综合门禁）
+    在其之后才跑——"该步自身成功"≠AGENTS.md 要求的"成功链末端"。实测后果
+    （2026-09-20 发布仓 quickstart-demo 复验，操作日志 [2026-09-20] verify 发现 3）：
+    同一路径产生 4 次无背书占槽，其中 1 份因终检 UNTESTED 失败、3 份因码率
+    门禁 FAIL，成片在门禁裁定前就已站在交付目录里。
+
+    现：全部下游门禁通过后，一次 os.replace 落槽。同卷 rename 只改目录项，
+    不产生第二份副本（磁盘峰值＝temp 产物 + 被换下的旧成片，与修复前持平）；
+    跨卷时 os.replace 自身报 EXDEV，此处不做 st_dev 预检（Windows 上该字段
+    语义不可靠），失败即回滚槽位并返回 False——交付目录不得出现半成品。
+    被换下的旧成片进 temp 的 {stem}.prev.mp4，绝不进成果目录：历史上一个
+    "*.noaudio.mp4"（实为含音频+旧字幕的成片）曾在交付目录里被误认成成品。
+    """
+    artifact_path = Path(artifact_path)
+    output_path = Path(output_path)
+    temp_dir = Path(temp_dir)
+    if not artifact_path.exists():
+        print(f"  ERROR: 交付产物缺失，拒绝落槽（否则会搬走槽位里的旧成片）: {artifact_path}")
+        return False
+
+    backup = None
     if output_path.exists():
         backup = temp_dir / f"{output_path.stem}.prev.mp4"
         if backup.exists():
             backup.unlink()
         output_path.rename(backup)
-        print(f"  Previous output moved to temp: {backup}")
 
-    temp_output.rename(output_path)
-    print(f"  Output: {output_path}\n")
+    try:
+        os.replace(artifact_path, output_path)
+    except OSError as e:
+        if backup is not None:
+            try:
+                backup.rename(output_path)
+                print(f"  槽位已回滚为原文件（{output_path.name} 字节不变）")
+            except OSError as re_err:
+                print(f"  ERROR: 槽位回滚失败，旧成片在 {backup}：{re_err}")
+        print(f"  ERROR: 落槽失败: {e}")
+        print(f"  最常见原因是 temp 与成果目录跨卷（os.replace 不支持跨卷改名，"
+              f"退化成拷贝会让磁盘峰值翻倍）：{artifact_path} → {output_path}")
+        return False
+
+    size_mb = output_path.stat().st_size / 1024 / 1024
+    print(f"  Delivery slot written: {output_path} ({size_mb:.1f} MB)")
+    if backup is not None:
+        print(f"  Previous output moved to temp: {backup}")
+    print()
     return True
 
 
@@ -2329,7 +2373,12 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
 
 
 def step6_burn_subtitles(video_path, subtitle_path, temp_dir):
-    """Burn SRT subtitles into video (hardcoded)"""
+    """Burn SRT subtitles into the temp working artifact.
+
+    video_path 是 step3 的 temp 产物（不是交付槽位）。烧录结果先落
+    temp/final_with_subs.mp4，再把它搬回 step3 产物所在位置，保持
+    "交付槽位只由 _commit_delivery_slot() 写入"的单一写点。
+    """
     print("=== Step 6: Burn Subtitles into Video ===")
 
     if not subtitle_path.exists():
@@ -2373,12 +2422,12 @@ def step6_burn_subtitles(video_path, subtitle_path, temp_dir):
     if not ok:
         return False
 
-    # Replace the video file
-    video_path.unlink()
-    temp_output.rename(video_path)
+    # 烧录结果顶掉 step3 产物（两者都在 temp，os.replace 同卷原子改目录项，
+    # 不做第二份拷贝）；交付槽位仍由 _commit_delivery_slot() 独占
+    os.replace(temp_output, video_path)
 
     size_mb = video_path.stat().st_size / 1024 / 1024
-    print(f"  Output: {video_path} ({size_mb:.1f} MB)\n")
+    print(f"  Output (temp working artifact): {video_path} ({size_mb:.1f} MB)\n")
     return True
 
 
@@ -2990,7 +3039,7 @@ async def main():
                         help="Re-run audio/subtitle/burn steps from the clean render_raw.mp4 "
                              "(saves ~5min render time; TTS step still runs — cache hits are "
                              "instant, stale text regenerates). The delivery slot is written "
-                             "only when the merge succeeds.")
+                             "only after every downstream gate has passed.")
     args = parser.parse_args()
 
     config_cfg = None
@@ -3020,8 +3069,8 @@ async def main():
 
     # Quick-fix 模式：输入必须是纯净渲染 render_raw.mp4（get_paths 已如此解析）。
     # 旧实现在这里 unlink 成果槽位再把裸片复制进去——等于在后处理成功之前就把
-    # 无声裸片写进交付目录，还会直接删掉已交付成片。现在槽位只由 step3（混音）
-    # 与 step6（烧字幕）在成功路径上写入，中途失败则槽位保持原状。
+    # 无声裸片写进交付目录，还会直接删掉已交付成片。现在槽位只由全部下游门禁
+    # （step4/step7）通过后的 _commit_delivery_slot() 写入，中途失败则保持原状。
     if args.quick_fix:
         render_raw = temp_dir / "render_raw.mp4"
         if not render_raw.exists():
@@ -3059,7 +3108,12 @@ async def main():
     if not ok:
         sys.exit(1)
 
-    ok = step3_merge_all(video_file, temp_dir, output_file)
+    # 后处理产物全程留在 temp，交付槽位由末个门禁通过后的单次原子 rename 写入。
+    # 磁盘峰值与修复前相同：step3 产物 + step6 中间产物本就同时在 temp 里存在，
+    # 落槽用 os.replace（同卷改目录项），不产生第三份额外副本。
+    working_artifact = temp_dir / "final_output.mp4"
+
+    ok = step3_merge_all(video_file, temp_dir)
     if not ok:
         sys.exit(1)
 
@@ -3069,7 +3123,7 @@ async def main():
             print("\nSubtitle generation FAILED")
             sys.exit(1)
 
-        ok = step6_burn_subtitles(output_file, subtitle_file, temp_dir)
+        ok = step6_burn_subtitles(working_artifact, subtitle_file, temp_dir)
         if not ok:
             print("\nSubtitle burn-in FAILED")
             sys.exit(1)
@@ -3077,16 +3131,19 @@ async def main():
         # 纯BGM路径：无旁白 → 无 SRT/烧录（类型化豁免，step7 同步豁免字幕检查）
         print("=== Steps 5-6: Subtitles skipped (tts_enabled=false, no narration) ===\n")
 
-    ok = step4_verify(output_file)
+    ok = step4_verify(working_artifact)
     if not ok:
         print("\nFinal verification FAILED")
         sys.exit(1)
 
     # Step 7: Comprehensive validation gate
-    ok = step7_validate(subtitle_file, temp_dir, output_file, VIDEO_DURATION)
+    ok = step7_validate(subtitle_file, temp_dir, working_artifact, VIDEO_DURATION)
     if not ok:
         print("\n⚠ VALIDATION GATE FAILED — see errors above")
         print("Fix the issues and re-run with --quick-fix (no need to re-render video)")
+        sys.exit(1)
+
+    if not _commit_delivery_slot(working_artifact, output_file, temp_dir):
         sys.exit(1)
 
     print("\n✓ All checks passed. Done!")

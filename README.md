@@ -20,6 +20,7 @@
 | hyperframes 渲染器 | 最新 | `npm install -g hyperframes` | 全局 npm 包，流水线经 `npx hyperframes render` 调用 |
 | Chrome | 稳定版 | 官方安装包 | 预览与渲染载体 |
 | DashScope API Key | — | 用户自备（可选） | qwen TTS 引擎；无 Key 时可用离线/Edge 路径 |
+| GSAP（随仓 vendored） | 3.14.2 | 无需安装，随仓携带于 `程序文件/源码/hyperframes/quickstart-demo/gsap.min.js` | GreenSock Standard License（https://gsap.com/standard-license ），允许开源项目随附使用 |
 
 ### API Key 配置（可选）
 
