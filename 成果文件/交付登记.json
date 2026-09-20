@@ -1,0 +1,15 @@
+{
+  "$description": "已交付成片登记表——本仓唯一版本化的交付台账（mp4 成片不入 git）。由 pipeline_runner 完工报告成功后自动写入，禁止手工编辑；删除条目不会删除成片，但会让交付物保护门禁失去该成片的交付依据。覆盖边界：本表自 2026-08-31 起登记，此前历史成片不入表，其交付判据回退至 VALIDATED 完工报告。",
+  "deliveries": [
+    {
+      "video": "quickstart-demo.mp4",
+      "subtitle": "quickstart-demo.srt",
+      "project": "quickstart-demo",
+      "config": "quickstart-demo.json",
+      "duration_seconds": 46.92,
+      "bytes": 3141878,
+      "report_status": "VALIDATED",
+      "delivered_at": "2026-09-20T11:39:35"
+    }
+  ]
+}

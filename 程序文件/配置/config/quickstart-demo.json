@@ -1,6 +1,8 @@
 {
   "video_duration": 46.9,
   "cover_duration": 3.0,
+  "fps": 25,
+  "resolution": "1920x1080",
   "bgm_enabled": false,
   "tts_engine": "qwen",
   "voice": "longanling_v3",
