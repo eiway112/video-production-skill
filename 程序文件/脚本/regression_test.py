@@ -49,6 +49,10 @@ class RegressionTestCase:
     
     def assert_true(self, condition: bool, message: str):
         """断言条件为真"""
+        # condition 入口收归 bool：真值对象（re.Match 等）直存入 result 会在
+        # --output 的 json.dump 处炸 TypeError（云端 CI 带 --output、本地不带，
+        # 2026-09-20 用例61 源码锚定断言实证此分叉）
+        condition = bool(condition)
         self.result["assertions"].append({
             "type": "assert_true",
             "condition": condition,
@@ -6886,8 +6890,8 @@ def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
 
         # ── 7. 不适用维度在打印面不得显示为 PASS ──
         gcr_src = (script_dir / "generate_completion_report.py").read_text(encoding='utf-8')
-        tc.assert_true(re.search(r'if res\.get\("applicable",\s*True\) is False:\s*\n\s*mark = "N/A"',
-                                 gcr_src),
+        tc.assert_true(bool(re.search(r'if res\.get\("applicable",\s*True\) is False:\s*\n\s*mark = "N/A"',
+                                      gcr_src)),
                        "审计打印按 applicable 分档，未裁定项不得印成 PASS")
 
         tc.mark_passed()
