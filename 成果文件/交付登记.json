@@ -7,9 +7,9 @@
       "project": "quickstart-demo",
       "config": "quickstart-demo.json",
       "duration_seconds": 46.92,
-      "bytes": 3141878,
+      "bytes": 3139055,
       "report_status": "VALIDATED",
-      "delivered_at": "2026-09-20T11:39:35"
+      "delivered_at": "2026-09-21T13:29:26"
     }
   ]
 }

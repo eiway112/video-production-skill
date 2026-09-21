@@ -658,7 +658,7 @@ def main():
                         print(f"    capture error: scene {err.get('sceneId')}: {err.get('error')}")
 
                     # 覆盖率裁定：Chrome 渲染进程中途崩溃时 manifest 只含部分场景
-                    # （2026-09-03 实测 wsi-commercial 截到 5/11 后 Target closed），
+                    # （2026-09-03 实测：某商业类项目截到 5/11 后 Target closed），
                     # 脚本此前照样打印 [PASS] 并退出 0——盲区必须成为机器可判的事实。
                     capture_gap, covered_scenes, expected_scenes = compute_capture_gap(
                         node_config.get("scenes", []), manifest.get("scenes", []), capture_dir)

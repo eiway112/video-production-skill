@@ -339,7 +339,7 @@ def generate_report(
       video_file: 视频文件路径
       subtitle_file: 字幕文件路径
       state_file: pipeline_state.json 路径
-      audit: True 时追加交付审计（5 维度治具裁定，见 run_delivery_audit）
+      audit: True 时追加交付审计（6 维度治具裁定，见 run_delivery_audit）
       config_file: 项目流水线配置路径（audit=True 时必填）
     
     返回：
@@ -505,7 +505,7 @@ def generate_report(
 
                 # P0（2026-07-29）：产物-状态一致性检查。成片 mtime 与
                 # postprocess 完成时刻偏差超过容差 → 成片可能在流水线之外
-                # 被改写（eiway-122-wall 逃逸脚本直接覆写成片的教训）。
+                # 被改写（某逃逸脚本直接覆写成片的教训）。
                 # 判定依据：正常路径下成片由 postprocess 步骤产出，其 mtime
                 # 与该步骤完成时刻应基本一致。
                 # P0 整改（2026-08-04 prefab 复盘）：容差不再固定 10s，改为
@@ -602,11 +602,28 @@ def generate_report(
                     if isinstance(decision, dict):
                         cost["budget_decision"] = decision
                     report["data_sources"]["render_cost"] = cost
+
+                # 数据源d：放行决策键与时间轴历史透出（2026-09-21 Lint② 附带建议1/2）。
+                # 放行留痕不得只活在 state（temp 不入 git，交付后无从追溯）——参照
+                # render_budget_decision 先例统一入 data_sources。键名取
+                # duration_budget_decision，与 render_cost.budget_decision（源自
+                # render_budget_decision）区分，消除同名两源的误认面。
+                # timeline_runs 透出使 _record_timeline_run docstring"完工报告可追溯"
+                # 成立（该注释此前比代码承诺得多，与 Lint② 同型第二例）。
+                for _skey, _dkey in (("budget_decision", "duration_budget_decision"),
+                                     ("media_qa_untested_decision",
+                                      "media_qa_untested_decision")):
+                    _val = pipeline_state.get(_skey)
+                    if isinstance(_val, dict):
+                        report["data_sources"][_dkey] = _val
+                _runs = pipeline_state.get("timeline_runs")
+                if isinstance(_runs, list) and _runs:
+                    report["data_sources"]["timeline_runs"] = _runs
             except Exception as e:
                 report["issues"].append(f"Failed to read pipeline state: {e}")
                 all_valid = False
         else:
-            # P0（2026-07-29）：state 文件缺失曾被完全静默旁路（eiway-122-wall
+            # P0（2026-07-29）：state 文件缺失曾被完全静默旁路（某项目
             # 交付时无任何状态记录却生成了报告）——缺失即无法证明流水线执行过，
             # 显式拒收。
             report["issues"].append(
@@ -638,7 +655,7 @@ def generate_report(
         "issues_count": len(report["issues"])
     }
 
-    # 交付审计（--audit）：5 维度治具裁定，替代 SKILL.md 旧版自评量表。
+    # 交付审计（--audit）：6 维度治具裁定，替代 SKILL.md 旧版自评量表。
     # 必须在 status/validation_summary 定型之后执行（维度5 消费它们）。
     if audit:
         if not config_file:

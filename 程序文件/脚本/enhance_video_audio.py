@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_line_time, resolve_script_times, parse_scene_map
 from _narration_lint import scan_srt_file as _lint_scan_srt, format_findings as _lint_format
 from _script_env import ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE
+from media_qa_gate import inspect_frame_content
 import _forced_align as _fa  # 叶子模块（faster_whisper 仅在 load 时导入）；版本面消费 MODEL_SIZE
 
 import argparse
@@ -121,7 +122,7 @@ COVER_DURATION = 0.0  # auto-detected from HTML data-cover-duration, or set via 
 BGM_ENABLED = True  # config 可用 "bgm_enabled": false 关闭合成 BGM（低频 drone 容易被感知为嗡嗡声）
 SUBTITLE_DISPLAY_REPLACEMENTS = {}  # 字幕显示层替换（如 毫米→mm），不影响 TTS 朗读文本
 
-# === P0 类型体系（2026-07-29，eiway-122-wall 纯BGM项目逃逸教训） ===
+# === P0 类型体系（2026-07-29，一个纯 BGM 项目的逃逸教训） ===
 VIDEO_TYPE = ""         # config "video_type"：视频类型声明（如 product_showcase），日志/报告可读
 TTS_ENABLED = True      # config "tts_enabled"：false = 纯BGM无旁白路径（默认 true，既有项目零变化）
 BGM_SOURCE = None       # config "bgm_source" 解析后的外部 BGM 文件 Path（纯BGM路径必填）
@@ -1885,7 +1886,7 @@ _SUB_ASCII_RE = re.compile(r'[A-Za-z0-9]')
 def _sub_can_break(s, i):
     a, b = s[i-1], s[i]
     if _SUB_ASCII_RE.match(b) and (_SUB_ASCII_RE.match(a) or a == ' '):
-        return False  # ASCII 词组内部（QU38 / WSI 84 / 1200mm）不可断
+        return False  # ASCII 词组内部（型号串 / 数字+单位如 1200mm）不可断
     if b in '，。；、：？！%…）」】》':
         return False  # 避免标点悬挂行首
     return True
@@ -1930,8 +1931,8 @@ def _wrap_once(text, limit):
 def _wrap_subtitle_text(text, line_limit=22, min_tail=4):
     """SRT 显示层智能换行：标点优先断行、禁拆 ASCII 词组、孤行抑制。
 
-    libass 自动换行对 CJK 文本逐字硬断，会把 QU38、WSI 84、1200mm 等
-    完整名词拆到两行（用户反馈：QU38 被拆成 QU3/8）。改为在写 SRT 时
+    libass 自动换行对 CJK 文本逐字硬断，会把型号串、数字+单位（1200mm）等
+    完整名词拆到两行（用户反馈：型号串被从中间拆成两截）。改为在写 SRT 时
     预先插入换行符：行宽不超 line_limit（低于 libass 自动换行阈值，
     确保不被二次换行）。
 
@@ -2318,7 +2319,7 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
             # 全局术语词典（subtitle_term_rules.json）：项目级替换之后应用，
             # 点Json→.json 等朗读层写法不再直通显示层
             display_text = _normalize_subtitle_terms(display_text)
-            # 智能换行：标点优先断行，禁止拆散 QU38 / WSI 84 等 ASCII 词组
+            # 智能换行：标点优先断行，禁止拆散型号类 ASCII 词组
             display_text = _wrap_subtitle_text(display_text)
 
             entries.append((idx, start_t, end_t, display_text))
@@ -2513,30 +2514,77 @@ _RMS_LEVEL_RE = re.compile(r'RMS[ _](?:level dB:\s*|level=)(-?\d+(?:\.\d+)?)')
 _RMS_SILENCE_RE = re.compile(r'RMS[ _](?:level dB:\s*|level=)-inf')
 
 # 窗口聚合 RMS 低于此分界即视为"落在句间停顿/静音段"，不进入一致性比较样本。
-# 实测分界依据（2026-09-19，装配式隔墙项目案例_医疗养老.mp4）：语音窗口 -17~-27dB，
+# 实测分界依据（2026-09-19，一条已交付的医疗类主题成片）：语音窗口 -17~-27dB，
 # 整窗落在 2.1s 句间停顿时 -67.3dB（peak -32dB，含 10ms 语音尾巴），数字静音 -inf。
 # 权威值声明于 config/quality/video_quality_rules.json，此处仅为读不到时的回退。
 # 全轨静音/长死区不属本项职责，由 media_qa_gate 的 audio_not_silent / no_dead_air 裁定。
+# 注意：该分界只在**无 BGM** 的音轨上成立。带 BGM 成片里场景窗口尾段（TTS 读完到
+# 窗口结束的留白）聚合 RMS 实测 -52dB、句内 -28dB，全部高于 -60 → 被当语音参与极差
+# 比较（2026-09-20 推广片首条真实记录：RMS range 34.7dB FAIL）。故 dB 分界之外另设
+# 内容门控 _voice_intervals_from_srt，dB 分界只作无字幕可依据时的兜底。
 _RMS_WINDOW_SILENCE_FLOOR_DB_DEFAULT = -60.0
 
+# 采样窗内语音占空比（字幕区间并集覆盖窗口的比例）低于此值即判"该窗无语音"。
+# 实测（2026-09-20 两片 8 个采样点）：无语音窗 duty 0.55~0.60 且电平 -36~-52dB，
+# 有语音窗 duty ≥0.74 且电平 -19~-26dB，两簇间隔足够。权威值见 video_quality_rules.json。
+_RMS_VOICE_DUTY_MIN_DEFAULT = 0.5
 
-def _sample_windows_rms(media_path, sample_ts, floor_db):
-    """逐窗口取 2s 时段的**聚合** RMS，返回 (可比 dB 值, 停顿/静音窗口数, 无 RMS 输出窗口数)。
+
+def _rms_intervals_overlap_duty(intervals, start, end):
+    """[start,end) 被 intervals 并集覆盖的比例（0~1）。空表返回 0.0。"""
+    span = end - start
+    if span <= 0 or not intervals:
+        return 0.0
+    covered = sum(max(0.0, min(end, b) - max(start, a)) for a, b in intervals)
+    return covered / span
+
+
+def _voice_intervals_from_srt(srt_path):
+    """字幕时间轴＝旁白实际发声区间的可核依据（毫秒→秒）。
+
+    为什么用字幕而不是再调一个 dB 阈值：dB 只能表达"轻"，表达不了"轻的是不是人声"，
+    而任何阈值都要在语音簇与停顿簇之间找分界——带 BGM 时两簇会被 BGM 电平抬起而重叠。
+    字幕区间是该窗有没有旁白的直接证据，且与终检 subtitle_* 检查项同源取数。
+    取不到文件/解析不出条目返回 None（调用方据此退回 dB 兜底口径并告警，不静默当真）。
+    """
+    if not srt_path:
+        return None
+    try:
+        from media_qa_gate import parse_srt
+        entries = parse_srt(str(srt_path))
+    except Exception as exc:
+        print(f"  [RMS-GATE] 字幕解析失败，语音门控不可用: {exc}")
+        return None
+    intervals = [(e['start_ms'] / 1000.0, e['end_ms'] / 1000.0)
+                 for e in entries
+                 if isinstance(e.get('start_ms'), int) and isinstance(e.get('end_ms'), int)]
+    return intervals or None
+
+
+def _sample_windows_rms(media_path, sample_ts, floor_db, voice_intervals=None,
+                        voice_duty_min=_RMS_VOICE_DUTY_MIN_DEFAULT, window_s=2.0):
+    """逐窗口取 2s 时段的**聚合** RMS，返回 (可比 dB 值, 排除窗口数, 无 RMS 输出窗口数)。
 
     astats 不带 reset/metadata：默认口径在窗口音频全部处理完后打印 Overall 块，
     其 RMS 是该时段的聚合值（与 volumedetect mean_volume 实测逐点吻合）。旧口径
-    astats=metadata=1:reset=1 打印的是最后一个音频帧（≈14ms）的统计，帧落在句间
-    静音时 RMS=-inf、正则不匹配 → 该窗口零贡献，四点全落即整项 UNTESTED
-    （2026-09-19 修复，33.1s 成片 4/4 窗口恒零实证）。
-    分桶：低于 floor_db 或 -inf 的窗口是"落在停顿/静音"（真实测量结果），
-    完全没有 RMS 行的窗口才是"取不到测量"（无音频样本/解码失败）。
+    astats=metadata=1:reset=1 打印的是逐帧重置的末帧测量：33.1s 成片实测 4/4 窗口
+    末帧 RMS=-inf（约 14ms 单帧落在句间静音），四点全落 → 整项恒 UNTESTED
+    （2026-09-19 修复，同片 4/4 窗口恒零实证）。
+    窗口按 sample_ts **居中**（[ts-w/2, ts+w/2)）：右端起点会把窗口整段推进下一场景
+    的留白尾段（2026-09-20 推广片 frac=0.40 实测：右端窗 -52.0dB / 居中窗 -21.3dB）。
+    分三桶（排除桶不再按"停顿/静音"归因，带 BGM 时它含 BGM-only 段）：
+      · voice_intervals 给出时，窗内语音占空比 < voice_duty_min → 排除（该窗无语音）；
+      · 无字幕依据（voice_intervals=None）时退回 dB 兜底：低于 floor_db 或 -inf → 排除；
+      · 完全没有 RMS 行的窗口才是"取不到测量"（无音频样本/解码失败）。
     """
     values = []
-    silent = 0
+    excluded = 0
     unreadable = 0
+    half = window_s / 2.0
     for ts in sample_ts:
+        lo = ts - half
         result = subprocess.run(
-            ["ffmpeg", "-ss", f"{ts:.1f}", "-t", "2", "-i", str(media_path),
+            ["ffmpeg", "-ss", f"{lo:.1f}", "-t", f"{window_s:g}", "-i", str(media_path),
              "-af", "astats",
              "-f", "null", "-"],
             capture_output=True, text=True, encoding='utf-8', errors='replace'
@@ -2545,7 +2593,7 @@ def _sample_windows_rms(media_path, sample_ts, floor_db):
         rms_matches = _RMS_LEVEL_RE.findall(result.stderr)
         if not rms_matches:
             if _RMS_SILENCE_RE.search(result.stderr):
-                silent += 1
+                excluded += 1
             else:
                 unreadable += 1
             continue
@@ -2554,18 +2602,24 @@ def _sample_windows_rms(media_path, sample_ts, floor_db):
         except ValueError:
             unreadable += 1
             continue
-        if window_rms <= floor_db:
-            silent += 1
-        else:
-            values.append(window_rms)
-    return values, silent, unreadable
+        if voice_intervals is not None:
+            if _rms_intervals_overlap_duty(voice_intervals, lo, lo + window_s) < voice_duty_min:
+                excluded += 1
+                continue
+        elif window_rms <= floor_db:
+            excluded += 1
+            continue
+        values.append(window_rms)
+    return values, excluded, unreadable
 
 
-def _check_video_quality(video_path, expected_duration=None):
+def _check_video_quality(video_path, expected_duration=None, subtitle_path=None):
     """Check video for blank frames, low bitrate, duration mismatch, and audio inconsistency.
 
     Returns (errors, warnings, untested, not_applicable) lists — 四态分开落盘：
     "没测到"不得写成通过，也不得与"按规则不适用"混用一个字段。
+    subtitle_path：多点电平检查的语音门控依据（见 _voice_intervals_from_srt），
+    缺省时该门控退回 dB 兜底并告警，不静默改变裁定口径。
     """
     errors = []
     warnings = []
@@ -2637,54 +2691,40 @@ def _check_video_quality(video_path, expected_duration=None):
                 f"Video duration off by {pct:.0f}%: actual={v_dur:.1f}s vs expected={expected_duration:.1f}s"
             )
 
-    # --- Frame content check: extract samples, detect uniform/blank frames ---
-    if v_dur > 2:
-        import tempfile
-        num_samples = min(5, max(2, int(v_dur / 15)))
-        timestamps = [v_dur * (i + 0.5) / num_samples for i in range(num_samples)]
-        frame_sizes = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i, ts in enumerate(timestamps):
-                frame_path = os.path.join(tmpdir, f"f{i}.png")
-                subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{ts:.1f}", "-i", str(video_path),
-                     "-frames:v", "1", "-q:v", "2", frame_path],
-                    capture_output=True
-                )
-                if os.path.exists(frame_path):
-                    frame_sizes.append(os.path.getsize(frame_path))
-
-        if len(frame_sizes) >= 2:
-            if len(set(frame_sizes)) == 1:
-                errors.append(
-                    f"Blank video detected: all {len(frame_sizes)} sample frames identical "
-                    f"(size={frame_sizes[0]} bytes) \u2014 HTML content not rendering"
-                )
-            elif all(s < 15000 for s in frame_sizes):
-                errors.append(
-                    f"Video likely blank: all {len(frame_sizes)} sample frames < 15KB "
-                    f"(sizes: {frame_sizes})"
-                )
-        else:
-            untested.append(
-                f"Blank-frame check: UNTESTED — 请求 {num_samples} 帧，ffmpeg 只产出 "
-                f"{len(frame_sizes)} 帧（{video_path}），无法裁定画面是否为空"
-            )
+    # --- Frame content check: shared with render completion/cache validation ---
+    frame_status, frame_message = inspect_frame_content(video_path, v_dur)
+    if frame_status == "FAIL":
+        errors.append(frame_message)
+    elif frame_status == "UNTESTED":
+        untested.append(frame_message)
 
     # --- Audio level consistency check: RMS at multiple sample points ---
-    # 每点取 2s 窗口的**聚合** RMS（astats 不带 reset/metadata → 窗口结束后打印
-    # Overall 块）。旧口径 astats=metadata=1:reset=1 是逐帧重置的末帧测量：33.1s
-    # 成片实测 4/4 窗口末帧 RMS=-inf（约 14ms 的单帧落在句间静音），四点全落 →
-    # 整项恒 UNTESTED；同窗口聚合 RMS 与 volumedetect mean_volume 逐点吻合，证非音量问题。
-    # 聚合值仍低于语音分界（rms_window_silence_floor_db）的窗口按"落在句间停顿"剔除：
-    # 成片句间静音常达 2s，与 2s 采样窗等长，整窗可能只含停顿，否则会把停顿误判成
-    # "音量严重不一致"（医疗养老成片 26.7s 窗口实测 -67.3dB 即此形态）。
+    # 每点取以该时刻为**中心**的 2s 窗口**聚合** RMS（astats 不带 reset/metadata →
+    # 窗口结束后打印 Overall 块）。旧口径 astats=metadata=1:reset=1 是逐帧重置的末帧
+    # 测量：33.1s 成片实测 4/4 窗口末帧 RMS=-inf（约 14ms 的单帧落在句间静音），
+    # 四点全落 → 整项恒 UNTESTED；同窗口聚合 RMS 与 volumedetect mean_volume 逐点吻合。
+    # 窗口按中心对称：右端起点会把整窗推进下一场景的留白尾段（2026-09-20 推广片
+    # frac=0.40 实测右端窗 -52.0dB、居中窗 -21.3dB，电平本身正常）。
+    # 无语音窗口剔除：主判据＝窗内字幕（旁白）占空比 < rms_voice_duty_min；字幕取不到
+    # 时退回 dB 分界 rms_window_silence_floor_db（该分界实测只在无 BGM 音轨上成立：
+    # 无 BGM 成片句间停顿 -67.3dB，而带 BGM 成片的 BGM-only 留白段 -28~-52dB）。
     if a_streams and v_dur > 10:
         sample_ts = [v_dur * frac for frac in (0.15, 0.40, 0.65, 0.90)]
-        rms_floor_db = float(_load_video_quality_rules().get(
+        _rms_rules = _load_video_quality_rules()
+        rms_floor_db = float(_rms_rules.get(
             "rms_window_silence_floor_db", _RMS_WINDOW_SILENCE_FLOOR_DB_DEFAULT))
-        rms_values, silent_windows, unreadable_windows = _sample_windows_rms(
-            video_path, sample_ts, rms_floor_db)
+        voice_duty_min = float(_rms_rules.get(
+            "rms_voice_duty_min", _RMS_VOICE_DUTY_MIN_DEFAULT))
+        voice_intervals = _voice_intervals_from_srt(subtitle_path)
+        if voice_intervals is None:
+            warnings.append(
+                "Audio RMS consistency: 语音门控依据（字幕时间轴）不可用"
+                f"（subtitle_path={subtitle_path or '未传入'}），退回 dB 分界兜底口径 —— "
+                "带 BGM 成片的 BGM-only 留白段可能被计入语音电平样本"
+            )
+        rms_values, excluded_windows, unreadable_windows = _sample_windows_rms(
+            video_path, sample_ts, rms_floor_db,
+            voice_intervals=voice_intervals, voice_duty_min=voice_duty_min)
 
         if len(rms_values) >= 2:
             rms_range = max(rms_values) - min(rms_values)
@@ -2704,12 +2744,14 @@ def _check_video_quality(video_path, expected_duration=None):
             # 2026-09-19 归因修正：本项恒 0/4 的真实失效模式曾是"末帧采样落在静音段"
             # 而非文案所称的"astats 输出拼写变化"（两种拼写由模块级正则同时覆盖，
             # 用例48 已锁）。改取窗口聚合量后仍取不到值，指向的是采样窗口内没有可
-            # 解码的音频样本，故按静音/无样本两类分别点名，不再指向拼写。
+            # 解码的音频样本或无语音，故按"被排除"与"取不到测量"两类分别点名。
+            gate = (f"窗内旁白占空比 < {voice_duty_min:g}" if voice_intervals
+                    else f"聚合 RMS ≤ {rms_floor_db:.0f}dB 或 -inf")
             untested.append(
                 f"Audio RMS consistency: UNTESTED — {len(sample_ts)} 个 2s 采样窗口中 "
-                f"{len(rms_values)} 个取到可比 dB 值、{silent_windows} 个落在停顿/静音段"
-                f"（聚合 RMS ≤ {rms_floor_db:.0f}dB 或 -inf）、{unreadable_windows} 个 FFmpeg "
-                "未输出任何 RMS 行（该窗口无音频样本或解码失败，非 astats 输出拼写漂移），"
+                f"{len(rms_values)} 个取到可比 dB 值、{excluded_windows} 个被排除（{gate}，"
+                f"该窗无旁白或近静音）、{unreadable_windows} 个 FFmpeg 未输出任何 RMS 行"
+                "（该窗口无音频样本或解码失败，非 astats 输出拼写漂移），"
                 "无法裁定音量一致性"
             )
     else:
@@ -2743,7 +2785,7 @@ def step7_validate(subtitle_path, temp_dir, video_path=None, expected_duration=N
     # --- 0. Video & Audio Quality Checks ---
     if video_path and video_path.exists():
         v_errors, v_warnings, v_untested, v_na = _check_video_quality(
-            video_path, expected_duration)
+            video_path, expected_duration, subtitle_path=subtitle_path)
         errors.extend(v_errors)
         warnings.extend(v_warnings)
         untested.extend(v_untested)

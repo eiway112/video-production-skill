@@ -47,7 +47,7 @@ BASELINE_FRAME_H = 1080
 BASELINE_BAND_PX = 220
 
 # 预留带是"占画布高度的比例"，不是固定 px。实测依据（2026-09-02，
-# 过程产物/临时产物/wsi-cases_2026_md/probe_subtitle_band.py）：用生产
+# 过程产物/临时产物/{项目目录}/probe_subtitle_band.py）：用生产
 # ASS 样式（enhance_video_audio.py 的 force_style）在 1920×1080 与
 # 1080×1920 各烧 1/2/3 行字幕并量墨迹行——ffmpeg subtitles 滤镜按
 # PlayResY 排版，故底隙=0.0917h、行距=0.052h、N 行墨迹顶边

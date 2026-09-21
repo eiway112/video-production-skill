@@ -2231,7 +2231,8 @@ def test_duration_budget_gate() -> RegressionTestCase:
     预算门禁，完工报告盖章 VALIDATED 后才人工返工（各耗 ~25 分钟全链重跑）。
     本用例锁定：hard 超限直接 FAIL；soft 超限需 --accept-over-budget 显式放行
     并在 state 留痕；预算内通过同样留痕（duration_budget_check，使门禁可证真）；
-    仅未声明预算 = 零副作用。
+    放行分支结论键同轮写入（over_budget_accepted，2026-09-21 Lint② 补写，
+    budget_decision 与 duration_budget_check 不再互斥）；仅未声明预算 = 零副作用。
     """
     tc = RegressionTestCase(
         "duration_budget_gate",
@@ -2279,6 +2280,20 @@ def test_duration_budget_gate() -> RegressionTestCase:
                             "acceptance decision recorded in state")
             tc.assert_equal(dec.get("actual_seconds"), 253.0,
                             "recorded actual duration for audit")
+            # Lint②（2026-09-21）：放行分支同样评估了，结论键必须留痕，两键不再互斥
+            chk3 = r3.state.data.get("duration_budget_check", {})
+            tc.assert_equal(chk3.get("decision"), "over_budget_accepted",
+                            "accept path also records checkpoint conclusion")
+            tc.assert_equal(chk3.get("actual_seconds"), 253.0,
+                            "checkpoint conclusion carries measured duration")
+            tc.assert_equal(chk3.get("budget_seconds"), 240.0,
+                            "checkpoint conclusion carries declared budget")
+            tc.assert_equal(chk3.get("enforcement"), "soft",
+                            "checkpoint conclusion carries enforcement mode")
+            on_disk3 = json.loads(r3.state.path.read_text(encoding="utf-8"))
+            tc.assert_true("budget_decision" in on_disk3
+                           and "duration_budget_check" in on_disk3,
+                           "one save on accept path persists both decision and conclusion keys")
 
             # (c) 预算内 → 通过且留下"检查点跑过"的痕迹；未声明 → 零副作用
             r4 = make_runner({"video_duration": 253.0}, idx=4)
@@ -2477,6 +2492,7 @@ def test_render_watchdog_stall_kill() -> RegressionTestCase:
         import io
         import types
         import contextlib
+        import subprocess
         import time as _time
         script_dir = Path(__file__).parent
         if str(script_dir) not in sys.path:
@@ -2502,7 +2518,34 @@ def test_render_watchdog_stall_kill() -> RegressionTestCase:
             tc.assert_true(w.stalled, "stall detected")
             tc.assert_equal(killed, [12345], "process tree killed (fail-fast)")
 
-            # (b) 刚启动（进度刚刷新）→ 不误杀
+            # (b) 真实短命子进程：看门狗线程经 _run 注入并终止实际卡死进程
+            orig_log_dir = _pr.LOG_DIR
+            _pr.LOG_DIR = tmp
+            try:
+                runner_live = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+                runner_live.config_path = tmp / "watchdog_live.json"
+                runner_live._log_seq = 0
+                runner_live._current_step = None
+                runner_live.last_log_path = None
+                w_live = Watcher([tmp], render_raw, 0,
+                                 watchdog={"enabled": True, "grace_seconds": 0.1,
+                                           "stall_seconds": 0.1})
+                w_live.POLL_INTERVAL = 0.02
+                w_live.start()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc_live = runner_live._run(
+                            [sys.executable, "-c", "import time; time.sleep(30)"],
+                            desc="watchdog live stall", attach_watchdog=w_live)
+                finally:
+                    w_live.stop()
+                tc.assert_true(w_live.stalled, "real child stall is detected")
+                tc.assert_true(rc_live != 0,
+                               "watchdog terminates the real stalled child through _run")
+            finally:
+                _pr.LOG_DIR = orig_log_dir
+
+            # (c) 刚启动（进度刚刷新）→ 不误杀
             w2 = Watcher([tmp], render_raw, 0, watchdog=wd_cfg)
             killed2 = []
             w2._kill_process_tree = lambda pid: killed2.append(pid)
@@ -2868,7 +2911,7 @@ def test_render_budget_gate() -> RegressionTestCase:
 
 
 def test_pre_render_duration_consistency() -> RegressionTestCase:
-    """用例38：渲染前时长一致性预检（2026-08-23 agent-wiki-promo 复盘）
+    """用例38：渲染前时长一致性预检（2026-08-23 复盘）
 
     背景：run2 的 adjust_timeline 静默回退 HTML 至 150s 基线后判"零调整"，
     HTML/config 分叉直达 45 分钟全量渲染，渲染后验证才发现。本预检 O(1)
@@ -2936,7 +2979,7 @@ def test_pre_render_duration_consistency() -> RegressionTestCase:
 
 
 def test_delivery_registry_backing() -> RegressionTestCase:
-    """用例39：交付登记表背书（2026-08-31 agent-wiki-promo 复盘 🟢）
+    """用例39：交付登记表背书（2026-08-31 复盘 🟢）
 
     背景：mp4 成片不入 git，git 里没有任何地方记录"交付了什么"。交付物保护门禁
     因此只能认 temp_dir 里的 VALIDATED 完工报告——8-22 那次跑到 verify 就中断，
@@ -3199,7 +3242,7 @@ def test_fresh_guard_requires_confirmation() -> RegressionTestCase:
 
 
 def test_doc_to_markdown_picture_extraction_fallback() -> RegressionTestCase:
-    """用例42：PPT/Word 图片抽取对未注册图片部件的容错（2026-09-02 WSI 案例 PPT）
+    """用例42：PPT/Word 图片抽取对未注册图片部件的容错（2026-09-02 客户案例 PPT）
 
     背景：doc_to_markdown.convert_pptx 原用 shape.image 取字节。python-pptx 只对
     image_content_types 白名单内的部件返回 ImagePart，其余（本例为 4 个 webp 部件，
@@ -3295,7 +3338,7 @@ def test_scene_patch_default_route_and_time_witness() -> RegressionTestCase:
     背景：29 份 pipeline_state 实测 scene_patch_attempts 全为 0——能力在位却零投产。
     两层原因：①触发权在外部 CLI（不加 --scene-patch 就不尝试，跳过零成本且零留痕，
     事后既不能证真也不能证伪）；②时间源信任前提过窄（脚本无 `end:` 字面量即判"不可
-    信"→ sidecar scene_times=None → classify 永久 FULL），wsi-hotel-cases 真实基线
+    信"→ sidecar scene_times=None → classify 永久 FULL），某酒店案例项目真实基线
     实测 scene_times_error=S-block-end-unverifiable 即此形态。本用例锁定重构后语义：
     路由三态全部留痕、见证级别与其否决条件、白名单分类器裁定、裁定落盘为数据。
     夹具经 monkeypatch HTML_BASE/TEMP_BASE 全部落在临时目录，不写入仓库。
@@ -3606,7 +3649,7 @@ def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
     """用例44：交付槽位只由成功链末端写入（2026-09-03 结构性修复）
 
     背景：render 步曾无条件把无声裸片 copy2 进 成果文件/视频/{name}.mp4，于是
-    postprocess 失败（2026-09-02 WSI 批次 BGM 未落盘）时裸片留在交付槽冒充成片，
+    postprocess 失败（2026-09-02 一批项目 BGM 未落盘）时裸片留在交付槽冒充成片，
     而 [ORPHAN-SLOT] 告警在 postprocess 之后才跑，拦不住；重跑时 enhance 又把槽位
     当输入，等于拿已混音已烧字幕的成片再处理一遍。修复后：enhance 输入源为
     temp/render_raw.mp4（缺失才回退槽位），槽位由 step3/step6 在成功路径写入，
@@ -3787,7 +3830,15 @@ def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
                 rr2._probe_duration = lambda p: 9.0
                 rr2._run = lambda cmd, **kw: (
                     rr2.render_raw.write_bytes(b"RENDER" * 16), 0)[1]
-                tc.assert_true(rr2.step_render(), "D2 render succeeds on the stubbed path")
+                # 内容判据打桩：本夹具的 render_raw 是 96 字节假文件，ffprobe 取不到
+                # 时长 → 按"不可解析＝未测"阻断（2026-09-20 口径修复后的正确行为）。
+                # 本段锁的是"成功渲染不写槽位"的写盘时序，内容裁定由用例64 专门锁定。
+                saved_content = _pr._render_content_status
+                _pr._render_content_status = lambda path: ("PASS", "fixture content")
+                try:
+                    tc.assert_true(rr2.step_render(), "D2 render succeeds on the stubbed path")
+                finally:
+                    _pr._render_content_status = saved_content
                 tc.assert_true(rr2.render_raw.exists(), "D2 clean render landed in temp")
                 tc.assert_true(not slot.exists(),
                                "D2 delivery slot untouched by a successful render")
@@ -3795,6 +3846,23 @@ def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
                                 "D2 render step completed (assertion above is not vacuous)")
                 tc.assert_equal(rr2.state.data["render_metrics"]["full_render_attempts"], 1,
                                 "D2 the full-render path really executed")
+
+                # D2b 同一路径去掉打桩：不可解析的 render_raw 不得记 passed
+                #      （真文件+真 ffprobe，非打桩三态——内容判据在 render 完成点的
+                #       接线由此得到端到端证据，用例64 锁的是判据本身与缓存命中点）
+                rr2b = make_runner("state_d2b.json", d2_dir)
+                rr2b._probe_duration = lambda p: 9.0
+                rr2b._run = lambda cmd, **kw: (
+                    rr2b.render_raw.write_bytes(b"RENDER" * 16), 0)[1]
+                tc.assert_true(not rr2b.step_render(),
+                               "D2b unparseable render_raw is not marked passed")
+                tc.assert_equal(rr2b.state.data["steps"]["render"]["status"], "failed",
+                                "D2b render step left failed")
+                tc.assert_true("UNTESTED" in rr2b.state.data["steps"]["render"]["error"]
+                               or "ffprobe" in rr2b.state.data["steps"]["render"]["error"],
+                               "D2b failure names the un-adjudicable content check")
+                tc.assert_true(not slot.exists(),
+                               "D2b rejected render did not reach the delivery slot")
 
                 # D3 已交付成片 → postprocess 写入点拦截（quick-fix 跳过 render 时唯一防线）
                 d3_dir = td / "d3"
@@ -3848,9 +3916,9 @@ def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
 
 
 def test_asset_signoff_gate() -> RegressionTestCase:
-    """用例45：位点1 素材确认单消费门禁 check_asset_signoff（2026-09-03 WSI 批次）
+    """用例45：位点1 素材确认单消费门禁 check_asset_signoff（2026-09-03 一批竖版项目）
 
-    背景：上一批 4 条 WSI 竖版退回原因是"画面图片选择较差，不符合宣传的品质要求"
+    背景：上一批 4 条竖版被客户退回，理由是画面图片的选择品质不达宣传要求
     ——素材选择从未成为"人工可签认、机器可核验"的对象，改稿时也没有任何门禁能
     发现屏显与签认分叉。本用例锁定判据的六个面与"存在即强制"的触发形态
     （无 opt-in 开关、无项目名单，与 narration_source 指针同一判据形态），
@@ -4014,9 +4082,9 @@ var S = [{"id": "s0", "start": 0, "end": 3.0, "dur": 3.0, "type": "cover", "cove
 
 
 def test_preview_coverage_gap() -> RegressionTestCase:
-    """用例46：预览截图覆盖率裁定（2026-09-03 WSI 位点2 首跑实证）
+    """用例46：预览截图覆盖率裁定（2026-09-03 位点2 首跑实证）
 
-    背景：instant_preview 对 wsi-commercial-cases 首跑时 Chrome 渲染进程在第 6 场
+    背景：instant_preview 对某商业类项目首跑时 Chrome 渲染进程在第 6 场
     崩溃（Page.captureScreenshot: Target closed），manifest 只含 5/11 场，脚本仍打印
     "[PASS] All scenes stay above subtitle safety line" 并退出 0——退出码 3 只覆盖
     "零截图"，部分盲区被当成通过。位点2 要人看画面签核，"哪些场根本没成像"必须是
@@ -4605,6 +4673,646 @@ def test_step_fingerprint_binds_real_inputs() -> RegressionTestCase:
     except Exception as e:
         tc.mark_failed(str(e))
 
+    return tc
+
+
+def test_render_content_blocks_blank_cache_reuse() -> RegressionTestCase:
+    """用例64：空渲染产物不得标记完成或复用缓存。"""
+    tc = RegressionTestCase(
+        "render_content_blocks_blank_cache_reuse",
+        "验证共享抽帧判据拒收空片，并使同指纹 render 缓存失效"
+    )
+    try:
+        import contextlib
+        import io
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate as mq
+        _pr = _safe_import_pipeline_runner()
+
+        class _Out:
+            returncode = 0
+
+        def sample_status(sizes, produce=None):
+            """sizes＝逐帧写入的字节数；produce＝允许 ffmpeg 真正产出几帧（其余产帧失败）。
+
+            produce=1 是 `len(frame_sizes) < 2` 与 `< 1` 两种阈值唯一可分辨的形态，
+            故 0 帧与 1 帧两条都必须断言，否则抽帧不足的未测分支可被任意改动而全绿。
+            """
+            saved_run = mq.subprocess.run
+            queue = list(sizes)
+            budget = [len(queue) if produce is None else produce]
+
+            def fake_run(argv, *args, **kwargs):
+                frame_path = Path(argv[-1])
+                if queue and budget[0] > 0:
+                    budget[0] -= 1
+                    frame_path.write_bytes(b"x" * queue.pop(0))
+                return _Out()
+
+            try:
+                mq.subprocess.run = fake_run
+                return mq.inspect_frame_content("fake.mp4", duration=30.0)
+            finally:
+                mq.subprocess.run = saved_run
+
+        status, _ = sample_status([20000, 20000])
+        tc.assert_equal(status, "FAIL", "identical sampled frames are rejected")
+        status, _ = sample_status([20000, 23000])
+        tc.assert_equal(status, "PASS", "different substantial sampled frames pass")
+        status, _ = sample_status([20000, 23000], produce=0)
+        tc.assert_equal(status, "UNTESTED", "missing sample frames are not treated as pass")
+        status, _ = sample_status([20000, 23000], produce=1)
+        tc.assert_equal(status, "UNTESTED", "single sampled frame is not enough to adjudicate")
+
+        # 探测失败哨兵不得混入"时长 ≤2s 不适用"：文件不存在时 ffprobe 返回 -1.0，
+        # 旧实现在此判 NOT_APPLICABLE，于是 render_raw 被清理后同指纹缓存照常命中。
+        with tempfile.TemporaryDirectory() as td0:
+            absent = str(Path(td0) / "render_raw.mp4")
+            status, message = mq.inspect_frame_content(absent)
+            tc.assert_equal(status, "UNTESTED",
+                            "unprobeable file is unmeasured, not 'not applicable'")
+            tc.assert_true("ffprobe" in message,
+                           "untested message names the probe failure as the cause")
+        status, _ = mq.inspect_frame_content(absent, duration=1.5)
+        tc.assert_equal(status, "NOT_APPLICABLE",
+                        "a genuinely sub-2s clip stays not-applicable")
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state = _pr.PipelineState(tmp / "pipeline_state.json")
+            state.data["steps"]["render"] = {
+                "status": "passed", "input_fingerprint": "stable", "completed": "2026-09-20T00:00:00"
+            }
+            runner = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+            runner.state = state
+            runner.force = False
+            runner.render_raw = tmp / "render_raw.mp4"
+            runner._fingerprint = lambda step: "stable"
+
+            saved_status = _pr._render_content_status
+            try:
+                _pr._render_content_status = lambda path: ("FAIL", "Blank video detected")
+                tc.assert_equal(runner._step_dirty_reason("render"), "content-invalid",
+                                "same fingerprint does not reuse a blank render")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.assert_true(not runner._can_skip("render"),
+                                   "blank render cache is rejected at skip point")
+                _pr._render_content_status = lambda path: ("UNTESTED", "Frame extraction failed")
+                tc.assert_equal(runner._step_dirty_reason("render"), "content-invalid",
+                                "unmeasured render content is not reusable")
+                _pr._render_content_status = lambda path: ("PASS", "content available")
+                tc.assert_equal(runner._step_dirty_reason("render"), None,
+                                "verified content remains reusable")
+            finally:
+                _pr._render_content_status = saved_status
+
+            # 真实判据（不打桩）走一遍缓存位点：render_raw 已被清理＝产物不存在，
+            # 同指纹不得再判"可跳过"，否则整个 render 步被历史 passed 免检。
+            missing_runner = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+            missing_runner.state = state
+            missing_runner.force = False
+            missing_runner.render_raw = tmp / "gone_render_raw.mp4"
+            missing_runner._fingerprint = lambda step: "stable"
+            tc.assert_equal(missing_runner._step_dirty_reason("render"), "content-invalid",
+                            "absent render_raw is not a cache hit for the render step")
+            with contextlib.redirect_stdout(io.StringIO()):
+                tc.assert_true(not missing_runner._can_skip("render"),
+                               "cache skip refused when the render product is gone")
+
+        render_body = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8").split(
+            "if not self.render_raw.exists():", 1)[1].split(
+                "self.state.mark_completed(\"render\"", 1)[0]
+        tc.assert_true("_render_content_status(self.render_raw)" in render_body,
+                       "new render validates content before being marked completed")
+
+        # 后处理侧必须消费同一个函数对象：删 import 或复活内联副本都要在此变红
+        # （模块能 import 成功不代表名字在 namespace 里，故用身份比对而非源码文本单证）
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+        tc.assert_true(getattr(eva, "inspect_frame_content", None) is mq.inspect_frame_content,
+                       "postprocess consumes the shared frame-content judge, not a copy")
+        vq_body = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8").split(
+            "def _check_video_quality", 1)[1].split("\ndef ", 1)[0]
+        tc.assert_true("inspect_frame_content(" in vq_body,
+                       "quality check body calls the shared judge")
+        tc.assert_true("-frames:v" not in vq_body and "frame_sizes" not in vq_body,
+                       "no inline frame extraction revived in postprocess")
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
+    return tc
+
+
+def test_duration_consistency_checkpoint_leaves_state_trace() -> RegressionTestCase:
+    """用例65：时长一致性检查点的每条出口都要留下可核证据（2026-09-20 Lint 登记）
+
+    旧实现只在一致通过时 print 一行、在三条"无从裁定"分支静默 return True：
+    过程产物/ 与日志都不入 git，交付后"这个检查点跑过没有"只能由"state 里查不到
+    duration_check"反推，而该反推分不清"跑过且干净"与"没跑成"（与 2026-09-01 修
+    duration_budget 通过路径留痕同族判据）。本用例锁三态结论（consistent / drift /
+    not_adjudicated，且未测三分支各自点名归因）、留痕真的落盘（重读文件而非只看内存，
+    摘掉 state.save() 必须变红）、阈值取自 audio_sync_rules 而非调用点字面量，
+    并驱动真实 step_postprocess 证明判据在链路上被执行且早于后处理子进程启动。
+    """
+    tc = RegressionTestCase(
+        "duration_consistency_checkpoint_leaves_state_trace",
+        "验证时长一致性门禁三态写 state.duration_check 并挂在 postprocess 早失败位点"
+    )
+    try:
+        import contextlib
+        import io
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+
+        def read_state(path):
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        def make_runner(work, config, probe, max_diff=1.0, state_name="pipeline_state.json"):
+            """最小夹具：render_raw 由调用方决定是否落盘，ffprobe 结果由 probe 注入。"""
+            r = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+            r.state = _pr.PipelineState(work / state_name)
+            r.render_raw = work / "render_raw.mp4"
+            r.output_file = work / "成果文件" / "视频.mp4"
+            r.temp_dir = work
+            r.config = config
+            r.config_path = work / "cfg.json"
+            r.quick_fix = False
+            r.force = False
+            r.audio_sync_rules = {"duration_consistency": {"max_diff_seconds": max_diff}}
+            r._probe_duration = lambda p: probe
+            return r
+
+        def run_ok(r):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return r._duration_consistency_ok()
+
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            (work / "render_raw.mp4").write_bytes(b"RENDER" * 16)
+
+            # ── A 通过路径留痕（本用例主命题：旧实现此处零写入）──
+            r = make_runner(work, {"video_duration": 9.0}, 9.02)
+            tc.assert_true(run_ok(r), "A1 一致时长仍然放行")
+            chk = r.state.data.get("duration_check") or {}
+            tc.assert_equal(chk.get("decision"), "consistent",
+                            "A1 通过路径写入检查点结论（不得只留在 print）")
+            tc.assert_equal(chk.get("config_seconds"), 9.0, "A1 记录 config 时长")
+            tc.assert_equal(chk.get("actual_seconds"), 9.0, "A1 记录实测时长")
+            tc.assert_equal(chk.get("diff_seconds"), 0.02, "A1 记录偏差")
+            tc.assert_equal(chk.get("max_diff_seconds"), 1.0, "A1 记录生效阈值")
+            tc.assert_equal(chk.get("measured_target"), "render_raw.mp4",
+                            "A1 证据点名被测量的文件")
+            tc.assert_true("reason" not in chk,
+                           "A1 已裁定的结论不携带未测归因（两态不得混写）")
+            tc.assert_equal(read_state(work / "pipeline_state.json")
+                            .get("duration_check", {}).get("decision"), "consistent",
+                            "A1b 留痕落到 state 文件（内存 dict 不算证据）")
+
+            # ── B 裁定来自配置而非字面量：同一组数字，阈值放宽即改判 ──
+            #    mark_started 复刻真实调用时序（step_postprocess 先起步骤再判一致性），
+            #    漂移分支要写步骤状态，夹具不得凭"helper 单测"假设步骤已存在。
+            r_tight = make_runner(work, {"video_duration": 9.0}, 12.0,
+                                  max_diff=1.0, state_name="b_tight.json")
+            r_loose = make_runner(work, {"video_duration": 9.0}, 12.0,
+                                  max_diff=5.0, state_name="b_loose.json")
+            r_edge = make_runner(work, {"video_duration": 9.0}, 10.0,
+                                 max_diff=1.0, state_name="b_edge.json")
+            r_over = make_runner(work, {"video_duration": 9.0}, 10.001,
+                                 max_diff=1.0, state_name="b_over.json")
+            r_tight.state.mark_started("postprocess")
+            r_over.state.mark_started("postprocess")
+            tc.assert_true(run_ok(r_edge), "B0 偏差恰等于阈值仍属容差内（边界为 <=）")
+            tc.assert_equal(r_edge.state.data["duration_check"]["decision"], "consistent",
+                            "B0 边界态结论同样留痕")
+            tc.assert_true(not run_ok(r_over), "B0 刚过阈值即拦截（边界不是 <）")
+            tc.assert_true(not run_ok(r_tight), "B1 阈值内无对象：漂移应拦截")
+            tc.assert_true(run_ok(r_loose), "B1 阈值放宽后同一片应放行（阈值读配置文件）")
+            tc.assert_equal(r_tight.state.data["duration_check"]["decision"], "drift",
+                            "B1 拦截侧结论为 drift")
+            tc.assert_equal(r_loose.state.data["duration_check"]["decision"], "consistent",
+                            "B1 放行侧结论为 consistent")
+
+            # ── C 漂移：留痕 + 步骤失败 + 归因字段缺席 ──
+            r2 = make_runner(work, {"video_duration": 9.0}, 12.0, state_name="c_drift.json")
+            r2.state.mark_started("postprocess")
+            tc.assert_true(not run_ok(r2), "C 漂移时长被拦截")
+            chk2 = r2.state.data["duration_check"]
+            tc.assert_equal(chk2.get("decision"), "drift", "C 拦截同样留痕")
+            tc.assert_equal(chk2.get("diff_seconds"), 3.0, "C 记录偏差供事后归因")
+            tc.assert_equal(r2.state.data["steps"]["postprocess"]["status"], "failed",
+                            "C 拦截落到 postprocess 步骤状态")
+
+            # ── D 三条"无从裁定"分支：放行但必须点名归因 ──
+            r3 = make_runner(work, {"video_duration": 9.0}, 9.0, state_name="d_absent.json")
+            r3.render_raw = work / "gone.mp4"          # render_raw 与槽位均不存在
+            tc.assert_true(run_ok(r3), "D1 产物缺失不在此处报错")
+            tc.assert_equal(r3.state.data["duration_check"].get("decision"), "not_adjudicated",
+                            "D1 无从裁定不得写成通过")
+            tc.assert_equal(r3.state.data["duration_check"].get("reason"), "artifact_missing",
+                            "D1 未测文案点名取数断点")
+            tc.assert_equal(r3.state.data["duration_check"].get("measured_target"), "视频.mp4",
+                            "D1 证据点名的是回退后的槽位文件（不得写成常量 render_raw）")
+            tc.assert_equal(r3.state.data["duration_check"].get("actual_seconds"), None,
+                            "D1 未测量即无实测值（不得由 config 反推）")
+
+            r4 = make_runner(work, {"video_duration": 9.0}, None, state_name="d_probe.json")
+            tc.assert_true(run_ok(r4), "D2 ffprobe 不可用不阻断")
+            tc.assert_equal(r4.state.data["duration_check"].get("reason"), "ffprobe_unavailable",
+                            "D2 归因指向探测失败而非产物缺失")
+
+            r5 = make_runner(work, {}, 9.0, state_name="d_nocfg.json")
+            tc.assert_true(run_ok(r5), "D3 config 无时长不阻断")
+            tc.assert_equal(r5.state.data["duration_check"].get("reason"), "config_duration_missing",
+                            "D3 归因指向权威源缺失")
+            tc.assert_equal(r5.state.data["duration_check"].get("config_seconds"), None,
+                            "D3 无 config 值即写 None，不得造 0.0")
+
+            r6 = make_runner(work, {"video_duration": "about 9 seconds"}, 9.0,
+                             state_name="d_badcfg.json")
+            tc.assert_true(run_ok(r6), "D4 时长非数值不得炸门禁")
+            tc.assert_equal(r6.state.data["duration_check"].get("reason"), "config_duration_missing",
+                            "D4 解析失败与缺失同归未测（旧实现两处静默 return 现须可区分于通过）")
+
+            # ── E 接线：真实 step_postprocess 在后处理子进程启动前完成裁定并留痕 ──
+            rr = make_runner(work, {"video_duration": 9.0}, 12.0, state_name="e_wiring.json")
+            launched = []
+            rr._can_skip = lambda name: False
+            rr._delivery_slot_guard = lambda step: True   # 槽位保护由用例42锁定，此处隔离
+            rr._final_media_qa = lambda: True             # 末端终检由用例53锁定，此处隔离
+            rr._fingerprint = lambda name: "fixture"      # 同上：不驱动真实指纹计算
+            rr._run = lambda cmd, **kw: (launched.append(cmd), 0)[1]
+            rr._merge_verification_file = lambda *a, **kw: None
+            with contextlib.redirect_stdout(io.StringIO()):
+                passed = rr.step_postprocess()
+            tc.assert_true(not passed, "E1 漂移时 step_postprocess 返回失败")
+            tc.assert_equal(launched, [],
+                            "E1 早失败：enhance 子进程未被启动（省一轮 TTS/BGM 再生成）")
+            tc.assert_equal(rr.state.data["duration_check"]["decision"], "drift",
+                            "E2 留痕由调用路径真实写入，而非 helper 单测自证")
+            tc.assert_equal(rr.state.data["steps"]["postprocess"]["status"], "failed",
+                            "E2 步骤状态与检查点结论一致")
+
+            # ── F 一次性证据的生命周期：--fresh 后上一轮结论作废 ──
+            r.state.reset(reason="--fresh")
+            tc.assert_true("duration_check" not in r.state.data,
+                           "F --fresh 清掉上一轮时长一致性证据（与 duration_budget_check 同族）")
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
+    return tc
+
+
+def test_release_decisions_and_timeline_runs_surfaced_in_report() -> RegressionTestCase:
+    """用例66：放行决策键与 timeline_runs 的完工报告透出接线（2026-09-21 Lint② 附带建议1/2）
+
+    背景：盘点表实测 budget_decision / media_qa_untested_decision 写入后全仓 0 生产
+    消费者（报告 render_cost.budget_decision 源自 render_budget_decision，重名易误认），
+    而 state 属 temp 不入 git——放行留痕交付后即失追溯面；_record_timeline_run
+    docstring 声称"完工报告可追溯"但报告对该键读取点为 0（注释比代码承诺得多，
+    Lint② 同型第二例）。本用例锁定三组 源→透出面 绑定与向后兼容：
+    缺键不写节、空 timeline_runs 不透出、两源同名不串扰。断言条数以
+    ci_gate.py --output 的 JSON 为准（A12 同族，不手抄）。
+    """
+    tc = RegressionTestCase(
+        "release_decisions_and_timeline_runs_surfaced_in_report",
+        "验证完工报告透出 duration_budget_decision/media_qa_untested_decision/timeline_runs 且与 render_budget_decision 不串扰"
+    )
+    try:
+        import io
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from generate_completion_report import generate_report
+
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            video = tmpdir / "v.mp4"
+            video.write_bytes(b"\x00" * 100000)
+
+            def run_report(state: dict, tag: str) -> dict:
+                sf = tmpdir / f"state_{tag}.json"
+                sf.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    return generate_report(
+                        project_name=f"Case66_{tag}",
+                        video_file=str(video),
+                        subtitle_file=None,
+                        state_file=str(sf))
+
+            base_steps = {"steps": {
+                s: {"status": "passed", "completed": "2026-09-21T10:00:00"}
+                for s in ("preflight", "tts", "timeline", "render", "verify", "postprocess")}}
+
+            # (a) 三键齐全 → 逐一透出，且源绑定正确（budget_decision ≠ render_budget_decision）
+            full = dict(base_steps)
+            full.update({
+                "budget_decision": {"decision": "accepted", "actual_seconds": 253.0,
+                                    "budget_seconds": 240.0, "at": "2026-09-21T10:00:00"},
+                "media_qa_untested_decision": {"decision": "accepted",
+                                               "reason": "抽帧未测放行",
+                                               "at": "2026-09-21T10:01:00"},
+                "timeline_runs": [{"at": "2026-09-21T09:00:00", "duration": 60.1},
+                                  {"at": "2026-09-21T09:30:00", "duration": 61.0}],
+                "render_metrics": {"full_render_attempts": 2,
+                                   "full_render_total_seconds": 120.0,
+                                   "scene_patch_attempts": 0, "scene_patch_hits": 0,
+                                   "watchdog_kills": 0},
+                "render_budget_decision": {"decision": "accepted", "attempts": 3,
+                                           "at": "2026-09-21T09:40:00"},
+            })
+            ds = run_report(full, "full")["data_sources"]
+            tc.assert_equal(ds["duration_budget_decision"]["actual_seconds"], 253.0,
+                            "A1 budget_decision 透出为 duration_budget_decision（实测值随迁）")
+            tc.assert_equal(ds["duration_budget_decision"]["decision"], "accepted",
+                            "A2 透出内容与源键一致")
+            tc.assert_equal(ds["media_qa_untested_decision"]["reason"], "抽帧未测放行",
+                            "A3 media_qa_untested_decision 透出")
+            tc.assert_equal([r["duration"] for r in ds["timeline_runs"]], [60.1, 61.0],
+                            "A4 timeline_runs 全量透出（docstring 承诺兑现）")
+            # 两源同名防串扰：render_cost.budget_decision 必须仍取自 render_budget_decision
+            tc.assert_equal(ds["render_cost"]["budget_decision"]["attempts"], 3,
+                            "A5 render_cost.budget_decision 源仍是 render_budget_decision，未被 state.budget_decision 污染")
+            tc.assert_true("attempts" not in ds["duration_budget_decision"],
+                           "A6 duration_budget_decision 不含渲染侧字段（两节互不混入）")
+
+            # (b) 旧 state 无这三键 → 不写入透出面（向后兼容，不崩不误造节）
+            ds_legacy = run_report(dict(base_steps), "legacy")["data_sources"]
+            for k in ("duration_budget_decision", "media_qa_untested_decision",
+                      "timeline_runs"):
+                tc.assert_true(k not in ds_legacy,
+                               f"B 缺键不造节：{k} 不应出现在无留痕的旧 state 报告")
+
+            # (c) 空 timeline_runs 列表 → 不透出（空历史不构成追溯证据）
+            empty_runs = dict(base_steps)
+            empty_runs["timeline_runs"] = []
+            ds_empty = run_report(empty_runs, "empty")["data_sources"]
+            tc.assert_true("timeline_runs" not in ds_empty,
+                           "C 空列表不透出，避免报告出现无从追溯的空节")
+
+            # (d) 接线锚定：报告源码读取的是 state 的 budget_decision/timeline_runs 键本身
+            #     （取数断链＝A06 同族；透出键改名或读错源须在源码面即红）
+            gcr_src = (script_dir / "generate_completion_report.py").read_text(
+                encoding="utf-8")
+            tc.assert_true(
+                '("budget_decision", "duration_budget_decision")' in gcr_src,
+                "D1 透出映射以 state.budget_decision 为源（源码锚定）")
+            tc.assert_true(
+                'pipeline_state.get("timeline_runs")' in gcr_src,
+                "D2 timeline_runs 透出读取 state 同名键（源码锚定）")
+
+            # (e) 放行分支双键同轮写入的行为锚在用例31 (b) 段锁定；此处补源码接线锚：
+            #     放行分支必须调用 _record_budget_check（摘掉即 A06"判据对但取数断链"同族）
+            pr_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+            seg = pr_src[pr_src.index("if self.accept_over_budget:"):]
+            seg = seg[:seg.index("BLOCKED: {msg}")]
+            tc.assert_true('_record_budget_check("over_budget_accepted"' in seg,
+                           "E 放行分支源码区间内存在结论键补写调用（接线未被挪出）")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
+    return tc
+
+
+def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase:
+    """用例67：发布面业务标识脱敏门禁（2026-09-21 公开仓复核定级）
+
+    背景：清单 §7.3 的"内容合规复扫"历史上只按扩展名查二进制（`.mp4/.png` tracked 0 个
+    即打勾），文本面从未扫过——于是发布仓 `regression_test.py` 里的客户退回原因原文、
+    `beat_table_rules.json` 里的客户产品型号一路绿灯进了公开仓。判据不能靠"导出时有人
+    记得看一眼注释"，故词条住配置、裁定住脚本、验收住本用例。
+
+    本用例锁六件事：命中即 FAIL 且携带归因；词表是唯一数据源（词条抄进脚本或本测试源码
+    即成第二份、必漂移，故 B2 用词表反扫门禁自身、样本住在词表里）；词表缺/空/单条正则
+    非法/词条扫不中自带样本一律整体未测且 scanned=0（不得带着残缺词表给出"干净"裁定）；
+    退出码 0/1/2 与四态一致；豁免必须带 note（无声豁免＝把裁定藏起来），且生效不溢出；
+    不可解读文件归未测而非静默跳过。另在文档面锚定门禁与词表已登记入导出清单的
+    "明确不导出"节并在 §8 有必跑命令——清单是发布仓的唯一生成依据，机制缺席即等于下次导出丢失。
+
+    仓库角色分岔：门禁脚本、词表、导出清单三件套按 §2.3/§3.3 不出现在发布仓。发布仓跑本
+    套件时三者同时缺席，本用例断言面随之切成"确认确实没带出去"（缺席即锁）；只缺席一部分
+    判 FAIL——半导出等于机制半生效。
+    """
+    tc = RegressionTestCase(
+        "publish_export_gate_blocks_business_identifiers",
+        "验证发布面脱敏门禁以词表为唯一数据源、四态裁定、豁免需注、且不进发布仓"
+    )
+    try:
+        import contextlib
+        import io
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+
+        # 三件套（门禁脚本 / 权威词表 / 导出清单）按清单 §2.3、§3.3 属"明确不导出"，
+        # 它们在发布仓缺席本身就是本机制要维持的不变量。发布仓跑本套件时三者同时不在位，
+        # 断言面随之切成"确认确实没带出去"（缺席即锁），而不是 import 失败白记一条红。
+        gate_src_path = script_dir / "publish_export_gate.py"
+        terms_src_path = (script_dir.parent / "配置" / "config_dev" /
+                          "publish_redact_terms.json")
+        manifest_path = (script_dir.parent.parent / "AI视频制作工作流模板" /
+                         "发布仓导出清单_方案B.md")
+        trio = [gate_src_path, terms_src_path, manifest_path]
+        present = [p for p in trio if p.exists()]
+        if 0 < len(present) < len(trio):
+            tc.assert_true(
+                False,
+                f"脱敏三件套仅部分在位（{[p.name for p in present]}）：部分导出＝机制半生效")
+        if not present:
+            for p in trio:
+                tc.assert_true(not p.exists(),
+                               f"R1 {p.name} 不在发布仓（词条与清单入公开仓＝内部标识一并公开）")
+            tc.mark_passed()
+            return tc
+        import publish_export_gate as peg
+
+        ACME = {"pattern": r"\bACME\b", "kind": "client_brand_term", "note": "夹具品牌词"}
+
+        def terms_doc(entries, exempt=None, never=None):
+            d = {"terms": entries}
+            if exempt is not None:
+                d["exempt_paths"] = exempt
+            if never is not None:
+                d["never_in_target"] = never
+            return d
+
+        def put(base, rel, text):
+            p = base / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+            return p
+
+        def gate(tdir, doc, files=None, repo=None):
+            tp = put(tdir, "terms.json", json.dumps(doc, ensure_ascii=False))
+            return peg.run_gate(repo=repo, files=files, terms_path=tp), tp
+
+        def quiet(fn, *a, **kw):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return fn(*a, **kw)
+
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            dirty = put(tdir, "src/dirty.py", "# ACME 客户退回原因\nx = 1\n")
+            clean = put(tdir, "src/clean.py", "x = 1\n")
+
+            # ── A 命中面：位置 + 类别 + 归因三者齐备 ──
+            r, _ = gate(tdir, terms_doc([ACME]), files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "FAIL", "A1 命中业务标识即 FAIL（不得降级为告警）")
+            tc.assert_equal(len(r["hits"]), 1, "A1 一行命中一条记录，不重复计数")
+            tc.assert_equal(r["hits"][0]["line"], 1, "A1 命中定位到行号")
+            tc.assert_equal(r["hits"][0]["kind"], "client_brand_term", "A1 命中带类别")
+            tc.assert_true("夹具品牌词" in r["hits"][0]["note"],
+                           "A1 命中带词条自带的理由（只给位置不给归因＝无人知道为何要改）")
+            tc.assert_equal(r["scanned"], 1, "A1 统计被扫文件数")
+            r, _ = gate(tdir, terms_doc([ACME]), files=[str(clean)])
+            tc.assert_equal(r["verdict"], "PASS", "A2 无命中的干净面判 PASS")
+            tc.assert_equal(r["hits"], [], "A2 PASS 时命中集为空")
+
+            # ── B 词表是唯一数据源 ──
+            #    B1 行为面：换掉词表即换掉裁定（夹具里 ACME 不再被任何词条覆盖）
+            r, _ = gate(tdir, terms_doc([{"pattern": r"\bNOPE\b", "kind": "k", "note": "n"}]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "PASS",
+                            "B1 裁定完全由词表决定：词表不覆盖即不命中")
+            #    B2 源码面：门禁脚本自身不得写死业务词——判据是用权威词表扫它自己，
+            #       不是在本用例里再抄一遍字面量（抄一遍＝词表之外的第二份词条，必漂移；
+            #       且本文件入发布仓，样本抄进来即把标识二次公开）
+            real, _ex, _nv, real_problems = peg.load_terms(peg.default_terms_path())
+            hits_on_gate, untested_on_gate = peg.scan_file(
+                script_dir, gate_src_path.name, real, [])
+            tc.assert_true(len(real) >= 8, "B2 权威词表非空（空词表扫谁都扫不中，B2 即恒真）")
+            tc.assert_equal(untested_on_gate, [],
+                            "B2 门禁源码确实被读到并可扫（读不动的'零命中'不构成证据）")
+            tc.assert_equal(hits_on_gate, [],
+                            "B2 门禁源码对权威词表零命中（词条只住词表）")
+            #    B3 真实词表仍是活的判据：每条自带样本，复扫在 load_terms 加载期完成
+            #       （样本住词表、不住测试源码；扫不中即词条与形态脱钩，整体判未测）
+            tc.assert_equal(real_problems, [],
+                            "B3 权威词表逐条通过加载期自检（非法正则/扫不中自带样本在此现形）")
+            tc.assert_true(all(t["kind"] and t["note"] and t["sample"] for t in real),
+                           "B3 每条词条都带类别、理由与自带样本（无归因/无样本词条不构成立法）")
+            #    B4 正面对照：占位符与账号名不得被误伤（门禁报假警＝下次没人再看）
+            benign = put(tdir, "src/benign.md",
+                         "DASHSCOPE_API_KEY=__FILL_YOUR_DASHSCOPE_API_KEY__\n"
+                         "owner: eiway112\nkey: sk-xxx\n")
+            real_doc = terms_doc([{"pattern": t["pattern"], "kind": t["kind"],
+                                   "note": t["note"], "sample": t["sample"]} for t in real])
+            r, _ = gate(tdir, real_doc, files=[str(benign)])
+            tc.assert_equal(r["verdict"], "PASS",
+                            "B4 占位符/账号名/示例 key 不误伤（GitHub 账号名非项目代号）")
+
+            # ── C 词表不可用一律未测，且不带着残缺词表继续裁定 ──
+            r, _ = gate(tdir, {}, files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "UNTESTED", "C1 词表无 terms 键判未测，不得写成通过")
+            tc.assert_true("为空" in r["reason"], "C1 未测文案点名归因")
+            tp_missing = tdir / "nope" / "terms.json"
+            r = peg.run_gate(files=[str(dirty)], terms_path=tp_missing)
+            tc.assert_equal(r["verdict"], "UNTESTED", "C2 词表文件不存在判未测")
+            tc.assert_equal(r["scanned"], 0, "C2 无从裁定时一个文件都不扫")
+            r, _ = gate(tdir, terms_doc([ACME, {"pattern": r"([", "kind": "bad", "note": "n"}]),
+                                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "UNTESTED",
+                            "C3 词表含非法正则即整体未测（不得丢掉坏条目继续给'干净'裁定）")
+            tc.assert_equal(r["scanned"], 0, "C3 残缺词表不参与裁定")
+            tc.assert_true("非法" in " ".join(r["untested"]), "C3 未测文案点名坏条目")
+            r, _ = gate(tdir, terms_doc([ACME]), files=[])
+            tc.assert_equal(r["verdict"], "UNTESTED", "C4 待扫集合为空不得判 PASS")
+            #    C5 自带样本扫不中＝词条与它要抓的形态已脱钩（改名/转义/边界写错都这样）
+            #       脱钩条目不得留在词表里参与裁定，否则"干净"结论少了一条没人看出来的腿
+            r, _ = gate(tdir, terms_doc([ACME, {"pattern": r"\bGONE\b", "kind": "k",
+                                                "note": "n", "sample": "样本里没有那个形态"}]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "UNTESTED",
+                            "C5 扫不中自带样本的词条使整体判未测（不得丢掉坏条目继续给'干净'裁定）")
+            tc.assert_equal(r["scanned"], 0, "C5 含脱钩词条的词表不参与裁定")
+            tc.assert_true("脱钩" in " ".join(r["untested"]), "C5 未测文案点名脱钩条目")
+            r, _ = gate(tdir, terms_doc([dict(ACME, sample="含 ACME 的样本")]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "FAIL",
+                            "C5b 样本匹配的词条照常参与裁定（自检不是把词表变成只读摆设）")
+
+            # ── D 退出码与四态一致（CI 只认退出码）──
+            r_fail, tp = gate(tdir, terms_doc([ACME]), files=[str(dirty)])
+            tc.assert_equal(quiet(peg.main, ["--files", str(dirty), "--terms", str(tp)]), 1,
+                            "D1 FAIL 退出码 1")
+            tc.assert_equal(quiet(peg.main, ["--files", str(clean), "--terms", str(tp)]), 0,
+                            "D2 PASS 退出码 0")
+            tc.assert_equal(quiet(peg.main, ["--files", str(dirty),
+                                             "--terms", str(tdir / "nope" / "terms.json")]), 2,
+                            "D3 UNTESTED 退出码 2（与 FAIL 可区分）")
+            tc.assert_equal(r_fail["verdict"], "FAIL", "D1 同夹具在 run_gate 侧结论一致")
+
+            # ── E 豁免必须带理由，且生效不溢出 ──
+            r, _ = gate(tdir, terms_doc([ACME], exempt=[{"path": "dirty.py"}]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "UNTESTED",
+                            "E1 豁免条目无 note 即整体未测（无声豁免＝把裁定藏起来）")
+            tc.assert_equal(r["scanned"], 0, "E1 不可信豁免面不产生裁定")
+            r, _ = gate(tdir, terms_doc([ACME], exempt=[{"path": "dirty.py",
+                                                         "note": "第三方 vendored 文件"}]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "PASS", "E2 带理由的豁免确实放行")
+            r, _ = gate(tdir, terms_doc([ACME], exempt=[{"path": "other_thing",
+                                                         "note": "不相关条目"}]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "FAIL", "E3 豁免不溢出到未声明的文件")
+
+            # ── F 不可解读面归未测，不静默当作干净 ──
+            weird = put(tdir, "src/raw.dat", "")
+            weird.write_bytes(b"\xff\xfe\x00\x01 not utf-8")
+            r, _ = gate(tdir, terms_doc([ACME]), files=[str(weird)])
+            tc.assert_equal(r["verdict"], "UNTESTED", "F1 无法按文本解读的文件判未测")
+            tc.assert_true(str(weird.name) in " ".join(r["untested"]),
+                           "F1 未测文案点名是哪个文件读不动")
+            png = tdir / "src" / "pic.png"
+            png.write_bytes(b"\xff\xfe\x00\x01 not utf-8")
+            r, _ = gate(tdir, terms_doc([ACME]), files=[str(png)])
+            tc.assert_equal(r["verdict"], "PASS",
+                            "F2 已知二进制扩展名按设计跳过（词表面只裁文本，不谎报未测）")
+
+            # ── G 门禁与词表自身入仓即红（never_in_target 自检）──
+            cwd = Path.cwd()
+            os.chdir(tdir)
+            try:
+                put(tdir, "pkg/publish_export_gate.py", "# gate\n")
+                r = peg.run_gate(files=["pkg/publish_export_gate.py"], terms_path=tp)
+                tc.assert_equal(r["verdict"], "PASS", "G0 夹具词表未声明 never 时不误报")
+                r, _ = gate(tdir, terms_doc([ACME], never=["pkg/publish_export_gate.py"]),
+                            files=["pkg/publish_export_gate.py"])
+                tc.assert_equal(r["verdict"], "FAIL",
+                                "G1 门禁/词表本体出现在待发布集合即命中（词条与内部标识一并公开）")
+                tc.assert_equal(r["hits"][0]["kind"], "gate_self_leak", "G1 命中类别可归因")
+            finally:
+                os.chdir(cwd)
+
+            # ── H 清单登记接线：清单是发布仓唯一生成依据，机制缺席＝下次导出丢失 ──
+            manifest = manifest_path.read_text(encoding="utf-8")
+            seg23 = manifest[manifest.index("### 2.3"):manifest.index("## 3. 配置闭包")]
+            tc.assert_true("publish_export_gate.py" in seg23,
+                           "H1 门禁脚本已登记入 §2.3 明确不导出")
+            seg33 = manifest[manifest.index("### 3.3"):manifest.index("## 4. Skill")]
+            tc.assert_true("publish_redact_terms.json" in seg33,
+                           "H2 词表已登记入 §3.3 明确不导出")
+            tc.assert_true("publish_export_gate.py" in seg33,
+                           "H2b 门禁脚本路径在 §3.3 与词表同节点名（两文件成对排除）")
+            seg8 = manifest[manifest.index("## 8. 导出后检查项"):]
+            tc.assert_true("publish_export_gate.py --repo" in seg8,
+                           "H3 §8 导出后必做项含门禁命令（不是只写在文档里的口头纪律）")
+            tc.assert_true("覆盖边界" in (peg.__doc__ or ""),
+                           "H4 模块 docstring 声明覆盖边界（不得被读成'发布面已完全脱敏'）")
+            tc.assert_true(peg.default_terms_path().exists(),
+                           "H5 权威词表在位（清单 §3.3 指向的路径与脚本取数路径一致）")
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
     return tc
 
 
@@ -6045,7 +6753,7 @@ def test_audio_rms_window_aggregate_measure() -> RegressionTestCase:
     修后：①取不带 reset 的窗口聚合 RMS（与 volumedetect mean_volume 实测逐点吻合）；
     ②"落在停顿/静音段"（-inf 或低于 video_quality_rules.rms_window_silence_floor_db）
     与"FFmpeg 未输出任何 RMS 行"（无音频样本/解码失败）分成两桶各自点名；
-    ③停顿窗口不进入 dB 极差，否则会把 2s 停顿判成"音量严重不一致"（医疗养老成片
+    ③停顿窗口不进入 dB 极差，否则会把 2s 停顿判成"音量严重不一致"（某医疗类主题成片
     26.7s 窗口实测 -67.3dB，按聚合量直算极差 47.5dB 即此形态）。
     """
     tc = RegressionTestCase(
@@ -6181,7 +6889,7 @@ def test_audio_rms_window_aggregate_measure() -> RegressionTestCase:
         sub_floor_stderr = _astats_stderr(-67.3)
         no_rms_stderr = "size=N/A time=00:00:02.00 bitrate=N/A speed=18x"
 
-        # D-1：1 窗有值 + 3 窗 -inf → UNTESTED，计数写成"3 个落在停顿/静音段"
+        # D-1：1 窗有值 + 3 窗 -inf → UNTESTED，计数写成"3 个被排除"
         try:
             eva.subprocess.run = _make_run([voiced, inf_stderr, inf_stderr, inf_stderr])
             with contextlib.redirect_stdout(_io.StringIO()):
@@ -6192,7 +6900,7 @@ def test_audio_rms_window_aggregate_measure() -> RegressionTestCase:
         tc.assert_equal(len(rms_u1), 1, "one usable sample cannot adjudicate → named as untested")
         tc.assert_true("UNTESTED" in rms_u1[0]
                        and "1 个取到可比 dB 值" in rms_u1[0]
-                       and "3 个落在停顿/静音段" in rms_u1[0]
+                       and "3 个被排除" in rms_u1[0]
                        and "0 个 FFmpeg 未输出任何 RMS 行" in rms_u1[0],
                        f"pause windows counted as pause, not as measurement gap (got: {rms_u1[0]})")
 
@@ -6204,7 +6912,7 @@ def test_audio_rms_window_aggregate_measure() -> RegressionTestCase:
                 _, _, untested_d2, _ = eva._check_video_quality("fake.mp4")
         finally:
             eva.subprocess.run = saved_run
-        tc.assert_true(any("3 个落在停顿/静音段" in u
+        tc.assert_true(any("3 个被排除" in u and "聚合 RMS ≤ -60dB 或 -inf" in u
                            for u in untested_d2 if "Audio RMS consistency" in u),
                        "sub-floor aggregate RMS counts as a pause window, not a voiced sample")
 
@@ -6258,7 +6966,7 @@ def test_audio_rms_window_aggregate_measure() -> RegressionTestCase:
 def test_forced_align_segment_face_guards() -> RegressionTestCase:
     """用例59：match_ratio 是全局聚合量，守卫必须落在分段面
 
-    背景（agent-wiki-promo-v2 _修订01 实证）：场景 4 TTS 音频正常（首句
+    背景（一次修订交付 _修订01 实证）：场景 4 TTS 音频正常（首句
     mean -26.1dB、静音分布正常），但 whisper 把第一句整段漏识别（转写从
     5.94s 才起口）→ 首句锚定失败、时间戳全由"0→首个锚点"线性插值造出，
     塌缩为零长句（rel_start==rel_end==5.54）；match_ratio 0.516 勉强过
@@ -6814,6 +7522,21 @@ def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
             tc.assert_equal(ch_idem, False, "内容一致时 changed=False")
             tc.assert_equal(again, replaced, "内容一致时字节不变（幂等）")
 
+            # ── 3b. 取数接线：真身 _subtitle_source_note_line 读 state 的终检事实 ──
+            #   第 4 段把取数面桩成 lambda，桩法本身不证明"state 里那条路径是对的"。
+            #   此处用真身方法驱动，锁住 verifications.media_qa_final.media_facts.
+            #   subtitle_timestamp_source 这一整条链（A06 同族：判据对、取数断链＝空跑）。
+            wired = SimpleNamespace(
+                state=SimpleNamespace(data={"verifications": {"media_qa_final": {
+                    "media_facts": {"subtitle_timestamp_source": facts}}}}))
+            tc.assert_equal(
+                pr.PipelineRunner._subtitle_source_note_line(wired), line,
+                "取数路径与 format_subtitle_source_line 同源（state 键改名即红）")
+            tc.assert_true(
+                pr.PipelineRunner._subtitle_source_note_line(
+                    SimpleNamespace(state=SimpleNamespace(data={}))) is None,
+                "state 无终检事实时返回 None，不得凭空造节")
+
             # ── 4. 写入端行为 ──
             fake = SimpleNamespace(output_file=video,
                                    _subtitle_source_note_line=lambda: line)
@@ -7214,6 +7937,246 @@ def test_delivery_slot_committed_only_after_all_gates() -> RegressionTestCase:
 
 
 # ============================================================================
+# 2026-09-20 推广片首跑：RMS 语音门控（字幕占空比 + 窗口居中）
+# ============================================================================
+
+def test_audio_rms_voice_duty_gating() -> RegressionTestCase:
+    """用例63：带 BGM 成片里"无语音窗口"不得进入电平极差，否则把留白判成音量缺陷
+
+    背景（2026-09-20 一条带 BGM 的推广片交付首次真实触发，全仓该错误唯一记录）：5 场 68.9s
+    推广片带 BGM，时间轴按设计给每场窗口留了 TTS+1.5s 尾段（scene3 TTS 15.086s /
+    窗口 16.6s）。frac=0.40 的 2s 采样窗整段落进该留白，实测聚合 RMS -52.0dB，高于
+    video_quality_rules.rms_window_silence_floor_db(-60) —— 该分界只在**无 BGM** 音轨
+    上成立（2026-09-19 一条无 BGM 的已交付成片实测：句间停顿 -67.3dB），于是
+    -52dB 被当语音参与比较，极差 34.7dB > 30 → step7 报 "Audio level severely
+    inconsistent" 并阻断 postprocess，而两片人声实测逐窗全在 -17~-26dB。
+    修后：①窗口按采样时刻居中（右端起点会把整窗推进下一场留白）；②主判据改为窗内
+    字幕（旁白）占空比 < rms_voice_duty_min 即排除；③字幕不可用时退回 dB 兜底并告警
+    （退回面必须可见，不得静默换口径）。
+    """
+    tc = RegressionTestCase(
+        "audio_rms_voice_duty_gating",
+        "验证 RMS 语音门控按字幕占空比排除无语音窗、窗口居中采样、无字幕依据时退回并告警"
+    )
+    try:
+        import io as _io
+        import re
+        import contextlib
+        import subprocess
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        # ── A. 占空比与字幕区间取数（纯函数，不碰 FFmpeg）──
+        tc.assert_equal(eva._rms_intervals_overlap_duty(
+            [(1.0, 3.0), (5.0, 6.0)], 2.0, 4.0), 0.5,
+            "duty is the covered fraction of the window (1s of 2s), not of the track")
+        tc.assert_equal(eva._rms_intervals_overlap_duty([], 0.0, 2.0), 0.0,
+                        "an empty interval set covers nothing")
+        tc.assert_equal(eva._rms_intervals_overlap_duty([(1.0, 3.0)], 2.0, 2.0), 0.0,
+                        "a zero-length window cannot be adjudicated by duty")
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "absent.srt"
+            tc.assert_true(eva._voice_intervals_from_srt(str(missing)) is None,
+                           "an unreadable subtitle file yields None (fallback), not an empty gate")
+            tc.assert_true(eva._voice_intervals_from_srt(None) is None,
+                           "no subtitle path yields None")
+            srt = Path(td) / "v.srt"
+            srt.write_text(
+                "1\n00:00:01,000 --> 00:00:03,000\n甲\n\n"
+                "2\n00:00:11,000 --> 00:00:13,000\n乙\n", encoding='utf-8')
+            iv = eva._voice_intervals_from_srt(str(srt))
+            tc.assert_equal(iv, [(1.0, 3.0), (11.0, 13.0)],
+                            "subtitle ms are converted to seconds in file order")
+
+        # ── B. 采样窗口居中锁（spy 真实 argv）──
+        class _Out:
+            def __init__(self, stdout="", stderr=""):
+                self.stdout, self.stderr = stdout, stderr
+
+        def _stderr(overall):
+            return (f"[Parsed_astats_0 @ 0x1] RMS level dB: {overall:.6f}\n"
+                    "[Parsed_astats_0 @ 0x1] Overall\n"
+                    f"[Parsed_astats_0 @ 0x1] RMS level dB: {overall:.6f}")
+
+        calls = []
+
+        def _spy(argv, *a, **k):
+            calls.append(list(argv))
+            return _Out(stderr=_stderr(-20.0))
+
+        saved_run = eva.subprocess.run
+        try:
+            eva.subprocess.run = _spy
+            eva._sample_windows_rms("fake.wav", [10.0, 20.0], -60.0,
+                                    voice_intervals=[(9.0, 21.0)], voice_duty_min=0.5)
+        finally:
+            eva.subprocess.run = saved_run
+        tc.assert_equal([c[c.index("-ss") + 1] for c in calls], ["9.0", "19.0"],
+                        "the 2s window is centered on the sample time (start = ts - w/2)")
+        tc.assert_equal([c[c.index("-t") + 1] for c in calls], ["2", "2"],
+                        "window length stays 2s")
+
+        # ── C. 门控裁定矩阵：同一组电平，字幕给不给 / 阈值高低 → 极差 FAIL 或裁定通过 ──
+        probe_payload = json.dumps({"streams": [
+            {"codec_type": "video", "bit_rate": "5000000", "duration": "20.0"},
+            {"codec_type": "audio", "duration": "20.0"}]})
+        levels = [-20.0, -21.0, -19.0, -52.0]
+        # ↑ 三窗语音电平彼此 2dB 内（真实成片实测形态：-17~-26dB），第四窗是 BGM-only
+        #   留白的 -52dB —— 它进不进样本集，正是本用例的裁定对象。
+
+        def _make_run(seq):
+            state = {"i": 0}
+
+            def _run(argv, *a, **k):
+                if argv[0] == "ffprobe":
+                    return _Out(stdout=probe_payload)
+                if "astats" not in argv:
+                    return _Out(stderr="")
+                s = seq[min(state["i"], len(seq) - 1)]
+                state["i"] += 1
+                return _Out(stderr=_stderr(s))
+            return _run
+
+        # 采样时刻 = 20 × (0.15,0.40,0.65,0.90) → 居中窗 2/7/12/17 起。
+        # 第四窗（BGM-only 留白，-52dB）在 SRT 里没有旁白覆盖。
+        srt_seq = [(1.0, 4.0), (7.8, 8.9), (12.0, 15.0)]
+        with tempfile.TemporaryDirectory() as td:
+            v_mp4 = Path(td) / "fake.mp4"
+            v_mp4.write_bytes(b"ftyp")
+            srt_ok = Path(td) / "ok.srt"
+            srt_ok.write_text(
+                "1\n00:00:01,000 --> 00:00:04,000\n甲\n\n"
+                "2\n00:00:07,800 --> 00:00:08,900\n乙\n\n"
+                "3\n00:00:12,000 --> 00:00:15,000\n丙\n", encoding='utf-8')
+            # 稀疏字幕：四个采样窗各只被覆盖 1s（占空比 0.5）。srt_ok 不能用于"全排除"
+            # 场景——(1,4) 与 (12,15) 把窗 1/3 整窗盖住，占空比恒 1.0，任何 ≤1 的阈值
+            # 都留得下两窗，塌缩不会发生（首版夹具即在此误判）。
+            srt_sparse = Path(td) / "sparse.srt"
+            srt_sparse.write_text(
+                "1\n00:00:02,000 --> 00:00:03,000\n甲\n\n"
+                "2\n00:00:07,000 --> 00:00:08,000\n乙\n\n"
+                "3\n00:00:12,000 --> 00:00:13,000\n丙\n\n"
+                "4\n00:00:17,000 --> 00:00:18,000\n丁\n", encoding='utf-8')
+            tc.assert_equal(
+                [round(eva._rms_intervals_overlap_duty(srt_seq, t - 1.0, t + 1.0), 2)
+                 for t in (3.0, 8.0, 13.0, 18.0)], [1.00, 0.55, 1.00, 0.00],
+                "the fixture's fourth window is genuinely voiceless by subtitle evidence")
+
+            def _check(srt_arg, duty=0.5):
+                saved_loader = eva._load_video_quality_rules
+                try:
+                    eva.subprocess.run = _make_run(levels)
+                    eva._load_video_quality_rules = lambda *a, **k: {
+                        "min_video_bitrate_kbps_fail": 200,
+                        "min_video_bitrate_kbps_warn": 500,
+                        "rms_window_silence_floor_db": -60,
+                        "rms_voice_duty_min": duty}
+                    with contextlib.redirect_stdout(_io.StringIO()):
+                        return eva._check_video_quality(
+                            str(v_mp4), 20.0, subtitle_path=srt_arg)
+                finally:
+                    eva.subprocess.run = saved_run
+                    eva._load_video_quality_rules = saved_loader
+
+            # C-负：无字幕依据 → -52dB 被当语音，极差 33dB 判"严重不一致"（旧缺陷形态）
+            errs_old, warns_old, untested_old, _ = _check(None)
+            tc.assert_true(any("Audio level severely inconsistent" in e and "-52.0dB" in e
+                               for e in errs_old),
+                           "without subtitle evidence the old dB-floor口径 still misfires "
+                           "(the negative control must be the failure itself)")
+            tc.assert_true(not any("Audio RMS consistency" in u for u in untested_old),
+                           "the misfire is reported as a FAIL, not smuggled in as 'untested'")
+            tc.assert_true(any("语音门控依据" in w and "dB 分界兜底" in w for w in warns_old),
+                           "falling back to the dB口径 is announced, not silent")
+
+            # C-中：duty 0.5 只掉无语音窗（-52dB），三窗极差 2dB → 不 FAIL、不 UNTESTED、
+            #      也不该有 variation 告警（告警出现即说明 -52dB 混进了样本集）
+            errs_mid, warns_mid, untested_mid, _ = _check(str(srt_ok))
+            tc.assert_true(not any("Audio level" in e for e in errs_mid)
+                           and not any("Audio level" in w for w in warns_mid)
+                           and not any("Audio RMS consistency" in u for u in untested_mid),
+                           f"duty 0.5 adjudicates on the 3 voiced windows "
+                           f"(errs={errs_mid} warns={warns_mid})")
+            tc.assert_true("-52.0dB" not in " ".join(errs_mid + warns_mid),
+                           "the voiceless window must be gone from the sample set, not merely forgiven")
+
+            # C-门控成员：直接断言两次采样的入选集合差一条 -21.0dB（duty 0.55 的窗），
+            #      证明阈值在真正选样而非装饰
+            eva.subprocess.run = _make_run(levels)
+            try:
+                vals_loose, excl_loose, _ = eva._sample_windows_rms(
+                    str(v_mp4), [3.0, 8.0, 13.0, 18.0], -60.0,
+                    voice_intervals=srt_seq, voice_duty_min=0.5)
+                # 每轮采样换一个全新序列（同一序列的游标会被上一轮推到末尾并钳位在
+                # 最后一个值上，两轮共用会把 -52dB 假性带进第二窗）
+                eva.subprocess.run = _make_run(levels)
+                vals_tight, excl_tight, _ = eva._sample_windows_rms(
+                    str(v_mp4), [3.0, 8.0, 13.0, 18.0], -60.0,
+                    voice_intervals=srt_seq, voice_duty_min=0.98)
+            finally:
+                eva.subprocess.run = saved_run
+            tc.assert_equal([round(v, 1) for v in vals_loose], [-20.0, -21.0, -19.0],
+                            "duty 0.5 keeps every window that carries narration")
+            tc.assert_equal([round(v, 1) for v in vals_tight], [-20.0, -19.0],
+                            "duty 0.98 drops the 0.55-duty window and nothing else")
+            tc.assert_equal((excl_loose, excl_tight), (1, 2),
+                            "exclusion count tracks the threshold, one window at a time")
+            errs_hi, warns_hi, untested_hi, _ = _check(str(srt_ok), duty=0.98)
+            tc.assert_true(not any("severely" in e for e in errs_hi)
+                           and not any("Audio RMS consistency" in u for u in untested_hi),
+                           f"two voiced samples still adjudicate at the tighter threshold "
+                           f"(errs={errs_hi})")
+
+            # C-样本塌缩：字幕对每个采样窗的覆盖都不达阈值 → 四窗全被排除，无可比样本，
+            #      必须点名 UNTESTED 并写出实际生效的门（不得隐式通过）
+            _, _, untested_zero, _ = _check(str(srt_sparse), duty=0.99)
+            rms_z = [u for u in untested_zero if "Audio RMS consistency" in u]
+            tc.assert_equal(len(rms_z), 1,
+                            "a duty gate that excludes every window must be named, not left implicit")
+            tc.assert_true("4 个被排除" in rms_z[0] and "窗内旁白占空比 < 0.99" in rms_z[0],
+                           f"the untested note names the duty gate actually applied (got {rms_z[0]})")
+            # 阈值边界为严格小于：占空比恰等于阈值的窗仍入选（直接验采样面，
+            # 不经 _check —— 四窗全在时 -52dB 会参与极差，那是另一条裁定）
+            eva.subprocess.run = _make_run(levels)
+            try:
+                vals_edge, excl_edge, _ = eva._sample_windows_rms(
+                    str(v_mp4), [3.0, 8.0, 13.0, 18.0], -60.0,
+                    voice_intervals=eva._voice_intervals_from_srt(str(srt_sparse)),
+                    voice_duty_min=0.5)
+            finally:
+                eva.subprocess.run = saved_run
+            tc.assert_equal((len(vals_edge), excl_edge), (4, 0),
+                            "duty exactly equal to the threshold keeps the window (<, not <=)")
+
+        # ── D. 阈值权威源在配置文件，不是调用点硬编码 ──
+        declared = eva._load_video_quality_rules().get("rms_voice_duty_min")
+        tc.assert_true(isinstance(declared, (int, float)),
+                       "rms_voice_duty_min is declared in the authoritative rules file")
+        src = (script_dir / "enhance_video_audio.py").read_text(encoding='utf-8')
+        m = re.search(r'_rms_rules\.get\(\s*\n?\s*"rms_voice_duty_min"\s*,\s*([^\)]+?)\)', src)
+        tc.assert_true(bool(m) and '"0.5"' not in (m.group(1) or ''),
+                       "the call site passes a module constant as fallback, not an inline literal")
+
+        # ── E. 接线：step7 必须把字幕路径递给质量检查（否则门控永远收不到依据）──
+        # 判据面正确但取数面断链，正是 A06"登记面＝真实读取路径"同族缺陷。
+        call_sites = re.findall(r'(?<!def )_check_video_quality\(([^)]*)\)', src)
+        wired = [c for c in call_sites if "subtitle_path" in c]
+        tc.assert_true(len(wired) >= 1,
+                       f"step7's call site passes subtitle_path (call sites found: {call_sites})")
+        tc.assert_true(not any("subtitle_path=None" in c for c in wired),
+                       "no call site hardcodes subtitle_path=None (that disables the gate silently)")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+# ============================================================================
 # 测试运行器
 # ============================================================================
 
@@ -7273,6 +8236,7 @@ class RegressionTestRunner:
             test_audio_rms_parse_and_untested_trace,
             test_explicit_engine_binds_config_path,
             test_step_fingerprint_binds_real_inputs,
+            test_render_content_blocks_blank_cache_reuse,
             test_narration_rich_fields_survive_timeline_writeback,
             test_media_qa_gate_four_state_report,
             test_final_media_qa_wired_into_postprocess,
@@ -7285,6 +8249,10 @@ class RegressionTestRunner:
             test_subtitle_timestamp_source_hit_rate_gate,
             test_delivery_notes_subtitle_source_section,
             test_delivery_slot_committed_only_after_all_gates,
+            test_audio_rms_voice_duty_gating,
+            test_duration_consistency_checkpoint_leaves_state_trace,
+            test_release_decisions_and_timeline_runs_surfaced_in_report,
+            test_publish_export_gate_blocks_business_identifiers,
         ]
         self.results = []
     

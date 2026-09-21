@@ -61,8 +61,8 @@ python config_manager.py
 
 产出物落在 `程序文件/源码/hyperframes/<项目名>/`（项目名用英文短横线风格）：
 
-1. `narration.json` — 场景单一权威源。结构参照现有成功项目（如 `quickstart-demo/narration.json`）。必填字段：`scene_id`（整数）、`start`、`end`、`narration`（旁白文本）；可选字段：`type`（cover|content，缺省视为 content）、`title`、`narration_required`。编译后的 `_compiled_scenes.json` 由 `compile_narration_to_scenes.py` 自动补全 duration 等派生字段（完整契约见 `config/schema/compiled_scenes_schema.json`）。
-2. 流水线配置 JSON → `程序文件/配置/config/<项目名>.json`（也可放入 `config/pipelines/` 子目录，runner 自动搜索）。参照 `config/quickstart-demo.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（qwen 引擎音色如 `longanling_v3`，默认即 qwen 无需声明 tts_engine；禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen 引擎，TTS 步会报错拒收；需要情感起伏时用 Instruct 音色 longanyang/longanhuan + `tts_instruction`，见 AGENTS.md TTS 引擎纪律）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 的 declared_matches_measured 检查会实测回比）。
+1. `narration.json` — 场景单一权威源。结构参照现有成功项目（如 `wall-crack-remedy/narration.json`）：scene_id/title/start/end/duration/type(cover|gsap|static)/narration。
+2. 流水线配置 JSON → `程序文件/配置/config/pipelines/<项目名>.json`。参照 `wall-crack-remedy.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（qwen 引擎音色如 `longanling_v3`，默认即 qwen 无需声明 tts_engine；禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen 引擎，TTS 步会报错拒收；需要情感起伏时用 Instruct 音色 longanyang/longanhuan + `tts_instruction`，见 AGENTS.md TTS 引擎纪律）、fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 检查13会实测回比）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。
 3. `index.html` — 手写 HTML+GSAP。**完成后逐项核对踩坑清单"阶段C检查表"全部条目**（占位符、subtitle-safe 高度、装饰层 opacity、字号分层、无 >3s 静止、动画必须挂在主 timeline `tl` 上等），并对照 HTML 模板参考基准。
 4. 场景 div 必须声明 `data-scene-id` / `data-scene-entry` / `data-scene-subtitle-safe`（AGENTS.md HTML 契约）。
 
@@ -85,7 +85,7 @@ python config_manager.py
 
 ## 交付审计（阶段D强制，退出码 0 才可声明完成）
 
-**原则：模型不得给自己打分**（agent-wiki 角色分离）。旧版“自评量表”已废除——执行者不自评，由 `generate_completion_report.py --audit` 治具裁定：
+**原则：模型不得给自己打分**（agent-wiki 角色分离）。旧版"自评量表"已废除——执行者不自评，由 `generate_completion_report.py --audit` 治具裁定：
 
 | 维度 | 数据来源 |
 |------|---------|
@@ -106,4 +106,3 @@ python config_manager.py
 - **配置里手工复制场景数据**而不指向 narration.json → 违反单一权威源，改一处漏一处。
 - **在素材目录或项目根目录生成中间文件** → 一律进 `过程产物/临时产物/`。
 - **渲染前不跑 preview 就 render** → 11 分钟渲染浪费在本可静态发现的问题上。
-- **visual_check 为三点采样**（场景时长 30%/50%/70%，取最坏值判定），比旧两点采样更严；旧项目边缘内容可能由 PASS 变 FAIL，属预期质量增强，应修内容而非绕门禁。

@@ -48,6 +48,8 @@ from _gsap_time_utils import parse_scene_map
 from pipeline_state_fingerprint import compute_inputs_fingerprint
 from _script_env import ROOT, VENV_PYTHON
 from script_interface import atomic_write_json
+from media_qa_gate import inspect_frame_content
+import _gate_status as gs
 
 # 换包装时必须持住旧流对象：旧 TextIOWrapper 一旦被 GC，其析构会关掉共享的底层
 # buffer，宿主进程（import 本模块的测试/工具）之后任何打印都报 "I/O operation on
@@ -147,6 +149,14 @@ def _cache_age_str(completed_iso):
         return f"({hours:.1f}h ago)"
     except (TypeError, ValueError):
         return "(? ago)"
+
+
+def _render_content_status(render_raw):
+    """返回 render_raw 的四态内容检查结果，抽帧故障不得被缓存掩盖。"""
+    try:
+        return inspect_frame_content(str(render_raw))
+    except Exception as exc:
+        return gs.UNTESTED, f"Frame-content check: UNTESTED — {exc}"
 
 
 class _RenderProgressWatcher:
@@ -356,7 +366,7 @@ class PipelineState:
                 print(f"  RECOVERY FAILED: Starting with fresh state")
                 return {"steps": {}, "last_run": None}
         # P0（2026-07-29）：状态文件缺失不再完全静默——显式提示从零开始，
-        # 避免"看似有历史、实际无状态"的误判（eiway-122-wall 逃逸教训）。
+        # 避免"看似有历史、实际无状态"的误判（某项目逃逸教训）。
         print(f"  [STATE] No pipeline state file: {self.path} — starting fresh (all steps will run)")
         return {"steps": {}, "last_run": None}
 
@@ -421,8 +431,8 @@ class PipelineState:
         计数源。旧实现把 self.data 整表换成 4 键新 dict，等于 --fresh 顺带清账——
         "fresh → 重渲 → fresh → 重渲"可无限绕开门禁，而 --fresh 恰是被推荐给
         "怀疑状态不可信"一方的恢复路径（A10，2026-09-19）。其余顶层节
-        （verifications/duration_budget_check/scene_patch/…）属上一轮运行的证据，
-        全量重置后即为陈旧，随步骤状态一并作废。
+        （verifications/duration_budget_check/duration_check/scene_patch/…）属上一轮
+        运行的证据，全量重置后即为陈旧，随步骤状态一并作废。
         """
         ledger = self.data.get("render_metrics")
         self.data = {"steps": {}, "last_run": None, "reset_reason": reason,
@@ -1050,6 +1060,7 @@ class PipelineRunner:
           status=<x>     — 未通过/未执行/被失效
           no-fingerprint — 历史状态无指纹，不予信任
           inputs-changed — 输入指纹与完成时刻不一致（上游已变化）
+          content-invalid — render_raw 未通过内容检查，缓存不得复用
         """
         rec = self.state.data.get("steps", {}).get(step, {})
         if rec.get("status") != "passed":
@@ -1059,6 +1070,10 @@ class PipelineRunner:
             return "no-fingerprint"
         if old_fp != self._fingerprint(step):
             return "inputs-changed"
+        if step == "render":
+            status, _ = _render_content_status(self.render_raw)
+            if status not in (gs.PASS, gs.NOT_APPLICABLE):
+                return "content-invalid"
         return None
 
     def _earliest_rerun_step(self):
@@ -1117,6 +1132,10 @@ class PipelineRunner:
             return False
         if reason == "inputs-changed":
             print(f"  [CHANGED] Inputs changed since {completed} (fingerprint mismatch) — re-running")
+            return False
+        if reason == "content-invalid":
+            status, message = _render_content_status(self.render_raw)
+            print(f"  [STALE] Render cache rejected ({status}): {message} — re-running")
             return False
         if reason is not None:
             return False
@@ -1292,7 +1311,9 @@ class PipelineRunner:
 
         留痕分工：`budget_decision` 只在**显式放行**时写入（决策事实，一条）；
         `duration_budget_check` 记录**检查点是否真的评估过**及其结论（within_budget /
-        not_adjudicated），使门禁可证真。未声明预算与 quick_fix 保持零副作用。
+        not_adjudicated / over_budget_accepted），使门禁可证真。放行分支两键同轮
+        写入（2026-09-21 Lint② 补写后不再互斥：前者答"谁放行了"，后者答"门禁跑过
+        且结论为何"）。未声明预算与 quick_fix 保持零副作用。
         """
         if self.quick_fix:
             return True
@@ -1335,7 +1356,10 @@ class PipelineRunner:
                 "budget_seconds": budget,
                 "at": datetime.now().isoformat(),
             }
-            self.state.save()
+            # Lint②（2026-09-21）：放行分支同样完成了评估动作，结论键必须留痕——
+            # 与 _duration_consistency_ok"全出口单点留痕"同口径，改注释即反向豁免。
+            # 不另起 save()：_record_budget_check 落盘时连带 budget_decision 一并写入。
+            self._record_budget_check("over_budget_accepted", actual, budget, enforcement)
             print(f"  [BUDGET] {msg} — --accept-over-budget 显式放行，决策已记录")
             return True
         print(f"  BLOCKED: {msg} [enforcement=soft]")
@@ -1428,7 +1452,7 @@ class PipelineRunner:
         return record
 
     def _pre_render_duration_consistent(self) -> bool:
-        """渲染前时长一致性预检（2026-08-23，agent-wiki-promo 复盘 🟢）。
+        """渲染前时长一致性预检（2026-08-23 复盘 🟢）。
 
         教训：run2 的 adjust_timeline 把 HTML 静默回退基线（160.6→150s）后判定
         "零调整"，HTML 与 config 永久分叉，渲染后时长验证才发现，浪费 45 分钟
@@ -1606,7 +1630,7 @@ class PipelineRunner:
         if not self._delivery_slot_guard("render"):
             return False
 
-        # ── 成果槽位无背书残留告警（agent-wiki-promo 复盘 2026-08-31）：槽位里有成片
+        # ── 成果槽位无背书残留告警（2026-08-31 复盘）：槽位里有成片
         #    但没有任何交付背书时，按定义"不是交付物"，上面的保护门禁会放过——而人
         #    在成果目录里看到它就会当成已交付成片取用。本次 150s 旧基线正是以此形态
         #    占了规范交付名 9 天。不阻断（覆盖残留是合法诉求），只点名实测值 + 留痕。──
@@ -1645,7 +1669,7 @@ class PipelineRunner:
 
         self.state.mark_started("render")
 
-        # ── 渲染前时长一致性预检（2026-08-23 agent-wiki-promo 复盘 🟢）：
+        # ── 渲染前时长一致性预检（2026-08-23 复盘 🟢）：
         #    O(1) 拦截 HTML/config 时长分叉，防 timeline 静默回退直达全量渲染
         #    （见 _pre_render_duration_consistent，45 分钟渲染浪费事故）──
         if not self._pre_render_duration_consistent():
@@ -1769,12 +1793,17 @@ class PipelineRunner:
             self._fail("render", "render_raw.mp4 not created", OUTPUT_MISSING)
             return False
 
+        content_status, content_message = _render_content_status(self.render_raw)
+        if content_status not in (gs.PASS, gs.NOT_APPLICABLE):
+            self._fail("render", content_message, VERIFY_FAILED)
+            return False
+
         size_mb = self.render_raw.stat().st_size / 1024 / 1024
         print(f"  Rendered: {self.render_raw} ({size_mb:.1f} MB)")
         # 交付槽位不在此写入（2026-09-03 结构性修复）：render 产物只落 temp，
         # 成果文件/视频/{name}.mp4 由 postprocess 的混音与烧字幕在成功路径上写。
         # 旧实现这里 copy2(render_raw → 槽位)，一旦 postprocess 失败（如 BGM 未
-        # 落盘），无声裸片就留在交付目录冒充成片——2026-09-02 WSI 批次 4 条即此
+        # 落盘），无声裸片就留在交付目录冒充成片——2026-09-02 一批 4 条即此
         # 形态，且 [ORPHAN-SLOT] 告警在 postprocess 之后才跑，拦不住。
         # enhance_video_audio.get_paths 现直接以 render_raw.mp4 为输入源；槽位旧
         # 文件的物理保护由 step3 的 {stem}.prev.mp4（落 temp）承担。
@@ -2075,33 +2104,70 @@ class PipelineRunner:
         quick-fix 与全量两种模式的后处理输入都是 temp/render_raw.mp4（enhance 的
         get_paths 如此解析），故检查对象同为它；仅在 render_raw 缺失（手工把视频
         放进成果目录后单独调用）时回退检查槽位文件。
+
+        三条"放行但不裁定"的分支（产物缺失 / ffprobe 不可用 / config 无时长）与
+        通过、漂移一并写 state.duration_check —— 旧实现通过路径只 print，日志不入
+        git，交付后"检查点跑过"只能由"state 无记录"反推，而该反推分不清"跑过且干净"
+        和"没跑成"（与 2026-09-01 修 duration_budget 同族判据，2026-09-20 Lint 登记）。
         """
         target = self.render_raw if self.render_raw.exists() else self.output_file
-        if not target.exists():
-            return True  # 产物缺失由后续步骤拦截，此处不重复报错
-        actual = self._probe_duration(target)
-        if actual is None:
-            return True  # ffprobe 不可用时不阻断，交由 enhance 内部门禁判定
+        max_diff = float(self.audio_sync_rules.get("duration_consistency", {})
+                         .get("max_diff_seconds", 1.0))
         try:
             expected = float(self.config.get("video_duration", 0) or 0)
         except (TypeError, ValueError):
+            expected = 0.0
+        if not target.exists():
+            # 产物缺失由后续步骤拦截，此处不重复报错；但"无从裁定"要留下正面证据
+            self._record_duration_check("not_adjudicated", expected, None,
+                                        None, max_diff, target, "artifact_missing")
+            return True
+        actual = self._probe_duration(target)
+        if actual is None:
+            # ffprobe 不可用时不阻断，交由 enhance 内部门禁判定
+            self._record_duration_check("not_adjudicated", expected, None,
+                                        None, max_diff, target, "ffprobe_unavailable")
             return True
         if expected <= 0:
+            self._record_duration_check("not_adjudicated", expected, actual,
+                                        None, max_diff, target, "config_duration_missing")
             return True
-        max_diff = float(self.audio_sync_rules.get("duration_consistency", {})
-                         .get("max_diff_seconds", 1.0))
         diff = abs(actual - expected)
         if diff <= max_diff:
+            self._record_duration_check("consistent", expected, actual,
+                                        diff, max_diff, target)
             print(f"  Duration consistency OK: config {expected:.1f}s vs actual {actual:.1f}s (diff {diff:.2f}s)")
             return True
         msg = (f"Duration drift: config {expected:.1f}s vs actual {actual:.1f}s "
                f"(diff {diff:.1f}s > {max_diff:.1f}s)")
+        self._record_duration_check("drift", expected, actual, diff, max_diff, target)
         print(f"  ERROR: {msg}")
         print("  定点修复指引（勿直接全量重渲）：")
         print("    1. 时间轴确需变化 → 重跑 pipeline_runner（timeline 步骤会同步 config）后渲染")
         print(f"    2. 渲染产物正确 → 手工对齐 config.video_duration={actual:.1f} 后 --quick-fix")
         self.state.mark_failed("postprocess", msg, error_code=VERIFY_FAILED)
         return False
+
+    def _record_duration_check(self, decision, expected, actual, diff, max_diff,
+                               target, reason=None):
+        """时长一致性检查点的执行留痕（三态：consistent / not_adjudicated / drift）。
+
+        与 `_record_budget_check` 同族：使"检查点跑过"成为 state 里的正证据。
+        `reason` 只在 not_adjudicated 时出现，用于区分三个无从裁定的取数断点。
+        """
+        entry = {
+            "decision": decision,
+            "config_seconds": round(expected, 1) if expected > 0 else None,
+            "actual_seconds": round(actual, 1) if actual is not None else None,
+            "diff_seconds": round(diff, 2) if diff is not None else None,
+            "max_diff_seconds": max_diff,
+            "measured_target": target.name,
+            "at": datetime.now().isoformat(),
+        }
+        if reason:
+            entry["reason"] = reason
+        self.state.data["duration_check"] = entry
+        self.state.save()
 
     def _subtitle_source_note_line(self):
         """终检实测的字幕时间戳来源分布 → 交付说明可直接引用的一行（无记录返回 None）。

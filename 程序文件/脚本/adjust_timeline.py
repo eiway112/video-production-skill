@@ -363,7 +363,7 @@ def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, b
         # 场景定义的单一权威源（AGENTS.md 权威源表）。旧实现用四个字面键重建场景
         # dict，等于每跑一次 timeline 就把 title/type/duration/narration_required/
         # subtitle_required/assets 从权威源上裁掉（富字段实例见
-        # 程序文件/源码/hyperframes/eiway-122-wall/narration.json 的 10 字段 schema）。
+        # 程序文件/源码/hyperframes/{项目目录}/narration.json 的 10 字段 schema）。
         updated = dict(s)
         updated['start'] = round(new_start, 1)
         updated['end'] = round(new_end, 1)
@@ -528,7 +528,7 @@ def main():
             # boundaries already carry the adjusted values, so restoring the
             # baseline HTML would roll back GSAP times/data-duration while
             # narration keeps adjusted values -> permanent divergence
-            # (2026-08-22 agent-wiki-promo incident: rendered 150s vs 160.6s).
+            # (2026-08-22 incident: rendered 150s vs declared 160.6s).
             # Defer the decision until the scene source is known.
             html_restore_pending = True
 

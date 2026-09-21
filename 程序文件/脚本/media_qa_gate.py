@@ -111,6 +111,56 @@ def ffprobe_get_duration(video_path: str) -> float:
         pass
     return -1.0
 
+
+def inspect_frame_content(video_path: str, duration: float = None) -> Tuple[str, str]:
+    """以多个等距抽帧判定画面内容是否可用。"""
+    if duration is None:
+        duration = ffprobe_get_duration(video_path)
+    # 探测失败哨兵（-1/None＝文件缺失或不可解析）与"时长真的 ≤2s"是两件事：
+    # 前者无从裁定必须判未测，否则 render_raw 被清理后同指纹缓存照常命中、
+    # 整个 render 步被跳过（四态纪律：不得把"没跑成"读成"不适用"）。
+    if duration is None or duration <= 0:
+        return (gs.UNTESTED,
+                f"Frame-content check: UNTESTED — ffprobe 取不到时长（返回 {duration}，"
+                f"文件缺失或不可解析：{video_path}），无从裁定画面内容")
+    if duration <= 2:
+        return gs.NOT_APPLICABLE, "Frame-content check not applicable: duration is at most 2s"
+
+    import tempfile
+
+    num_samples = min(5, max(2, int(duration / 15)))
+    timestamps = [duration * (i + 0.5) / num_samples for i in range(num_samples)]
+    frame_sizes = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, ts in enumerate(timestamps):
+            frame_path = os.path.join(tmpdir, f"f{i}.png")
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", f"{ts:.1f}", "-i", str(video_path),
+                     "-frames:v", "1", "-q:v", "2", frame_path],
+                    capture_output=True,
+                    timeout=30
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if os.path.exists(frame_path):
+                frame_sizes.append(os.path.getsize(frame_path))
+
+    if len(frame_sizes) < 2:
+        return (gs.UNTESTED,
+                f"Blank-frame check: UNTESTED — 请求 {num_samples} 帧，ffmpeg 只产出 "
+                f"{len(frame_sizes)} 帧（{video_path}），无法裁定画面是否为空")
+    if len(set(frame_sizes)) == 1:
+        return (gs.FAIL,
+                f"Blank video detected: all {len(frame_sizes)} sample frames identical "
+                f"(size={frame_sizes[0]} bytes) — HTML content not rendering")
+    if all(size < 15000 for size in frame_sizes):
+        return (gs.FAIL,
+                f"Video likely blank: all {len(frame_sizes)} sample frames < 15KB "
+                f"(sizes: {frame_sizes})")
+    return gs.PASS, f"Frame-content check passed ({len(frame_sizes)} samples)"
+
+
 def ffmpeg_detect_silence(audio_file: str, duration: float = None) -> float:
     """检测音频中的静音时长"""
     try:

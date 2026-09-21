@@ -4,5 +4,7 @@
   "min_video_bitrate_kbps_fail": 200,
   "min_video_bitrate_kbps_warn": 500,
   "rms_window_silence_floor_db": -60,
-  "$rms_window_silence_floor_db_note": "enhance_video_audio._check_video_quality 多点 RMS 采样中，2s 窗口的聚合 RMS 低于此分界即视为整窗落在句间停顿/静音段，不进入音量一致性比较样本（仅 RMS 数值口径，与 audio_sync_rules.alignment.silence_db 的 silencedetect 采样级噪声门是两种量，不得互相替代）。分界实测依据 2026-09-19：语音窗口 -17~-27dB，整窗落在 2.1s 停顿 -67.3dB，数字静音 -inf。读不到本键时脚本回退 -60dB。"
+  "$rms_window_silence_floor_db_note": "enhance_video_audio._check_video_quality 多点 RMS 采样的**兜底**口径（仅当字幕时间轴不可用时生效）：2s 窗口的聚合 RMS 低于此分界即视为整窗落在句间停顿/静音段，不进入音量一致性比较样本（仅 RMS 数值口径，与 audio_sync_rules.alignment.silence_db 的 silencedetect 采样级噪声门是两种量，不得互相替代）。分界实测依据 2026-09-19：语音窗口 -17~-27dB，整窗落在 2.1s 停顿 -67.3dB，数字静音 -inf——该分界只在**无 BGM** 音轨上成立，带 BGM 成片的 BGM-only 留白段实测 -28~-52dB 高于本分界，故主判据改用 rms_voice_duty_min。读不到本键时脚本回退 -60dB。",
+  "rms_voice_duty_min": 0.5,
+  "$rms_voice_duty_min_note": "多点 RMS 采样主判据（2026-09-20 落地）：窗口（2s，按采样时刻**居中**）内字幕/旁白区间覆盖的占空比低于此值即判该窗无语音，不进入音量一致性比较样本。动因：推广片带 BGM，采样窗落在场景窗口尾段（TTS 读完到窗口结束的 1.5s 留白）时聚合 RMS -52dB，高于 -60dB 停顿分界 → 被当语音参与极差比较，误判 'Audio level severely inconsistent: RMS range=34.7dB' 并阻断 postprocess（全仓该错误的首条真实记录）。分界实测 2026-09-20 两片 8 个采样点：无语音窗 duty 0.55~0.60（电平 -36~-52dB）、有语音窗 duty ≥0.74（电平 -19~-26dB）。字幕不可用时退回 rms_window_silence_floor_db 并告警。读不到本键时脚本回退 0.5。"
 }

@@ -160,14 +160,14 @@
           "params": {
             "anchors": {
               "number": { "keywords": ["%", "dB", "mm", "kg", "数字"], "visual": "数字可视化" },
-              "product": { "keywords": ["WSI", "模块", "系统", "系列"], "visual": "产品图片或标识" },
+              "product": { "keywords": ["型号", "模块", "系统", "系列"], "visual": "产品图片或标识" },
               "comparison": { "keywords": ["对比", "相比", "不同于", "传统vs"], "visual": "对比布局" },
               "process": { "keywords": ["步骤", "路径", "从...到..."], "visual": "流程箭头或步骤图" },
               "space": { "keywords": ["会议室", "走廊", "租区", "前台"], "visual": "空间标注或实景" }
             }
           },
           "severity": "warning",
-          "source": "旁白说WSI 120时画面没有WSI 120视觉标识"
+          "source": "旁白点名的型号在画面没有对应视觉标识"
         },
         {
           "id": "3.3",
@@ -222,7 +222,7 @@
           "name": "产品提及必须有图",
           "check": "旁白提到具体产品名且该beat素材列为空时，标记关键缺失",
           "severity": "warning",
-          "source": "WSI 82被多次提及但只有1张照片"
+          "source": "某型号被多次提及但只有1张照片"
         },
         {
           "id": "4.3",

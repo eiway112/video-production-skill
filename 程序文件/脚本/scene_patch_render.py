@@ -166,7 +166,7 @@ def extract_scene_times(html, config):
     # 时长见证（2026-09-03 R8 重构）：S-block 数值 end 只是见证之一，不是唯一见证。
     # 旧实现把"脚本里没有 end: 字面量"一律判不可信 → 现行手写风格（T-block +
     # root data-duration，不写 S-block end）的基线永久降级 FULL，增量渲染零投产
-    # （wsi-hotel-cases 基线实测 scene_times_error=S-block-end-unverifiable）。
+    # （某酒店案例项目基线实测 scene_times_error=S-block-end-unverifiable）。
     # 重构后：end 字面量**在场即必须自洽**（脏数据仍强制降级，R8 语义保留）；
     # 缺席改由三重见证承接 —— ①root data-duration ②config video_duration 交叉校验
     # ③classify 帧网格 total_frames == round(duration*fps)（取自基线成片实测）。
