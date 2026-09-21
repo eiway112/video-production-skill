@@ -45,6 +45,9 @@ import _gate_status as gs
 # 1080 基准：底部预留 220px 字幕带 → y=860（渐变起点，字幕文字约 y=940）。
 BASELINE_FRAME_H = 1080
 BASELINE_BAND_PX = 220
+# 报告默认落点名（不带 --report-out 时跟着被测视频走）。流水线总是显式传
+# --report-out，故该字面量只是独立运行时的默认值；两处字面量一致性由回归用例锁。
+VISUAL_REPORT_NAME = "visual_boundary_report.json"
 
 # 预留带是"占画布高度的比例"，不是固定 px。实测依据（2026-09-02，
 # 过程产物/临时产物/{项目目录}/probe_subtitle_band.py）：用生产
@@ -443,6 +446,9 @@ def main():
     parser.add_argument("--video", required=True, help="Path to rendered video (render_raw.mp4)")
     parser.add_argument("--config", default=None, help="Pipeline config JSON (for scene boundaries)")
     parser.add_argument("--scenes-json", default=None, help='Inline scenes JSON: \'[{"start":0,"end":30},...]\'')
+    parser.add_argument("--report-out", default=None,
+                        help=f"Report落点（默认与被测视频同目录、名 {VISUAL_REPORT_NAME}）；"
+                             "流水线显式声明 temp 落点，避免写读两端各推一条路径")
 
     args = parser.parse_args()
 
@@ -467,7 +473,8 @@ def main():
     passed, results, summary = run_check(args.video, scenes, ffmpeg_exe)
 
     # Write results to JSON for pipeline consumption
-    report_path = Path(args.video).parent / "visual_boundary_report.json"
+    report_path = (Path(args.report_out) if args.report_out
+                   else Path(args.video).parent / VISUAL_REPORT_NAME)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump({
             "passed": passed,

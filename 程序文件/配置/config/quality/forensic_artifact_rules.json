@@ -1,0 +1,24 @@
+{
+  "$schema": "Forensic/diagnostic artifact convention shared by producers and project_cleanup",
+  "$description": "取证产物归类与保留期的唯一权威源。产生侧（preflight_check 等）据此决定写入子目录 forensic_subdir；清理侧（project_cleanup.scan_scattered_artifacts）据此读保留期 retention_days 与归类规则。禁止任何脚本另写一份模式或保留期（单一权威源，A06 同族：登记面=真实读取路径）。归类判据是『目录归属』而非文件名枚举——过程产物/临时产物 根目录不承载任何持久文件，持久产物只住 *_audio/ 项目子目录或 forensic_subdir 日期子目录；故根目录任一文件只要不在 protect_names 且扩展名不在 protect_extensions，即按散落取证产物归类，再按 mtime 与 retention_days 裁定可清理/保留期未到。见 AGENTS.md → 过程产物散文件治理。",
+  "forensic_subdir": "_取证",
+  "retention_days": 30,
+  "protect_names": [
+    "package.json",
+    "package-lock.json",
+    "asset_audit.jsonl",
+    "render_raw.mp4",
+    "scene_fingerprints.json",
+    "pipeline_state.json",
+    "_subtitle_timestamp_source.json"
+  ],
+  "protect_extensions": [
+    ".md"
+  ],
+  "$field_notes": {
+    "forensic_subdir": "新取证产物的固定落点子目录名（位于 过程产物/临时产物/ 下），其下按 YYYYMMDD 再分日期子目录，使『散落』不再发生；清理侧按日期子目录整目录裁定保留期。",
+    "retention_days": "取证产物保留期（天）。与 project_cleanup 的过期缓存语义同档；产生侧不消费此值，但同列于此以令『保留期』只有这一处权威定义。",
+    "protect_names": "永不进删除面的根目录文件名（basename 精确匹配，先于归类判据检查）。含 npm 清单、append-only 审计日志，以及四个 *_audio/ 子目录常驻的受保护产物名（防御性冗余：根目录扫描本不递归进子目录，列出以令约束自文档化且对递归扫描鲁棒）。",
+    "protect_extensions": "永不进删除面的扩展名。.md 为参考/盘点文档（如 AGENTS.md 引用的检查点盘点），不是取证 JSON/日志，按扩展名整体豁免以免逐名枚举。"
+  }
+}

@@ -1524,9 +1524,18 @@ def summarize_history_logs(html_project: str, current_mode: str):
     if not LOG_DIR.exists():
         return
 
+    # Find logs for this project — 取数面同时覆盖两处：旧版散落在临时产物根目录的
+    # preflight_*.json，与新版 _取证/YYYYMMDD/ 日期子目录下的产物（产生侧已迁移，
+    # 消费侧同步迁移以免历史断链；A06：登记面=真实读取路径）。子目录名读自单一
+    # 权威源配置，与 project_cleanup 共用。只在 _取证 内递归，不遍历 *_audio/ 项目目录。
+    forensic_root = LOG_DIR / _script_env.load_forensic_rules()["forensic_subdir"]
+    candidates = list(LOG_DIR.glob("preflight_*.json"))
+    if forensic_root.is_dir():
+        candidates += list(forensic_root.rglob("preflight_*.json"))
+
     # Find logs for this project
     project_logs = []
-    for f in sorted(LOG_DIR.glob("preflight_*.json"), reverse=True):
+    for f in sorted(candidates, key=lambda p: p.name, reverse=True):
         try:
             data = json.loads(f.read_text(encoding='utf-8'))
             if data.get('html_project') == html_project:
@@ -1688,9 +1697,13 @@ def main():
     check_asset_signoff(project_dir, cfg or pre_cfg, html_path, r)
     check_output_dir_cleanliness(output_dir, r)
 
-    # Structured log
-    log_dir = ROOT / "过程产物" / "临时产物"
-    log_path = log_dir / f"preflight_{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    # Structured log — 取证产物落点：_取证/YYYYMMDD/ 日期子目录（产生侧消因，
+    # 使『散落在临时产物根目录』不再发生）。子目录名读自单一权威源配置，
+    # 与 project_cleanup 共用同一份约定（_script_env.load_forensic_rules）。
+    _now = datetime.now()
+    forensic_sub = _script_env.load_forensic_rules()["forensic_subdir"]
+    log_dir = _script_env.TEMP_BASE / forensic_sub / _now.strftime('%Y%m%d')
+    log_path = log_dir / f"preflight_{args.mode}_{_now.strftime('%Y%m%d_%H%M%S')}.json"
     r.write_log(log_path, config_name=config_path.name, html_project=args.html or "")
 
     # Summary

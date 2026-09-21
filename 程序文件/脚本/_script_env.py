@@ -57,6 +57,8 @@ HTML_BASE = ROOT / "程序文件" / "源码" / "hyperframes"
 SOURCE_BASE = ROOT / "素材文件" / "图片"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
 LOG_PATH = TEMP_BASE / "asset_audit.jsonl"
+QUALITY_DIR = CONFIG_BASE / "config" / "quality"
+FORENSIC_RULES_PATH = QUALITY_DIR / "forensic_artifact_rules.json"
 
 # venv 解释器：存在则用项目 venv，否则回退当前解释器（异机/CI 兼容）
 VENV_PYTHON = ROOT / "程序文件" / "运行环境" / "venv" / "Scripts" / "python.exe"
@@ -129,3 +131,34 @@ def append_audit_log(entry: dict, log_path: Path = LOG_PATH):
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except Exception:
         pass
+
+
+_FORENSIC_REQUIRED_KEYS = (
+    "forensic_subdir", "retention_days", "protect_names", "protect_extensions")
+
+
+def load_forensic_rules() -> dict:
+    """取证产物归类与保留期规则（单一权威源 forensic_artifact_rules.json）。
+
+    产生侧（preflight_check 写 forensic_subdir 日期子目录）与清理侧
+    （project_cleanup.scan_scattered_artifacts 读 retention_days + 归类）共用
+    本函数，禁止任一处另写副本（A06：登记面=真实读取路径）。
+
+    fail-closed：缺文件 / 不可解析 / 缺必需键即 RuntimeError——禁止静默回退
+    默认值，否则清理侧会按错误规则裁定删除面（与 A10『损坏配置即报错』同族）。
+    """
+    try:
+        with open(FORENSIC_RULES_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(f"取证规则配置缺失：{FORENSIC_RULES_PATH}")
+    except Exception as e:
+        raise RuntimeError(f"取证规则配置不可解析：{FORENSIC_RULES_PATH}: {e}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"取证规则配置格式非法（应为对象）：{FORENSIC_RULES_PATH}")
+    missing = [k for k in _FORENSIC_REQUIRED_KEYS if k not in data]
+    if missing:
+        raise RuntimeError(
+            f"取证规则配置缺必需键 {missing}：{FORENSIC_RULES_PATH}")
+    return data
+

@@ -60,6 +60,12 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 
 
 SCRIPTS = ROOT / "程序文件" / "脚本"
+# visual_boundary 报告落点由调用方声明（--report-out），合并端复用同一变量。
+# 旧实现是两条独立推导——写端按"被测视频的父目录"、读端按 temp，二者仅在 render_raw
+# 恰好住在 temp 时相等；--video 是公开 CLI 入口，一旦指向交付槽位复检，报告便落进
+# 成果目录且合并端静默扑空＝门禁证据凭空消失（2026-09-21 收口，同 A06
+# "登记面＝真实读取路径"族）。
+VISUAL_REPORT_NAME = "visual_boundary_report.json"
 CONFIG_DIR = ROOT / "程序文件" / "配置" / "config"
 HTML_BASE = ROOT / "程序文件" / "源码" / "hyperframes"
 OUTPUT_DIR = ROOT / "成果文件" / "视频"
@@ -423,6 +429,17 @@ class PipelineState:
         self.data.setdefault("verifications", {})[key] = data
         self.save()
 
+    def expect_verification(self, key):
+        """登记"本轮该检查点已执行、必须留下证据"。
+
+        与 set_verification 刻意分写：前者出自执行位点，后者只在证据真读回来时才有，
+        两者的差集＝"门禁跑了但证据凭空消失"。
+        """
+        pending = self.data.setdefault("verifications_expected", [])
+        if key not in pending:
+            pending.append(key)
+            self.save()
+
     def reset(self, reason=""):
         """清空全部步骤状态（--fresh 真实重跑入口）。
 
@@ -431,7 +448,8 @@ class PipelineState:
         计数源。旧实现把 self.data 整表换成 4 键新 dict，等于 --fresh 顺带清账——
         "fresh → 重渲 → fresh → 重渲"可无限绕开门禁，而 --fresh 恰是被推荐给
         "怀疑状态不可信"一方的恢复路径（A10，2026-09-19）。其余顶层节
-        （verifications/duration_budget_check/duration_check/scene_patch/…）属上一轮
+        （verifications/verifications_expected/duration_budget_check/duration_check/
+        scene_patch/…）属上一轮
         运行的证据，全量重置后即为陈旧，随步骤状态一并作废。
         """
         ledger = self.data.get("render_metrics")
@@ -1038,20 +1056,29 @@ class PipelineRunner:
     def _merge_verification_file(self, key, result_path):
         """读取子进程落盘的验证结果 JSON，合并进 state['verifications'][key]。
 
-        文件缺失/损坏时静默跳过（向后兼容：旧流程无此文件，
-        完工报告端会标注不可追溯而非崩溃）。
+        进入本函数即代表"该检查点本轮真跑了"，先记 `verifications_expected` 再取文件：
+        审计 d2 用 expected − present 的差集判"跑了但证据没落盘"，旧 state 无该键不裁定
+        （2026-09-21，只对当轮新交付生效，历史交付结论不回改）。
+        缺失/损坏只点名不阻断——裁定权在退出码与各检查点，本函数的职责是把
+        "静默空跑的登记面"变成可见证据（同 `[FP-MISS]` 口径）。
         """
+        self.state.expect_verification(key)
+        p = Path(result_path)
+        if not p.exists():
+            print(f"  [VERIFY-MISS] {key}: 结果文件未落盘 → 完工报告与审计收不到该门禁 "
+                  f"({p})")
+            return False
         try:
-            p = Path(result_path)
-            if not p.exists():
-                return
             with open(p, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            self.state.set_verification(key, data)
-            passed = data.get("passed")
-            print(f"  [VERIFY] {key} result merged into pipeline_state (passed={passed})")
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  [VERIFY-MISS] {key}: 结果文件不可解析 ({type(e).__name__}) → "
+                  f"该门禁证据视为缺失 ({p})")
+            return False
+        self.state.set_verification(key, data)
+        passed = data.get("passed")
+        print(f"  [VERIFY] {key} result merged into pipeline_state (passed={passed})")
+        return True
 
     def _step_dirty_reason(self, step):
         """步骤失效原因的纯判定（无日志副作用），供跳步判定与全链扫描共用。
@@ -1915,16 +1942,17 @@ class PipelineRunner:
 
         self.state.mark_started("visual_check")
 
+        visual_report = self.temp_dir / VISUAL_REPORT_NAME
         cmd = [
             str(VENV_PYTHON), "visual_boundary_check.py",
             "--video", str(self.render_raw),
             "--config", str(self.config_path),
+            "--report-out", str(visual_report),
         ]
 
         rc = self._run(cmd, cwd=str(SCRIPTS), desc="visual boundary check")
         # 四态报告入 state：未测/合法不适用与"通过"分开留痕，追溯时不靠控制台
-        self._merge_verification_file(
-            "visual_boundary", self.temp_dir / "visual_boundary_report.json")
+        self._merge_verification_file("visual_boundary", visual_report)
         if rc == 0:
             self.state.mark_completed("visual_check", self._fingerprint("visual_check"))
             return True

@@ -100,7 +100,7 @@ def run_delivery_audit(report: Dict[str, Any],
     背景：SKILL.md 旧版"自评量表"由执行者自评 5 维度，属 Generator 自证。
     本函数把 6 维度全部改为从真实数据推导，治具裁定，退出码说话：
       1. end_to_end_authenticity  ← 全步 passed + 音视频流真实存在
-      2. gate_integrity           ← verifications 全过 + 无未测项 + 无 --force 绕过留痕
+      2. gate_integrity           ← verifications 全过 + 无未测项 + 无"跑了却无证据"的缺键 + 无 --force 绕过留痕
       3. delivery_compliance      ← 交付文件名无技术词 + srt 与 mp4 同基名
       4. storyboard_fidelity      ← narration_source 指针可解析、场景指纹可追溯
       5. completion_integrity     ← 报告状态 VALIDATED + ffprobe 实测 + 产物一致性已执行
@@ -147,14 +147,30 @@ def run_delivery_audit(report: Dict[str, Any],
             "verification(s) incomplete (UNTESTED is not a pass): "
             + ", ".join(f"{k}={n}" for k, n in sorted(untested_by_verif.items())))
     forced_run = None
+    state_data: Dict[str, Any] = {}
     if state_file and Path(state_file).exists():
         try:
             with open(state_file, 'r', encoding='utf-8') as f:
-                forced_run = json.load(f).get("forced_run")
+                state_data = json.load(f)
         except (OSError, json.JSONDecodeError):
-            forced_run = None
+            state_data = {}
+        forced_run = state_data.get("forced_run")
     if forced_run:
         d2_reasons.append(f"--force bypass recorded at {forced_run.get('at', '?')}")
+    # 证据缺失裁定（2026-09-21）：runner 在每个门禁执行位点先记 verifications_expected，
+    # 只有结果真读回来才写 verifications——差集即"门禁跑了但证据凭空消失"（合并端旧实现
+    # 对缺失/损坏静默 return，d2 又只查"整节为空或有 False"，缺一个键会被读成 N 项通过）。
+    # 无该键的旧 state 不裁定：本判据只对当轮新交付生效，历史交付的复审结论不回改。
+    expected = state_data.get("verifications_expected")
+    if isinstance(expected, list) and expected:
+        present = {k[len("verification_"):-len("_passed")]
+                   for k in validation
+                   if k.startswith("verification_") and k.endswith("_passed")}
+        absent = sorted(set(expected) - present)
+        if absent:
+            d2_reasons.append(
+                "verification(s) ran but left no evidence (gate evidence missing): "
+                + ", ".join(absent))
     dims["gate_integrity"] = {
         "passed": not d2_reasons,
         "evidence": "; ".join(d2_reasons) if d2_reasons
@@ -584,6 +600,14 @@ def generate_report(
                             all_valid = False
                 else:
                     report["data_sources"]["verifications"] = "not_recorded (legacy state, not traceable)"
+
+                # 执行位点记了"应做"、verifications 里却没有＝证据缺失。此处只透传不裁定
+                # （同 render_cost 口径），裁定在 --audit 第 2 维。
+                _expected = pipeline_state.get("verifications_expected")
+                if isinstance(_expected, list) and _expected:
+                    _absent = sorted(set(_expected) - set(verifications))
+                    if _absent:
+                        report["data_sources"]["verifications_missing"] = _absent
 
                 # 数据源c：渲染成本度量（render_metrics 节，pipeline_runner 写入，2026-08-19）
                 # 只透传不裁定——成本不作质量门禁（预算门禁在渲染时点判定并留痕）；

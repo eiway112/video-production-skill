@@ -8176,6 +8176,371 @@ def test_audio_rms_voice_duty_gating() -> RegressionTestCase:
     return tc
 
 
+def test_scattered_forensic_artifact_three_state() -> RegressionTestCase:
+    """用例68：散落取证产物按『目录归属』归类并三态裁定（2026-09-21 散文件治理）
+
+    背景：project_cleanup.scan_scattered_scripts 旧实现是 25 个全名精确匹配白名单，
+    与真实散文件交集长期为 0（结构性空转），每次取证都制造新的漏网对象。本批改为
+    目录归属判据 + 单一权威源配置（forensic_artifact_rules.json）：临时产物根目录
+    不承载持久文件，根目录任一文件只要不在 protect_names 且扩展名不在 protect_extensions
+    即按散落取证产物归类，再按 mtime 与 retention_days 裁定三态。
+
+    本用例锁三态（可清理 / 保留期未到 / 不在扫描面），并用 in-test 负向对照证明
+    保留期与保护名/扩展名确实取自配置且在裁定（改配置即改判，摘门即漏）——
+    对应『变异测试证明判据真的在裁定』，无需改源码即可锁死单源接线。
+    """
+    tc = RegressionTestCase(
+        "scattered_forensic_artifact_three_state",
+        "验证散落取证产物按目录归属归类、三态裁定，保留期与保护名取自单一权威源配置"
+    )
+    try:
+        import types
+        import time
+        from datetime import timedelta
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import project_cleanup as pc
+
+        now = time.time()
+        OLD = now - 40 * 86400   # >retention(30d)
+        NEW = now - 2 * 86400    # <=retention
+
+        def touch(p: Path, mtime, data=b"x"):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            os.utime(p, (mtime, mtime))
+
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            # 可清理：陈旧根文件（含非约定前缀，证明按目录归属而非文件名枚举）
+            touch(temp / "preflight_render_20260101_000000.json", OLD)
+            touch(temp / "old_probe.js", OLD)
+            # 保留期未到：近期根文件
+            touch(temp / "_recent_verify.log", NEW)
+            # 不在扫描面：受保护名 + .md 文档
+            touch(temp / "package.json", OLD)
+            touch(temp / "package-lock.json", OLD)
+            touch(temp / "检查点盘点_20260921.md", OLD)
+            # 不在扫描面：*_audio/ 子目录内的受保护产物（根扫描非递归，不得触达）
+            touch(temp / "proj_audio" / "render_raw.mp4", OLD, b"R" * 32)
+            touch(temp / "proj_audio" / "_subtitle_timestamp_source.json", OLD)
+            touch(temp / "proj_audio" / "pipeline_state.json", OLD)
+            # _取证 日期子目录：陈旧→可清理，近期→保留
+            stale_day = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
+            recent_day = datetime.now().strftime("%Y%m%d")
+            touch(temp / "_取证" / stale_day / "preflight_render_x.json", OLD)
+            touch(temp / "_取证" / recent_day / "preflight_render_y.json", NEW)
+
+            cm = types.SimpleNamespace(
+                paths=types.SimpleNamespace(process_temp=temp))
+            rep = pc.CleanupReport()
+            pc.scan_scattered_artifacts(cm, rep)
+
+            clean = {i.path.name for i in rep.items}
+            retained = {i.path.name for i in rep.retained}
+
+            # ── 三态①：可清理 ──
+            tc.assert_true("preflight_render_20260101_000000.json" in clean,
+                           "A1 陈旧根文件判可清理")
+            tc.assert_true("old_probe.js" in clean,
+                           "A2 非约定前缀的陈旧根文件同样按目录归属判可清理（不靠文件名枚举）")
+            tc.assert_true(stale_day in clean,
+                           "A3 过期 _取证 日期子目录整目录判可清理")
+            tc.assert_true(all(i.category == "scattered" for i in rep.items),
+                           "A4 可清理项类别为 scattered")
+
+            # ── 三态②：保留期未到 ──
+            tc.assert_true("_recent_verify.log" in retained,
+                           "B1 近期根文件判保留期未到（入 retained 展示占用）")
+            tc.assert_true("_recent_verify.log" not in clean,
+                           "B2 近期文件不得进删除面")
+            tc.assert_true(recent_day in retained,
+                           "B3 保留期内 _取证 日期子目录不删")
+
+            # ── 三态③：不在扫描面 ──
+            for prot in ("package.json", "package-lock.json", "检查点盘点_20260921.md"):
+                tc.assert_true(prot not in clean and prot not in retained,
+                               f"C1 受保护对象 {prot} 不在扫描面（既不删也不展示）")
+            for sub in ("render_raw.mp4", "_subtitle_timestamp_source.json",
+                        "pipeline_state.json"):
+                tc.assert_true(sub not in clean,
+                               f"C2 *_audio/{sub} 不被根扫描触达（非递归，硬约束保护名不进删除面）")
+
+            # ── 单源验证：保留期与保护名/扩展名取自配置且确在裁定 ──
+            #    in-test 负向对照（改配置即改判）——等价于源码变异，但无需改源码、
+            #    可自动复跑。摘掉任一门，下面的对照即与基线无差异 → 断言转红。
+            real_loader = pc.load_forensic_rules
+            try:
+                pc.load_forensic_rules = lambda: {**real_loader(), "retention_days": 0}
+                r2 = pc.CleanupReport(); pc.scan_scattered_artifacts(cm, r2)
+                tc.assert_true("_recent_verify.log" in {i.path.name for i in r2.items},
+                               "E1 保留期=0 时近期文件转入可清理（retention_days 确取自配置并在裁定）")
+
+                pc.load_forensic_rules = lambda: {**real_loader(), "protect_names": []}
+                r3 = pc.CleanupReport(); pc.scan_scattered_artifacts(cm, r3)
+                tc.assert_true("package.json" in {i.path.name for i in r3.items},
+                               "E2 保护名清空后 package.json 转入可清理（protect_names 确取自配置并在裁定）")
+
+                pc.load_forensic_rules = lambda: {**real_loader(), "protect_extensions": []}
+                r4 = pc.CleanupReport(); pc.scan_scattered_artifacts(cm, r4)
+                tc.assert_true("检查点盘点_20260921.md" in {i.path.name for i in r4.items},
+                               "E3 保护扩展名清空后 .md 转入可清理（protect_extensions 确取自配置并在裁定）")
+            finally:
+                pc.load_forensic_rules = real_loader
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
+    return tc
+
+
+def test_gate_evidence_cannot_silently_disappear() -> RegressionTestCase:
+    """用例69：门禁证据不得静默消失（写读同源 + 缺证点名 + 审计按差集裁定）
+
+    背景（2026-09-21 排查）：`_merge_verification_file` 旧实现对结果文件缺失/损坏
+    `return`/`pass` 零点名，而审计 d2 只在 verifications 整节为空、或某项 False/UNTESTED
+    时报错——缺一个键等于 all() 少一个入参，报告照印"N verifications passed"，
+    "门禁跑了但证据没落盘"与"门禁没跑"在裁定面上不可区分。visual_boundary 一支最脆：
+    写端按被测视频父目录推导、读端按 temp 推导，两条路径只在 render_raw 恰好住 temp 时
+    相等，而 --video 是公开 CLI 入口（指向交付槽位复检是常态用法）——同 A06
+    "登记面＝真实读取路径"族。判据范围按用户裁定：只对当轮新交付生效，历史 state 无
+    verifications_expected 键即退回现行为，存量交付复审结论不回改。
+    """
+    tc = RegressionTestCase(
+        "gate_evidence_cannot_silently_disappear",
+        "验证 证据链写读同源、缺证点名、审计 expected−present 差集裁定且不误杀旧 state"
+    )
+
+    try:
+        import contextlib
+        import io
+        import sys as _sys
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from generate_completion_report import run_delivery_audit
+        import visual_boundary_check as vbc
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        def _quiet(fn, *a, **k):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = fn(*a, **k)
+            return rc, buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            temp_dir = td / "temp"
+            temp_dir.mkdir()
+            cfg = td / "cfg.json"
+            cfg.write_text("{}", encoding='utf-8')
+            render_raw = temp_dir / "render_raw.mp4"
+            render_raw.write_bytes(b"")
+
+            def build(scenario, quick_fix=False, cached=False):
+                state = PipelineState(temp_dir / f"state_{scenario}.json")
+                r = PipelineRunner.__new__(PipelineRunner)
+                r.state = state
+                r.quick_fix = quick_fix
+                r.temp_dir = temp_dir
+                r.render_raw = render_raw
+                r.config_path = cfg
+                r._can_skip = lambda step: cached
+                r._fingerprint = lambda step: "fp-stub"
+                return r, state
+
+            def fake_run(cmd, cwd=None, desc=""):
+                """按 CLI 契约取落点：--report-out 指哪写哪（写端真身由 D 段直调验证）。"""
+                out = None
+                for i, a in enumerate(cmd):
+                    if a == "--report-out":
+                        out = Path(cmd[i + 1])
+                if out is not None:
+                    out.write_text(json.dumps({"passed": True, "verdict": "PASS"}),
+                                   encoding='utf-8')
+                return 0
+
+            # ── A. 合并端三态：缺证必须点名，且"应做"登记先于取数 ──
+            r, st = build("merge")
+            ok_missing, out_missing = _quiet(
+                r._merge_verification_file, "visual_boundary", temp_dir / "nope.json")
+            tc.assert_true(ok_missing is False,
+                           "缺失的结果文件返回 False（旧实现返回 None 且零输出）")
+            tc.assert_true("[VERIFY-MISS]" in out_missing and "visual_boundary" in out_missing,
+                           "缺失即点名 [VERIFY-MISS] 并带键名，不得静默 return")
+
+            corrupt = temp_dir / "corrupt.json"
+            corrupt.write_text("{not json", encoding='utf-8')
+            ok_corrupt, out_corrupt = _quiet(
+                r._merge_verification_file, "media_quality", corrupt)
+            tc.assert_true(ok_corrupt is False and "[VERIFY-MISS]" in out_corrupt,
+                           "不可解析的结果文件同样判缺证并点名（不得读成通过）")
+
+            good = temp_dir / "tts_verify_result.json"
+            good.write_text(json.dumps({"passed": True}), encoding='utf-8')
+            ok_good, _ = _quiet(r._merge_verification_file, "tts_product", good)
+            tc.assert_true(ok_good is True
+                           and "tts_product" in st.data.get("verifications", {}),
+                           "正常路径仍合并进 verifications")
+            expected = st.data.get("verifications_expected", [])
+            tc.assert_equal(sorted(expected),
+                            ["media_quality", "tts_product", "visual_boundary"],
+                            "三次调用（含两次失败）全部登记为应做——差集才是缺证")
+            tc.assert_true("visual_boundary" not in st.data.get("verifications", {})
+                           and "media_quality" not in st.data.get("verifications", {}),
+                           "失败的两次不得留下 verifications 痕迹（否则差集恒空、判据失效）")
+            _quiet(r._merge_verification_file, "visual_boundary", temp_dir / "nope.json")
+            tc.assert_equal(st.data["verifications_expected"].count("visual_boundary"), 1,
+                            "同键重复调用不产生第二份应做登记")
+
+            # ── B. 真实驱动 step_visual_check：证据入 state 且不污染视频所在目录 ──
+            r, st = build("visual")
+            r._run = fake_run
+            done, out_b = _quiet(r.step_visual_check)
+            tc.assert_true(done is True
+                           and "visual_boundary" in st.data.get("verifications", {}),
+                           "visual_check 的四态结论经 --report-out 声明的落点回到 state")
+            tc.assert_true("visual_boundary" in st.data.get("verifications_expected", []),
+                           "执行位点同时登记应做，供审计比对")
+            slot_dir = td / "成果文件" / "视频"
+            slot_dir.mkdir(parents=True)
+            outside = slot_dir / "业务成片.mp4"
+            outside.write_bytes(b"")
+            r.render_raw = outside
+            r._run = fake_run
+            _quiet(r.step_visual_check)
+            tc.assert_true(not (slot_dir / "visual_boundary_report.json").exists(),
+                           "被测视频在成果目录时，报告仍不落进该目录（旧写端会污染交付面）")
+
+            # ── C. 跳过与缓存命中不登记应做（跳过 ≠ 跑了没证据）──
+            r, st = build("quickfix", quick_fix=True)
+            _quiet(r.step_visual_check)
+            tc.assert_true("visual_boundary" not in
+                           (st.data.get("verifications_expected") or []),
+                           "quick-fix 跳过 visual_check 时不得登记应做")
+            r, st = build("cached", cached=True)
+            _quiet(r.step_visual_check)
+            tc.assert_true("visual_boundary" not in
+                           (st.data.get("verifications_expected") or []),
+                           "缓存命中复用上一轮结论时同样不登记应做")
+
+            # ── D. 写端真身：--report-out 生效，缺省仍跟随视频目录 ──
+            def drive_main(argv, video_path):
+                old_argv, old_rc, old_ff = (_sys.argv, vbc.run_check, vbc.find_ffmpeg)
+                vbc.run_check = lambda *a: (True, [{"safety_line": 860}],
+                                            {"verdict": "PASS", "counts": {},
+                                             "untested": [], "not_applicable": []})
+                vbc.find_ffmpeg = lambda: "ffmpeg-stub"
+                _sys.argv = ["visual_boundary_check.py"] + argv
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            vbc.main()
+                        except SystemExit:
+                            pass
+                finally:
+                    _sys.argv, vbc.run_check, vbc.find_ffmpeg = old_argv, old_rc, old_ff
+
+            v1 = td / "v1.mp4"
+            v1.write_bytes(b"")
+            (td / "sub").mkdir()
+            drive_main(["--video", str(v1), "--scenes-json", '[{"start":0,"end":5}]',
+                        "--report-out", str(td / "sub" / "report.json")], v1)
+            tc.assert_true((td / "sub" / "report.json").exists(),
+                           "写端遵 --report-out 落点（读端按同一路径取数才成对）")
+            tc.assert_true(not (td / vbc.VISUAL_REPORT_NAME).exists(),
+                           "给了 --report-out 就不再往视频目录写第二份")
+            drive_main(["--video", str(v1), "--scenes-json", '[{"start":0,"end":5}]'], v1)
+            tc.assert_true((td / vbc.VISUAL_REPORT_NAME).exists(),
+                           "独立运行（无 --report-out）保持原默认落点，人工复访不受影响")
+            tc.assert_true(_pr.VISUAL_REPORT_NAME == vbc.VISUAL_REPORT_NAME,
+                           "两处默认名同源，改名须两处同改")
+
+            # ── E. 审计 d2：差集裁定 + 旧 state 不误杀 + 报告透出 ──
+            def _base_report(extra_validation=None):
+                v = {"step_preflight_passed": True, "step_tts_passed": True,
+                     "step_timeline_passed": True, "step_render_passed": True,
+                     "step_verify_passed": True, "step_postprocess_passed": True,
+                     "has_video_stream": True, "has_audio_stream": True,
+                     "product_state_consistent": True}
+                v.update(extra_validation or {})
+                return {"status": "VALIDATED", "issues": [], "validation": v,
+                        "data_sources": {"video_file": {"ffprobe_available": True}}}
+
+            narration = td / "narration.json"
+            narration.write_text(json.dumps({"scenes": [
+                {"scene_id": 1, "start": 0, "end": 10, "narration": "测试旁白",
+                 "type": "gsap"}]}, ensure_ascii=False), encoding='utf-8')
+            audit_cfg = td / "audit_cfg.json"
+            audit_cfg.write_text(json.dumps({
+                "cover_duration": 0, "narration_source": "./narration.json",
+                "delivery": {"prohibited_terms": ["final", "raw", "tmp"]}},
+                ensure_ascii=False), encoding='utf-8')
+            video_ok = td / "业务主题.mp4"
+            srt_ok = td / "业务主题.srt"
+            video_ok.write_bytes(b"")
+            srt_ok.write_bytes(b"")
+            both = {"verification_tts_product_passed": True,
+                    "verification_visual_boundary_passed": True}
+
+            st_missing = td / "audit_missing.json"
+            st_missing.write_text(json.dumps({
+                "steps": {}, "verifications": {"tts_product": {"passed": True}},
+                "verifications_expected": ["tts_product", "visual_boundary"]}),
+                encoding='utf-8')
+            audit = run_delivery_audit(_base_report({"verification_tts_product_passed": True}),
+                                       str(video_ok), str(srt_ok), str(st_missing),
+                                       str(audit_cfg))
+            d2 = audit["dimensions"]["gate_integrity"]
+            tc.assert_true(not d2["passed"] and "visual_boundary" in d2["evidence"],
+                           "本轮跑过但证据没落盘 → 门禁完整性 FAIL 且点名缺的键")
+            tc.assert_true(not audit["passed"],
+                           "缺证必须让整体审计翻红，不得只印在 evidence 里")
+
+            st_full = td / "audit_full.json"
+            st_full.write_text(json.dumps({
+                "steps": {}, "verifications": {"tts_product": {"passed": True},
+                                               "visual_boundary": {"passed": True}},
+                "verifications_expected": ["tts_product", "visual_boundary"]}),
+                encoding='utf-8')
+            audit = run_delivery_audit(_base_report(both), str(video_ok), str(srt_ok),
+                                       str(st_full), str(audit_cfg))
+            tc.assert_true(audit["dimensions"]["gate_integrity"]["passed"],
+                           "应做与实有一致时 d2 判过（新判据不得把正常交付判红）")
+
+            st_legacy = td / "audit_legacy.json"
+            st_legacy.write_text(json.dumps({
+                "steps": {}, "verifications": {"tts_product": {"passed": True}}}),
+                encoding='utf-8')
+            audit = run_delivery_audit(_base_report({"verification_tts_product_passed": True}),
+                                       str(video_ok), str(srt_ok), str(st_legacy),
+                                       str(audit_cfg))
+            tc.assert_true(audit["dimensions"]["gate_integrity"]["passed"],
+                           "旧 state 无 verifications_expected → 不裁定（存量复审不误杀）")
+
+            from generate_completion_report import generate_report
+            st_expect_only = td / "ds_state.json"
+            st_expect_only.write_text(json.dumps({
+                "steps": {}, "verifications": {"tts_product": {"passed": True}},
+                "verifications_expected": ["tts_product", "media_quality"]}),
+                encoding='utf-8')
+            rep = generate_report(project_name="业务主题", video_file=str(video_ok),
+                                  subtitle_file=None, state_file=str(st_expect_only))
+            tc.assert_equal(rep["data_sources"].get("verifications_missing"),
+                            ["media_quality"],
+                            "完工报告透出缺证清单（只透传不裁定，裁定归 d2）")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -8253,6 +8618,8 @@ class RegressionTestRunner:
             test_duration_consistency_checkpoint_leaves_state_trace,
             test_release_decisions_and_timeline_runs_surfaced_in_report,
             test_publish_export_gate_blocks_business_identifiers,
+            test_scattered_forensic_artifact_three_state,
+            test_gate_evidence_cannot_silently_disappear,
         ]
         self.results = []
     

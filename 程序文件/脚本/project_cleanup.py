@@ -11,6 +11,9 @@
   5. 空目录      — 过程产物下的空子目录
   6. 增量基线    — render_raw.mp4 + scene_fingerprints.json 为 --scene-patch
                   增量渲染基线，保留最近一次，仅超过 stale-days 才列入清理
+  7. 散落取证产物 — 临时产物根目录的取证/调试文件 + _取证/YYYYMMDD 日期子目录，
+                  按目录归属归类、按 forensic_artifact_rules.json 的 retention_days
+                  裁定可清理/保留期未到；受保护名与 .md 文档不在扫描面
 
 安全机制:
   - 默认预览模式（dry-run），不删除任何文件
@@ -42,6 +45,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 
 from config_manager import ConfigManager
 from _fs_walk import dir_size as _dir_size, rglob as _rglob_no_reparse, walk as _walk
+from _script_env import load_forensic_rules
 
 # 过期缓存天数阈值（可通过 --stale-days 覆盖）
 STALE_DAYS = 30
@@ -109,22 +113,12 @@ RENDER_CACHE_PATTERNS = {
 # 保留期间在预览中显示占用量。
 PATCH_BASELINE_NAMES = ["render_raw.mp4", "scene_fingerprints.json"]
 
-# 散落在临时产物根目录的一次性调试/测试文件（文件名精确匹配）
-# 这些文件是开发调试过程中产生的临时脚本，不具有复用价值
-SCATTERED_SCRIPT_NAMES = {
-    # 调试截帧
-    "debug_frame_001.png", "debug_frame_002.png", "debug_frame_003.png",
-    "debug_frame_004.png", "debug_frame_005.png", "debug_frame_006.png",
-    # 一次性调试脚本
-    "check_img.py", "check_video.js", "check_voices.ps1",
-    "debug_nm.js", "debug_path.js",
-    "download_gsap.js", "download_gsap.py", "download_gsap2.py", "download_gsap3.py",
-    "extract_frames.js", "find_hf.js", "search_hf.js",
-    "fix_index.py", "fix_timeline.py",
-    "gen_tts.py", "gen_tts_retry.py", "write_texts.py",
-    "render_direct.js", "run_render.ps1", "run_render_direct.ps1",
-    "test_edge_tts.mp3", "test_edge_tts.py",
-}
+# 散落在临时产物根目录的取证/调试产物：归类与保留期不在本文件硬编码，
+# 而是读自单一权威源 config/quality/forensic_artifact_rules.json（与产生侧
+# preflight_check 共用同一份约定）。判据是『目录归属』而非文件名枚举——
+# 见 scan_scattered_artifacts。旧的 25 名精确匹配白名单 SCATTERED_SCRIPT_NAMES
+# 已删除：它与真实散文件交集长期为 0（结构性空转），且每次取证都制造新的漏网对象。
+
 
 
 def scan_render_cache(cm: ConfigManager, report: CleanupReport):
@@ -264,19 +258,77 @@ def scan_empty_dirs(cm: ConfigManager, report: CleanupReport):
             report.add(CleanupItem(dp, "empty", "空目录", 0))
 
 
-def scan_scattered_scripts(cm: ConfigManager, report: CleanupReport):
-    """扫描临时产物根目录下散落的一次性调试/测试文件"""
+def scan_scattered_artifacts(cm: ConfigManager, report: CleanupReport):
+    """扫描临时产物根目录散落的取证/调试产物 + _取证 日期子目录。
+
+    归类判据是『目录归属』而非文件名枚举：临时产物根目录不承载任何持久文件，
+    持久产物只住 *_audio/ 项目子目录或 _取证/ 日期子目录。故根目录任一文件，
+    只要不在 protect_names 且扩展名不在 protect_extensions，即按散落取证产物归类，
+    再按 mtime 与配置 retention_days 裁定三态：
+      - 可清理（mtime 早于阈值）       → report.items（category=scattered）
+      - 保留期未到（mtime 在阈值内）   → report.retained（仅展示占用，不删）
+      - 不在扫描面（受保护名/.md/子目录）→ 不报、不动
+    _取证/YYYYMMDD/ 日期子目录按目录名日期整目录裁定（自带日期，无需逐文件 mtime）。
+    保留期与归类规则读自单一权威源 forensic_artifact_rules.json，与产生侧共用。
+    """
     temp_dir = cm.paths.process_temp
     if not temp_dir.exists():
         return
 
+    rules = load_forensic_rules()
+    retention_days = int(rules["retention_days"])
+    forensic_sub = rules["forensic_subdir"]
+    protect_names = set(rules["protect_names"])
+    protect_exts = set(rules["protect_extensions"])
+
+    threshold = datetime.now() - timedelta(days=retention_days)
+
+    # (a) 根目录散落文件（非递归；*_audio/ 等子目录天然不在扫描面）
     for f in temp_dir.iterdir():
-        if f.is_file() and f.name in SCATTERED_SCRIPT_NAMES:
+        if not f.is_file():
+            continue
+        if f.name in protect_names or f.suffix in protect_exts:
+            continue  # 不在扫描面：受保护名 / 受保护扩展名
+        try:
+            st = f.stat()
+        except (OSError, PermissionError):
+            continue
+        mtime = datetime.fromtimestamp(st.st_mtime)
+        age = (datetime.now() - mtime).days
+        if mtime < threshold:
             report.add(CleanupItem(
                 f, "scattered",
-                "一次性调试/测试文件",
-                f.stat().st_size
-            ))
+                f"散落取证产物 ({age}天未更新, 阈值{retention_days}天)",
+                st.st_size))
+        else:
+            report.retained.append(CleanupItem(
+                f, "scattered",
+                f"散落取证产物（保留 {age}/{retention_days} 天）",
+                st.st_size))
+
+    # (b) _取证/YYYYMMDD/ 日期子目录（按目录名日期整目录裁定）
+    forensic_root = temp_dir / forensic_sub
+    if forensic_root.is_dir():
+        for d in forensic_root.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                day_dt = datetime.strptime(d.name, "%Y%m%d")
+            except ValueError:
+                # 非日期命名子目录：按 mtime 兜底（仍受同一保留期治理）
+                day_dt = datetime.fromtimestamp(d.stat().st_mtime)
+            size = _dir_size(d)
+            if day_dt < threshold:
+                report.add(CleanupItem(
+                    d, "scattered",
+                    f"过期取证日志目录 ({d.name}, 阈值{retention_days}天)",
+                    size))
+            else:
+                report.retained.append(CleanupItem(
+                    d, "scattered",
+                    f"取证日志目录（保留期内 {d.name}, 阈值{retention_days}天）",
+                    size))
+
 
 
 def scan_cdrive_residuals(report: CleanupReport):
@@ -314,7 +366,7 @@ CATEGORY_NAMES = {
     "render": "渲染缓存",
     "stale": "过期缓存",
     "backup": "备份文件",
-    "scattered": "散落调试文件",
+    "scattered": "散落取证产物",
     "empty": "空目录",
     "cdrive": "C盘残留（工作流）",
 }
@@ -363,11 +415,11 @@ def print_preview(report: CleanupReport, category_filter: str = None):
 
 
 def _print_retained(report: CleanupReport):
-    """展示保留中的增量渲染基线占用量（不列入清理）"""
+    """展示保留期内、不列入清理的项（增量渲染基线 + 散落取证产物）占用量"""
     if not report.retained:
         return
     total_mb = sum(i.size_bytes for i in report.retained) / 1024 / 1024
-    print(f"\n[增量渲染基线 — 保留中] ({len(report.retained)} 项, 占用 {total_mb:.1f} MB)")
+    print(f"\n[保留期内 — 不清理] ({len(report.retained)} 项, 占用 {total_mb:.1f} MB)")
     for item in report.retained:
         mb = item.size_bytes / 1024 / 1024
         size_str = f" ({mb:.1f} MB)" if mb >= 1 else f" ({item.size_bytes // 1024} KB)"
@@ -431,7 +483,7 @@ def main():
     scan_patch_baseline(cm, report, args.stale_days)
     scan_stale_cache(cm, report, args.stale_days)
     scan_backup_videos(cm, report)
-    scan_scattered_scripts(cm, report)
+    scan_scattered_artifacts(cm, report)
     scan_empty_dirs(cm, report)
     scan_cdrive_residuals(report)
 
