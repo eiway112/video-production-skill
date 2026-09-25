@@ -452,7 +452,9 @@ def _wave_sha256(wav_path):
 # 后端（_forced_align）、时间戳语义变化时必须 bump；版本不符 → 缓存失效。
 # v2（2026-09-19）：_forced_align 加分段面守卫（首句零匹配/塌缩零长句 → 降级），
 # 存量 v1 的 asr_forced 记录须全部重对齐。
-ALIGN_ALGO_VERSION = "v2"
+# v3（2026-09-24）：_forced_align 加"去 prompt 重试"（参考文本被 whisper 当成
+# 已说过时回显尾巴、吞掉音频开头），存量 punct_gap 记录须重对齐才有机会走主路径。
+ALIGN_ALGO_VERSION = "v3"
 
 
 def _build_timeline_manifest(temp_dir):

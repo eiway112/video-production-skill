@@ -168,15 +168,34 @@ def _render_content_status(render_raw):
 class _RenderProgressWatcher:
     """render 阶段旁路进度观察者（P2 优化项3）。
 
-    daemon 线程每 10s 轮询 hyperframes 工作目录（work-*/captured-frames/frame_*.jpg）
-    的已捕获帧数并打印进度心跳。纯只读旁路：任何内部异常静默停止轮询，
+    daemon 线程每 10s 轮询进度并打印心跳。纯只读旁路：任何内部异常静默停止轮询，
     绝不向外抛出、绝不影响渲染子进程与 step_render 返回值。整体可移除。
 
-    降级链：captured-frames 帧计数 → render_raw.mp4 文件大小 → 纯耗时心跳。
+    进度源降级链（2026-09-25 结构化加固，单一权威源＝渲染子进程自己的 stdout）：
+      ① stdout 进度条 'NN%  Capturing frame X/Y' / trace framesCompleted
+      ② work-*/captured-frames 帧计数（旧版 HyperFrames 落盘布局）
+      ③ render_raw.mp4 文件大小
+      ④ 0（"什么都没发生"本身即进度信号）
     只统计本次渲染启动后有更新的目录/文件（mtime 门槛），避免旧渲染残留误报。
+
+    教训（WorkBuddy 竖屏 hotel-partition-promo，2026-09-25）：screenshot 模式下
+    HyperFrames 把帧写进事务目录（.render_raw.hf-transaction-*）、encode 完成后才
+    原子落盘 render_raw.mp4，于是 ②③ 两条文件系统腿同时失明 → 进度恒 0 → 退化成
+    纯耗时模式 → capture 明明已跑到 2760/2760 帧（stdout 进度条 70%）仍在 grace
+    360s 被误杀（日志 hotel-partition-promo_resume_render_20260925_155733.log:1186）。
+    ① 消费 stdout 后，进度条与 framesCompleted 在 dev 与 WorkBuddy 两个 HyperFrames
+    版本上都稳定推进（实测两版 bar 映射逐字一致），看门狗不再依赖落盘布局。
     """
 
     POLL_INTERVAL = 10  # 秒
+    # stdout 进度条百分比 → 阶段映射（dev 与 WorkBuddy 两个 HyperFrames 版本实测一致）：
+    # capture 25→70%、Encoding video 75%、Assembling 90%、Render complete 100%。
+    # ≥75% 即 capture 已完成、进入有界收尾（实测 2760 帧 encode 17.4s + assemble 0.3s）。
+    POST_CAPTURE_PCT = 75
+    _CAPTURE_FRAME_RE = re.compile(r"Capturing frame\s+(\d+)\s*/\s*(\d+)")
+    _TRACE_FRAMES_RE = re.compile(r'"framesCompleted"\s*:\s*(\d+)')
+    _BAR_PCT_RE = re.compile(r"(\d{1,3})\s*%")
+    _BAR_BLOCK_CHARS = "\u2588\u2591"  # █ ░ —— 进度条独有，避免误匹配其它含 % 的行
 
     def __init__(self, watch_dirs, render_raw, total_frames=0, watchdog=None):
         self.watch_dirs = [Path(d) for d in watch_dirs]
@@ -192,10 +211,45 @@ class _RenderProgressWatcher:
         self._stop_event = threading.Event()
         self._thread = None
         self._start_time = time.time()
+        # stdout 进度（主线程 observe_stdout 写、看门狗线程读；单属性绑定 GIL 原子，
+        # 与既有跨线程读 self._proc 同风格，不另加锁）。None=尚未见到任何进度条。
+        self._stdout_progress = None  # (pct:int, frames:int) 单调非减
+        self._stood_down = False      # capture 完成后看门狗站立放行（见 _check_watchdog）
 
     def attach_process(self, proc):
         """_run 的 Popen 成功后调用：看门狗需要进程句柄才能在卡死时杀进程树。"""
         self._proc = proc
+
+    def observe_stdout(self, line):
+        """消费渲染子进程的一行 stdout，提取版本无关的权威进度（_run 行循环内调用）。
+
+        HyperFrames 两个版本都打印 'NN%  Capturing frame X/Y' 进度条；较新版本另在
+        [Render:trace] JSON 里带 framesCompleted。任一推进即抬高单调进度，使看门狗
+        不再依赖 work-*/captured-frames 落盘布局（screenshot+事务目录会让其失明）。
+        纯只读旁路：解析异常一律吞掉，绝不干扰渲染子进程。"""
+        try:
+            frames = None
+            m = self._CAPTURE_FRAME_RE.search(line)
+            if m:
+                frames = int(m.group(1))
+            else:
+                m = self._TRACE_FRAMES_RE.search(line)
+                if m:
+                    frames = int(m.group(1))
+            pct = None
+            # 百分比只认进度条行（含 █/░ 块字符），避免误匹配 coverage 等其它含 % 的行
+            if any(c in line for c in self._BAR_BLOCK_CHARS):
+                m = self._BAR_PCT_RE.search(line)
+                if m:
+                    pct = int(m.group(1))
+            if pct is None and frames is None:
+                return
+            cur_pct, cur_frames = self._stdout_progress or (0, 0)
+            new = (max(cur_pct, pct or 0), max(cur_frames, frames or 0))
+            if new != (cur_pct, cur_frames):
+                self._stdout_progress = new
+        except Exception:
+            pass  # 观察者故障绝不干扰渲染
 
     def start(self):
         self._start_time = time.time()
@@ -235,9 +289,17 @@ class _RenderProgressWatcher:
         return None if best is None else best[1]
 
     def _progress_value(self):
-        """看门狗进度度量（单调非减）：帧数 → render_raw 大小降级链。
-        两者皆无时返回 0——"什么都没发生"本身就是进度（prefab 渲染 #1
-        卡 0 帧 12 分钟正是这种形态）。"""
+        """看门狗进度度量（单调非减）：stdout 进度 → 帧数 → render_raw 大小降级链。
+        全部皆无时返回 0——"什么都没发生"本身就是进度（prefab 渲染 #1
+        卡 0 帧 12 分钟正是这种形态）。
+
+        stdout 腿优先：复合量 pct*1e7+frames 让百分比跨阶段推进（capture 25→70、
+        encode 75、assemble 90、complete 100）且帧计数在 capture 阶段内提供细粒度推进，
+        任一前进即视为有进度——这条腿与文件系统布局无关，是 screenshot/事务目录模式下
+        唯一不会失明的信号（旧实现只有文件系统两腿，该模式下同时失明致误杀）。"""
+        sp = self._stdout_progress
+        if sp is not None:
+            return sp[0] * 10_000_000 + sp[1]
         frames = self._count_frames()
         if frames is not None:
             return frames
@@ -260,9 +322,24 @@ class _RenderProgressWatcher:
     def _check_watchdog(self):
         """卡死判定：进度连续 stall_seconds 零增长且总耗时已过 grace_seconds
         → 判定卡死，杀进程树 fail-fast。教训：prefab-agent-launch 渲染 #1
-        卡 0%（0/5305 帧）12 分钟无任何诊断，只能干等崩溃。"""
+        卡 0%（0/5305 帧）12 分钟无任何诊断，只能干等崩溃。
+
+        后捕获站立放行（2026-09-25）：stdout 进度条一旦到 'Encoding video'(≥75%)，
+        说明历史上唯一会卡死的 capture 阶段（prefab #1：0/5305 帧）已完整跑完，
+        其后 encode/assemble 是有界收尾（实测 2760 帧 encode 17.4s + assemble 0.3s）
+        且 HyperFrames 不再打印增量进度——此时按"进度恒 0"杀进程只会丢弃一个已捕获
+        完成的渲染。残留取舍：真正的 encode 卡死不再由本看门狗拦截，由渲染命令自带的
+        --protocol-timeout 600000（600s）兜底；capture 卡死（看门狗设立初衷）不受影响，
+        因其百分比恒 ≤70%、永不触发站立放行。"""
         wd = self.watchdog
         if not wd.get("enabled") or self.stalled or self._proc is None:
+            return
+        sp = self._stdout_progress
+        if sp is not None and sp[0] >= self.POST_CAPTURE_PCT:
+            if not self._stood_down:
+                self._stood_down = True
+                print(f"\n  [WATCHDOG] Capture complete ({sp[0]}%); standing down for "
+                      f"bounded encode/assemble phase (no incremental stdout).", flush=True)
             return
         now = time.time()
         val = self._progress_value()
@@ -284,9 +361,20 @@ class _RenderProgressWatcher:
                 self._kill_process_tree(pid)
 
     def _report(self):
-        frames = self._count_frames()
         elapsed = self._elapsed_str()
-        if frames is not None:
+        sp = self._stdout_progress
+        frames = self._count_frames()
+        if sp is not None and (sp[0] > 0 or sp[1] > 0):
+            # stdout 进度条优先：screenshot/事务目录模式下 _count_frames 失明，
+            # 但子进程自己的进度条仍在推进，是唯一可显示的真实进度。
+            bar_pct, bar_frames = sp
+            if bar_frames > 0 and self.total_frames > 0:
+                cap_pct = min(100, bar_frames * 100 // self.total_frames)
+                print(f"  [RENDER] ~{cap_pct}% ({bar_frames}/{self.total_frames} frames, "
+                      f"bar {bar_pct}%, elapsed {elapsed})", flush=True)
+            else:
+                print(f"  [RENDER] {bar_pct}% (bar), elapsed {elapsed}", flush=True)
+        elif frames is not None:
             if self.total_frames > 0:
                 pct = min(100, frames * 100 // self.total_frames)
                 print(f"  [RENDER] ~{pct}% ({frames}/{self.total_frames} frames, "
@@ -706,6 +794,10 @@ class PipelineRunner:
                     for line in proc.stdout:
                         print(line, end="", flush=True)
                         log.write(line)
+                        # 进度权威源接线：把渲染子进程自己的进度条/trace 行喂给看门狗，
+                        # 使其不再依赖 work-*/captured-frames 落盘布局（screenshot 模式失明）。
+                        if attach_watchdog is not None:
+                            attach_watchdog.observe_stdout(line)
                     rc = proc.wait()
                     completed_normally = True
                 finally:

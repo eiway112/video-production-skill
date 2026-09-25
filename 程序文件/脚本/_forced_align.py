@@ -223,16 +223,33 @@ def align_scene(wav_path, text, segments, model=None):
     if not ref_norm:
         return None
 
-    try:
-        words = _transcribe_words(wav_path, model, initial_prompt=text[:180])
-    except Exception as e:
-        print(f"  [WARN] forced-align transcribe failed on {Path(wav_path).name}: {e}")
-        return None
-    hyp_stream = _hyp_char_stream(words)
-    if not hyp_stream:
-        return None
+    def _attempt(prompt):
+        """一次 ASR + 字符对齐。取数失败返回 None（区别于"跑通但不可靠"）。"""
+        try:
+            words = _transcribe_words(wav_path, model, initial_prompt=prompt)
+        except Exception as e:
+            print(f"  [WARN] forced-align transcribe failed on {Path(wav_path).name}: {e}")
+            return None
+        stream = _hyp_char_stream(words)
+        if not stream:
+            return None
+        return _align_char_times(ref_norm, stream)
 
-    starts, ends, ratio, matched_flags = _align_char_times(ref_norm, hyp_stream)
+    aligned = _attempt(text[:180])
+    if aligned is None:
+        return None
+    starts, ends, ratio, matched_flags = aligned
+    if starts is None or ratio < MIN_MATCH_RATIO:
+        # whisper 把参考文本当成"已经说过"：回显提示词的尾巴、吞掉音频开头的
+        # 词流（2026-09-24 _修订01 实测：同批 wav 带 prompt 0.47/0.27，去 prompt
+        # 0.86/0.88），整场时间戳退化为线性插值。去 prompt 重试一次；两次都不
+        # 过线才落降级链——重试不放宽判据，只救被 prompt 自己打掉的那类失败。
+        print(f"  [WARN] forced-align match ratio {ratio:.2f} < {MIN_MATCH_RATIO} "
+              f"({Path(wav_path).name}) — retry without initial_prompt")
+        aligned = _attempt(None)
+        if aligned is None:
+            return None
+        starts, ends, ratio, matched_flags = aligned
     if starts is None or ratio < MIN_MATCH_RATIO:
         print(f"  [WARN] forced-align match ratio {ratio:.2f} < {MIN_MATCH_RATIO} "
               f"({Path(wav_path).name}) — unreliable, fallback")

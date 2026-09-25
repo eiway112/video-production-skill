@@ -699,7 +699,7 @@ def main():
     parser.add_argument('--state-file', help='Path to pipeline_state.json')
     parser.add_argument('--config-file', help='Pipeline config JSON path (required with --audit)')
     parser.add_argument('--audit', action='store_true',
-                        help='Run delivery audit (5 dimensions, fixture-verdict; replaces self-scoring)')
+                        help='Run delivery audit (fixture-verdict dimensions, replaces self-scoring)')
     parser.add_argument('--output-file', help='Output report file path')
     
     args = parser.parse_args()

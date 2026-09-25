@@ -5186,7 +5186,7 @@ def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase
             #       不是在本用例里再抄一遍字面量（抄一遍＝词表之外的第二份词条，必漂移；
             #       且本文件入发布仓，样本抄进来即把标识二次公开）
             real, _ex, _nv, real_problems = peg.load_terms(peg.default_terms_path())
-            hits_on_gate, untested_on_gate = peg.scan_file(
+            hits_on_gate, untested_on_gate, _excused_on_gate = peg.scan_file(
                 script_dir, gate_src_path.name, real, [])
             tc.assert_true(len(real) >= 8, "B2 权威词表非空（空词表扫谁都扫不中，B2 即恒真）")
             tc.assert_equal(untested_on_gate, [],
@@ -5264,6 +5264,33 @@ def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase
                                                          "note": "不相关条目"}]),
                         files=[str(dirty)])
             tc.assert_equal(r["verdict"], "FAIL", "E3 豁免不溢出到未声明的文件")
+            #    E4 豁免按 kinds 收口：声明了类别的条目只放过该类别，同文件其余类别照扫
+            #       （不这么做则「豁免记录面的本机布局路径」会连带把「含用户名的路径」一起放过）
+            secret = {"pattern": r"sk-[A-Za-z0-9]{20,}", "kind": "secret_shape",
+                      "note": "夹具密钥形态", "sample": "sk-" + "A" * 20}
+            both = put(tdir, "src/both.md", "ACME 与夹具密钥 sk-" + "A" * 20 + " 同行\n")
+            r, _ = gate(tdir, terms_doc([ACME, secret],
+                                        exempt=[{"path": "both.md",
+                                                  "kinds": ["secret_shape"],
+                                                  "note": "夹具：只豁免密钥类别"}]),
+                        files=[str(both)])
+            tc.assert_equal(r["verdict"], "FAIL",
+                            "E4 按 kinds 的豁免只放过声明类别（同行的品牌词仍报红，豁免不越类别溢出）")
+            tc.assert_equal([h["kind"] for h in r["hits"]], ["client_brand_term"],
+                            "E4 剩余命中类别可归因，不得把被豁免的类别混进 hits")
+            tc.assert_equal(r["exempted"], 1,
+                            "E4 被豁免的命中单独计数（裁定可见，不把「放过」抹成「没有」）")
+            #    E5 豁免条目引用了词表里不存在的类别＝该条豁免静默失效，
+            #       读起来却像「这块已经裁过了」——必须现形，不得假装裁过
+            r, _ = gate(tdir, terms_doc([ACME],
+                                        exempt=[{"path": "dirty.py",
+                                                  "kinds": ["cliendt_brand_term"],
+                                                  "note": "夹具：拼错的类别名"}]),
+                        files=[str(dirty)])
+            tc.assert_equal(r["verdict"], "UNTESTED",
+                            "E5 kinds 引用不存在的词条类别即整体未测（坏豁免不参与裁定）")
+            tc.assert_equal(r["scanned"], 0, "E5 不可信豁免面不产生裁定")
+            tc.assert_true("不存在" in r["reason"], "E5 未测文案点名是哪一类别引用失败")
 
             # ── F 不可解读面归未测，不静默当作干净 ──
             weird = put(tdir, "src/raw.dat", "")
@@ -7094,6 +7121,86 @@ def test_forced_align_segment_face_guards() -> RegressionTestCase:
         tc.assert_true(starts is None and ratio == 0.0 and flags is None,
                        "no-match returns (None, None, 0.0, None)")
 
+        # ── H. prompt 回显形态（2026-09-24 _修订01 实证，两支真实 wav A/B）：
+        #      带参考文本时 whisper 把它当成"已经说过"，只吐音频尾部词流
+        #      （scene1 hyp_len 34/73→ratio 0.47、scene3 25/93→0.27），去掉
+        #      prompt 同一批 wav 得 0.86/0.88。修后必须去 prompt 重试一次并
+        #      走通主路径，而不是整场落到 punct-gap 降级链（降级字幕滞后
+        #      1.552s → 终检 subtitle_audio_alignment FAIL）。──
+        import io as _io
+        import contextlib as _cl
+
+        _segs = ['第一句话在这里。', '第二句话在这里。']
+        _ref_text = ''.join(_segs)
+
+        def _run_stub(stub, segments, text):
+            calls = []
+
+            def _wrapped(wav, model, initial_prompt=None):
+                calls.append(initial_prompt)
+                return stub(initial_prompt)
+
+            saved = fa._transcribe_words
+            fa._transcribe_words = _wrapped
+            buf = _io.StringIO()
+            try:
+                with _cl.redirect_stdout(buf):
+                    r = fa.align_scene("fake_scene.wav", text, segments, model=object())
+            finally:
+                fa._transcribe_words = saved
+            return r, calls, buf.getvalue()
+
+        r, calls, log = _run_stub(
+            lambda p: _words('二句话在这里', 6.0) if p
+            else _words('第一句话在这里第二句话在这里', 0.1),
+            _segs, _ref_text)
+        tc.assert_true(r is not None and r.get('method') == 'asr_forced',
+                       "prompt-echo failure (ratio low with prompt, healthy without) "
+                       "must be rescued by one retry without initial_prompt")
+        tc.assert_equal(len(calls), 2, "exactly one retry, no ASR loop")
+        tc.assert_true(bool(calls[0]) and calls[1] is None,
+                       "the retry must actually drop the prompt (first call keeps it)")
+        tc.assert_true('retry without initial_prompt' in log,
+                       "the rescue must name itself (降级/重试不得静默换口径)")
+
+        # ── I. 重试不放宽判据：两次都不过线仍然降级。缺了这条，"重试"就成了
+        #      绕过 ratio 线的后门。出口顺序也要锁——先点名重试、再点名降级，
+        #      只印降级说明第二次结果从未被裁定。──
+        r, calls, log = _run_stub(
+            lambda p: _words('二句话在这里', 6.0), _segs, _ref_text)
+        tc.assert_true(r is None,
+                       "both attempts below MIN_MATCH_RATIO → still unreliable → None "
+                       "(retry must not become a bypass)")
+        tc.assert_equal(len(calls), 2, "second attempt happened before falling back")
+        tc.assert_true('retry without initial_prompt' in log
+                       and 'unreliable, fallback' in log
+                       and log.index('retry without initial_prompt')
+                       < log.index('unreliable, fallback'),
+                       "fallback verdict must come after the retry verdict")
+
+        # ── I2. 上条 I 的独有判据补强（变异 M2 首版存活原因）：尾漏形态下
+        #      首句零匹配/塌缩守卫也会把结果判 None，故"重试后被无条件接受"
+        #      打不红 I。此支取一个"两次都低 ratio、但两句都有真实匹配字符、
+        #      窗口张开、单调性成立"的词流（ratio 5/14=0.36）——只有重试后的
+        #      第二次 ratio 裁定拦得住它。──
+        r, calls, log = _run_stub(
+            lambda p: _words('一句话说第二句', 0.1), _segs, _ref_text)
+        tc.assert_true(r is None,
+                       "two attempts at ratio 0.36 with both segments genuinely "
+                       "anchored (no collapse/non-monotonic) must be rejected by the "
+                       "post-retry ratio check itself")
+        tc.assert_equal(len(calls), 2, "retry ran before the rejection")
+        tc.assert_true('unreliable, fallback' in log,
+                       "rejection must be the ratio verdict, not a silent None")
+
+        # ── J. 健康词流不得为重试多花一次本地 ASR（成本面），且参考文本仍在用
+        #      （prompt 对数字/术语对齐有正向作用，不能被整段删掉）。──
+        r, calls, log = _run_stub(
+            lambda p: _words('第一句话在这里第二句话在这里', 0.1), _segs, _ref_text)
+        tc.assert_true(r is not None, "healthy word stream must still align")
+        tc.assert_equal(len(calls), 1, "a first-attempt pass must not trigger a retry")
+        tc.assert_true(bool(calls[0]), "initial_prompt (reference text) is still in use")
+
         tc.mark_passed()
 
     except Exception as e:
@@ -8541,6 +8648,174 @@ def test_gate_evidence_cannot_silently_disappear() -> RegressionTestCase:
     return tc
 
 
+def test_render_watchdog_stdout_progress_source() -> RegressionTestCase:
+    """用例70：看门狗进度源结构化加固——消费渲染子进程自己的 stdout（2026-09-25）
+
+    背景（WorkBuddy 竖屏 hotel-partition-promo 误杀，2026-09-25）：screenshot 模式下
+    HyperFrames 把帧写进事务目录、encode 完成后才原子落盘 render_raw.mp4，看门狗旧有的
+    两条文件系统腿（work-*/captured-frames 帧计数 + render_raw 大小）同时失明 → 进度恒 0
+    → 退化纯耗时模式 → capture 明明已 2760/2760 帧（stdout 进度条 70%）仍在 grace 360s
+    被误杀（日志 hotel-partition-promo_resume_render_20260925_155733.log:1186）。
+    修复＝看门狗消费子进程 stdout 进度条/trace（dev 与 WorkBuddy 两版 HyperFrames 实测
+    bar 映射逐字一致，版本无关权威源）＋ capture 完成（≥75% Encoding video）后站立放行。
+    本用例锁定：A capture 阶段 stdout 推进则单调前进且绝不误杀（自然复位、非人工重置时基）
+    B 真·capture 卡死（帧 0 冻结、pct<75）仍被杀（守卫须仍能失败，防站立放行阈值下调）
+    C 后捕获站立放行不杀已捕获完成的渲染 D 文件系统两腿全失明时 stdout 腿独立撑起进度
+    E 含 % 的非进度条行不误解析 F _run 真把子进程 stdout 喂进 observe_stdout（产生侧接线）
+    G 源码锚定接线存在与降级链顺序。变异 M1 摘接线/M2 摘 stdout 腿/M3 摘站立放行/
+    M4 站立放行阈值下调到 capture 区/M5 摘进度条块字符守卫 —— 各被对应段杀死。
+    """
+    tc = RegressionTestCase(
+        "render_watchdog_stdout_progress_source",
+        "验证看门狗以 stdout 为版本无关进度源、capture 不误杀、真卡死仍杀、后捕获站立放行"
+    )
+    try:
+        import io
+        import types
+        import contextlib
+        import re
+        import time as _time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        W = _pr._RenderProgressWatcher
+        POST = W.POST_CAPTURE_PCT
+
+        def bar(pct, frm=None, tot=None, label=None):
+            """复刻 HyperFrames 进度条行：块字符 + NN% + 标签（两版实测同形）。"""
+            blocks = "\u2588" * (pct // 4) + "\u2591" * (25 - pct // 4)
+            if frm is not None:
+                return f"  {blocks}  {pct}%  Capturing frame {frm}/{tot}"
+            return f"  {blocks}  {pct}%  {label}"
+
+        # capture 阶段真实推进序列（复合量严格单调）
+        SEQ = [(25, 1), (25, 8), (26, 32), (40, 1100), (60, 2200), (70, 2760)]
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            render_raw = tmp / "render_raw.mp4"   # 不存在＝screenshot 模式落盘前
+            wd_cfg = {"enabled": True, "grace_seconds": 0.5, "stall_seconds": 0.5}
+
+            # ── A1：stdout 推进 → 进度值严格单调；同百分比桶内帧计数仍推进 ──
+            wA = W([tmp], render_raw, 2760, watchdog=wd_cfg)
+            vals = []
+            for pct, frm in SEQ:
+                wA.observe_stdout(bar(pct, frm, 2760))
+                vals.append(wA._progress_value())
+            tc.assert_true(all(b > a for a, b in zip(vals, vals[1:])),
+                           "capture: stdout progress strictly monotonic")
+            wA2 = W([tmp], render_raw, 2760, watchdog=wd_cfg)
+            wA2.observe_stdout(bar(25, 1, 2760)); v1 = wA2._progress_value()
+            wA2.observe_stdout(bar(25, 8, 2760)); v2 = wA2._progress_value()
+            tc.assert_true(v2 > v1, "frame counter advances within a fixed pct bucket")
+
+            # ── A2：耗时远超 grace+stall，但每轮喂入新 stdout 进度 → 自然复位、绝不误杀 ──
+            # 关键：不人工重置 _last_progress_ts，靠 _progress_value 变化触发 _check_watchdog
+            # 内部自然复位——若 stdout 腿失效（M1/M2），进度恒 0、第 2 轮即被杀。
+            wA3 = W([tmp], render_raw, 2760, watchdog=wd_cfg)
+            wA3.attach_process(types.SimpleNamespace(pid=111))
+            killedA = []
+            wA3._kill_process_tree = lambda pid: killedA.append(pid)
+            wA3._start_time = _time.time() - 999          # total >> grace
+            wA3._last_progress_ts = _time.time() - 999    # 若不复位则 stall >> stall_seconds
+            wA3._last_progress_val = -1
+            for pct, frm in SEQ:
+                wA3.observe_stdout(bar(pct, frm, 2760))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    wA3._check_watchdog()
+            tc.assert_true(not wA3.stalled and not killedA,
+                           "capture advancing via stdout is NOT false-killed past grace")
+
+            # ── B：真·capture 卡死（帧 0 冻结、pct<75）→ 仍必须杀（守卫须能失败）──
+            wB = W([tmp], render_raw, 5305, watchdog=wd_cfg)
+            wB.attach_process(types.SimpleNamespace(pid=222))
+            killedB = []
+            wB._kill_process_tree = lambda pid: killedB.append(pid)
+            wB.observe_stdout(bar(25, 0, 5305))            # 卡在 frame 0
+            wB._start_time = _time.time() - 999
+            wB._last_progress_ts = _time.time() - 999
+            wB._last_progress_val = wB._progress_value()   # 冻结值，无变化
+            with contextlib.redirect_stdout(io.StringIO()):
+                wB._check_watchdog()
+            tc.assert_true(wB.stalled and killedB == [222],
+                           "true capture hang (frozen frame 0, pct<75) is STILL killed")
+
+            # ── C：后捕获站立放行（≥75% Encoding video）→ 不杀已捕获完成的渲染 ──
+            wC = W([tmp], render_raw, 2760, watchdog=wd_cfg)
+            wC.attach_process(types.SimpleNamespace(pid=333))
+            killedC = []
+            wC._kill_process_tree = lambda pid: killedC.append(pid)
+            wC.observe_stdout(bar(70, 2760, 2760))
+            wC.observe_stdout(bar(POST, label="Encoding video"))
+            wC._start_time = _time.time() - 999
+            wC._last_progress_ts = _time.time() - 999      # encode 期间 stdout 冻结
+            wC._last_progress_val = wC._progress_value()
+            with contextlib.redirect_stdout(io.StringIO()):
+                wC._check_watchdog()
+            tc.assert_true(wC._stood_down, "post-capture stand-down engaged at >=75%")
+            tc.assert_true(not wC.stalled and not killedC,
+                           "bounded encode phase NOT killed despite frozen stdout")
+
+            # ── D：文件系统两腿全失明时，stdout 腿独立撑起进度（布局无关性）──
+            wD = W([tmp], render_raw, 2760, watchdog=wd_cfg)
+            tc.assert_true(wD._count_frames() is None, "fs frame leg blind (no work-* dir)")
+            tc.assert_true(not render_raw.exists(), "fs size leg blind (no render_raw)")
+            tc.assert_equal(wD._progress_value(), 0, "both fs legs dead -> 0 before stdout")
+            wD.observe_stdout(bar(45, 1200, 2760))
+            tc.assert_true(wD._progress_value() > 0,
+                           "stdout leg alone lifts progress when both fs legs are blind")
+
+            # ── E：含 % 的非进度条行（coverage 等）不得被误解析为进度 ──
+            wE = W([tmp], render_raw, 0, watchdog=wd_cfg)
+            wE.observe_stdout("  \u2713 Scene 5: coverage 57% \u2192 57%")
+            tc.assert_true(wE._stdout_progress is None,
+                           "non-bar percent line (no block chars) not parsed as progress")
+
+            # ── F：_run 真把子进程 stdout 行喂进 observe_stdout（产生侧接线，真子进程）──
+            orig_log_dir = _pr.LOG_DIR
+            _pr.LOG_DIR = tmp
+            try:
+                runner = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+                runner.config_path = tmp / "wd_stdout.json"
+                runner._log_seq = 0
+                runner._current_step = None
+                runner.last_log_path = None
+                wF = W([tmp], render_raw, 2760, watchdog={"enabled": False})
+                emit = ("import sys;"
+                        "b='  ' + '\\u2588'*6 + '\\u2591'*19 + '  25%  Capturing frame 700/2760\\n';"
+                        "sys.stdout.write(b); sys.stdout.flush()")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rcF = runner._run([sys.executable, "-c", emit],
+                                      desc="wd stdout wiring", attach_watchdog=wF)
+                tc.assert_equal(rcF, 0, "emit subprocess exits 0")
+                tc.assert_true(wF._stdout_progress is not None
+                               and wF._stdout_progress[1] == 700,
+                               "_run feeds child stdout into observe_stdout (wiring live)")
+            finally:
+                _pr.LOG_DIR = orig_log_dir
+
+            # ── G：源码锚定——接线存在 + 降级链顺序 + 站立放行阈值（防"建而未接"/顺序回退）──
+            src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+            tc.assert_true(re.search(r"attach_watchdog\.observe_stdout\(line\)", src),
+                           "_run stdout loop calls observe_stdout (source anchor)")
+            mprog = re.search(r"def _progress_value\(self\):(.*?)def _kill_process_tree",
+                              src, re.S)
+            tc.assert_true(mprog is not None, "_progress_value body located")
+            body = mprog.group(1)
+            tc.assert_true(body.index("_stdout_progress") < body.index("_count_frames"),
+                           "stdout leg precedes filesystem legs in _progress_value")
+            tc.assert_true(re.search(r"POST_CAPTURE_PCT\s*=\s*75", src),
+                           "post-capture threshold anchored to observed 75% Encoding video")
+
+            tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -8620,6 +8895,7 @@ class RegressionTestRunner:
             test_publish_export_gate_blocks_business_identifiers,
             test_scattered_forensic_artifact_three_state,
             test_gate_evidence_cannot_silently_disappear,
+            test_render_watchdog_stdout_progress_source,
         ]
         self.results = []
     
