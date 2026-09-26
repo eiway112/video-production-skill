@@ -55,3 +55,32 @@ vibe_images/
 # 本地密钥 / 环境变量覆盖（openmontage.env.local 等）——切勿将真实 API Key 提交
 *.env.local
 .env.local
+
+# ===== 交付物类别默认拒绝（补齐导出清单 §1 登记项，2026-09-26）=====
+# 上方既有规则已覆盖 成果文件/{视频,字幕}/*、素材文件/图片/*、过程产物/**；
+# 缺口是"未被点名的新路径"：真实项目产出的 成果文件/交付说明_<业务名>.md、
+# 素材文件/{视频,文档}/ 下的客户素材，按旧规则 git add -A 会直接带走。
+# .gitignore 随 clone 复制，而钩子与 config 不随——它是唯一能拦住在别人那份
+# 克隆里 git add -A 的结构屏障（门禁只在导出侧裁定，拦不住旁路提交）。
+#
+# 放行集的唯一权威源＝程序文件/配置/config_dev/publish_redact_terms.json 的
+# delivery_artifact_ban.fixtures（当前为 quickstart-demo / bgm-showcase-test）。
+# .gitignore 读不了 JSON，故此处为手抄副本：改 fixtures 必须同批改这两行，
+# 判据面以 publish_export_gate.py --repo 的裁定为准。
+# 与门禁同形的一点：只放行**精确夹具名**，夹具交付说明的修订变体
+# （交付说明_quickstart-demo-修订01.md）按门禁规则同属禁入，不得在此放宽。
+成果文件/**
+!成果文件/视频/
+成果文件/视频/*
+!成果文件/视频/.gitkeep
+!成果文件/字幕/
+成果文件/字幕/*
+!成果文件/字幕/.gitkeep
+!成果文件/交付登记.json
+!成果文件/交付说明_quickstart-demo.md
+!成果文件/交付说明_bgm-showcase-test.md
+
+素材文件/**
+!素材文件/图片/
+素材文件/图片/*
+!素材文件/图片/.gitkeep

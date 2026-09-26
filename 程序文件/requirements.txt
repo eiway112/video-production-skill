@@ -26,6 +26,8 @@ python-pptx>=0.6.21
 
 # 文档处理
 python-docx>=0.8.11
+# HTML 源文档转 Markdown（creating-video-projects 阶段A，doc_to_markdown.py 不收 .html）
+markitdown>=0.1.6
 
 # 日志与追踪
 tqdm>=4.66.0

@@ -5137,7 +5137,12 @@ def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase
         ACME = {"pattern": r"\bACME\b", "kind": "client_brand_term", "note": "夹具品牌词"}
 
         def terms_doc(entries, exempt=None, never=None):
-            d = {"terms": entries}
+            d = {"terms": entries,
+                 # 交付物类别禁区与词条同属一份权威配置；缺区即整体未测（fail-closed），
+                 # 故夹具必须带上它，否则本用例的断言面测的是"配置残缺"而不是词条行为。
+                 "delivery_artifact_ban": {
+                     "fixtures": ["quickstart-demo"],
+                     "rules": [{"pattern": "^成果文件/.+", "note": "夹具类别禁区"}]}}
             if exempt is not None:
                 d["exempt_paths"] = exempt
             if never is not None:
@@ -5337,6 +5342,253 @@ def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase
                            "H4 模块 docstring 声明覆盖边界（不得被读成'发布面已完全脱敏'）")
             tc.assert_true(peg.default_terms_path().exists(),
                            "H5 权威词表在位（清单 §3.3 指向的路径与脚本取数路径一致）")
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
+    return tc
+
+
+def test_publish_gate_bans_delivery_artifact_categories() -> RegressionTestCase:
+    """用例71：发布面交付物类别禁区（2026-09-26 用户裁定"自用成果不需要对外开放"）
+
+    背景：脱敏门禁（用例67）此前只按**标识词**扫内容，词表自己的 $scope 也写明"不含代号
+    的业务叙述属人工复核面"。于是 2026-09-26 出现一个判据盲区：一份不含任何代号的交付说明
+    与客户现场照片，按类别就该禁，正则却抓不到——外部留档副本里那个含业务交付件的提交，
+    用旧门禁扫是 0 命中。类别禁区把这条从"靠人读"移进机算面：判据对象是**路径形态**，
+    与内容无关，故词条被豁免、被绕过或整表失效时它仍然成立。
+
+    本用例锁六件事：
+    A 真实权威配置逐条裁定（夹具名从配置读，用例内不写死业务字面量——同用例67 的 B2 纪律，
+      抄一份进来即成第二处公开面且必漂移）；含一条今日实测到的质量缺陷回测：负向前查里
+      裸写 `(?!{FIXTURE_NAMES}\\.md$)` 时 `\\.md$` 只绑到交替的最后一条，夹具名的**修订变体**
+      会从第一条漏网，故规则必须自带 `(?:…)` 分组，A3 即锁此形态；
+    B 配置残缺一律整体未测且不参与裁定（缺区/空规则/未知占位符/缺 note/非法正则），
+      与词条面同构——带着残缺配置给"干净"裁定＝少腿的结论；
+    C 模式分岔：--files 是开发仓侧预扫，开发仓按设计承载业务项目，类别判据在该模式
+      **不得**生效（否则每次导出前预扫必红，纪律会被当成误杀而整条弃用）；
+    D 白名单清空取最严不取最松（防"清空白名单＝放行全部"的语义倒置）；
+    E 接线锚定：类别扫描真的在 run_gate 的 repo 分支里被调用，且夹具名不住脚本源码；
+    F 报告面唯一生成点：裁定态与跳过态两行文案都在，PASS 时的覆盖边界文案须已改成两层口径
+      （旧句"只裁可识别标识"在本批后成为假陈述）。
+    """
+    tc = RegressionTestCase(
+        "publish_gate_bans_delivery_artifact_categories",
+        "验证发布面交付物类别禁区按路径形态裁定、配置残缺即未测、且不在源侧预扫生效"
+    )
+    try:
+        import contextlib
+        import io
+        import re
+        import subprocess as sp
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+
+        gate_src = script_dir / "publish_export_gate.py"
+        terms_src = (script_dir.parent / "配置" / "config_dev" /
+                     "publish_redact_terms.json")
+        manifest_path = (script_dir.parent.parent / "AI视频制作工作流模板" /
+                         "发布仓导出清单_方案B.md")
+        present = [p for p in (gate_src, terms_src, manifest_path) if p.exists()]
+        if 0 < len(present) < 3:
+            tc.assert_true(False, f"脱敏三件套仅部分在位（{[p.name for p in present]}）")
+        if not present:
+            # 发布仓侧：三件套缺席即本机制的不变量成立，断言面切成"确认没带出去"
+            for p in (gate_src, terms_src, manifest_path):
+                tc.assert_true(not p.exists(), f"R1 {p.name} 不在发布仓")
+            tc.mark_passed()
+            return tc
+        # import 必须位于缺席分支之后：发布仓三件套按设计缺席，先 import 会在
+        # 到达缺席分支前抛 ModuleNotFoundError（2026-09-26 发布仓首轮 70/71 即此形态）
+        import publish_export_gate as peg
+
+        real_doc = json.loads(terms_src.read_text(encoding="utf-8"))
+        ban_cfg = real_doc.get("delivery_artifact_ban") or {}
+        fixtures = [f for f in (ban_cfg.get("fixtures") or []) if f]
+        NOT_FIXTURE = "__not_a_fixture__"
+
+        def expand(pattern, fx=None):
+            fx = fixtures if fx is None else fx
+            names = "|".join(re.escape(f) for f in fx) or "$^"
+            dirs = "|".join(re.escape(f) + "/" for f in fx) or "$^"
+            return re.sub(r"\{([A-Z_]+)\}",
+                          lambda m: names if m.group(1) == "FIXTURE_NAMES" else dirs,
+                          pattern)
+
+        def real_rules():
+            out = []
+            for r in ban_cfg.get("rules") or []:
+                out.append((re.compile(expand(r["pattern"])), r["note"]))
+            return out
+
+        def banned(rel, rules=None):
+            return [n for cre, n in (rules or real_rules()) if cre.search(rel)]
+
+        # ── A 真实权威配置的裁定面（逐条判据都要有正反对照）──
+        tc.assert_true(bool(fixtures), "A0 fixtures 非空（空表下 A2-A6 的正面侧恒真＝空跑）")
+        tc.assert_true(len(ban_cfg.get("rules") or []) >= 4,
+                       "A0b 类别规则条数不得退化成一条兜底（每类对象各自可归因）")
+        fx0 = fixtures[0]
+        tc.assert_equal(banned(f"成果文件/交付说明_{fx0}.md"), [],
+                        "A1 夹具交付说明放行（禁区不得杀既有发布产物）")
+        tc.assert_true(banned(f"成果文件/交付说明_{NOT_FIXTURE}.md"),
+                       "A2 非夹具交付说明判违规（交付说明含客户名/项目背景/实测值）")
+        tc.assert_true(banned(f"成果文件/交付说明_{fx0}-修订01.md"),
+                       "A3 夹具名的修订变体不得从白名单第一条漏网——负向前查须自带 (?:…) 分组，"
+                       "否则 (?!A|B\\.md$) 里 \\.md$ 只绑到最后一条，A 之后的任意后缀都算命中白名单")
+        for ext in ("mp4", "mov", "srt", "vtt"):
+            seg = "视频" if ext in ("mp4", "mov") else "字幕"
+            tc.assert_true(banned(f"成果文件/{seg}/x.{ext}"),
+                           f"A4 成片/字幕扩展名 {ext} 入公开面即违规（既有「mp4 不入 git」首次机器化）")
+        tc.assert_equal(banned("成果文件/字幕/.gitkeep"), [],
+                        "A4b 空目录占位不命中（否则发布仓结构约束本身会被判红）")
+        tc.assert_true(banned("素材文件/图片/site-photo.jpg"),
+                       "A5 业务素材/客户照片判违规")
+        tc.assert_equal(banned("素材文件/图片/.gitkeep"), [], "A5b 素材目录占位放行")
+        tc.assert_true(banned(f"程序文件/源码/hyperframes/{NOT_FIXTURE}/index.html"),
+                       "A6 非夹具项目源码判违规")
+        tc.assert_equal(banned(f"程序文件/源码/hyperframes/{fx0}/index.html"), [],
+                        "A6b 夹具项目源码放行")
+        tc.assert_true(banned("过程产物/临时产物/probe.log"),
+                       "A7 过程产物入公开面即违规")
+        tc.assert_equal(banned("过程产物/临时产物/.gitkeep"), [],
+                        "A7b 过程产物占位文件放行——清单 §1 要求该目录以 .gitkeep 随仓，"
+                        "首版规则写成 ^过程产物/.+ 时对真实发布仓 tracked 集一跑即 FAIL（存量误杀），"
+                        "类别禁区必须按既有发布产物的真实 tracked 集验过，不能只按夹具想当然")
+        tc.assert_equal(banned("程序文件/脚本/pipeline_runner.py"), [],
+                        "A8 正常发布产物不命中任何类别规则（禁区不得扩到代码面）")
+
+        # ── B 配置残缺＝未测，且不带着残缺配置裁定 ──
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+
+            def put(base, rel, text):
+                p = base / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text, encoding="utf-8")
+                return p
+
+            def run_with(doc, **kw):
+                tp = put(tdir, "t.json", json.dumps(doc, ensure_ascii=False))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return peg.run_gate(terms_path=tp, **kw)
+
+            def doc_with(ban):
+                d = {"terms": [{"pattern": r"\bZZZNOPE\b", "kind": "k", "note": "n"}]}
+                if ban is not None:
+                    d["delivery_artifact_ban"] = ban
+                return d
+
+            r = run_with(doc_with(None), files=[])
+            tc.assert_equal(r["verdict"], "UNTESTED",
+                            "B1 缺 delivery_artifact_ban 区判未测（不得由词条面 PASS 顶替类别面）")
+            tc.assert_true("delivery_artifact_ban" in r["reason"],
+                           "B1 未测文案点名缺的是哪一区（只说'不可用'＝无人知道要补什么）")
+            r = run_with(doc_with({"fixtures": fixtures, "rules": []}), files=[])
+            tc.assert_equal(r["verdict"], "UNTESTED", "B2 rules 为空判未测（空判据不得读成干净）")
+            r = run_with(doc_with({"fixtures": fixtures, "rules": [
+                {"pattern": "^成果文件/{WAT}.+", "note": "n"}]}), files=[])
+            tc.assert_true("未知占位符" in r["reason"],
+                           "B3 未知占位符点名（拼错的 token 会让规则永不命中而看起来在裁定）")
+            r = run_with(doc_with({"fixtures": fixtures, "rules": [
+                {"pattern": "^成果文件/.+"}]}), files=[])
+            tc.assert_true("note" in r["reason"],
+                           "B4 规则缺 note 判未测（无声判据＝命中了也没人知道为何要改）")
+            r = run_with(doc_with({"fixtures": fixtures, "rules": [
+                {"pattern": "^成果文件/(", "note": "n"}]}), files=[])
+            tc.assert_equal(r["verdict"], "UNTESTED", "B5 非法正则整体未测，不得丢掉坏条目继续扫")
+            tc.assert_equal(r["scanned"], 0, "B5 残缺配置不参与裁定")
+
+            # ── D 白名单清空取最严（必须驱动门禁本体，测试内自算展开＝恒真空跑）──
+            empty_repo = tdir / "emptyfx"
+            put(empty_repo, f"成果文件/交付说明_{fx0}.md", "x\n")
+            sp.run(["git", "init", "-q", str(empty_repo)], check=True, capture_output=True)
+            sp.run(["git", "-C", str(empty_repo), "add", "-A"], check=True, capture_output=True)
+            strict_tp = put(tdir, "strict.json", json.dumps(
+                doc_with({"fixtures": [], "rules": [ban_cfg["rules"][0]]}), ensure_ascii=False))
+            with contextlib.redirect_stdout(io.StringIO()):
+                r_strict = peg.run_gate(repo=str(empty_repo), terms_path=strict_tp)
+            tc.assert_true(any(h["kind"] == "delivery_artifact_public" for h in r_strict["hits"]),
+                           "D1 清空 fixtures 后夹具名同样判违规（不得把'白名单为空'读成'全部放行'）")
+
+            # ── C 模式分岔（真 git 仓走 repo 分支，不桩 tracked_files）──
+            repo_dir = tdir / "pubrepo"
+            (repo_dir / "成果文件").mkdir(parents=True)
+            (repo_dir / "程序文件" / "脚本").mkdir(parents=True)
+            put(repo_dir, f"成果文件/交付说明_{NOT_FIXTURE}.md", "# 客户现场交付说明\n")
+            put(repo_dir, "程序文件/脚本/tool.py", "print(1)\n")
+            sp.run(["git", "init", "-q", str(repo_dir)], check=True, capture_output=True)
+            sp.run(["git", "-C", str(repo_dir), "add", "-A"], check=True, capture_output=True)
+            real_tp = put(tdir, "real.json", json.dumps(real_doc, ensure_ascii=False))
+            with contextlib.redirect_stdout(io.StringIO()):
+                r_repo = peg.run_gate(repo=str(repo_dir), terms_path=real_tp)
+            tc.assert_equal(r_repo["verdict"], "FAIL",
+                            "C2 repo 模式下非夹具交付说明被裁红（真实 git tracked 集，非桩）")
+            tc.assert_equal(r_repo["path_shape"], "adjudicated", "C2 repo 模式标记为已裁定")
+            kinds = {h["kind"] for h in r_repo["hits"]}
+            tc.assert_true("delivery_artifact_public" in kinds,
+                           "C2 命中带类别 kind（与词条命中可区分，归因不混）")
+            paths_hit = {h["path"] for h in r_repo["hits"]
+                         if h["kind"] == "delivery_artifact_public"}
+            tc.assert_equal(paths_hit, {f"成果文件/交付说明_{NOT_FIXTURE}.md"},
+                            "C2 只裁类别命中的那一个路径（不得连带正常发布产物）")
+            tc.assert_equal(r_repo["scanned"], 2, "C2 内容扫描照常进行（类别面不替代词条面）")
+
+            biz_file = repo_dir / "成果文件" / f"交付说明_{NOT_FIXTURE}.md"
+            biz_file.unlink()
+            sp.run(["git", "-C", str(repo_dir), "add", "-A"], check=True, capture_output=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                r_clean = peg.run_gate(repo=str(repo_dir), terms_path=real_tp)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                peg.print_report(r_clean)
+            tc.assert_equal(r_clean["verdict"], "PASS",
+                            "C3 移除业务件后同一仓判 PASS（判据对路径形态敏感，不是恒红）")
+            tc.assert_true("已裁定" in buf.getvalue(),
+                           "C3 报告行印出类别面已裁定（裁定态不得静默）")
+
+            biz_src = put(tdir, "源侧预扫_交付说明.md", "x\n")
+            with contextlib.redirect_stdout(io.StringIO()) as bf:
+                r_files = peg.run_gate(files=[str(biz_src)], terms_path=real_tp)
+            tc.assert_equal(r_files["path_shape"], "skipped_files_mode",
+                            "C1 --files 模式不裁定类别面（开发仓按设计承载业务项目，"
+                            "在此生效会让导出前预扫必红，纪律会被当成误杀而整条弃用）")
+            tc.assert_equal(r_files["verdict"], "PASS",
+                            "C1 同一份业务交付说明路径在源侧预扫不判红")
+            with contextlib.redirect_stdout(io.StringIO()) as bs:
+                peg.print_report(r_files)
+            tc.assert_true("不裁定" in bs.getvalue(),
+                           "C1 跳过态必须点名（静默换口径＝把裁定藏起来）")
+
+        # ── E 接线与单源锚定（源码面）──
+        src = gate_src.read_text(encoding="utf-8")
+        body = src[src.index("def run_gate("):src.index("def print_report(")]
+        tc.assert_true("scan_path_shape(" in body,
+                       "E1 run_gate 区间内真的调用类别扫描（判据写了没接线＝A06 同族失效）")
+        tc.assert_true(re.search(
+            r"if repo:\s*\n(?:\s*#.*\n)+\s*result\[[\"']hits[\"']\]\.extend\(scan_path_shape",
+            body),
+                       "E1b 调用点被 repo 分支守卫（不得在 --files 模式也裁定类别面）")
+        for fx in fixtures:
+            tc.assert_true(fx not in src,
+                           f"E2 夹具名 {fx} 不住门禁源码（住配置第二处＝必漂移）")
+        doc_src = terms_src.read_text(encoding="utf-8")
+        tc.assert_true(doc_src.count("FIXTURE_NAMES") >= 1 and
+                       "(?!(?:{FIXTURE_NAMES})" in doc_src,
+                       "E3 夹具引用带 (?:…) 分组（A3 那条漏网形态由配置面单源锁死，不靠脚本补救）")
+
+        # ── F 文档/报告面陈述与实现一致 ──
+        doc = peg.__doc__ or ""
+        tc.assert_true("两层" in doc,
+                       "F1 模块 docstring 已改口为两层口径（旧句'只裁可识别标识'在本批后是假陈述）")
+        rep = src[src.index("def print_report("):src.index("def main(")]
+        tc.assert_true("交付物类别禁区" in rep and rep.count("交付物类别禁区") == 2,
+                       "F2 两态报告行唯一生成点在 print_report（裁定态与跳过态各一行，不散落）")
+        tc.assert_true("只裁可识别标识" not in rep,
+                       "F2b 旧覆盖边界文案不得残留（PASS 时印一句已被实现推翻的话＝误导）")
+        tc.assert_true("delivery_artifact_ban" in manifest_path.read_text(encoding="utf-8"),
+                       "F3 类别禁区已登记入导出清单（清单是发布仓唯一生成依据）")
         tc.mark_passed()
     except Exception as e:
         tc.mark_failed(str(e))
@@ -8893,6 +9145,7 @@ class RegressionTestRunner:
             test_duration_consistency_checkpoint_leaves_state_trace,
             test_release_decisions_and_timeline_runs_surfaced_in_report,
             test_publish_export_gate_blocks_business_identifiers,
+            test_publish_gate_bans_delivery_artifact_categories,
             test_scattered_forensic_artifact_three_state,
             test_gate_evidence_cannot_silently_disappear,
             test_render_watchdog_stdout_progress_source,

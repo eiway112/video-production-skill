@@ -1,0 +1,27 @@
+# 行尾策略：入仓一律 LF；仅"会被直接执行的入口"强制检出 LF。
+# 为什么需要显式声明：本机 core.autocrlf 是 system 级 true（--global 未设），
+# "仓内是纯 LF"只是尚未被各机器配置触碰的假象——带 shebang 的脚本一旦以 CRLF
+# 落盘，在 Git Bash / Linux 上以 ./script.py 执行会因解释器路径尾随 \r 而失败。
+# 写进仓内才随 clone 生效，不依赖各机器配置。
+* text=auto
+
+# 执行入口：由 shell / 系统直接解释，必须 LF
+*.py    text eol=lf
+*.pyw   text eol=lf
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.zsh   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.ps1   text eol=lf
+
+# Windows 批处理：LF 会让 cmd 解析异常，必须 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.vbs   text eol=crlf
+*.reg   text eol=crlf
+
+# 无扩展名的执行入口：`* text=auto` + 本机 autocrlf=true 会把钩子检出成 CRLF，
+# 而 git 经 sh 调用它，`#!/bin/sh\r` 即失效——必须显式钉 LF（同上一条判据同源）。
+_工具/hooks/**    text eol=lf
+*.ts              text eol=lf

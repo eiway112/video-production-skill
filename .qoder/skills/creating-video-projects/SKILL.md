@@ -25,8 +25,9 @@ description: 通过现有视频制作工作流（Doc2Video → AI导演 → Hype
 | 输入特征 | 路由 | 入口命令 |
 |---------|------|---------|
 | .pptx / .docx 文档 | 阶段0→A→B→C→D 全流程 | `doc_to_markdown.py` 起步 |
+| HTML **源文档**（技术手册/文档站/长文，即输入是"要讲的内容"） | 跳过 `doc_to_markdown.py`，从阶段A素材盘点开始 | `markitdown` 转换，见阶段A 第 1 步末注 |
 | Markdown / 文本脚本 | 跳过转换，从阶段A素材盘点开始 | — |
-| 已有 HTML 项目（`程序文件/源码/hyperframes/<项目>/` 存在 index.html） | 直通阶段D | `pipeline_runner.py --config <配置>` |
+| 已有 HTML **项目**（`程序文件/源码/hyperframes/<项目>/` 存在 index.html，即输入是"要渲染的分镜"） | 直通阶段D | `pipeline_runner.py --config <配置>` |
 | SDL YAML | 直通阶段D 一键入口 | `pipeline_runner.py --sdl <yaml>` |
 | 语义模糊（如"把这个做成视频"但意图不明） | **暂停**，列出待确认项问用户 | — |
 
@@ -49,7 +50,15 @@ python config_manager.py
    python doc_to_markdown.py "<输入文档>" -o "过程产物/临时产物/<项目名>_md/<项目名>.md"
    ```
    提取的图片自动落在同目录 `images/` 下。
-2. 素材盘点：按踩坑清单 §6.1 生成清单（图片数量/尺寸/比例、内容摘要、无素材场景标注、未使用素材确认）。图片比例用 ffprobe 或 PIL 实测，禁止目测。
+
+   **输入是 HTML 源文档时不走 `doc_to_markdown.py`**：其 `converters` 仅注册 `.pptx`/`.docx`，喂 HTML 会 `ValueError: Unsupported format`。改用 venv 内的 `markitdown`：
+
+   ```
+   python -c "from markitdown import MarkItDown as M; print(M().convert(r'<输入HTML>').text_content)" > "过程产物/临时产物/<项目名>_md/<项目名>.md"
+   ```
+
+   转完必须做正文完整性核验，**不得按输出体量判成败**：2026-09-26 以一份 320KB 级产品技术手册实测，源 320,068 B 转出正文仅 7,176 字符（UTF-8 计 15,086 B，重定向落盘 15,447 B，差额＝每行一个 CR）——这个"缩水"是对的，页面大头是 UI 脚本与内联图片。核验口径是**结构量逐档比对**而非字节比：同测源 `<h2>` 9 个 → 产物 `^## ` 9 行、`<h3>` 20 → `^### ` 20 行，另抽样比对表格数值。计数须用行首锚 `^`，漏锚会把行内 `## ` 算进来（实测同一文件漏锚读成 43/34）。缺档即判转换不可信，回退人工抽取并留来源指针。
+2. 素材盘点：按踩坑清单 §6.1 生成清单（图片数量/尺寸/比例、内容摘要、无素材场景标注、未使用素材确认）。盘点根是素材库 `素材文件/图片/`，不是项目空 `photos/`——项目起步时后者恒为空，只扫它会得出"无素材"结论并直接跳到 ImageGen。图片比例用 ffprobe 或 PIL 实测，禁止目测。
 
 ### 阶段B：分镜设计（AI 导演判断 + 用户确认节点）
 

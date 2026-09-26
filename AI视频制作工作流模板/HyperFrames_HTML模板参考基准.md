@@ -167,6 +167,25 @@ body { width:1920px; height:1080px; overflow:hidden;
 
 ## 三、GSAP 时间轴规范
 
+### 3.0 时间轴唯一权威源：T-block（先读本节再写任何时间位）
+
+场景起点一律声明在 T-block 里，动画时间位一律写成对它的引用：
+
+```javascript
+var T = { s1: 3.0, s2: 25.3, s3: 46.4 };   // 场景起点，adjust_timeline 唯一改写对象
+tl.fromTo("#s2-title", {...}, {...}, T.s2 + 0.8);   // ✅ 引用
+tl.fromTo("#s2-title", {...}, {...}, 26.1);         // ❌ 绝对数字
+```
+
+**为什么必须是引用**：`adjust_timeline.py` 在存在 T-block 时只改写 `var T = {...};` 这一个块（`adjust_t_block`，`adjust_timeline.py:679-684`），并**短路**逐行正则兜底路径。写成绝对数字的时间位因此不随场景窗口位移，与引用系分叉。
+
+真实代价（2026-09-26 实测）：scene2 转场写成字面量 `28.0`，而 T-block 声明 `s2: 25.3`——转场比场景边界晚 2.7s，预览在该窗口采样时画面仍停在转场中途（内容被推到 y1079），`instant_preview` 连续两轮报安全区溢出 FAIL，而根因不在布局、在时间轴。这类失败在预览报告上长得像排版问题，按排版去改会白改两轮。
+
+**约束**：
+- 本节示例中的 `T` 是符号，须落地为 `T.sN`（如 `T+0.5` → `T.s3+0.5`），**不得手工代入成具体秒数**。
+- 唯一允许的字面量时间位是**封面窗口 0–3s**（§3.2）：封面不入 T-block、时长由 `data-cover-duration` 固定并受 `html_template_validator.check_cover_duration` 校验。
+- 自查判据：一个场景 div 的入场/转场/装饰语句里出现裸数字，且该数字 ≥ 首个内容场景起点，即为待改项。
+
 ### 3.1 时间轴初始化
 ```javascript
 window.__timelines = window.__timelines || {};
@@ -181,7 +200,7 @@ window.__timelines["main"] = tl;
 - 必须 `paused:true`，由 HyperFrames seek-and-capture 引擎驱动
 - 所有 tween 必须在同一个 `tl` 上，禁止创建独立 timeline
 - 禁止使用 `setInterval` 或 `requestAnimationFrame`
-- **场景内容动画起始时间 T ≥ 3**（封面占 0-3s，`tl.set("body", {}, 3)` 后主线才开始）
+- **场景内容动画起始时间一律取 `T.sN`（见 §3.0），不得代入具体秒数**；封面占 0–3s，`tl.set("body", {}, 3)` 后主线才开始
 
 ### 3.2 封面淡出
 ```javascript
@@ -438,6 +457,8 @@ tl.fromTo("#sNl1", { scaleX:0, opacity:0 }, { scaleX:1, opacity:0.3, duration:1.
 </div>
 ```
 
+**容器高度须为字幕安全线留量**：图片容器底边必须落在安全线之上（1080 画布 → y860，推导口径见 `AGENTS.md` 字幕安全区预检条）。**不得用"画布高 − 安全线"当可用高度**——标题行、上下 padding、栅格 gap 都吃在同一区间里。实测点（2026-09-26）：竖版容器 640px 时底边压线 6-7px 被预览判溢出，降到 590px 过。数值属该布局下的观测，换排版须重新以 `instant_preview.py` 实测，不得当常量套用。
+
 ---
 
 ## 六、检查清单（HTML 制作完成后）
@@ -452,6 +473,7 @@ tl.fromTo("#sNl1", { scaleX:0, opacity:0 }, { scaleX:1, opacity:0.3, duration:1.
 - [ ] 字号分层符合规范
 - [ ] 装饰层 opacity ≥ 0.08
 - [ ] GSAP 只有一个 `tl`（paused:true）
+- [ ] 内容场景的动画时间位全部写成 `T.sN + offset`，除封面窗口（0–3s）外无裸数字时间位（§3.0）
 - [ ] 封面淡出在 2.5s，body offset 在 3s
 - [ ] 转场类型交替使用
 - [ ] 卡片 stagger 间隔 2-3s
