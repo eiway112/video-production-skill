@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import threading
 import time
+import tempfile
 
 class LogAggregator:
     """结构化日志聚合器"""
@@ -177,7 +178,7 @@ def create_aggregator(workspace_root: str = None) -> LogAggregator:
 
 if __name__ == "__main__":
     # 测试
-    agg = LogAggregator("/tmp/test_pipeline.log")
+    agg = LogAggregator(str(Path(tempfile.gettempdir()) / "test_pipeline.log"))
     
     agg.log_event("preflight_check", "PASS", {"mode": "audit"}, 1250)
     agg.log_event("adjust_timeline", "PASS", {"scenes": 7}, 850)
