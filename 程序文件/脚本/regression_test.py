@@ -5595,6 +5595,309 @@ def test_publish_gate_bans_delivery_artifact_categories() -> RegressionTestCase:
     return tc
 
 
+def test_publish_gate_drift_baseline() -> RegressionTestCase:
+    """用例72：跨仓漂移比对（清单 §4.2 判据的执行载体，2026-09-26）
+
+    背景：§4.2 的判据（"哈希比对只在导出闭包内做，闭包外的不等属预期"）2026-09-26 已成文，
+    但执行载体一直是操作者现场手工跑一遍归一化哈希。同一判据在手工形态下已两次读错：
+    09-02 把 5 个漂移面读成 1 个、09-19 因键集口径报出 60+ 假差异。条文在生效路径上没有
+    脚本承载，即"记得跑"式约束——本用例锁脚本化之后的裁定面。
+
+    取证中实测到两个只有真跑才显形的形态，均已进判据并各有一条断言锁定：
+      ① 开发仓 git 索引把根规范文件记成 agents.md（小写），磁盘工作树是 AGENTS.md，发布仓
+         tracked 名为 AGENTS.md。按精确名匹配时它落进"发布仓独有"分支——"本该不同"被误判成
+         "本就不存在"，豁免规则形同虚设且报告给出的归因是错的（B5 锁）。
+      ② 取 tracked 集时附加 -c core.quotepath=off 会改变 -z 的输出字节形态，对真实两仓凭空
+         造出 14 个假"发布仓独有"路径。清单 §8 那条"比对须加 core.quotepath=off"只适用于
+         非 -z 输出，两个口径相反（E2 锁）。
+
+    方向性判据（B3）：比对是单向的。发布面按设计是开发仓的子集（业务项目不导出），故
+    "开发仓有、发布仓无"一律不判；反向出现未登记对象必须 FAIL——那才是本模式的存在理由。
+    """
+    tc = RegressionTestCase(
+        "publish_gate_drift_baseline",
+        "验证跨仓漂移按归一化哈希单向裁定、豁免须命中登记、配置残缺即未测"
+    )
+    try:
+        import re
+        import subprocess as sp
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+
+        gate_src = script_dir / "publish_export_gate.py"
+        terms_src = (script_dir.parent / "配置" / "config_dev" /
+                     "publish_redact_terms.json")
+        manifest_path = (script_dir.parent.parent / "AI视频制作工作流模板" /
+                         "发布仓导出清单_方案B.md")
+        present = [p for p in (gate_src, terms_src, manifest_path) if p.exists()]
+        if 0 < len(present) < 3:
+            tc.assert_true(False, f"漂移三件套仅部分在位（{[p.name for p in present]}）")
+        if not present:
+            # 发布仓侧：门禁/词表/清单按设计同时缺席（同用例67/71 的角色分岔），
+            # 故本用例在发布仓走"确认没带出去"分支。import 必须在缺席分支之后。
+            for p in (gate_src, terms_src, manifest_path):
+                tc.assert_true(not p.exists(), f"R1 {p.name} 不在发布仓")
+            tc.mark_passed()
+            return tc
+        import publish_export_gate as peg
+
+        real_doc = json.loads(terms_src.read_text(encoding="utf-8"))
+        db = real_doc.get("drift_baseline") or {}
+        fixtures = [f for f in
+                    ((real_doc.get("delivery_artifact_ban") or {}).get("fixtures") or []) if f]
+
+        def put(base, rel, data):
+            p = Path(base) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            return p
+
+        def mkrepo(base, files):
+            base = Path(base)
+            base.mkdir(parents=True, exist_ok=True)
+            # capture_output：临时仓继承全局 core.autocrlf，git add 对每个 LF 文件都印一行
+            # "LF will be replaced by CRLF" 例行提醒，不吞掉会把回归报告的真实读数淹掉。
+            sp.run(["git", "init", "-q"], cwd=str(base), check=True, capture_output=True)
+            for rel, data in files.items():
+                put(base, rel, data)
+            sp.run(["git", "add", "-A"], cwd=str(base), check=True, capture_output=True)
+            return base
+
+        def terms_with(doc):
+            p = Path(td) / "_terms.json"
+            p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            return p
+
+        # 干净态夹具：每个对象都对应一类裁定分支，且都是"该 PASS"的一侧
+        CLEAN_PUB = {
+            "same.py": b"x = 1\n",
+            "AGENTS.md": b"# pub rewrite\n",          # 本该不同（dev 侧索引名是小写）
+            "LICENSE": b"MIT\n",                       # 发布仓原生件（与夹具名无关）
+            "成果文件/交付登记.json": b'{"pub": 1}\n',  # 本该不同
+            "crlf.py": b"y = 2\r\n",                   # 与 dev 侧仅换行不同
+        }
+        CLEAN_DEV = {
+            "same.py": b"x = 1\n",
+            "agents.md": b"# dev original, longer\n",  # 大小写与内容都不同
+            "成果文件/交付登记.json": b'{"dev": 1, "business": 1}\n',
+            "crlf.py": b"y = 2\n",
+            "dev_only.py": b"z = 3\n",                 # 开发仓独有 → 一律不判
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            tp = terms_src
+            pub = mkrepo(Path(td) / "pub", CLEAN_PUB)
+            dev = mkrepo(Path(td) / "dev", CLEAN_DEV)
+
+            # ── A 真实权威配置的裁定面 ──
+            tc.assert_true(bool(db.get("expected_different")) and bool(db.get("native_paths")),
+                           "A0 drift_baseline 两区均非空")
+            zones = {z: db.get(z) or [] for z in ("expected_different", "native_paths")}
+            tc.assert_true(all((r.get("note") or "").strip()
+                               for z in zones.values() for r in z),
+                           "A1 每条豁免规则都带 note（无声豁免＝把裁定藏起来）")
+            exp_ed, exp_np, probs = peg.load_drift_baseline(tp)
+            tc.assert_equal(probs, [], "A2 真实配置加载零问题")
+            tc.assert_true(bool(fixtures),
+                           "A2b fixtures 非空（空表下 C6 的正面侧恒真＝空跑）")
+            # 三个"本该不同"对象逐字对应清单 §4.2 表格三行；写死路径名而非从配置读，
+            # 否则成了配置自己证明自己。
+            for probe in ("AGENTS.md", ".gitignore", "成果文件/交付登记.json"):
+                tc.assert_true(peg._first_match(peg.drift_key(probe), exp_ed),
+                               f"A3 {probe} 命中 expected_different（§4.2 三行须全部代码化）")
+            fx0 = fixtures[0]
+            for probe in ("LICENSE", "README.md", "readme.MD",
+                          f"程序文件/源码/hyperframes/{fx0}/index.html",
+                          "成果文件/字幕/.gitkeep"):
+                tc.assert_true(peg._first_match(peg.drift_key(probe), exp_np),
+                               f"A4 {probe} 命中 native_paths")
+            tc.assert_equal(peg._first_match(peg.drift_key("same.py"), exp_np), None,
+                            "A5 正常发布产物不命中任何豁免（豁免面不得扩到代码面）")
+
+            # ── B 合成两仓端到端：裁定分支逐条可核 ──
+            r = peg.run_drift(str(pub), str(dev), terms_path=tp)
+            tc.assert_equal(r["verdict"], "PASS", f"B1 干净态判 PASS（读数={r.get('reason','')}）")
+            tc.assert_equal(r["drift"], [], "B1b 干净态零漂移")
+            tc.assert_equal(r["unregistered"], [], "B1c 干净态无未登记对象")
+            tc.assert_equal(r["pub_total"], len(CLEAN_PUB), "B2 pub_total 取发布仓 tracked 实测")
+            tc.assert_equal(r["compared"], 4,
+                            "B2b compared 只算两侧都有的对象（5 个发布仓对象里 LICENSE 属原生，"
+                            "故为 4）——计数错位说明匹配面没真跑")
+            tracked_pub = peg.tracked_files(str(pub))
+            tc.assert_true("dev_only.py" not in tracked_pub,
+                           "B3 开发仓独有对象不进比对（单向判据：发布面按设计是子集）")
+            c = [e["path"] for e in r["exempted_diff"]]
+            tc.assert_true("crlf.py" not in c,
+                           "B4 仅换行不同的两侧判相等（去 CR 归一化生效，否则每次比对必红）")
+            ag = [e for e in r["exempted_diff"] if peg.drift_key(e["path"]) == "agents.md"]
+            tc.assert_equal(len(ag), 1,
+                            "B5 大小写失配须走 expected_different 而非 native_paths——"
+                            "按精确名匹配时它落进『发布仓独有』分支，把『本该不同』误判成"
+                            "『本就不存在』，豁免规则形同虚设且归因是错的")
+            if ag:
+                tc.assert_equal(ag[0]["dev_path"], "agents.md",
+                                "B5b 报告须带出 dev 侧真实 tracked 名（大小写失配可归因）")
+            tc.assert_true(any(e["path"] == "LICENSE" for e in r["exempted_native"]),
+                           "B6 发布仓原生件点名且带 note（豁免是正证据，不是静默跳过）")
+            tc.assert_true(all(e["note"] for e in r["exempted_native"]),
+                           "B6b 每条豁免读数都携带裁定理由")
+
+            # 含占位符的 native 规则须真的按夹具名展开——单独建一个带夹具路径的仓，
+            # 与 C6 的"夹具名清空"构成同对象正反对照
+            fx_path = f"程序文件/源码/hyperframes/{fx0}/index.html"
+            pub_fx = mkrepo(Path(td) / "pub_fx", dict(CLEAN_PUB, **{fx_path: b"<html/>\n"}))
+            dev_c = mkrepo(Path(td) / "dev_c", CLEAN_DEV)
+            rf = peg.run_drift(str(pub_fx), str(dev_c), terms_path=tp)
+            tc.assert_equal(rf["verdict"], "PASS", f"B6c 夹具路径应被豁免（{rf.get('reason','')}）")
+            tc.assert_true(fx_path in [e["path"] for e in rf["exempted_native"]],
+                           "B6d {FIXTURE_NAMES} 真的展开成配置里的夹具名")
+
+            # 注入两类缺陷：内容漂移 + 未登记多出
+            put(pub, "same.py", b"x = 1  # tampered\n")
+            put(pub, "sneaked_in.py", b"import os\n")
+            sp.run(["git", "add", "-A"], cwd=str(pub), check=True, capture_output=True)
+            r2 = peg.run_drift(str(pub), str(dev), terms_path=tp)
+            tc.assert_equal(r2["verdict"], "FAIL", "B7 注入缺陷后判 FAIL")
+            tc.assert_equal([d["path"] for d in r2["drift"]], ["same.py"],
+                            "B7b 内容漂移点名到具体路径")
+            tc.assert_equal([u["path"] for u in r2["unregistered"]], ["sneaked_in.py"],
+                            "B8 发布仓出现未登记对象即判 FAIL（热修残留/被人塞进来的文件）")
+            tc.assert_true(r2["drift"][0]["pub_sha"] != r2["drift"][0]["dev_sha"],
+                           "B8b 漂移条目带两侧哈希（读数可复核，不是只说『不等』）")
+
+            # tracked 里有、工作树读不到 → 无从裁定，不得读成一致。
+            # 用独立干净仓：注入态下 hits 非空会盖住未测裁定（FAIL 优先于 UNTESTED），
+            # 在那上面断言 UNTESTED 等于断一个恒不成立的方向。
+            pub_b9 = mkrepo(Path(td) / "pub_b9", CLEAN_PUB)
+            (pub_b9 / "crlf.py").unlink()
+            r3 = peg.run_drift(str(pub_b9), str(dev), terms_path=tp)
+            tc.assert_equal(r3["verdict"], "UNTESTED",
+                            "B9 工作树缺文件判未测而非跳过（静默跳过＝把缺失读成一致）")
+            tc.assert_true(any("crlf.py" in u for u in r3["untested"]),
+                           "B9b 未测文案点名是哪个对象读不到")
+            tc.assert_equal(r3["compared"], 3,
+                            "B9c 读不到的对象不计入 compared（计数不得把未测算成比过）")
+
+            # 两侧不可枚举 / 空集合
+            r4 = peg.run_drift(str(Path(td) / "not_a_repo"), str(dev), terms_path=tp)
+            tc.assert_equal(r4["verdict"], "UNTESTED", "B10 目标不是 git 仓 → 未测")
+            tc.assert_true(any("发布仓" in u for u in r4["untested"]),
+                           "B10b 未测归因点名是哪一侧")
+            empty_pub = mkrepo(Path(td) / "empty_pub", {})
+            r5 = peg.run_drift(str(empty_pub), str(dev), terms_path=tp)
+            tc.assert_equal(r5["verdict"], "UNTESTED",
+                            "B11 发布仓 tracked 为空 → 未测（『没东西可比』不得读成『零漂移』）")
+
+            # ── C 配置残缺＝整体未测，且不带着残缺配置裁定 ──
+            def variant(mut):
+                doc = json.loads(terms_src.read_text(encoding="utf-8"))
+                mut(doc)
+                return terms_with(doc)
+
+            def drop_zone(doc):
+                doc.pop("drift_baseline")
+
+            def no_note(doc):
+                doc["drift_baseline"]["expected_different"][0].pop("note")
+
+            def bad_placeholder(doc):
+                doc["drift_baseline"]["native_paths"][0]["pattern"] = "{NO_SUCH_TOKEN}x"
+
+            def bad_regex(doc):
+                doc["drift_baseline"]["expected_different"][0]["pattern"] = "^([a-z"
+
+            def empty_zones(doc):
+                doc["drift_baseline"]["expected_different"] = []
+                doc["drift_baseline"]["native_paths"] = []
+
+            def drop_ban(doc):
+                doc.pop("delivery_artifact_ban")
+
+            for label, mut, needle in (
+                    ("C1 缺 drift_baseline 区", drop_zone, "drift_baseline"),
+                    ("C2 规则缺 note", no_note, "note"),
+                    ("C3 未知占位符", bad_placeholder, "占位符"),
+                    ("C4 正则非法", bad_regex, "正则非法")):
+                rv = peg.run_drift(str(pub), str(dev), terms_path=variant(mut))
+                tc.assert_equal(rv["verdict"], "UNTESTED", f"{label} → 未测")
+                tc.assert_true(needle in rv.get("reason", ""),
+                               f"{label} 的 reason 须点名成因（不得只给一个空泛的未测）")
+            rv = peg.run_drift(str(pub), str(dev), terms_path=variant(empty_zones))
+            tc.assert_equal(rv["verdict"], "UNTESTED",
+                            "C5 两区皆空 → 未测（空豁免名单不等于零漂移）")
+            # 夹具名唯一住在 delivery_artifact_ban.fixtures；该区被删时占位符无从展开
+            rv = peg.run_drift(str(pub), str(dev), terms_path=variant(drop_ban))
+            tc.assert_equal(rv["verdict"], "UNTESTED",
+                            "C5b 引用夹具名却缺 fixtures 来源 → 未测，不得静默按空名单裁定")
+            tc.assert_true("delivery_artifact_ban" in rv.get("reason", ""),
+                           "C5b2 须点名是跨区引用断链（与『夹具名单为空』是两件事，后者走 C6 最严展开）")
+            # 空白名单取最严：夹具路径不得被放行。用 B6c 同一个仓做正反对照——
+            # 换配置前后唯一变量是 fixtures，裁定翻转才证明占位符真的接在裁定面上
+            strict = json.loads(terms_src.read_text(encoding="utf-8"))
+            strict["delivery_artifact_ban"]["fixtures"] = []
+            rv = peg.run_drift(str(pub_fx), str(dev_c), terms_path=terms_with(strict))
+            tc.assert_equal(rv["verdict"], "FAIL",
+                            "C6 夹具名清空后同一仓不再判 PASS（最严展开必须改变裁定）")
+            tc.assert_true(fx_path in [u["path"] for u in rv["unregistered"]],
+                           "C6b 夹具名清空时含 {FIXTURE_NAMES} 的规则取最严展开（$^ 永不匹配），"
+                           "不得读成『白名单为空＝放行全部』")
+            tc.assert_true(any(e["path"] == "LICENSE" for e in rv["exempted_native"]),
+                           "C6c 空白名单只影响含占位符的规则，与夹具无关的豁免仍成立")
+
+            # ── D 模式互斥 ──
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = peg.main(["--drift", str(pub), "--repo", str(dev)])
+            tc.assert_equal(code, 2, "D1 --drift 与 --repo 同给 → 待裁集合无从确定，按未测退出")
+            tc.assert_true("无从确定" in buf.getvalue(),
+                           "D1b 互斥退出须说明原因（不得只给一个退出码）")
+
+        # ── E 接线与单一权威源 ──
+        src = gate_src.read_text(encoding="utf-8")
+        seg_load = src[src.index("def load_drift_baseline("):src.index("def norm_hash(")]
+        seg_norm = src[src.index("def norm_hash("):src.index("def _first_match(")]
+        seg_drift = src[src.index("def run_drift("):src.index("DRIFT_BOUNDARY_NOTE")]
+        tc.assert_true("drift_baseline" in seg_load and "expected_different" in seg_load,
+                       "E1 脚本读配置区名（判据住配置，改判据不该改代码）")
+        tc.assert_true(fx0 not in seg_drift and "agents.md" not in seg_drift
+                       and "LICENSE" not in seg_drift
+                       and "agents.md" not in seg_load and "LICENSE" not in seg_load,
+                       "E1b 脚本源码内不得写死豁免对象（豁免名单唯一住在词表）")
+        seg_tracked = src[src.index("def tracked_files("):src.index("_BAN_PLACEHOLDER =")]
+        tc.assert_true('"-z"' in seg_tracked,
+                       "E2 取 tracked 集须用 -z（原始字节，不经 octal 转义）")
+        tc.assert_true("quotepath" not in seg_tracked,
+                       "E2b -z 模式下不得附加 core.quotepath=off：清单 §8 那条教训只适用于非 -z"
+                       "输出，在 -z 下该配置反而改变输出字节形态（2026-09-26 实测凭空造出 14 个"
+                       "假『发布仓独有』路径）")
+        tc.assert_true("sha256" in seg_norm and 'replace(b"\\r\\n", b"\\n")' in seg_norm,
+                       "E3 归一化哈希是去 CR 后取 SHA256（原始字节哈希会把换行差异报成内容漂移）")
+        tc.assert_true("gs.verdict" in seg_drift,
+                       "E4 裁定走 _gate_status 四态单一权威源，不自造词汇")
+        buf5 = io.StringIO()
+        with contextlib.redirect_stdout(buf5):
+            peg.print_drift_report(r)
+        tc.assert_true("覆盖边界" in buf5.getvalue(),
+                       "E5 PASS 时报告真的打印出覆盖边界（漂移面 PASS 不等于发布面已脱敏）。"
+                       "本条刻意按行为取证而非扫源码：首版扫的是函数体文本切片，右边界误取 "
+                       "def main( 把无关的 print_report 一并圈入，而它也含『覆盖边界』四字，"
+                       "断言恒真——M10 摘掉整行 print 后用例仍全绿才暴露")
+        tc.assert_true("不裁『内容是否该公开』" in peg.DRIFT_BOUNDARY_NOTE,
+                       "E5b 边界文案须保住那条关键限定（否则两问会被读成一问）")
+        manifest = manifest_path.read_text(encoding="utf-8")
+        tc.assert_true("--drift" in manifest,
+                       "E6 执行载体已登记入导出清单（判据成文而载体无人知＝条文永不生效）")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(str(e))
+    return tc
+
+
 def test_narration_rich_fields_survive_timeline_writeback() -> RegressionTestCase:
     """用例51：timeline 写回不得裁掉单一权威源字段（A05，2026-09-18 审核）
 
@@ -9146,6 +9449,7 @@ class RegressionTestRunner:
             test_release_decisions_and_timeline_runs_surfaced_in_report,
             test_publish_export_gate_blocks_business_identifiers,
             test_publish_gate_bans_delivery_artifact_categories,
+            test_publish_gate_drift_baseline,
             test_scattered_forensic_artifact_three_state,
             test_gate_evidence_cannot_silently_disappear,
             test_render_watchdog_stdout_progress_source,
