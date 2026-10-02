@@ -57,6 +57,17 @@ NPX_BIN = shutil.which("npx.cmd") or shutil.which("npx") or "npx"
 if str(OPENMONTAGE_SRC) not in sys.path:
     sys.path.insert(0, str(OPENMONTAGE_SRC))
 
+def missing_source_tree():
+    """缺位的 OpenMontage 依赖根路径；齐备则 None。
+
+    判据抽成函数供 run() 与回归用例共用同一源——写在 run() 内联的话，用例只能靠
+    真跑一次流水线才能验"不误杀"，代价与风险都不成比例。读模块全局 OPENMONTAGE_SRC
+    于调用期，便于替身注入（不做成默认参数，def 期求值会冻结它）。
+    """
+    root = Path(OPENMONTAGE_SRC) / "tools"
+    return None if root.is_dir() else root
+
+
 # ---------------------------------------------------------------------------
 # Pipeline step definitions per pipeline type
 # ---------------------------------------------------------------------------
@@ -1749,6 +1760,22 @@ class OpenMontageRunner:
     # -----------------------------------------------------------------------
     def run(self, start_from: Optional[str] = None) -> bool:
         """Execute the full pipeline."""
+        # fail-closed 而非逐步炸：本文件属发布闭包，而它要 import 的 vendored 源码树
+        # 按导出清单刻意不随发布产物携带。旧形态是 _init_registry 打一行 WARNING 后回退
+        # 直连导入，随后每个 step 因取不到工具而失败——使用者看到的是"流水线坏了"，
+        # 真实原因（该引擎只在开发源仓可用）无人告知。缺位即在此点名并退出。
+        missing = missing_source_tree()
+        if missing is not None:
+            print("=" * 60)
+            print("OPENMONTAGE 引擎不可用（已拒绝启动，未执行任何步骤）")
+            print("=" * 60)
+            print(f"  缺失: {missing}")
+            print("  原因: 该引擎依赖随仓库分发的 OpenMontage 源码树，发布产物不包含它，")
+            print("        故 --engine openmontage 仅在含该源码树的开发源仓内可运行。")
+            print("  出路: 改用默认引擎（去掉 --engine，走 HyperFrames HTML+GSAP 链），")
+            print("        或在开发源仓内确认上述目录存在后重跑。")
+            return False
+
         print("=" * 60)
         print(f"OPENMONTAGE PIPELINE: {self.pipeline_name}")
         print("=" * 60)

@@ -4388,6 +4388,11 @@ def test_explicit_engine_binds_config_path() -> RegressionTestCase:
     openmontage 时路由分支直接引用它 → UnboundLocalError，该入口完全不可用。
     用哨兵类替换 OpenMontageRunner 捕获实参：既证明绑定成立，也不让真实流水线
     在测试里被执行（夹具不触碰渲染与交付目录）。
+
+    H 段（2026-10-02 追加，同属该引擎入口）：路由位存在但依赖的 vendored 源码树按导出
+    清单不随发布产物携带，旧形态是 WARNING 后逐步炸。现缺位即 fail-closed 点名缺失路径。
+    判据抽为 `missing_source_tree()` 供 run() 与用例共用；两向都验（缺位拒绝／在位放行），
+    且"未执行任何步骤"由 `run(None)` 不触 self 这一事实正面证明，不必真跑流水线。
     """
     tc = RegressionTestCase(
         "explicit_engine_binds_config_path",
@@ -4444,6 +4449,56 @@ def test_explicit_engine_binds_config_path() -> RegressionTestCase:
                        "resolved config path is handed to the runner unchanged")
         tc.assert_true(bool(resolved) and Path(resolved).is_absolute(),
                        "relative --config is resolved against CONFIG_DIR for every engine")
+
+        # ── H 引擎位缺依赖时 fail-closed（2026-10-02，收"公开面半条路由位"）──
+        # 本文件属发布闭包，而它要 import 的 vendored 源码树按导出清单刻意不随发布产物
+        # 携带。旧形态：_init_registry 打一行 WARNING 后回退直连导入，随后每个 step 因取不到
+        # 工具而失败——使用者看到"流水线坏了"，真实原因（该引擎只在开发源仓可用）无人告知。
+        #
+        # 刻意走子进程而非 in-process import：openmontage_runner 模块级重设 sys.stdout/stderr
+        # 且不持旧引用，旧包装被 GC 即关掉共享 buffer，之后任何 in-process 打印炸
+        # `I/O operation on closed file`（AGENTS.md 交付说明条记过名，本用例首版就踩中——
+        # 表现为无关用例 68 之后整套件 lost sys.stderr）。判据抽为 missing_source_tree()
+        # 供 run() 与本用例共用，两向都验（缺位拒绝／在位放行），只验单向等于空跑。
+        import subprocess
+
+        def om_probe(root_path, with_tree):
+            fake = Path(root_path)
+            (fake / "程序文件" / "脚本").mkdir(parents=True, exist_ok=True)
+            (fake / "AGENTS.md").write_text("# marker", encoding="utf-8")
+            if with_tree:
+                (fake / "程序文件" / "源码" / "openmontage" / "tools").mkdir(parents=True)
+            env = dict(os.environ, VIDEO_WORKFLOW_ROOT=str(fake), PYTHONIOENCODING="utf-8")
+            code = ("import openmontage_runner as om;"
+                    "m=om.missing_source_tree();"
+                    "print('SRC', om.OPENMONTAGE_SRC);print('MISSING', m);"
+                    "print('RC', om.OpenMontageRunner.run(None))")
+            return subprocess.run([sys.executable, "-c", code], cwd=str(script_dir), env=env,
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=120)
+
+        with tempfile.TemporaryDirectory() as _td:
+            miss = om_probe(Path(_td) / "absent", with_tree=False)
+            tc.assert_equal(miss.returncode, 0,
+                            f"H0 缺位探测应正常退出而非炸（读数={miss.stderr[-160:]}）")
+            tc.assert_true("OPENMONTAGE 引擎不可用" in miss.stdout,
+                           "H1 源码树缺位时 run() 必须拒绝启动（旧形态在此放行、稍后逐步炸）")
+            # 比对用临时目录名（唯一）而非整条路径：子进程里 ROOT 经 resolve() 成反斜杠
+            # 形态，as_posix() 的整串子串匹配必然落空——那是取数口径错，不是文案缺路径。
+            tc.assert_true(Path(_td).name in miss.stdout and "openmontage" in miss.stdout
+                           and "tools" in miss.stdout,
+                           f"H2 拒绝文案须点名缺失路径（读数={miss.stdout[:220]}）")
+            tc.assert_true("未执行任何步骤" in miss.stdout,
+                           "H2b 须声明零步骤执行（缺位判定排在任何步骤与状态写入之前）")
+            tc.assert_true("RC False" in miss.stdout,
+                           "H2c run() 返回 False → 路由侧 sys.exit(1)，不得虚报成功")
+            ok = om_probe(Path(_td) / "present", with_tree=True)
+            tc.assert_true("OPENMONTAGE 引擎不可用" not in ok.stdout,
+                           "H3 源码树在位时守卫必须放行（只验单向＝空跑）")
+            tc.assert_true("MISSING None" in ok.stdout,
+                           f"H3b 判据本身在位时须返回 None（读数={ok.stdout[:160]}）")
+            tc.assert_true("AttributeError" in ok.stderr or "RC " not in ok.stdout,
+                           "H3c 放行后须真往下走步骤（此处因替身 self 缺属性而炸＝守卫确已放行）")
 
         tc.mark_passed()
 
@@ -10246,6 +10301,259 @@ def test_subtitle_display_style_resolution_tier() -> RegressionTestCase:
 # 测试运行器
 # ============================================================================
 
+def test_consumer_feedback_intake_replays_claims() -> RegressionTestCase:
+    """用例77：使用者反馈收件器——报告断言必须在开发仓重放，不得照抄报告结论（2026-10-02）
+
+    背景：跨仓拉扯的成因不是"使用者忘了同步"，而是它唯一会说话的路径就是自己改代码、
+    自己提交、再手写一份《开发仓回灌清单》。那份清单 6 项里 4 项在开发仓已过期，其 P0 的
+    验证命令 `grep -c "<消费者自造符号名>"` 在开发仓恒 0，而同一修复早已以另一组名字落地
+    （SUBTITLE_STYLE_NARROW / SUBTITLE_NARROW_WIDTH_MAX）——清单自写的"若 grep 显示已存在
+    则跳过"因此永不触发，照做即把已落地修复重复套一遍。
+    本机制给使用者一条比改代码更省路的出口（写固定格式报告，落 _反馈/ 且不入版本库），
+    由收件器把报告第 3 段每条断言**在开发仓当前版本上重放**，别名/过期读数在进件口即点名。
+
+    A 权威载体自证：落点登记表在 config_dev 且加载零问题；模板存在；**模板内示例过自己的
+      校验器且在真实开发仓重放全过**——示例与开发仓现状脱钩即红，文档不靠人记得更新
+    B 重放三态：相符／断言"缺失"而命中（须回给现位置 path:line）／断言"存在"而命中 0 →
+      **未测不是 FAIL**（在场是硬事实、缺席不是，两向不对称属刻意设计）／期望值越域／锚为空／
+      整文件不存在（归因须与"文件在、锚不在"区分）
+    C schema 残缺属"无从裁定"不属"判违规"：缺段、无位置行均判 UNTESTED 且点名，
+      未过校验的原件仍归档到 _待补正（反馈不得静默消失）
+    D 归档幂等与台账冲突：同编号同字节二次摄取不重写（mtime 逐纳秒不变）；同编号异字节
+      判 FAIL 且已归档件字节不变
+    E 落点四态：登记表缺失／repos 空表 → 整体 UNTESTED 且退出码 2；落点目录不存在 → 该条
+      UNTESTED；目录可读但无件 → NOT_APPLICABLE 且整体 PASS（例行跑不得长期红）
+    F 编号即路径输入：含 ../ 的编号不得拼出仓外路径（改名进待补正），且**不阻断重放**
+      ——内容可核性与台账键合法性是两件事
+    G 写盘护栏与单源：任何落点必须在 ROOT 之下；消费者目录跑完字节不变（对其只读）；
+      脚本源码零盘符字面量；三个入口函数不得把 ROOT/INBOX/REPOS_CONFIG 绑成签名默认值
+    仓库角色分岔（与用例67 同一手法）：收件器与落点登记表属开发侧专有，按清单 §2.3/§3.3
+      不导出。发布仓跑本套件时两者同时缺席，断言面切成 R1/R2——报告模板**须在**公开面
+      （消费者 pull 即得格式），登记表**不得**在（内含异机拓扑路径）；只缺席一半判 FAIL，
+      半导出等于机制半生效（公开面出现收件器会诱导使用者自跑自写）。
+    变异：M1 摘重放（照抄报告结论）/ M2 "期望缺失"命中仍判相符 / M3 空 repos 判 PASS /
+      M4 归档不比编号冲突（异字节静默覆盖）/ M5 摘 assert_under_root / M6 缺段仍按内容裁定 /
+      M7 落点路径写死进脚本 / M8 编号非法即跳过重放 / M9 签名默认值退回 def 期冻结 /
+      M10 把 B3 两向对称（"期望存在而命中 0"也判 FAIL＝把取数口径的窄当事实的反面）。
+    """
+    tc = RegressionTestCase(
+        "consumer_feedback_intake_replays_claims",
+        "验证使用者反馈收件器：断言在开发仓重放、schema 残缺判未测、归档幂等、编号不得逃出仓")
+    import re
+    import tempfile
+    import _gate_status as gs
+
+    # 仓库角色分岔（与用例67 同一手法）：收件器与落点登记表按清单 §2.3/§3.3 不导出，
+    # 发布仓跑本套件时两者同时缺席——缺席本身就是本机制要维持的不变量，断言面切成
+    # "确认确实没带出去 + 报告格式仍在公开面"，而不是 import 失败白记一条红。
+    script_dir = Path(__file__).parent
+    intake_path = script_dir / "consumer_feedback_intake.py"
+    repos_path = script_dir.parent / "配置" / "config_dev" / "consumer_repos.json"
+    tpl_probe = script_dir.parent.parent / "AI视频制作工作流模板" / "使用者反馈报告模板.md"
+    present = [p for p in (intake_path, repos_path) if p.exists()]
+    if 0 < len(present) < 2:
+        tc.assert_true(False,
+                       f"收件器与落点登记表仅部分在位（{[p.name for p in present]}）："
+                       "半导出＝机制半生效（公开面出现收件器会诱导使用者自跑自写）")
+    if not present:
+        tc.assert_true(tpl_probe.is_file(),
+                       "R1 报告模板随发布面公开（消费者 pull 即得格式，不靠转达）")
+        tc.assert_true(not repos_path.exists(),
+                       "R2 落点登记表不得进发布仓（内含异机拓扑路径）")
+        tc.mark_passed()
+        return tc
+
+    import consumer_feedback_intake as cfi
+
+    REAL = {"ROOT": cfi.ROOT, "INBOX": cfi.INBOX, "REPOS": cfi.REPOS_CONFIG}
+    tpl_path = REAL["ROOT"] / "AI视频制作工作流模板" / "使用者反馈报告模板.md"
+
+    def report(编号="FB-20261002-01", drop=(), locations=(("程序文件/脚本/mod.py", "ABSENT_ANCHOR", "缺失"),),
+               meta=True):
+        secs = {"## 1. 现象": "字幕被二次硬折", "## 2. 复现": "跑后处理步目测",
+                "## 4. 影响": "单项目多花 20 分钟", "## 5. 建议方向": "按画布宽分档"}
+        out = ["# 使用者反馈报告", ""]
+        if meta:
+            out += [f"- 编号: {编号}", "- 提交者: probe", "- 观测版本: abc1234"]
+        out.append("")
+        for key in ("## 1. 现象", "## 2. 复现", "## 3. 位置", "## 4. 影响", "## 5. 建议方向"):
+            if key in drop:
+                continue
+            out.append(key)
+            out.append("")
+            if key == "## 3. 位置":
+                out += [f"- 位置: {p} | 锚: {a} | 期望: {e}" for p, a, e in locations]
+            else:
+                out.append(secs[key])
+            out.append("")
+        return "\n".join(out) + "\n"
+
+    def loc(path, anchor, expect):
+        return {"path": path, "anchor": anchor, "expect": expect, "raw": ""}
+
+    try:
+        # ── A 权威载体与模板自证 ──
+        tc.assert_true(tpl_path.is_file(), "A0 报告模板住本仓（消费者 pull 即得，不靠用户转达）")
+        tc.assert_true(REAL["REPOS"].is_file(), "A0b 落点登记表在 config_dev 权威源位")
+        rp, rprobs = cfi.load_repos()
+        tc.assert_equal(rprobs, [], "A1 真实落点登记表加载零问题")
+        tc.assert_true(bool(rp) and all(r.get("feedback_dir") for r in rp),
+                       "A1b 至少一条落点且逐条声明 feedback_dir")
+        tsrc = tpl_path.read_text(encoding="utf-8")
+        _i = tsrc.index("```markdown", tsrc.index("一条填好的示例"))
+        ex = tsrc[_i:tsrc.index("```", _i + 12)]
+        emeta, emissing, elocs, _e = cfi.parse_report(ex)
+        tc.assert_equal(emissing, [], "A2 模板内示例五段齐全（示例自己缺段＝教坏格式）")
+        tc.assert_true(len(elocs) >= 1, "A2b 示例至少含一条可重放位置行")
+        ev = [cfi.replay_location(l) for l in elocs]
+        tc.assert_equal([x["status"] for x in ev], [gs.PASS] * len(ev),
+                        "A2c 示例断言在开发仓当前版本上全部成立——示例与现状脱钩即红")
+        tc.assert_true(bool(emeta.get("编号")), "A2d 示例自带合法编号（可被收件器直接摄取）")
+
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            dev = t / "devroot"
+            (dev / "程序文件" / "脚本").mkdir(parents=True)
+            (dev / "AGENTS.md").write_text("# marker", encoding="utf-8")
+            (dev / "程序文件" / "脚本" / "mod.py").write_text("KEEP = 1\nOTHER = 2\n",
+                                                              encoding="utf-8")
+            fb = t / "consumer" / "_反馈"
+            fb.mkdir(parents=True)
+            cfi.ROOT, cfi.INBOX, cfi.REPOS_CONFIG = dev, dev / "收件箱", t / "repos.json"
+
+            # ── B 重放三态 ──
+            tc.assert_equal(cfi.replay_location(loc("程序文件/脚本/mod.py", "GONE", "缺失"),
+                                                 dev_root=dev)["status"], gs.PASS,
+                            "B1 锚确实不在且期望缺失 → 相符")
+            b2 = cfi.replay_location(loc("程序文件/脚本/mod.py", "KEEP", "缺失"), dev_root=dev)
+            tc.assert_equal(b2["status"], gs.FAIL,
+                            "B2 断言『开发仓缺失』而重放命中 → 不相符（M1/M2 的漏网形态）")
+            tc.assert_true("mod.py:1" in (b2.get("found_at") or ""),
+                           "B2b 必须回给现位置 path:line，只说『不相符』等于没给整改线索")
+            b3 = cfi.replay_location(loc("程序文件/脚本/mod.py", "NOPE", "存在"), dev_root=dev)
+            tc.assert_equal(b3["status"], gs.UNTESTED,
+                            "B3 断言『存在』而命中 0 → 无从证伪（未测），不判不相符：在场是硬事实、"
+                            "缺席不是——字面命中 0 可能只是同一事物改了写法，据此判证伪等于把取数口径"
+                            "的窄读成事实的反面（与 B2 的不对称是刻意设计）")
+            tc.assert_true("无从证伪" in b3["reason"], "B3b 归因须点名『字面缺失≠语义缺失』而非泛称未测")
+            tc.assert_equal(cfi.replay_location(loc("程序文件/脚本/mod.py", "KEEP", "也许"),
+                                                 dev_root=dev)["status"], gs.UNTESTED,
+                            "B4 期望值越域 → 未测，不得默认按某一档裁定")
+            tc.assert_equal(cfi.replay_location(loc("程序文件/脚本/mod.py", "", "缺失"),
+                                                 dev_root=dev)["status"], gs.UNTESTED,
+                            "B5 锚为空 → 未测（空锚参与计数会造出假相符/假不相符）")
+            b6 = cfi.replay_location(loc("程序文件/脚本/absent.py", "X", "缺失"), dev_root=dev)
+            tc.assert_equal(b6["status"], gs.PASS, "B6 整文件不存在且期望缺失 → 相符")
+            tc.assert_true("整体不存在" in b6["reason"],
+                           "B6b 归因须区分『文件也不在』与『文件在、锚不在』——两者整改方向不同")
+
+            # ── C schema 残缺属未测不属违规 ──
+            (fb / "c1.md").write_text(report(编号="FB-C-01", drop=("## 4. 影响",)), encoding="utf-8")
+            c1 = cfi.ingest_one(fb / "c1.md")
+            tc.assert_equal(c1["status"], gs.UNTESTED,
+                            "C1 缺段判未测而非 FAIL（报告写得不全不等于断言被证伪）")
+            tc.assert_true(any("## 4. 影响" in p for p in c1["problems"]),
+                           "C1b 未测必须点名缺哪段")
+            (fb / "c2.md").write_text(report(编号="FB-C-02", locations=()), encoding="utf-8")
+            c2 = cfi.ingest_one(fb / "c2.md")
+            tc.assert_equal(c2["status"], gs.UNTESTED,
+                            "C2 第 3 段无位置行 → 未测（不得由『报告写了现象』反推为已核）")
+            tc.assert_true((cfi.INBOX / "_待补正" / "FB-C-01.md").is_file(),
+                           "C3 未过校验的原件仍归档到 _待补正，不得静默丢弃")
+
+            # ── D 归档幂等与台账冲突 ──
+            (fb / "d.md").write_text(report(编号="FB-D-01"), encoding="utf-8")
+            d1 = cfi.ingest_one(fb / "d.md")
+            dpath = cfi.INBOX / "FB-D-01.md"
+            tc.assert_equal(d1["status"], gs.PASS, f"D1 干净报告摄取判 PASS（{d1['problems']}）")
+            tc.assert_true(dpath.is_file(), "D1b 归档件落收件箱根（非 _待补正）")
+            # 端到端那层必须自己判红：B 段直调 replay_location 打得通，不代表摄取链真在重放
+            (fb / "stale.md").write_text(
+                report(编号="FB-D-02", locations=(("程序文件/脚本/mod.py", "KEEP", "缺失"),)),
+                encoding="utf-8")
+            d1c = cfi.ingest_one(fb / "stale.md")
+            tc.assert_equal(d1c["status"], gs.FAIL,
+                            "D1c 报告称『开发仓缺失』而该符号真实存在 → 整链摄取必须判 FAIL"
+                            "（此处若放行即等于照抄报告结论，正是《回灌清单》P0 的原形态）")
+            tc.assert_true(any("mod.py:1" in (x.get("found_at") or "") for x in d1c["replay"]),
+                           "D1d 归档裁定须带现位置，否则整改方还得自己再 grep 一遍")
+            tc.assert_true((cfi.INBOX / "FB-D-02.裁定.json").is_file(),
+                           "D1e 机器裁定与原件分开落盘（原件不得被改写）")
+            ns = dpath.stat().st_mtime_ns
+            d2 = cfi.ingest_one(fb / "d.md")
+            tc.assert_true("已存在" in str(d2["archived"]), "D2 同编号同字节 → 不重写")
+            tc.assert_equal(dpath.stat().st_mtime_ns, ns,
+                            "D2b 幂等须逐纳秒不动 mtime（刷新已归档件＝把台账改成刚收到的）")
+            (fb / "d.md").write_text(report(编号="FB-D-01") + "\n追加\n", encoding="utf-8")
+            d3 = cfi.ingest_one(fb / "d.md")
+            tc.assert_equal(d3["status"], gs.FAIL, "D3 同编号异字节 → 台账冲突判 FAIL")
+            tc.assert_true("追加" not in dpath.read_text(encoding="utf-8"),
+                           "D3b 冲突时不得覆盖已归档件（覆盖即抹掉先到那份的证据）")
+
+            # ── F 编号即路径输入 ──
+            (fb / "evil.md").write_text(report(编号="../../escape"), encoding="utf-8")
+            f1 = cfi.ingest_one(fb / "evil.md")
+            tc.assert_true(not (t / "escape.md").exists() and not (t.parent / "escape.md").exists(),
+                           "F1 含 ../ 的编号不得拼出仓外路径")
+            tc.assert_true(str(f1["archived"]).startswith("收件箱"),
+                           f"F1b 非法编号改名进待补正而非丢弃（读数={f1['archived']}）")
+            tc.assert_true(any("编号" in p for p in f1["problems"]), "F1c 必须点名编号非法")
+            tc.assert_true(bool(f1["replay"]),
+                           "F2 编号非法不得顺带跳过重放——内容可核性与台账键合法性是两件事")
+
+            (t / "consumer" / "_空目录").mkdir()
+
+            # ── E 落点四态 ──
+            rc = cfi.main([])
+            tc.assert_equal(rc, 2, "E1 落点登记表缺失 → 退出码 2（不得按『无反馈』放行）")
+            cfi.REPOS_CONFIG.write_text(json.dumps({"repos": []}), encoding="utf-8")
+            tc.assert_equal(cfi.main([]), 2,
+                            "E2 repos 空表 → 未测，不得由 verdict() 空输入短路成 PASS")
+            cfi.REPOS_CONFIG.write_text(json.dumps(
+                {"repos": [{"id": "x", "path": str(t / "nobody"), "feedback_dir": "_反馈"}]}),
+                encoding="utf-8")
+            e3 = cfi.scan_repos([{"id": "x", "path": str(t / "nobody"), "feedback_dir": "_反馈"}])
+            tc.assert_equal([r["status"] for r in e3], [gs.UNTESTED],
+                            "E3 落点目录不存在 → 该消费者反馈面未测")
+            cfi.REPOS_CONFIG.write_text(json.dumps(
+                {"repos": [{"id": "x", "path": str(t / "consumer"), "feedback_dir": "_空目录"}]}),
+                encoding="utf-8")
+            e4 = cfi.scan_repos([{"id": "x", "path": str(t / "consumer"), "feedback_dir": "_空目录"}])
+            tc.assert_equal([r["status"] for r in e4], [gs.NOT_APPLICABLE],
+                            "E4 目录可读但无件 → 不适用（扫过且为空 ≠ 未扫）")
+            tc.assert_equal(cfi.overall_status(e4), gs.PASS,
+                            "E4b 仅不适用项时整体 PASS——例行巡检不得长期红")
+
+            # ── G 写盘护栏与单源 ──
+            try:
+                cfi.assert_under_root(t / "outside.md")
+                tc.assert_true(False, "G1 仓外落点必须 raise")
+            except RuntimeError:
+                tc.assert_true(True, "G1 仓外落点被 assert_under_root 拦下")
+            cfi.ROOT, cfi.INBOX, cfi.REPOS_CONFIG = REAL["ROOT"], REAL["INBOX"], REAL["REPOS"]
+            mod_src = Path(cfi.__file__).read_text(encoding="utf-8")
+            tc.assert_equal(re.findall(r"[A-Za-z]:[\\/]", mod_src), [],
+                            "G2 脚本源码零盘符字面量——消费者落点只住 config_dev")
+            tc.assert_equal(cfi.REPOS_CONFIG.parent.name, "config_dev",
+                            "G2b 落点登记表与脱敏词表同区（均含内部拓扑，不得进发布闭包）")
+            tc.assert_equal(cfi.INBOX.parent, REAL["ROOT"] / "AI视频制作工作流模板",
+                            "G3 收件箱与操作日志/模板同区，且由 ROOT 推导而非新立仓根目录")
+            frozen = re.findall(r"def (?:load_repos|replay_location|ingest_one)\([^)]*="
+                                r"(?:ROOT|INBOX|REPOS_CONFIG)", mod_src)
+            tc.assert_equal(frozen, [],
+                            "G4 三个入口不得把仓根/收件箱/登记表绑成签名默认值（def 期冻结＝替身失效）")
+            consumer_names = sorted(p.name for p in fb.iterdir() if p.is_file())
+            tc.assert_equal(consumer_names, ["c1.md", "c2.md", "d.md", "evil.md", "stale.md"],
+                            "G5 消费者目录只剩我自己写进去的夹具件——收件器对其零写出（只读）")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"consumer_feedback_intake fixture error: {e}")
+    finally:
+        cfi.ROOT, cfi.INBOX, cfi.REPOS_CONFIG = REAL["ROOT"], REAL["INBOX"], REAL["REPOS"]
+    return tc
+
+
 class RegressionTestRunner:
 
     """回归测试运行器"""
@@ -10328,6 +10636,7 @@ class RegressionTestRunner:
             test_pipeline_lock_blocks_concurrent_runs,
             test_product_state_consistency_three_legs,
             test_subtitle_display_style_resolution_tier,
+            test_consumer_feedback_intake_replays_claims,
         ]
         self.results = []
     
