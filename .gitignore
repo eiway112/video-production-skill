@@ -84,3 +84,18 @@ vibe_images/
 !素材文件/图片/
 素材文件/图片/*
 !素材文件/图片/.gitkeep
+
+# ===== 业务项目源码与配置默认拒绝（2026-10-02 补齐，导出清单 §1 登记项）=====
+# 上方块只点名 成果文件/素材文件/过程产物 三支，未点名下面这两条路径形态——
+# 实测外部副本一次 `git add -A` 即带走 40 件业务对象（--drift 判 unregistered=40）。
+# 夹具名集为 publish_redact_terms.json → delivery_artifact_ban.fixtures 的手抄副本，
+# 改 fixtures 必须同批改本块；裁定面以 publish_export_gate.py --repo 为准。
+程序文件/源码/hyperframes/*
+!程序文件/源码/hyperframes/quickstart-demo/
+!程序文件/源码/hyperframes/bgm-showcase-test/
+程序文件/配置/config/*.json
+!程序文件/配置/config/quickstart-demo.json
+!程序文件/配置/config/bgm-showcase-test.json
+
+# 宿主/智能体会话数据（此前由发布仓本地治理提交携带，现改由本仓导出侧携带）
+**/.workbuddy/

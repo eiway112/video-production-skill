@@ -123,6 +123,15 @@ COVER_DURATION = 0.0  # auto-detected from HTML data-cover-duration, or set via 
 BGM_ENABLED = True  # config 可用 "bgm_enabled": false 关闭合成 BGM（低频 drone 容易被感知为嗡嗡声）
 SUBTITLE_DISPLAY_REPLACEMENTS = {}  # 字幕显示层替换（如 毫米→mm），不影响 TTS 朗读文本
 
+# 字幕烧录样式按画布宽分档。libass 对 SRT 用默认 PlayRes(384×288) 虚拟画布缩放，
+# 同一字面字号在 1080×1920 按高放大约 6 倍、在 1920×1080 约 3.75 倍，两种画布观感不同；
+# 竖屏下 22 字宽长行（约 1300px）必被 libass 二次硬折且断点不择语义。
+# 窄屏档 2026-09-25 由消费侧竖屏实测定标，横屏档为既有交付项目沿用值（零变化）。
+SUBTITLE_STYLE_WIDE = {"font_size": 15, "margin_v": 25, "wrap_line_limit": 22}
+SUBTITLE_STYLE_NARROW = {"font_size": 10, "margin_v": 10, "wrap_line_limit": 14}
+SUBTITLE_NARROW_WIDTH_MAX = 1200
+SUBTITLE_STYLE = SUBTITLE_STYLE_WIDE  # load_config 按 config resolution 换档
+
 # === P0 类型体系（2026-07-29，一个纯 BGM 项目的逃逸教训） ===
 VIDEO_TYPE = ""         # config "video_type"：视频类型声明（如 product_showcase），日志/报告可读
 TTS_ENABLED = True      # config "tts_enabled"：false = 纯BGM无旁白路径（默认 true，既有项目零变化）
@@ -666,11 +675,21 @@ def load_config(config_path):
     global SCENES, VIDEO_DURATION, VOICE, RATE, PITCH, TTS_ENGINE, QWEN_MODEL, BGM_ENABLED
     global SUBTITLE_DISPLAY_REPLACEMENTS, TTS_INSTRUCTION
     global VIDEO_TYPE, TTS_ENABLED, BGM_SOURCE, AUDIO_BITRATE
+    global SUBTITLE_STYLE
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     
     VIDEO_DURATION = float(cfg.get('video_duration', VIDEO_DURATION))
     BGM_ENABLED = _coerce_bool(cfg.get('bgm_enabled', BGM_ENABLED))
+
+    _res_raw = str(cfg.get('resolution', '') or '').strip()
+    _res = re.match(r'(\d+)\s*[xX]\s*\d+', _res_raw)
+    if _res_raw and not _res:
+        print(f"  [WARN] config resolution 格式异常（{_res_raw!r}），字幕样式按横屏档处理")
+    # 未声明/异常一律取横屏档（既有项目零变化）；不做"沿用上一轮"的惰性赋值，
+    # 否则窄屏项目之后接一个未声明分辨率的项目会静默继承窄屏样式
+    SUBTITLE_STYLE = (SUBTITLE_STYLE_NARROW if _res and int(_res.group(1)) <= SUBTITLE_NARROW_WIDTH_MAX
+                      else SUBTITLE_STYLE_WIDE)
 
     # ---- P0 类型体系（2026-07-29）：纯BGM无旁白路径的类型化配置 ----
     VIDEO_TYPE = str(cfg.get('video_type', '') or '')
@@ -1963,7 +1982,7 @@ def _wrap_once(text, limit):
     return lines
 
 
-def _wrap_subtitle_text(text, line_limit=22, min_tail=4):
+def _wrap_subtitle_text(text, line_limit=None, min_tail=4):
     """SRT 显示层智能换行：标点优先断行、禁拆 ASCII 词组、孤行抑制。
 
     libass 自动换行对 CJK 文本逐字硬断，会把型号串、数字+单位（1200mm）等
@@ -1975,6 +1994,8 @@ def _wrap_subtitle_text(text, line_limit=22, min_tail=4):
     首行塞到上限、尾行只剩 1-2 字符。当尾行显示宽度 < min_tail 时，
     按行数均衡目标宽度重新断行，两行 12+12 优于 22+2。
     """
+    if line_limit is None:  # 缺省取当前分辨率档的行宽（load_config 换档，不在签名里绑死）
+        line_limit = SUBTITLE_STYLE["wrap_line_limit"]
     if _disp_width(text) <= line_limit:
         return text
     lines = _wrap_once(text, line_limit)
@@ -2354,7 +2375,9 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
             # 全局术语词典（subtitle_term_rules.json）：项目级替换之后应用，
             # 点Json→.json 等朗读层写法不再直通显示层
             display_text = _normalize_subtitle_terms(display_text)
-            # 智能换行：标点优先断行，禁止拆散型号类 ASCII 词组
+            # 智能换行：标点优先断行，禁止拆散型号类 ASCII 词组；行宽取当前分辨率档
+            # 的 SUBTITLE_STYLE["wrap_line_limit"]（窄屏 14 / 横屏 22），确保预换行结果
+            # 窄于 libass 二次折行阈值，断点由本函数控制而非 libass 逐字硬断
             display_text = _wrap_subtitle_text(display_text)
 
             entries.append((idx, start_t, end_t, display_text))
@@ -2429,15 +2452,16 @@ def step6_burn_subtitles(video_path, subtitle_path, temp_dir):
     srt_str = srt_str.replace(":", "\\:", 1)
 
     # Subtitle style: compact, within safe zone, outline only (no opaque box)
+    # 字号/底边距按画布宽分档（见 SUBTITLE_STYLE_WIDE/NARROW），横屏维持既有值
     style = (
         "FontName=Microsoft YaHei,"
-        "FontSize=15,"
+        f"FontSize={SUBTITLE_STYLE['font_size']},"
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,"
         "BorderStyle=1,"
         "Outline=2,"
         "Shadow=1,"
-        "MarginV=25,"
+        f"MarginV={SUBTITLE_STYLE['margin_v']},"
         "Alignment=2"
     )
 

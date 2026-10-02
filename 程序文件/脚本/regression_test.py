@@ -10105,6 +10105,143 @@ def test_product_state_consistency_three_legs() -> RegressionTestCase:
     return tc
 
 
+def test_subtitle_display_style_resolution_tier() -> RegressionTestCase:
+    """用例76：字幕烧录样式按画布宽分档，横屏既有项目零变化（2026-10-02，回灌自消费侧竖屏修复）
+
+    背景：libass 烧 SRT 用默认 PlayRes(384×288) 虚拟画布缩放，字号/边距按画布高放大——
+    1080×1920 竖屏约 6 倍、1920×1080 横屏约 3.75 倍，同一字面 FontSize 在两种画布观感不同。
+    消费侧竖屏项目实测定标出窄屏档（FontSize=10 / MarginV=10 / 预换行 14 字宽；22 字宽长行
+    约 1300px 必被 libass 二次硬折且断点不择语义，如"首要/原因"被拆开）。该修复在消费侧是
+    **无条件**把 15→10、25→10，直接套用会让本仓全部横屏交付项目的字幕同时缩小——
+    故回灌时改成按画布宽分档，横屏维持既有值（消费侧注释自身亦承认"应按分辨率分档"）。
+
+    本用例锁定：
+    A 横屏档逐字等于既有基线（15/25/22）——"既有项目零变化"要有正证据而非靠"没改到"反推
+    B 窄屏档生效且预换行行宽真的收窄到 14（同句行数多于横屏）
+    C 未声明 resolution 一律回横屏档，**且必须在一个窄屏项目之后跑**（落地时实测到的缺陷：
+      惰性赋值使未声明的项目继承上一轮档位，跨项目状态泄漏，与 A06"登记面＝真实读取路径"同族）
+    D resolution 格式异常 → 按横屏档处理并打印点名（静默换口径＝把裁定藏起来）
+    E 窄屏阈值由 SUBTITLE_NARROW_WIDTH_MAX 单源驱动，不是调用点字面量
+    F 行宽不绑死在函数签名默认值（def 期求值会冻结模块常量，config 换档后签名默认仍是旧值）
+    G/H 样式串的唯一生成点：源码中 FontSize 字面量只出现一处，且该处在构造 SUBTITLE_STYLE 的值。
+      属源码锚定断言（本段不调 ffmpeg 子进程，功能面无法覆盖烧录串），与 A12"锁唯一生成点"同类。
+    变异：M1 换档退回"resolution 存在才赋值"（C 抓）/ M2 阈值写死成 1200 字面量并删常量引用（E 抓）/
+    M3 行宽绑回签名默认 22（F 抓）/ M4 样式退回硬编码 FontSize=15（G 抓）/
+    M5 窄屏档 limit 写成 22＝等于没换档（B 抓）/ M6 缺省档反置成窄屏（A 抓）。
+    """
+    tc = RegressionTestCase(
+        "subtitle_display_style_resolution_tier",
+        "验证字幕字号/边距/预换行行宽按画布宽分档：横屏零变化、窄屏收窄、未声明不继承上一轮"
+    )
+    try:
+        import io
+        import json as _json
+        import inspect
+        import re
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        LONG = "装配式高隔声隔墙系统的首要原因是空腔结构内的阻尼层将振动能量转化为热能散失" \
+               + "剩余部分用于验证断行" * 2
+        SCENES = [{"scene_id": "s1", "type": "content", "start": 0.0, "end": 12.0,
+                   "duration": 12.0, "narration": LONG, "narration_required": True,
+                   "subtitle_required": True}]
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            def load(tag, body):
+                cfg = dict(video_duration=12.0, tts_enabled=True, bgm_enabled=False,
+                           scenes=SCENES)
+                cfg.update(body)
+                p = tmp / f"{tag}.json"
+                p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    eva.load_config(str(p))
+                return buf.getvalue()
+
+            # ── A0：模块初始档 = 横屏（任何未走 load_config 的读取面不得继承窄屏）──
+            # 源码锚定而非读活值：套件单进程，本用例自己已用窄屏 config 改写过模块全局，
+            # 活值随用例顺序浮动；初始值只由常量声明处决定，故钉声明行。
+            _decl = re.search(r'^SUBTITLE_STYLE = (SUBTITLE_STYLE_\w+)',
+                              (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8"), re.M)
+            tc.assert_true(bool(_decl) and _decl.group(1) == "SUBTITLE_STYLE_WIDE",
+                           "A0 default tier at declaration is wide (zero change for legacy callers)")
+
+            # ── A：横屏档 = 既有基线（零变化的正证据）──
+            load("wide", {"resolution": "1920x1080"})
+            tc.assert_equal(eva.SUBTITLE_STYLE["font_size"], 15, "A wide FontSize unchanged")
+            tc.assert_equal(eva.SUBTITLE_STYLE["margin_v"], 25, "A wide MarginV unchanged")
+            tc.assert_equal(eva.SUBTITLE_STYLE["wrap_line_limit"], 22,
+                            "A wide wrap limit unchanged")
+            wide_lines = eva._wrap_subtitle_text(LONG).splitlines()
+            tc.assert_true(all(eva._disp_width(l) <= 22 for l in wide_lines),
+                           "A wide wrapping respects its own limit")
+
+            # ── B：窄屏档换档，且行宽确实收窄 ──
+            load("narrow", {"resolution": "1080x1920"})
+            tc.assert_equal((eva.SUBTITLE_STYLE["font_size"], eva.SUBTITLE_STYLE["margin_v"],
+                             eva.SUBTITLE_STYLE["wrap_line_limit"]), (10, 10, 14),
+                            "B narrow tier applied")
+            narrow_lines = eva._wrap_subtitle_text(LONG).splitlines()
+            tc.assert_true(all(eva._disp_width(l) <= 14 for l in narrow_lines),
+                           "B narrow wrapping keeps every line under the libass re-wrap threshold")
+            tc.assert_true(len(narrow_lines) > len(wide_lines),
+                           "B same sentence wraps into more lines on narrow canvas (not a no-op tier)")
+
+            # ── C：未声明 resolution 回横屏档，且不继承上一轮（窄屏之后跑）──
+            load("undeclared", {})
+            tc.assert_equal(eva.SUBTITLE_STYLE, eva.SUBTITLE_STYLE_WIDE,
+                            "C missing resolution falls back to wide, never inherits the previous run")
+
+            # ── D：格式异常按横屏处理并点名 ──
+            out_d = load("bogus", {"resolution": "unknown"})
+            tc.assert_equal(eva.SUBTITLE_STYLE, eva.SUBTITLE_STYLE_WIDE,
+                            "D malformed resolution adjudicated as wide, not left stale")
+            tc.assert_true("resolution" in out_d and "异常" in out_d,
+                           "D the fallback is announced, not hidden")
+
+            # ── E：窄屏阈值住常量单源，不是调用点字面量 ──
+            _orig_max = eva.SUBTITLE_NARROW_WIDTH_MAX
+            try:
+                eva.SUBTITLE_NARROW_WIDTH_MAX = 1000
+                load("e1080", {"resolution": "1080x1920"})
+                tc.assert_equal(eva.SUBTITLE_STYLE, eva.SUBTITLE_STYLE_WIDE,
+                                "E threshold read from the constant (1080 > 1000 → wide)")
+                eva.SUBTITLE_NARROW_WIDTH_MAX = 2000
+                load("e2080", {"resolution": "1080x1920"})
+                tc.assert_true(eva.SUBTITLE_STYLE is not eva.SUBTITLE_STYLE_WIDE,
+                               "E same input flips tier when the constant changes")
+            finally:
+                eva.SUBTITLE_NARROW_WIDTH_MAX = _orig_max
+
+            # ── F：行宽不绑死在签名默认值 ──
+            sig = inspect.signature(eva._wrap_subtitle_text)
+            tc.assert_true(sig.parameters["line_limit"].default is None,
+                           "F signature default carries no width (def-time binding would freeze the tier)")
+
+            # ── G/H：烧录样式串唯一生成点（源码锚定，本用例不起 ffmpeg）──
+            src = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8")
+            tc.assert_equal(src.count("FontSize="), 1,
+                            "G FontSize appears exactly once in source (no second hardcoded copy)")
+            style_pos = src.find("FontSize=")
+            tc.assert_true("SUBTITLE_STYLE['font_size']" in src[style_pos - 20:style_pos + 60],
+                           "G the single site reads the tiered style, H style values live in one place")
+            tc.assert_equal(src.count('"font_size":'), 2,
+                            "H tier values declared exactly twice (wide/narrow), nowhere else")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -10190,6 +10327,7 @@ class RegressionTestRunner:
             test_render_post_capture_deadline_guard,
             test_pipeline_lock_blocks_concurrent_runs,
             test_product_state_consistency_three_legs,
+            test_subtitle_display_style_resolution_tier,
         ]
         self.results = []
     
