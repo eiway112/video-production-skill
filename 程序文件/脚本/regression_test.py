@@ -10254,8 +10254,13 @@ def main():
                 summary = runner.get_summary()
                 break
         else:
+            # 名字写错时"跑了 0 个用例"在退出码上必须与"跑过且通过"可区分（四态纪律）：
+            # 旧实现 print ERROR 后 return，退出码归 0，调用方按管道末端码即读成绿灯。
             print(f"[ERROR] Test case not found: {args.run_case}")
-            return
+            print("[HINT] --run-case 收不带 test_ 前缀的名字；可用名：")
+            for test_func in runner.test_cases:
+                print(f"  - {test_func.__name__[5:]}")
+            sys.exit(1)
     else:
         # 列出所有可用用例
         print("[INFO] Available test cases:")
