@@ -9371,6 +9371,740 @@ def test_render_watchdog_stdout_progress_source() -> RegressionTestCase:
     return tc
 
 
+def test_render_post_capture_deadline_guard() -> RegressionTestCase:
+    """用例73：站立放行后的绝对墙钟上限——收尾阶段不退出不再等于无限等待（2026-10-02）
+
+    背景（外部 WorkBuddy 副本 build-expert-promo，2026-10-01 实测）：09-25 的进度源
+    加固把 stdout ≥75% 之后的"零进度"这条腿整条关掉（正确——按零进度杀等于丢弃一个
+    已捕获完成的渲染），但没有任何东西接替它：子进程打印 100% Render complete 之后不
+    退出时，流水线只能干等。该形态真实发生过——render_raw.mp4 22:41:20 已完整落盘
+    （ffprobe 84.72s），子进程静默 311s 后才以 exit 1 结束；渲染器自带的
+    --protocol-timeout 属其内部协议超时，管不到这一段。AGENTS.md 原句"改由
+    protocol-timeout 兜底"因此是过度承诺，本批更正并以脚本承载。
+    本用例锁定：A 上限只在站立放行后生效（pct<75 的 capture 卡死仍走零进度腿）
+    B 收尾超上限→杀进程树 + deadline_exceeded 置位 + 不被归因成 stalled；上限内不误杀、
+    命中一次后幂等不再重复杀 C 阈值取自配置，缺键回退 documented 默认（边界 ±1s 两侧）
+    D 产物在盘→step_render 不丢弃、留痕 render_deadline_salvage 且 watchdog_deadline_kills
+    与 watchdog_kills 分列；产物不在盘→照常 FAIL 且归因点名 deadline；产物存在但内容为空
+    →内容门禁仍拦下（保留≠放行）E 配置与源码接线锚定（防"建而未接"、防阈值写死在调用点）
+    F 完工报告透出 render_cost.watchdog_deadline_kills 与 data_sources.render_deadline_salvage，
+    缺键不造节。断言条数以 ci_gate.py --output 的 JSON 为准（A12 同族，不手抄）。
+    变异：M1 摘 _check_watchdog 里对 _check_post_capture_deadline 的调用 / M2 把上限判定
+    挪到站立放行之前（pct<75 也按 deadline 杀）/ M3 摘 step_render 的保留分支（退回
+    "非零即丢弃"）/ M4 保留分支去掉 render_raw.exists() 条件（空产物也被接受）/
+    M5 阈值写死字面量不读配置 / M6 两个 kill 计数合并 / M7 报告不透出 salvage 节。
+    """
+    tc = RegressionTestCase(
+        "render_post_capture_deadline_guard",
+        "验证站立放行后的绝对墙钟上限生效、不误杀、产物完整时不丢弃已完成渲染且全程留痕"
+    )
+    try:
+        import io
+        import re
+        import types
+        import contextlib
+        import time as _time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        gs = _pr.gs
+        W = _pr._RenderProgressWatcher
+        DEF = W.POST_CAPTURE_TIMEOUT_DEFAULT
+
+        def bar(pct, frm=None, tot=None, label=None):
+            blocks = "█" * (pct // 4) + "░" * (25 - pct // 4)
+            if frm is not None:
+                return f"  {blocks}  {pct}%  Capturing frame {frm}/{tot}"
+            return f"  {blocks}  {pct}%  {label}"
+
+        def mk(wd_cfg, pid=4242):
+            w = W([], Path("nowhere.mp4"), 2118, watchdog=wd_cfg)
+            w.attach_process(types.SimpleNamespace(pid=pid))
+            kills = []
+            w._kill_process_tree = lambda pid_: kills.append(pid_)
+            return w, kills
+
+        # ── A：上限不得越界到 capture 区（站立放行前它完全不参与裁定）──
+        wA, kA = mk({"enabled": True, "grace_seconds": 0.5, "stall_seconds": 0.5,
+                     "post_capture_timeout_seconds": 0.0})
+        wA.observe_stdout(bar(70, 2118, 2118))
+        wA._start_time = _time.time() - 9999
+        wA._last_progress_ts = _time.time() - 9999
+        wA._last_progress_val = wA._progress_value()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wA._check_watchdog()
+        tc.assert_true(not wA._stood_down and not wA.deadline_exceeded,
+                       "A deadline inert before stand-down (limit 0, pct 70)")
+        tc.assert_true(wA.stalled and kA == [4242],
+                       "A capture-zone hang still killed by the zero-progress leg")
+
+        # ── B：收尾超上限 → 杀树 + 置位 + 不归因成 stalled；上限内不杀、命中后幂等 ──
+        wB, kB = mk({"enabled": True, "grace_seconds": 0.5, "stall_seconds": 300,
+                     "post_capture_timeout_seconds": 1.0})
+        wB.observe_stdout(bar(75, label="Encoding video"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            wB._check_watchdog()
+        tc.assert_true(wB._stood_down and not wB.deadline_exceeded and not kB,
+                       "B within limit after stand-down: nothing killed yet")
+        tc.assert_true(not wB.stalled,
+                       "B bounded encode phase NOT killed by the zero-progress leg")
+        wB._stood_down_at = _time.time() - 2
+        with contextlib.redirect_stdout(io.StringIO()):
+            wB._check_watchdog()
+        tc.assert_true(wB.deadline_exceeded and kB == [4242],
+                       "B tail beyond limit kills the process tree")
+        tc.assert_true(not wB.stalled,
+                       "B deadline kill NOT attributed to the zero-progress leg")
+        tc.assert_equal(wB.post_capture_limit_seconds, 1.0,
+                        "B effective limit echoed from the config value")
+        with contextlib.redirect_stdout(io.StringIO()):
+            wB._check_watchdog()
+        tc.assert_equal(len(kB), 1, "B deadline fires once (idempotent)")
+
+        # ── C：阈值来自配置；缺键回退 documented 默认，边界 ±1s 两侧 ──
+        wC, kC = mk({"enabled": True, "grace_seconds": 0.5, "stall_seconds": 300})
+        wC.observe_stdout(bar(90, label="Assembling final video"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            wC._check_watchdog()
+        wC._stood_down_at = _time.time() - (DEF - 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            wC._check_watchdog()
+        tc.assert_true(not wC.deadline_exceeded,
+                       f"C default {DEF}s: tail-1 not killed")
+        wC._stood_down_at = _time.time() - (DEF + 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            wC._check_watchdog()
+        tc.assert_true(wC.deadline_exceeded and kC,
+                       f"C default {DEF}s: tail+1 killed (documented fallback live)")
+        tc.assert_equal(wC.post_capture_limit_seconds, DEF,
+                        "C fallback limit is the class constant, not a call-site literal")
+
+        # ── D：驱动真实 step_render（零真实渲染，子进程经 _run 桩）──
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            render_raw = tmp / "render_raw.mp4"
+
+            def build_runner(tag):
+                r = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+                r.state = _pr.PipelineState(tmp / f"state_{tag}.json")
+                r.force = True
+                r.quick_fix = False
+                r.temp_dir = tmp
+                r.source_dir = tmp
+                r.render_raw = render_raw
+                r.output_file = tmp / "out.mp4"
+                r.config_path = tmp / "case73.json"
+                r.config = {"video_duration": 84.7}
+                r.env = {}
+                r.render_rules = {"watchdog": {"enabled": True, "grace_seconds": 360,
+                                               "stall_seconds": 300,
+                                               "post_capture_timeout_seconds": 900}}
+                r.audio_sync_rules = {}
+                r._can_skip = lambda step: False
+                r._delivery_slot_guard = lambda where: True
+                r._pre_render_duration_consistent = lambda: True
+                r._scene_patch_route = lambda: (False, "FULL", "no-baseline")
+                r._record_scene_patch = lambda *a, **k: None
+                r._render_budget_gate_ok = lambda: True
+                r._fingerprint = lambda step: "stable-fp"
+                r._log_seq = 0
+                r._current_step = None
+                r.last_log_path = None
+                return r
+
+            def arm(watcher):
+                watcher.deadline_exceeded = True
+                watcher.post_capture_tail_seconds = 901.0
+                watcher.post_capture_limit_seconds = 900
+                watcher._stood_down_pct = 100
+
+            orig_content = _pr._render_content_status
+            try:
+                # D1：产物已完整落盘 → 非零退出不得丢弃这次渲染，且必须留痕
+                _pr._render_content_status = lambda p: (gs.PASS, "Frame content OK")
+                rD1 = build_runner("D1")
+
+                def runD1(cmd, cwd=None, env=None, desc="", attach_watchdog=None):
+                    if "render" in desc:
+                        render_raw.write_bytes(b"\x00" * 2048)  # 收尾前已完整落盘
+                        arm(attach_watchdog)
+                        return 1
+                    return 0
+                rD1._run = runD1
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    okD1 = rD1.step_render()
+                out = buf.getvalue()
+                rec = rD1.state.data["steps"]["render"]
+                tc.assert_true(okD1 and rec["status"] == "passed",
+                               "D1 deadline kill with artifact on disk does not fail render")
+                tc.assert_true(render_raw.exists(),
+                               "D1 the completed render_raw is kept, not discarded")
+                sal = rD1.state.data.get("render_deadline_salvage")
+                tc.assert_true(isinstance(sal, dict),
+                               "D1 salvage trace written to state")
+                tc.assert_equal(sal.get("child_exit_code"), 1,
+                                "D1 trace names the nonzero child exit it accepted")
+                tc.assert_equal(sal.get("post_capture_tail_seconds"), 901.0,
+                                "D1 trace carries the measured silent tail")
+                tc.assert_equal(sal.get("post_capture_limit_seconds"), 900,
+                                "D1 trace carries the limit actually in force")
+                tc.assert_true("decided_by" in sal,
+                               "D1 trace points at the gates that still decide the artifact")
+                mD1 = rD1.state.data["render_metrics"]
+                tc.assert_equal(mD1.get("watchdog_deadline_kills"), 1,
+                                "D1 deadline counted in its own bucket")
+                tc.assert_equal(mD1.get("watchdog_kills"), 0,
+                                "D1 deadline is NOT added to watchdog_kills")
+                tc.assert_true("content gate" in out,
+                               "D1 console names where the verdict actually comes from")
+
+                # D2：产物不在盘 → 照常 FAIL，归因必须点名 deadline
+                render_raw.unlink(missing_ok=True)
+                rD2 = build_runner("D2")
+
+                def runD2(cmd, cwd=None, env=None, desc="", attach_watchdog=None):
+                    if "render" in desc:
+                        arm(attach_watchdog)
+                        return 1
+                    return 0
+                rD2._run = runD2
+                with contextlib.redirect_stdout(io.StringIO()):
+                    okD2 = rD2.step_render()
+                rec2 = rD2.state.data["steps"]["render"]
+                tc.assert_true(not okD2 and rec2["status"] == "failed",
+                               "D2 deadline kill without artifact still fails the step")
+                tc.assert_true("deadline" in (rec2.get("error") or ""),
+                               "D2 failure message names the post-capture deadline")
+                tc.assert_true("render_deadline_salvage" not in rD2.state.data,
+                               "D2 no salvage trace when there was nothing to salvage")
+                mD2 = rD2.state.data["render_metrics"]
+                tc.assert_equal(mD2.get("watchdog_deadline_kills"), 1,
+                               "D2 deadline kill counted")
+                tc.assert_equal(mD2.get("watchdog_kills"), 0,
+                               "D2 zero-progress counter stays clean on the deadline path")
+
+                # D3：产物存在但内容为空 → 内容门禁仍须拦下（保留 ≠ 放行）
+                _pr._render_content_status = lambda p: (gs.FAIL, "blank frames")
+                render_raw.write_bytes(b"\x00" * 2048)
+                rD3 = build_runner("D3")
+                rD3._run = runD1
+                with contextlib.redirect_stdout(io.StringIO()):
+                    okD3 = rD3.step_render()
+                tc.assert_true(not okD3,
+                               "D3 kept artifact still blocked by the content gate")
+                tc.assert_equal(rD3.state.data["steps"]["render"]["status"], "failed",
+                               "D3 blank artifact ends failed, not passed")
+            finally:
+                _pr._render_content_status = orig_content
+
+        # ── E：配置与源码接线锚定（阈值住配置、判据接进生效路径）──
+        rules = json.loads((script_dir.parent / "配置" / "config" / "quality" /
+                            "render_rules.json").read_text(encoding="utf-8"))
+        tc.assert_true("post_capture_timeout_seconds" in rules["watchdog"],
+                       "E threshold registered in render_rules.json watchdog section")
+        src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        tc.assert_true(re.search(r"def _check_watchdog\(self\):(.*?)def _check_post_capture_deadline",
+                                 src, re.S) is not None,
+                       "E deadline check sits on the watchdog's own call path")
+        tc.assert_true(re.search(r"self\._check_post_capture_deadline\(now, wd\)", src) is not None,
+                       "E stand-down branch calls the deadline check (wired, not dead code)")
+        mlimit = re.search(r"def _check_post_capture_deadline\(self.*?def _report", src, re.S)
+        tc.assert_true(mlimit is not None
+                       and 'wd.get("post_capture_timeout_seconds"' in mlimit.group(0),
+                       "E limit read from config inside the deadline check")
+        msal = re.search(r"def step_render\(self\):(.*?)def step_verify", src, re.S)
+        tc.assert_true(msal is not None
+                       and "_record_deadline_salvage(" in msal.group(1)
+                       and "watcher.deadline_exceeded" in msal.group(1),
+                       "E step_render consumes deadline_exceeded and records the salvage")
+        tc.assert_true("render_deadline_salvage" in
+                       (script_dir / "generate_completion_report.py").read_text(encoding="utf-8"),
+                       "E completion report reads the salvage trace (no orphan producer)")
+
+        # ── F：完工报告透出（只透传不裁定；缺键不造节）──
+        from generate_completion_report import generate_report
+        with tempfile.TemporaryDirectory() as td2:
+            tmp2 = Path(td2)
+            vid = tmp2 / "v.mp4"
+            vid.write_bytes(b"\x00" * 100000)
+
+            def run_report(state, tag):
+                sf = tmp2 / f"state_{tag}.json"
+                sf.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return generate_report(project_name=f"Case73_{tag}",
+                                          video_file=str(vid),
+                                          subtitle_file=None,
+                                          state_file=str(sf))
+            steps = {"steps": {s: {"status": "passed", "completed": "2026-10-02T10:00:00"}
+                              for s in ("preflight", "tts", "timeline", "render",
+                                        "verify", "postprocess")}}
+            full = dict(steps)
+            full.update({
+                "render_metrics": {"full_render_attempts": 1,
+                                   "full_render_total_seconds": 260.0,
+                                   "scene_patch_attempts": 0, "scene_patch_hits": 0,
+                                   "watchdog_kills": 0, "watchdog_deadline_kills": 1},
+                "render_deadline_salvage": {"at": "2026-10-02T10:00:00",
+                                           "child_exit_code": 1,
+                                           "post_capture_tail_seconds": 901.0,
+                                           "post_capture_limit_seconds": 900,
+                                           "stdout_pct_at_stand_down": 100,
+                                           "artifact_bytes": 2048,
+                                           "decided_by": "media_qa_gate.inspect_frame_content"},
+            })
+            ds = run_report(full, "full")["data_sources"]
+            tc.assert_equal(ds["render_cost"].get("watchdog_deadline_kills"), 1,
+                           "F deadline kills surfaced in render_cost")
+            tc.assert_equal(ds["render_cost"].get("watchdog_kills"), 0,
+                           "F the two kill buckets stay separate through the report")
+            tc.assert_equal(ds["render_deadline_salvage"]["child_exit_code"], 1,
+                           "F salvage trace surfaced in data_sources")
+            bare = run_report(dict(steps), "bare")["data_sources"]
+            tc.assert_true("render_deadline_salvage" not in bare,
+                           "F absent key does not fabricate a section")
+            tc.assert_equal(bare.get("render_cost", {}).get("watchdog_deadline_kills", 0), 0,
+                           "F missing metric reads as zero kills, not a missing verdict")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+
+def test_pipeline_lock_blocks_concurrent_runs() -> RegressionTestCase:
+    """用例74：同项目并发运行守卫——两个进程不得互相覆盖同一份 pipeline_state.json（2026-10-02）
+
+    背景（外部 WorkBuddy 副本 build-expert-promo，2026-10-01 实测）：A10 的原子写
+    （temp + os.replace）只保证"单文件不半截"，不保证跨进程一致——两个流水线进程共享
+    同一 temp 时后写者以整表覆盖，读回来的一份 state 会混合两个进程各自的 started /
+    completed。实证形态：verify.started 22:52:53.715 与 visual_check.started 22:52:53.921
+    相差 206ms（＝verify 只活了 0.2s），而 render/verify/visual_check 三条 completed 全挤
+    在 23:18:11 的 17ms 内；render 记 passed 且 started 与那条 exit_code: 1 的子进程日志
+    同源——按 step_render 的 rc!=0→_fail 分支，这两者不可能出自同一进程的同一次执行。
+    于是交付侧"10 步门禁全过"这种读数失去可复核性，而它正是本仓一切验收话术的地基。
+    本用例锁定：A 首个运行取得锁并写出持有者信息（pid/config/心跳）
+    B 第二个运行起跑即 BLOCKED（退出码 1）、不写 state、不跑任何步骤、消息点名持有者
+    C 心跳线程真在续写（否则"活着但卡住"与"已死"无从区分——这是用心跳而非 pid 的原因）
+    D release 只删自己的锁，绝不删别人的
+    E 心跳超期的陈旧锁自动接管且说明归因；锁不可解析按无锁处理（不得永久锁死项目）；
+      同 pid 的遗留锁不拦自己
+    F --take-over-lock 显式放行并留痕 state.lock_takeover（含被接管者 pid/step/心跳）
+    G 阈值住配置文件（state_lock 节）且 run() 里真接线（acquire 在 _setup_env 之前）
+    H 配置缺节时回退类常量默认值，而非静默无上限
+    变异：M1 摘 acquire 的 BLOCKED 出口（只告警不拦）/ M2 摘心跳线程（锁永不续写→
+    第二个运行把"活着但卡住"误判成陈旧而放行）/ M3 release 无条件删锁（删掉别人的）/
+    M4 陈旧判定反向（心跳越新越接管）/ M5 阈值写死字面量不读配置 / M6 摘 --take-over-lock
+    的留痕 / M7 把 acquire 挪到步骤循环之后（覆盖已经发生）。
+    """
+    tc = RegressionTestCase(
+        "pipeline_lock_blocks_concurrent_runs",
+        "验证同项目并发运行在起跑处被拦下、心跳区分卡死与已死、陈旧锁可接管且放行必须留痕"
+    )
+    try:
+        import io
+        import os
+        import re
+        import json as _json
+        import contextlib
+        import time as _time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        Lock = _pr.PipelineLock
+
+        def rules(interval=0.2, stale=1.0):
+            return {"state_lock": {"heartbeat_interval_seconds": interval,
+                                   "stale_after_seconds": stale}}
+
+        def read_lock(tmp):
+            return _json.loads((tmp / Lock.NAME).read_text(encoding="utf-8"))
+
+        def make_runner(tmp, state_name):
+            r = _pr.PipelineRunner.__new__(_pr.PipelineRunner)
+            r.temp_dir = tmp
+            r.source_dir = tmp
+            r.config_path = tmp / "case74.json"
+            r.state = _pr.PipelineState(tmp / state_name)
+            r._current_step = None
+            r.take_over_lock = False
+            r.quick_fix = False
+            r.force = False
+            r.gate_mode = "render"
+            r.html_project = "case74"
+            r.output_file = tmp / "out.mp4"
+            r._warn_previous_interrupted_runs = lambda: None
+            r._setup_env = lambda: False       # 取锁之后的第一位：证明拦在起跑处
+            return r
+
+        def call_run(runner):
+            code, out = None, ""
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    runner.run()
+            except SystemExit as e:
+                code = e.code
+            return code, buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            # ── A：首个运行取得锁 ──
+            a = Lock(tmp, rules=rules(), config_name="case74.json", pid=770001)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok_a, held_a = a.acquire()
+            tc.assert_true(ok_a and held_a is None, "A first runner acquires the lock")
+            lock_path = tmp / Lock.NAME
+            tc.assert_true(lock_path.exists(), "A lock file written in the project temp dir")
+            rec_a = read_lock(tmp)
+            tc.assert_equal(rec_a.get("pid"), a.pid, "A lock names its holder pid")
+            tc.assert_equal(rec_a.get("config"), "case74.json", "A lock names the config")
+            tc.assert_true("heartbeat_at" in rec_a and "started_at" in rec_a,
+                           "A lock carries the two timestamps the guard decides on")
+
+            # ── B：第二个运行起跑即被拦下，且拦在任何写入之前 ──
+            rb = make_runner(tmp, "state_b.json")
+            code_b, out_b = call_run(rb)
+            tc.assert_equal(code_b, 1, "B second run exits non-zero instead of racing")
+            tc.assert_true("BLOCKED" in out_b and "pipeline_state.json" in out_b,
+                           "B refusal says what would be overwritten")
+            tc.assert_true(f"pid={a.pid}" in out_b, "B message names the live holder")
+            tc.assert_true("--take-over-lock" in out_b,
+                           "B message gives the only legal way through")
+            tc.assert_true(not (tmp / "state_b.json").exists(),
+                           "B nothing written to state before the guard")
+
+            # ── C：心跳在续写（区分"活着但卡住"与"已死"的唯一依据）──
+            hb0 = read_lock(tmp)["heartbeat_at"]
+            _time.sleep(1.2)
+            hb1 = read_lock(tmp)["heartbeat_at"]
+            tc.assert_true(hb1 > hb0, "C heartbeat thread keeps refreshing the lock")
+
+            # ── D：release 只删自己的锁 ──
+            a.release()
+            tc.assert_true(not lock_path.exists(), "D release removes our own lock")
+            other = Lock(tmp, rules=rules(), config_name="other.json", pid=770002)
+            other._write()
+            a.release()
+            tc.assert_true(lock_path.exists() and read_lock(tmp)["pid"] == other.pid,
+                           "D release never deletes a lock held by another pid")
+            os.remove(lock_path)
+
+            # ── E：陈旧锁接管 / 不可解析锁不构成永久锁死 / 同 pid 不拦自己 ──
+            e1 = Lock(tmp, rules=rules(interval=999, stale=1.0), config_name="case74.json",
+                 pid=770003)
+            with contextlib.redirect_stdout(io.StringIO()):
+                e1.acquire()
+            e1._stop.set()
+            _time.sleep(1.3)
+            e2 = Lock(tmp, rules=rules(interval=999, stale=1.0))
+            buf_e = io.StringIO()
+            with contextlib.redirect_stdout(buf_e):
+                ok_e, held_e = e2.acquire()
+            tc.assert_true(ok_e and held_e and held_e["pid"] == e1.pid,
+                           "E stale lock is taken over automatically")
+            tc.assert_true("陈旧" in buf_e.getvalue(),
+                           "E takeover attributes it to a dead holder, not concurrency")
+            e2.release()
+            lock_path.write_text("{ not json", encoding="utf-8")
+            e3 = Lock(tmp, rules=rules())
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok_e3, held_e3 = e3.acquire()
+            tc.assert_true(ok_e3 and held_e3 is None,
+                           "E an unreadable lock must not lock the project out forever")
+            e3.release()
+            same = Lock(tmp, rules=rules(), config_name="case74.json")
+            same._write()                       # pid == 本进程
+            e4 = Lock(tmp, rules=rules(), config_name="case74.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok_e4, _ = e4.acquire()
+            tc.assert_true(ok_e4, "E a leftover lock with our own pid is not a blocker")
+            e4.release()
+
+            # ── F：显式接管必须留痕 ──
+            f1 = Lock(tmp, rules=rules(interval=999, stale=60), config_name="case74.json",
+                 pid=770004)
+            with contextlib.redirect_stdout(io.StringIO()):
+                f1.acquire()
+            rf = make_runner(tmp, "state_f.json")
+            rf.take_over_lock = True
+            code_f, out_f = call_run(rf)
+            tc.assert_equal(code_f, 1, "F takeover proceeds past the guard (then stops at stub)")
+            sal = rf.state.data.get("lock_takeover")
+            tc.assert_true(isinstance(sal, dict), "F takeover written to state (traceable)")
+            tc.assert_equal(sal.get("previous_pid"), f1.pid,
+                            "F trace names the process being displaced")
+            tc.assert_true(sal.get("previous_heartbeat_at"),
+                           "F trace keeps the fresh heartbeat it overrode")
+            tc.assert_equal(sal.get("reason"), "explicit --take-over-lock",
+                            "F trace says who authorised it")
+            f1._stop.set()
+            if rf.lock is not None:
+                rf.lock.release()
+
+            # ── G：阈值住配置 + run() 真接线（顺序在 _setup_env 之前）──
+            gate = _json.loads((script_dir.parent / "配置" / "config" / "quality" /
+                                "delivery_gate_rules.json").read_text(encoding="utf-8"))
+            tc.assert_true("state_lock" in gate
+                           and "stale_after_seconds" in gate["state_lock"]
+                           and "heartbeat_interval_seconds" in gate["state_lock"],
+                           "G thresholds registered in delivery_gate_rules.json state_lock")
+            src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+            mrun = re.search(r"def run\(self, start_from=None\):(.*?)# Setup environment",
+                             src, re.S)
+            tc.assert_true(mrun is not None, "G run() opening located")
+            body = mrun.group(1)
+            tc.assert_true("PipelineLock(self.temp_dir" in body
+                           and "acquire(take_over=self.take_over_lock)" in body,
+                           "G guard constructed and acquired inside run()")
+            tc.assert_true(body.index("acquire(take_over=self.take_over_lock)")
+                           < body.index("_warn_previous_interrupted_runs()"),
+                           "G guard runs before any step work (not after the loop)")
+            tc.assert_true('sys.exit(1)' in body[body.index("if not acquired:"):],
+                           "G refusal path exits non-zero (not a warning line)")
+            tc.assert_true("--take-over-lock" in src,
+                           "G the override is a declared CLI flag, not an undocumented env")
+
+            # ── H：配置缺节回退类常量（不得静默变成"永不超时"）──
+            h = Lock(tmp, rules={}, config_name="case74.json")
+            tc.assert_equal(h.stale_after, Lock.DEFAULT_STALE,
+                            "H missing section falls back to documented stale default")
+            tc.assert_equal(h.interval, Lock.DEFAULT_INTERVAL,
+                            "H missing section falls back to documented interval default")
+            h2 = Lock(tmp, rules={"state_lock": {"heartbeat_interval_seconds": 5}},
+                      config_name="case74.json")
+            tc.assert_equal(h2.stale_after, Lock.DEFAULT_STALE,
+                            "H partial config keeps the default for the absent key")
+            tc.assert_equal(h2.interval, 5, "H present key is honoured from config")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
+def test_product_state_consistency_three_legs() -> RegressionTestCase:
+    """用例75：产物-状态一致性拆腿——落槽登记做基准，终检耗时不再算进偏差（2026-10-02）
+
+    背景：旧判据 `abs(成片 mtime − postprocess 完成时刻) ≤ 自适应容差` 把两件不同的事塞进
+    一个式子。落槽（`enhance._commit_delivery_slot`，成功链末端唯一写入点）之后，父进程
+    `step_postprocess` 还要跑终检（抽帧 + ASR 对齐）才 mark_completed——这段耗时与成片新旧
+    无关，却被算进"偏差"。本仓 20 份已交付报告实测该偏差**全为负**、最大 -20.0s，
+    最差一支 136s 片的 -16.193s 对容差 16.8s 只剩 0.6s 余量；外部 WorkBuddy 副本同型
+    误拒已真实发生（110s 片、偏差 40s、容差 15.5s → 被拒收）。**阈值不放宽**——错的是基准
+    住哪个对象，不是容差太紧。
+    本用例锁定：A 三腿正例（登记在区间内、mtime 不晚于落槽、写盘→落槽间隔在容差内）
+    B 外部误拒形态在本仓被消除，且**同一输入走回退路径必判 FAIL**（正反对照，证"基准错、
+      产物没错"，而不是把门禁调松）
+    C 逃逸改写仍捕获（mtime 晚于落槽）D 陈旧产物改名冒充仍捕获（写盘早于落槽超容差）
+    E 登记与本片不符（字节/名称/不可解析）→ 逐字退回旧判据且点名回退原因
+    F 归属腿：落槽在 postprocess 区间外即拒；无 started 时只裁上界并注记
+    G 无从裁定不得读成通过（无起止时刻 → passed=None 且整体不一致）
+    H 真实 _commit_delivery_slot 落盘登记，且**不改写成片 mtime**（os.replace 保留源
+      mtime 是"字节何时写出"的独立证据，抹平它就等于放弃 D 腿）
+    I 标记文件名两侧单源锁相等（改名即两处同改）J 端到端 generate_report 基准选择正确。
+    变异：M1 摘 not_rewritten（改写不再被捕获）/ M2 摘 not_stale（陈旧不再被捕获）/
+    M3 回退分支不再裁定（无登记＝直接放行）/ M4 归属腿改成 abs 偏差（把终检耗时又请回来）/
+    M5 _commit_delivery_slot 不再写登记 / M6 落槽后 utime 抹平 mtime（H 抓）。
+    """
+    tc = RegressionTestCase(
+        "product_state_consistency_three_legs",
+        "验证落槽登记做基准的三腿裁定：消除终检耗时造成的误拒，同时保住改写与陈旧两条捕获"
+    )
+    try:
+        import io
+        import os
+        import re
+        import json as _json
+        import contextlib
+        from datetime import datetime, timedelta
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        gcr = _safe_import_rebinding_module("generate_completion_report")
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+        evaluate = gcr.evaluate_product_state_consistency
+
+        def iso(dt):
+            return dt.isoformat(timespec="microseconds")
+
+        def marker(name, size, committed_at, artifact_mtime=None):
+            return {"output": name, "bytes": size, "committed_at": iso(committed_at),
+                    "artifact_mtime": iso(artifact_mtime or committed_at)}
+
+        T0 = datetime(2026, 10, 2, 10, 0, 0)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            def video(tag, mtime_dt, size=4096):
+                v = tmp / f"{tag}.mp4"
+                v.write_bytes(b"\x00" * size)
+                os.utime(v, (mtime_dt.timestamp(), mtime_dt.timestamp()))
+                return v
+
+            # ── A：三腿正例 ──
+            vA = video("A", T0 + timedelta(seconds=5))
+            okA, dA = evaluate(vA, iso(T0), iso(T0 + timedelta(seconds=60)),
+                               marker("A.mp4", 4096, T0 + timedelta(seconds=10)), 15.0)
+            tc.assert_true(okA, "A happy path consistent")
+            tc.assert_equal(dA.get("check_basis"), "delivery_commit_marker",
+                            "A basis is the commit event, not postprocess completion")
+            tc.assert_true(all(v["passed"] is True for v in dA["legs"].values()),
+                           "A all three legs pass")
+
+            # ── B：外部误拒形态（终检 40s）在本仓被消除；同输入走回退必判 FAIL ──
+            # 写盘 T0+5，落槽 T0+10，postprocess 完成 T0+50（终检 40s）→ mtime−completed=-45s
+            vB = video("B", T0 + timedelta(seconds=5))
+            okB, dB = evaluate(vB, iso(T0), iso(T0 + timedelta(seconds=50)),
+                               marker("B.mp4", 4096, T0 + timedelta(seconds=10)), 15.5)
+            tc.assert_true(okB, "B the 40s final-QA gap no longer rejects a good delivery")
+            okB_fb, dB_fb = evaluate(vB, iso(T0), iso(T0 + timedelta(seconds=50)),
+                                      None, 15.5)
+            tc.assert_true(not okB_fb,
+                           "B same input on the legacy basis IS rejected (对照：错在基准不在产物)")
+            tc.assert_equal(dB_fb.get("check_basis"), "postprocess_completed_fallback",
+                           "B fallback labelled as such, not silently mixed in")
+
+            # ── C：落槽之后被外部改写，仍必须捕获 ──
+            vC = video("C", T0 + timedelta(seconds=70))
+            okC, dC = evaluate(vC, iso(T0), iso(T0 + timedelta(seconds=90)),
+                               marker("C.mp4", 4096, T0 + timedelta(seconds=10)), 15.0)
+            tc.assert_true(not okC and dC["legs"]["not_rewritten"]["passed"] is False,
+                           "C rewrite after commit still rejected")
+            tc.assert_true("改写" in str(dC["legs"]["not_rewritten"].get("reason")),
+                           "C reason names the rewrite leg, not a generic deviation")
+
+            # ── D：陈旧产物被改名冒充，仍必须捕获 ──
+            vD = video("D", T0 - timedelta(seconds=400))
+            okD, dD = evaluate(vD, iso(T0), iso(T0 + timedelta(seconds=60)),
+                               marker("D.mp4", 4096, T0 + timedelta(seconds=10)), 15.0)
+            tc.assert_true(not okD and dD["legs"]["not_stale"]["passed"] is False,
+                           "D stale artifact renamed into the slot still rejected")
+
+            # ── E：登记与本片不符 → 退回旧判据并点名原因 ──
+            vE = video("E", T0 + timedelta(seconds=2))
+            okE1, dE1 = evaluate(vE, iso(T0), iso(T0 + timedelta(seconds=5)),
+                                 marker("E.mp4", 111, T0 + timedelta(seconds=3)), 15.0)
+            tc.assert_equal(dE1.get("check_basis"), "postprocess_completed_fallback",
+                           "E size-mismatched marker falls back, never trusted")
+            tc.assert_true("字节" in str(dE1.get("fallback_reason")),
+                           "E fallback reason says which binding failed")
+            tc.assert_true(okE1, "E fallback still adjudicates (and passes a fresh product)")
+            okE2, dE2 = evaluate(vE, iso(T0), iso(T0 + timedelta(seconds=5)),
+                                 {"_unreadable": "Expecting value"}, 15.0)
+            tc.assert_equal(dE2.get("check_basis"), "postprocess_completed_fallback",
+                           "E unreadable marker falls back too")
+            okE3, dE3 = evaluate(vE, iso(T0), iso(T0 + timedelta(seconds=5)),
+                                 marker("other.mp4", 4096, T0 + timedelta(seconds=3)), 15.0)
+            tc.assert_true("不符" in str(dE3.get("fallback_reason")),
+                           "E name-mismatch attributed separately from size-mismatch")
+
+            # ── F：归属腿——落槽动作必须属于本轮 postprocess ──
+            vF = video("F", T0 + timedelta(seconds=5))
+            okF1, dF1 = evaluate(vF, iso(T0 + timedelta(seconds=200)),
+                                 iso(T0 + timedelta(seconds=260)),
+                                 marker("F.mp4", 4096, T0 + timedelta(seconds=10)), 15.0)
+            tc.assert_true(not okF1 and dF1["legs"]["in_run_window"]["passed"] is False,
+                           "F marker from another round rejected by the window leg")
+            okF2, dF2 = evaluate(vF, None, iso(T0 + timedelta(seconds=60)),
+                                 marker("F.mp4", 4096, T0 + timedelta(seconds=10)), 15.0)
+            tc.assert_true(okF2 and dF2["legs"]["in_run_window"].get("note"),
+                           "F missing started: upper bound only, note carried (no silent skip)")
+
+            # ── G：无从裁定不得读成通过 ──
+            okG, dG = evaluate(vF, None, None,
+                               marker("F.mp4", 4096, T0 + timedelta(seconds=10)), 15.0)
+            tc.assert_true(not okG and dG["legs"]["in_run_window"]["passed"] is None,
+                           "G no timing at all is UNTESTED, not a pass")
+            okG2, dG2 = evaluate(vF, iso(T0), iso(T0 + timedelta(seconds=60)),
+                                 marker("F.mp4", 4096, T0), 15.0)
+            tc.assert_true("committed_at" in str(dG2.get("untested_reason", ""))
+                           or not okG2,
+                           "G unparseable committed_at cannot yield a verdict")
+
+            # ── H：真实落槽写登记，且不改写成片 mtime ──
+            art = tmp / "final_with_subs.mp4"
+            art.write_bytes(b"\x11" * 8192)
+            # 真身登记走真实时钟，写盘时刻必须相对 now 取早——否则 mtime 落在未来，
+            # 会被"不晚于落槽"腿判成改写，那不是本例要测的形态。
+            stamp = (datetime.now() - timedelta(seconds=3)).timestamp()
+            os.utime(art, (stamp, stamp))
+            slot = tmp / "交付槽位.mp4"
+            bufH = io.StringIO()
+            with contextlib.redirect_stdout(bufH):
+                okH = eva._commit_delivery_slot(art, slot, tmp)
+            tc.assert_true(okH and slot.exists(), "H real commit lands the slot")
+            mk_path = tmp / eva.DELIVERY_COMMIT_MARKER
+            tc.assert_true(mk_path.exists(), "H commit registers its own timestamp")
+            mk = _json.loads(mk_path.read_text(encoding="utf-8"))
+            tc.assert_equal(mk.get("output"), slot.name, "H marker binds the delivered file name")
+            tc.assert_equal(mk.get("bytes"), slot.stat().st_size, "H marker binds the byte count")
+            tc.assert_true(mk.get("committed_at") and mk.get("artifact_mtime"),
+                           "H both timestamps recorded (action time vs write time)")
+            tc.assert_equal(slot.stat().st_mtime, stamp,
+                            "H the artifact mtime is NOT rewritten to flatter the gate")
+            _cH = datetime.fromisoformat(mk["committed_at"])   # 真身登记用的是真实时钟
+            okH2, dH2 = evaluate(slot, iso(_cH - timedelta(seconds=30)),
+                                 iso(_cH + timedelta(seconds=30)), mk, 15.0)
+            tc.assert_true(okH2, "H real marker adjudicates clean against real mtime")
+
+            # ── I：标记文件名两侧单源 ──
+            tc.assert_equal(eva.DELIVERY_COMMIT_MARKER, gcr.DELIVERY_COMMIT_MARKER,
+                            "I marker name identical on producer and consumer (no drift)")
+
+            # ── J：端到端 generate_report 基准选择 ──
+            vid = tmp / "J.mp4"
+            vid.write_bytes(b"\x00" * 100000)
+            _jw = (T0 - timedelta(seconds=25)).timestamp()   # 写盘早于登记里的落槽 5s
+            os.utime(vid, (_jw, _jw))
+            steps = {"steps": {s: {"status": "passed", "completed": iso(T0)}
+                               for s in ("preflight", "tts", "timeline", "render", "verify")}}
+            steps["steps"]["postprocess"] = {"status": "passed", "completed": iso(T0),
+                                             "started": iso(T0 - timedelta(seconds=90))}
+            st_dir = tmp / "jtemp"
+            st_dir.mkdir()
+            st_file = st_dir / "pipeline_state.json"
+
+            def run_j(tag):
+                st_file.write_text(_json.dumps({"steps": steps["steps"]},
+                                               ensure_ascii=False), encoding="utf-8")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return gcr.generate_report(project_name=f"Case75_{tag}",
+                                               video_file=str(vid), subtitle_file=None,
+                                               state_file=str(st_file))
+            (st_dir / gcr.DELIVERY_COMMIT_MARKER).write_text(_json.dumps(
+                marker("J.mp4", 100000, T0 - timedelta(seconds=20),
+                       T0 - timedelta(seconds=25)), ensure_ascii=False), encoding="utf-8")
+            rJ = run_j("with_marker")
+            tc.assert_equal(rJ["data_sources"]["state_product_check"]["check_basis"],
+                            "delivery_commit_marker",
+                            "J report reads the marker next to the state file")
+            tc.assert_true(rJ["validation"].get("product_state_consistent"),
+                           "J delivery validated on the commit basis")
+            os.remove(st_dir / gcr.DELIVERY_COMMIT_MARKER)
+            rJ2 = run_j("no_marker")
+            tc.assert_equal(rJ2["data_sources"]["state_product_check"]["check_basis"],
+                            "postprocess_completed_fallback",
+                            "J without marker keeps the legacy basis (historical deliveries)")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        tc.mark_failed(str(e))
+
+    return tc
+
+
 # ============================================================================
 # 测试运行器
 # ============================================================================
@@ -9453,6 +10187,9 @@ class RegressionTestRunner:
             test_scattered_forensic_artifact_three_state,
             test_gate_evidence_cannot_silently_disappear,
             test_render_watchdog_stdout_progress_source,
+            test_render_post_capture_deadline_guard,
+            test_pipeline_lock_blocks_concurrent_runs,
+            test_product_state_consistency_three_legs,
         ]
         self.results = []
     

@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_line_time, resolve_script_times, parse_scene_map
 from _narration_lint import scan_srt_file as _lint_scan_srt, format_findings as _lint_format
 from _script_env import ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE
+from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _forced_align as _fa  # 叶子模块（faster_whisper 仅在 load 时导入）；版本面消费 MODEL_SIZE
 
@@ -1697,6 +1698,33 @@ def step3_merge_all(video_path, temp_dir):
     return True
 
 
+DELIVERY_COMMIT_MARKER = "_delivery_slot_committed.json"
+
+
+def _record_delivery_commit(output_path, temp_dir):
+    """落槽动作时刻登记（2026-10-02）：给"产物-状态一致性"一个非代理量的基准。
+
+    存在理由：完工报告旧判据拿成片 mtime 去比 `state.postprocess.completed`，而落槽之后
+    父进程还要跑终检（抽帧 + ASR 对齐）才 mark_completed——该耗时与成片新旧无关，却被算进
+    了偏差。本仓 20 份已交付报告实测 lag 全为负、最大 -20.0s，最差一支 136s 片的
+    -16.193s 对容差 16.8s 只剩 0.6s 余量（外部副本同型误拒已发生：110s 片、lag 40s、
+    容差 15.5s）。
+
+    刻意**不改成片 mtime**：`os.replace` 保留源文件 mtime，那正是"字节何时写出"的独立证据，
+    抹平它就等于放弃"陈旧产物被改名冒充"这条腿。登记两个时刻（写盘 mtime 与落槽动作），
+    把三件事拆开各自裁定，判据归 generate_completion_report。
+    """
+    st = output_path.stat()
+    marker = {
+        "output": output_path.name,
+        "bytes": st.st_size,
+        "committed_at": datetime.now().isoformat(timespec="microseconds"),
+        "artifact_mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="microseconds"),
+    }
+    atomic_write_json(Path(temp_dir) / DELIVERY_COMMIT_MARKER, marker)
+    return marker
+
+
 def _commit_delivery_slot(artifact_path, output_path, temp_dir):
     """交付槽位的唯一写入点（2026-09-20 时序修复）。
 
@@ -1746,6 +1774,11 @@ def _commit_delivery_slot(artifact_path, output_path, temp_dir):
     print(f"  Delivery slot written: {output_path} ({size_mb:.1f} MB)")
     if backup is not None:
         print(f"  Previous output moved to temp: {backup}")
+    try:
+        _record_delivery_commit(output_path, temp_dir)
+    except OSError as e:
+        # 交付已完成，登记失败不得反把成功链判死；但报告侧会因此退回旧基准，须可见。
+        print(f"  WARNING: 落槽登记写入失败（完工报告将退回 postprocess 完成时刻为基准）: {e}")
     print()
     return True
 

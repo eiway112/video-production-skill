@@ -74,6 +74,144 @@ def _load_delivery_rules() -> Dict[str, Any]:
         return json.loads(json.dumps(_DELIVERY_RULE_DEFAULTS))
 
 
+DELIVERY_COMMIT_MARKER = "_delivery_slot_committed.json"
+
+
+def evaluate_product_state_consistency(video_path, pp_started, pp_completed,
+                                       commit_marker, tolerance_s, clock_epsilon_s=2.0):
+    """"产物-状态一致性"三腿裁定（2026-10-02 拆腿）。→ (consistent, detail)
+
+    旧判据把一件事塞进一个式子：`abs(成片 mtime − postprocess 完成时刻) ≤ 自适应容差`。
+    而落槽之后父进程还要跑终检（抽帧 + ASR 对齐）才 mark_completed，这段耗时与成片新旧
+    无关却被算进偏差——本仓 20 份已交付报告实测偏差全为负、最大 -20.0s，
+    最差一支 136s 片的 -16.193s 对容差 16.8s 只剩 0.6s 余量；外部副本同型误拒已
+    发生（110s 片、偏差 40s、容差 15.5s）。基准住错对象，不是阈值太紧，故不放宽阈值。
+
+    拆成三件各自可证伪的事（有落槽登记时）：
+      in_run_window    落槽动作必须落在本轮 postprocess 的 started..completed 区间内
+                       ——区间包含，与终检耗时无关（这一条取代旧判据，消除误拒）
+      not_rewritten    成片 mtime 不得晚于落槽动作（+时钟抖动余量）——防"落槽后被外部改写"
+      not_stale        落槽动作 − 成片 mtime 不得超过自适应容差——防陈旧产物被改名冒充
+                       （`os.replace` 保留源文件 mtime，故这条腿只在有登记时才成立；
+                       旧判据的 abs() 把这条与"改写"混为一谈）
+    无登记（手工交付/历史项目/旧流程）时**逐字退回**旧判据，并在 detail 里点名回退原因
+    ——退回的是既有行为，不是"放行"；三腿任一无从裁定即判不一致（四态纪律）。
+    """
+    detail = {
+        "postprocess_started": pp_started,
+        "postprocess_completed": pp_completed,
+        "tolerance_s": tolerance_s,
+        "tolerance_basis_duration_s": None,
+        "clock_epsilon_s": clock_epsilon_s,
+        "legs": {},
+    }
+    try:
+        _st = video_path.stat()
+    except OSError as e:
+        detail["check_basis"] = "untested"
+        detail["untested_reason"] = f"成片不可测量: {e}"
+        for k in ("in_run_window", "not_rewritten", "not_stale"):
+            detail["legs"][k] = {"passed": None, "reason": "成片不可测量"}
+        return False, detail
+
+    mtime = _st.st_mtime
+    detail["video_mtime"] = datetime.fromtimestamp(mtime).isoformat()
+
+    marker_ok = isinstance(commit_marker, dict) and "_unreadable" not in commit_marker
+    marker_reason = None
+    if commit_marker is None:
+        marker_reason = "temp 下无落槽登记（手工交付/历史项目/旧流程）"
+    elif not marker_ok:
+        marker_reason = f"落槽登记不可解析: {commit_marker.get('_unreadable')}"
+    elif commit_marker.get("output") != video_path.name:
+        marker_reason = (f"登记对象与本片不符（登记 {commit_marker.get('output')} ≠ "
+                         f"{video_path.name}）")
+    elif commit_marker.get("bytes") != _st.st_size:
+        marker_reason = (f"登记字节数与本片不符（登记 {commit_marker.get('bytes')} ≠ "
+                         f"{_st.st_size}）→ 成片在登记之后被动过")
+
+    def _leg(name, passed, **extra):
+        rec = {"passed": passed}
+        rec.update(extra)
+        detail["legs"][name] = rec
+        return passed
+
+    if marker_reason is not None:      # 缺位/不可解析/名称或字节不绑定，一律退回旧判据
+        detail["check_basis"] = "postprocess_completed_fallback"
+        detail["fallback_reason"] = marker_reason
+        if not pp_completed:
+            for k in ("in_run_window", "not_rewritten", "not_stale"):
+                _leg(k, None, reason="无落槽登记且无 postprocess 完成时刻，无从裁定")
+            detail["untested_reason"] = marker_reason
+            return False, detail
+        try:
+            _pp_ts = datetime.fromisoformat(pp_completed).timestamp()
+        except ValueError:
+            for k in ("in_run_window", "not_rewritten", "not_stale"):
+                _leg(k, None, reason="postprocess 完成时刻不可解析")
+            detail["untested_reason"] = "postprocess.completed 不可解析"
+            return False, detail
+        # 旧判据逐字保留（绝对差 + 自适应容差），并把它标成单腿，避免读成三腿已过
+        lag = mtime - _pp_ts
+        consistent = abs(lag) <= tolerance_s
+        detail["video_mtime_minus_completed_s"] = round(lag, 3)
+        _leg("legacy_abs_deviation", consistent,
+             deviation_seconds=round(lag, 3),
+             reason="回退判据：mtime 与 postprocess 完成时刻的绝对差超容差")
+        detail["basis"] = ("回退基准（无落槽登记）：成片 mtime 与 postprocess 完成时刻的绝对差"
+                           "不得超过自适应容差（base 10s + 5% × 视频时长，封顶 120s，参数见"
+                           " config/quality/delivery_gate_rules.json）")
+        return consistent, detail
+
+    detail["check_basis"] = "delivery_commit_marker"
+    detail["commit_marker"] = {k: commit_marker.get(k)
+                               for k in ("output", "bytes", "committed_at", "artifact_mtime")}
+    try:
+        committed_ts = datetime.fromisoformat(commit_marker["committed_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        for k in ("in_run_window", "not_rewritten", "not_stale"):
+            _leg(k, None, reason="登记里的 committed_at 不可解析")
+        detail["untested_reason"] = "落槽登记的 committed_at 不可解析"
+        return False, detail
+
+    detail["commit_minus_mtime_s"] = round(committed_ts - mtime, 3)
+
+    if pp_started and pp_completed:
+        try:
+            _s = datetime.fromisoformat(pp_started).timestamp()
+            _e = datetime.fromisoformat(pp_completed).timestamp()
+            l1 = _s - clock_epsilon_s <= committed_ts <= _e + clock_epsilon_s
+            _leg("in_run_window", l1,
+                 reason="落槽动作不在本轮 postprocess 区间内 → 登记属另一轮运行")
+        except ValueError:
+            _leg("in_run_window", None, reason="postprocess 起止时刻不可解析")
+    elif pp_completed:
+        try:
+            _e = datetime.fromisoformat(pp_completed).timestamp()
+            _leg("in_run_window", committed_ts <= _e + clock_epsilon_s,
+                 reason="落槽晚于 postprocess 完成时刻",
+                 note="state 无 postprocess.started，区间下界缺失，仅裁定不晚于完成时刻")
+        except ValueError:
+            _leg("in_run_window", None, reason="postprocess 完成时刻不可解析")
+    else:
+        _leg("in_run_window", None, reason="state 无 postprocess 起止时刻，归属无从裁定")
+
+    _leg("not_rewritten", mtime <= committed_ts + clock_epsilon_s,
+         reason="成片 mtime 晚于落槽动作 → 落槽之后被外部改写")
+    _stale = committed_ts - mtime
+    _leg("not_stale", _stale <= tolerance_s,
+         seconds_earlier=round(_stale, 3),
+         reason=(f"落槽的字节比落槽动作早 {_stale:.1f}s（>容差 {tolerance_s}s）"
+                 "→ 陈旧产物被改名冒充，不是本轮产出"))
+
+    verdicts = [v.get("passed") for v in detail["legs"].values()]
+    consistent = all(v is True for v in verdicts)
+    detail["basis"] = ("基准＝落槽动作时刻（由交付槽位唯一写入点登记）。三腿分别裁定：落槽落在本轮 "
+                       "postprocess 区间内（与终检耗时无关）／成片 mtime 不晚于落槽／落槽与写盘的间隔"
+                       "不超自适应容差。成片 mtime 未被改写以迎合基准——它仍是独立测量值。")
+    return consistent, detail
+
+
 def _adaptive_mtime_tolerance(video_duration_s: float) -> float:
     """产物 mtime 容差随视频时长自适应缩放（P0 整改，2026-08-04 prefab 复盘）。
 
@@ -519,47 +657,40 @@ def generate_report(
                         report["issues"].append(f"Pipeline step '{step}' not recorded")
                         all_valid = False
 
-                # P0（2026-07-29）：产物-状态一致性检查。成片 mtime 与
-                # postprocess 完成时刻偏差超过容差 → 成片可能在流水线之外
-                # 被改写（某逃逸脚本直接覆写成片的教训）。
-                # 判定依据：正常路径下成片由 postprocess 步骤产出，其 mtime
-                # 与该步骤完成时刻应基本一致。
-                # P0 整改（2026-08-04 prefab 复盘）：容差不再固定 10s，改为
-                # base + ratio × 视频时长（封顶 max，参数见 delivery_gate_rules.json）。
-                # 固定容差曾误判拒收 618.9s 合格成片（-12.7s 超差），诱发 9 小时连环重渲。
-                # 用绝对差值：mtime 早于完成时刻超差同样可疑（陈旧产物/时钟回拨）。
-                _pp_completed = pipeline_steps.get("postprocess", {}).get("completed")
-                if _pp_completed and video_path.exists():
+                # P0（2026-07-29）：产物-状态一致性检查——存在理由不变：某逃逸脚本
+                # 直接覆写过成片的教训。判据形态 2026-10-02 拆为三腿（见
+                # evaluate_product_state_consistency docstring）：旧式 abs(mtime −
+                # postprocess 完成时刻) 把"落槽后父进程还要跑终检"这段与成片新旧无关的
+                # 耗时算进偏差，本仓实测最大 -20.0s、最险一次只剩 0.6s 余量。
+                # 无落槽登记时逐字退回旧判据（手工/历史/旧流程交付），并点名回退原因。
+                _pp_rec = pipeline_steps.get("postprocess", {}) or {}
+                _video_dur_for_tol = float(report["validation"].get("video_duration", 0) or 0)
+                _tolerance_s = round(_adaptive_mtime_tolerance(_video_dur_for_tol), 1)
+                _marker = None
+                _marker_path = (Path(state_file).parent / DELIVERY_COMMIT_MARKER
+                                if state_file else None)
+                if _marker_path is not None and _marker_path.exists():
                     try:
-                        _pp_ts = datetime.fromisoformat(_pp_completed).timestamp()
-                        _video_ts = video_path.stat().st_mtime
-                        _video_dur_for_tol = float(report["validation"].get("video_duration", 0) or 0)
-                        _tolerance_s = round(_adaptive_mtime_tolerance(_video_dur_for_tol), 1)
-                        _lag = _video_ts - _pp_ts
-                        _consistent = abs(_lag) <= _tolerance_s
-                        report["data_sources"]["state_product_check"] = {
-                            "postprocess_completed": _pp_completed,
-                            "video_mtime": datetime.fromtimestamp(_video_ts).isoformat(),
-                            "video_mtime_minus_completed_s": round(_lag, 3),
-                            "tolerance_s": _tolerance_s,
-                            "tolerance_basis_duration_s": _video_dur_for_tol,
-                            "basis": ("成片 mtime 与 postprocess 完成时刻的绝对差不得超过自适应容差"
-                                      "（base 10s + 5% × 视频时长，封顶 120s，参数见"
-                                      " config/quality/delivery_gate_rules.json）；"
-                                      "超差说明成片在流水线之外被改写或为陈旧产物，拒收"),
-                        }
-                        report["validation"]["product_state_consistent"] = _consistent
-                        if not _consistent:
-                            report["issues"].append(
-                                f"Video mtime deviates {_lag:+.1f}s from postprocess "
-                                f"completion (adaptive tolerance ±{_tolerance_s}s for "
-                                f"{_video_dur_for_tol:.0f}s video) — product may "
-                                f"have been modified outside the pipeline; delivery rejected")
-                            all_valid = False
-                    except (ValueError, OSError) as _e:
-                        report["issues"].append(
-                            f"State-product consistency check failed: {_e}")
-                        all_valid = False
+                        _marker = json.loads(_marker_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError) as _me:
+                        _marker = {"_unreadable": str(_me)[:120]}
+                _consistent, _psc = evaluate_product_state_consistency(
+                    video_path=video_path,
+                    pp_started=_pp_rec.get("started"),
+                    pp_completed=_pp_rec.get("completed"),
+                    commit_marker=_marker,
+                    tolerance_s=_tolerance_s)
+                _psc["tolerance_basis_duration_s"] = _video_dur_for_tol
+                report["data_sources"]["state_product_check"] = _psc
+                report["validation"]["product_state_consistent"] = _consistent
+                if not _consistent:
+                    _failed = [k for k, v in _psc["legs"].items() if v.get("passed") is not True]
+                    report["issues"].append(
+                        f"Product-state consistency rejected (basis="
+                        f"{_psc.get('check_basis')}, failed legs={_failed}): "
+                        f"{'; '.join(str(_psc['legs'][k].get('reason')) for k in _failed)}"
+                        f" — delivery rejected")
+                    all_valid = False
 
                 # 数据源b：验证/质检结果追溯（verifications 节，由 pipeline_runner 合并写入）
                 # 向后兼容：旧 state 无此节 → 标注不可追溯（既不崩溃也不误判为失败）。
@@ -621,6 +752,11 @@ def generate_report(
                         "scene_patch_attempts": render_metrics.get("scene_patch_attempts", 0),
                         "scene_patch_hits": render_metrics.get("scene_patch_hits", 0),
                         "watchdog_kills": render_metrics.get("watchdog_kills", 0),
+                        # 与 watchdog_kills 分列：后者＝capture 未完成即空转（产物不可信），
+                        # 本项＝capture 已完成后的收尾不退出（产物可能完整），混记会让
+                        # "误杀已完成渲染"的信号失真。
+                        "watchdog_deadline_kills":
+                            render_metrics.get("watchdog_deadline_kills", 0),
                     }
                     decision = pipeline_state.get("render_budget_decision")
                     if isinstance(decision, dict):
@@ -636,7 +772,12 @@ def generate_report(
                 # 成立（该注释此前比代码承诺得多，与 Lint② 同型第二例）。
                 for _skey, _dkey in (("budget_decision", "duration_budget_decision"),
                                      ("media_qa_untested_decision",
-                                      "media_qa_untested_decision")):
+                                      "media_qa_untested_decision"),
+                                     # 收尾超时后保留产物＝"子进程非零退出被接受"的放行面，
+                                     # 不得只活在 state（temp/日志均不入 git），同 render_budget_decision
+                                     # 先例只透传不裁定，裁定归内容门禁与 step_verify。
+                                     ("render_deadline_salvage",
+                                      "render_deadline_salvage")):
                     _val = pipeline_state.get(_skey)
                     if isinstance(_val, dict):
                         report["data_sources"][_dkey] = _val

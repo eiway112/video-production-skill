@@ -5,7 +5,9 @@
     "enabled": true,
     "grace_seconds": 360,
     "stall_seconds": 300,
-    "description": "渲染卡死看门狗（prefab 复盘决策二，2026-08-07）：_RenderProgressWatcher 每 10s 采样一次进度（captured-frames 帧数 → render_raw 大小降级链），若进度连续 stall_seconds 零增长且渲染总时长已超过 grace_seconds，判定卡死并 taskkill 整个渲染进程树 fail-fast。教训：prefab-agent-launch 渲染 #1 卡 0%（0/5305 帧）12 分钟无任何诊断，只能人工盯守杀掉；正常 compile+probe 阶段 <1 分钟，grace 覆盖病态慢启动，绝不允许无进度空转超过 grace+stall。"
+    "post_capture_timeout_seconds": 900,
+    "description": "渲染卡死看门狗（prefab 复盘决策二，2026-08-07）：_RenderProgressWatcher 每 10s 采样一次进度（stdout 进度条/framesCompleted → captured-frames 帧数 → render_raw 大小降级链，stdout 腿 2026-09-25 起为首选），若进度连续 stall_seconds 零增长且渲染总时长已超过 grace_seconds，判定卡死并 taskkill 整个渲染进程树 fail-fast。教训：prefab-agent-launch 渲染 #1 卡 0%（0/5305 帧）12 分钟无任何诊断，只能人工盯守杀掉；正常 compile+probe 阶段 <1 分钟，grace 覆盖病态慢启动，绝不允许无进度空转超过 grace+stall。",
+    "post_capture_description": "站立放行后的绝对墙钟上限（2026-10-02 登记，据外部 WorkBuddy 副本 build-expert-promo 2026-10-01 实测）：stdout 进度到 POST_CAPTURE_PCT(75%) 即 capture 已完成，此后不再按'零进度'裁定——encode/assemble 无增量 stdout，按零进度杀等于丢弃一个已捕获完成的渲染（正是 09-25 修掉的误杀形态）。但完全没有上限等于：子进程打印 100% Render complete 之后不退出时，流水线无限等待。实测该形态真实发生：render_raw.mp4 22:41:20 已完整落盘（ffprobe 84.72s），子进程静默 311s 后才以 exit 1 结束；渲染器自带的 --protocol-timeout 是其内部协议超时，管不到这一段。本值从'站立放行那一刻'起算（与视频时长无关），命中即杀进程树并置 deadline_exceeded，交由 step_render 先判 render_raw 内容完整性再裁定：产物完整则不丢弃（仍走既有内容门禁与 step_verify 时长一致性裁定），产物缺失或空则照常 FAIL。阈值取实测 encode/assemble 上界的宽裕余量（4015 帧交付次全片渲染 569.9s）→ 900s。"
   },
   "render_budget": {
     "max_full_renders": 3,

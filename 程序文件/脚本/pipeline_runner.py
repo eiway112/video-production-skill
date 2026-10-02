@@ -31,6 +31,7 @@ OpenMontage 流水线步骤（按 pipeline 类型不同）：
 """
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -192,6 +193,9 @@ class _RenderProgressWatcher:
     # capture 25→70%、Encoding video 75%、Assembling 90%、Render complete 100%。
     # ≥75% 即 capture 已完成、进入有界收尾（实测 2760 帧 encode 17.4s + assemble 0.3s）。
     POST_CAPTURE_PCT = 75
+    # 站立放行后的绝对墙钟上限的 documented 默认值（权威值在 render_rules.json，
+    # 读不到才用它——上限缺失会让"100% 之后不退出"变成无限等待，不得静默旁路）。
+    POST_CAPTURE_TIMEOUT_DEFAULT = 900
     _CAPTURE_FRAME_RE = re.compile(r"Capturing frame\s+(\d+)\s*/\s*(\d+)")
     _TRACE_FRAMES_RE = re.compile(r'"framesCompleted"\s*:\s*(\d+)')
     _BAR_PCT_RE = re.compile(r"(\d{1,3})\s*%")
@@ -215,6 +219,14 @@ class _RenderProgressWatcher:
         # 与既有跨线程读 self._proc 同风格，不另加锁）。None=尚未见到任何进度条。
         self._stdout_progress = None  # (pct:int, frames:int) 单调非减
         self._stood_down = False      # capture 完成后看门狗站立放行（见 _check_watchdog）
+        self._stood_down_at = None    # 站立放行时刻，绝对上限的时基
+        self._stood_down_pct = 0      # 站立放行时的 stdout 百分比（诊断行用）
+        # 收尾超时（站立放行后子进程仍不退出）：与 stalled 分开置位，因为两者对
+        # "产物能否保留"的裁定相反——stalled 是 capture 未完成即空转（产物不可信），
+        # deadline 是 capture 已完成后的收尾不退出（产物可能完整，见 step_render）。
+        self.deadline_exceeded = False
+        self.post_capture_tail_seconds = None   # 命中时实测的收尾静默秒数（留痕用）
+        self.post_capture_limit_seconds = None  # 实际生效的上限值（权威源在配置文件）
 
     def attach_process(self, proc):
         """_run 的 Popen 成功后调用：看门狗需要进程句柄才能在卡死时杀进程树。"""
@@ -328,20 +340,25 @@ class _RenderProgressWatcher:
         说明历史上唯一会卡死的 capture 阶段（prefab #1：0/5305 帧）已完整跑完，
         其后 encode/assemble 是有界收尾（实测 2760 帧 encode 17.4s + assemble 0.3s）
         且 HyperFrames 不再打印增量进度——此时按"进度恒 0"杀进程只会丢弃一个已捕获
-        完成的渲染。残留取舍：真正的 encode 卡死不再由本看门狗拦截，由渲染命令自带的
-        --protocol-timeout 600000（600s）兜底；capture 卡死（看门狗设立初衷）不受影响，
-        因其百分比恒 ≤70%、永不触发站立放行。"""
+        完成的渲染。残留取舍（2026-10-02 更正）：真正的 encode 卡死不再由"零进度"这条
+        腿拦截，改由站立放行后的绝对上限 post_capture_timeout_seconds 兜底——渲染命令
+        自带的 --protocol-timeout 是渲染器内部协议超时，管不到"渲染器已打印 100% 之后
+        进程自身不退出"这一段（外部副本实测静默 311s）；capture 卡死（看门狗设立初衷）
+        不受影响，因其百分比恒 ≤70%、永不触发站立放行。"""
         wd = self.watchdog
         if not wd.get("enabled") or self.stalled or self._proc is None:
             return
+        now = time.time()
         sp = self._stdout_progress
         if sp is not None and sp[0] >= self.POST_CAPTURE_PCT:
             if not self._stood_down:
                 self._stood_down = True
+                self._stood_down_at = now
+                self._stood_down_pct = sp[0]
                 print(f"\n  [WATCHDOG] Capture complete ({sp[0]}%); standing down for "
                       f"bounded encode/assemble phase (no incremental stdout).", flush=True)
+            self._check_post_capture_deadline(now, wd)
             return
-        now = time.time()
         val = self._progress_value()
         if val != self._last_progress_val:
             self._last_progress_val = val
@@ -359,6 +376,37 @@ class _RenderProgressWatcher:
                 pid = None
             if pid:
                 self._kill_process_tree(pid)
+
+    def _check_post_capture_deadline(self, now, wd):
+        """站立放行后的绝对墙钟上限（时基＝站立放行那一刻，与视频时长无关）。
+
+        站立放行把"零进度"这条腿关掉，于是收尾阶段没有任何裁定：子进程若在打印
+        100% Render complete 之后不退出，流水线就无限等待。实测该形态真实发生
+        （外部 WorkBuddy 副本 build-expert-promo，2026-10-01）：render_raw.mp4 于
+        22:41:20 完整落盘（ffprobe 84.72s），子进程静默 311s 后才以 exit 1 结束。
+        命中上限即杀进程树并置 deadline_exceeded——**不在此处裁定产物**，交由
+        step_render 用既有内容门禁与时长一致性判据决定保留还是失败，避免把
+        09-25 修掉的"误杀已完成渲染"以另一形态引回来。"""
+        if self.deadline_exceeded or self._stood_down_at is None:
+            return
+        limit = wd.get("post_capture_timeout_seconds", self.POST_CAPTURE_TIMEOUT_DEFAULT)
+        tail = now - self._stood_down_at
+        if tail < limit:
+            return
+        self.deadline_exceeded = True
+        self.post_capture_tail_seconds = round(tail, 1)
+        self.post_capture_limit_seconds = limit
+        print(f"\n  [WATCHDOG] Post-capture deadline exceeded: {int(tail)}s > {int(limit)}s "
+              f"since capture completed (stdout {self._stood_down_pct}%) — killing render "
+              f"process tree; render_raw completeness decides the verdict. "
+              f"Threshold: render_rules.json watchdog.post_capture_timeout_seconds",
+              flush=True)
+        try:
+            pid = self._proc.pid
+        except Exception:
+            pid = None
+        if pid:
+            self._kill_process_tree(pid)
 
     def _report(self):
         elapsed = self._elapsed_str()
@@ -642,7 +690,8 @@ def _load_render_rules():
     """
     rules_path = CONFIG_DIR / "quality" / "render_rules.json"
     defaults = {
-        "watchdog": {"enabled": True, "grace_seconds": 360, "stall_seconds": 300},
+        "watchdog": {"enabled": True, "grace_seconds": 360, "stall_seconds": 300,
+                     "post_capture_timeout_seconds": 900},
         "render_budget": {"max_full_renders": 3, "enforcement": "soft"},
     }
     if not rules_path.exists():
@@ -658,8 +707,117 @@ def _load_render_rules():
         return defaults
 
 
+class PipelineLock:
+    """同项目并发运行守卫（2026-10-02）：一个 temp 目录同一时刻只有一个写者。
+
+    存在理由（外部 WorkBuddy 副本 build-expert-promo，2026-10-01 实证）：两个流水线
+    进程共享同一 state 文件时，A10 的原子写只保证"单文件不半截"，不保证跨进程一致——
+    后写者整表覆盖，交付后读回来的 started/completed 会来自两个进程，"N 步全过"这种
+    读数因此不可复核（实证：verify 只活了 206ms 却与 render/visual_check 挤在同一 17ms
+    内完成；render 记 passed 而其子进程日志尾行 exit_code: 1）。
+
+    心跳而非 pid 存活探测：pid 复用会把死锁读成活锁，而 Windows 上 `os.kill(pid, 0)`
+    会真的终止对方进程。心跳超期即视为可接管，"活着但卡住"则因心跳仍新被按并发拦下——
+    两种形态各得其所，且不需要任何平台相关的进程探测。
+    """
+
+    NAME = ".pipeline_runner.lock"
+    DEFAULT_INTERVAL = 10.0
+    DEFAULT_STALE = 90.0
+
+    def __init__(self, temp_dir, rules=None, config_name="", step_provider=None, pid=None):
+        rules = rules or {}
+        self.path = Path(temp_dir) / self.NAME
+        self.temp_dir = Path(temp_dir)
+        cfg = rules.get("state_lock", {}) if isinstance(rules, dict) else {}
+        self.interval = float(cfg.get("heartbeat_interval_seconds", self.DEFAULT_INTERVAL))
+        self.stale_after = float(cfg.get("stale_after_seconds", self.DEFAULT_STALE))
+        self.config_name = config_name
+        self._step_provider = step_provider or (lambda: None)
+        # 可注入 pid：同进程内造不出"另一个持有者"，回归夹具需要这个缝
+        # （与 _kill_process_tree 独立成方法以便替换是同源的取舍）。
+        self.pid = int(pid) if pid is not None else os.getpid()
+        self.started_at = datetime.now().isoformat(timespec="seconds")
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _write(self, step=None):
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.path, {
+            "pid": self.pid,
+            "config": self.config_name,
+            "started_at": self.started_at,
+            "heartbeat_at": datetime.now().isoformat(timespec="seconds"),
+            "step": step if step is not None else self._step_provider(),
+        })
+
+    def holder(self):
+        """当前占锁者的心跳信息；无锁/读不回（不存在、半截、缺字段）一律返回 None。
+
+        读不回＝无从裁定对方是否还活着＝按无锁处理（宁可让合法运行起来，也不让一个
+        解析不了的锁把项目永久锁死）。
+        """
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not data.get("pid") or not data.get("heartbeat_at"):
+            return None
+        return data
+
+    def _age(self, holder):
+        try:
+            return (datetime.now()
+                    - datetime.fromisoformat(holder["heartbeat_at"])).total_seconds()
+        except (TypeError, ValueError):
+            return None
+
+    def acquire(self, take_over=False):
+        """→ (ok, holder)。ok=False 时 holder 为占锁者信息，调用方须原样点名。"""
+        held = self.holder()
+        if held and held.get("pid") != self.pid:
+            age = self._age(held)
+            if age is not None and age < self.stale_after:
+                if not take_over:
+                    return False, held
+                print(f"  [LOCK] --take-over-lock 显式接管：原持有者 pid={held.get('pid')} "
+                      f"step={held.get('step')} 心跳距今 {age:.0f}s（<{self.stale_after:.0f}s）"
+                      f"仍在新心跳窗口内——两个进程会互相覆盖同一 state 文件，"
+                      f"其步时间戳不再构成可复核证据")
+            else:
+                why = "心跳时间不可解析" if age is None else f"心跳已超期 {age:.0f}s"
+                print(f"  [LOCK] 接管陈旧锁：pid={held.get('pid')} {why}"
+                      f"（原持有者已终止，非并发运行）")
+        self._write()
+        self._thread = threading.Thread(target=self._beat, name="pipeline-lock-heartbeat",
+                                        daemon=True)
+        self._thread.start()
+        return True, held
+
+    def _beat(self):
+        # 观察者纪律：心跳故障绝不改变流水线裁定——宁可有界陈旧后由下一个运行接管，
+        # 也不因写锁失败把一次正常交付判死。
+        while not self._stop.wait(self.interval):
+            try:
+                self._write()
+            except Exception:
+                return
+
+    def release(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval + 5)
+            self._thread = None
+        held = self.holder()
+        if held and held.get("pid") == self.pid:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+
+
 class PipelineRunner:
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -712,6 +870,9 @@ class PipelineRunner:
         self.accept_over_render = accept_over_render
         # 成片媒体终检 UNTESTED 的显式放行开关（2026-09-18 A04，见 _final_media_qa）
         self.accept_media_untested = accept_media_untested
+        # 同项目并发运行守卫的显式接管开关（2026-10-02，见 PipelineLock.acquire）
+        self.take_over_lock = take_over_lock
+        self.lock = None
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
         self._current_step = None      # run() 循环每步前设置，日志命名用
@@ -1549,6 +1710,25 @@ class PipelineRunner:
         except (OSError, json.JSONDecodeError):
             return None
 
+    def _record_deadline_salvage(self, rc, watcher):
+        """收尾超时杀进程后保留产物的留痕（只登记事实，不裁定成片可用性）。
+
+        没有这条留痕，"非零退出的渲染被接受"就只剩控制台一行，交付后（日志不入
+        git）无从追溯——与 2026-09-01 修 duration_budget 通过路径留痕同族。
+        `decided_by` 点名真正裁定产物去留的判据，防止把本方法读成"放行"。
+        """
+        self.state.data["render_deadline_salvage"] = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "child_exit_code": rc,
+            "post_capture_tail_seconds": watcher.post_capture_tail_seconds,
+            "post_capture_limit_seconds": watcher.post_capture_limit_seconds,
+            "stdout_pct_at_stand_down": watcher._stood_down_pct,
+            "artifact_bytes": (self.render_raw.stat().st_size
+                               if self.render_raw.exists() else None),
+            "decided_by": "media_qa_gate.inspect_frame_content (render step) + step_verify duration consistency",
+        }
+        self.state.save()
+
     def _record_scene_patch(self, verdict, reason, outcome=None):
         """裁定留痕：state.scene_patch（本次）+ render_metrics 计数（累计）。
 
@@ -1888,8 +2068,22 @@ class PipelineRunner:
                 + (time.monotonic() - _render_t0), 1)
             if watcher.stalled:
                 _metrics["watchdog_kills"] = int(_metrics.get("watchdog_kills", 0)) + 1
+            if watcher.deadline_exceeded:
+                # 与 watchdog_kills 分开计数：前者＝capture 未完成即空转（产物不可信），
+                # 后者＝收尾不退出（产物可能完整）。混记会让"误杀已完成渲染"的信号失真。
+                _metrics["watchdog_deadline_kills"] = int(
+                    _metrics.get("watchdog_deadline_kills", 0)) + 1
             self.state.save()
-            if rc != 0:
+            if rc != 0 and watcher.deadline_exceeded and self.render_raw.exists():
+                # 收尾超时是本页自己杀的：子进程已打印 100% 却不退出，产物已在盘上。
+                # 此时因"我们让它退出"而丢弃整次渲染＝把 09-25 修掉的误杀以另一形态
+                # 引回来。故只留痕、不在此裁定，保留的产物交给既有内容门禁与
+                # step_verify 的时长一致性判据（它们才是"成片能不能用"的权威源）。
+                self._record_deadline_salvage(rc, watcher)
+                print(f"  [WATCHDOG] render_raw.mp4 present ({self.render_raw.stat().st_size} B) "
+                      f"after the post-capture kill — kept; content gate and step_verify "
+                      f"duration consistency still decide the verdict.")
+            elif rc != 0:
                 # P1 整改（prefab 复盘）：渲染中断/失败不再等于归零——
                 # render_raw.prev.mp4（若有）保留了上一版可用渲染，给出定点恢复路径
                 hint = ""
@@ -1903,6 +2097,13 @@ class PipelineRunner:
                     reason = ("Render stalled — watchdog killed the process tree (fail-fast); "
                               f"thresholds stall={wd.get('stall_seconds')}s/"
                               f"grace={wd.get('grace_seconds')}s (render_rules.json)")
+                elif watcher.deadline_exceeded:
+                    reason = ("Render never exited after capture completed — killed at the "
+                              f"post-capture deadline "
+                              f"(tail={watcher.post_capture_tail_seconds}s > "
+                              f"limit={watcher.post_capture_limit_seconds}s) and no usable "
+                              "render_raw.mp4 was left behind "
+                              "(render_rules.json watchdog.post_capture_timeout_seconds)")
                 else:
                     reason = "HyperFrames render failed"
                 self._fail("render", f"{reason}{hint}", SUBPROCESS_FAILED)
@@ -2575,6 +2776,37 @@ class PipelineRunner:
         print(f"  Gate:     {self.gate_mode} ({'warn-only' if self.gate_mode == 'audit' else 'hard-block'})")
         print()
 
+        # ── 并发守卫（2026-10-02，外部副本 10-01 实证）：同项目两个进程共享同一 temp
+        #    时，A10 的原子写只保证"单文件不半截"，后写者仍以整表覆盖 state——步时间戳
+        #    会混合两个进程，"N 步门禁全过"因此不再构成可复核证据。起跑即裁定：未过则
+        #    不写 state、不跑任何步骤（阈值 delivery_gate_rules.json → state_lock）。──
+        self.lock = PipelineLock(self.temp_dir, rules=_load_delivery_gate_rules(),
+                                 config_name=self.config_path.name,
+                                 step_provider=lambda: self._current_step)
+        acquired, held = self.lock.acquire(take_over=self.take_over_lock)
+        if not acquired:
+            age = self.lock._age(held)
+            print("BLOCKED: 同一项目已有流水线在跑，两个进程会互相覆盖同一份 "
+                  f"{self.temp_dir.name}/pipeline_state.json")
+            print(f"  持有者: pid={held.get('pid')} config={held.get('config')} "
+                  f"step={held.get('step')} 起跑于 {held.get('started_at')}")
+            print(f"  最近心跳: {held.get('heartbeat_at')}"
+                  + (f"（距今 {age:.0f}s < {self.lock.stale_after:.0f}s，判为仍在运行）"
+                     if age is not None else ""))
+            print("  等它跑完再起跑；确需并行 → 追加 --take-over-lock（留痕 state.lock_takeover，"
+                  "代价是本轮 state 的步时间戳不再构成可复核证据）")
+            sys.exit(1)
+        if held and self.take_over_lock:
+            self.state.data["lock_takeover"] = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "previous_pid": held.get("pid"),
+                "previous_step": held.get("step"),
+                "previous_heartbeat_at": held.get("heartbeat_at"),
+                "reason": "explicit --take-over-lock",
+            }
+            self.state.save()
+        atexit.register(self.lock.release)
+
         # 中断可见性：上次运行若被外部中断（日志缺尾行），在此显式告警
         self._warn_previous_interrupted_runs()
 
@@ -2718,6 +2950,12 @@ Examples:
     parser.add_argument("--force", action="store_true",
                         help="Re-run all steps AND bypass hard gates (emergency use). "
                              "For clean verification runs use --fresh instead.")
+    parser.add_argument("--take-over-lock", action="store_true",
+                        help="Explicitly take over a project lock held by another running "
+                             "pipeline_runner. Default behaviour is BLOCKED: two processes "
+                             "sharing one temp dir overwrite pipeline_state.json as a whole "
+                             "table, so its step timestamps stop being auditable. Records "
+                             "state.lock_takeover when used.")
     parser.add_argument("--fresh", action="store_true",
                         help="Reset pipeline state and truly re-run every step, keeping "
                              "hard gates enforced. REQUIRED for verification/acceptance runs "
@@ -2844,6 +3082,7 @@ Examples:
         accept_over_budget=args.accept_over_budget,
         accept_over_render=args.accept_over_render,
         accept_media_untested=args.accept_media_untested,
+        take_over_lock=args.take_over_lock,
     )
 
     if args.status:
