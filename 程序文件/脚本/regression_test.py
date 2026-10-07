@@ -10702,36 +10702,66 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
 
             c1 = evaluate_with(res.gs.FAIL, ("4.0.0", "fixture"), target="4.9.9")
             up1 = [o for o in c1["outcomes"] if o["name"] == "upgrade_target_allowed"][0]
-            tc.assert_equal(up1["status"], res.gs.PASS,
-                            "C1 目标版本无探测腿 → 允许（探测 FAIL 不得连坐）")
+            tc.assert_equal(up1["status"], res.gs.NOT_APPLICABLE,
+                            "C1 目标版本无探测腿 → NOT_APPLICABLE（不得计成'探测也干净'的 PASS）")
+            tc.assert_equal(c1["verdict"], res.gs.NOT_APPLICABLE,
+                            "C1b 给出低于引入界的 --target 时整体不得判 FAIL——此即 2026-10-07 "
+                            "A 批修的本体：旧实现把三条腿一并喂 verdict()，本机"
+                            "`--target <钉住版本>` 因探测腿 FAIL 而整体判红、退出码 1，"
+                            "调用方只看退出码会读成'连处置指令给出的版本都不许装'")
+            tc.assert_equal(c1["counts"][res.gs.FAIL], 1,
+                            "C1c 降级的是裁定权不是读数：探测 FAIL 仍须原样计数并打印")
+            tc.assert_true(all(o.get("adjudicates") is False for o in c1["outcomes"]
+                               if o["name"] != "upgrade_target_allowed"),
+                           "C1d 给出 --target 时探测腿与安装腿双双标记为不进场")
             c2 = evaluate_with(res.gs.FAIL, ("4.0.0", "fixture"), target="7.0.0")
             up2 = [o for o in c2["outcomes"] if o["name"] == "upgrade_target_allowed"][0]
             tc.assert_equal(up2["status"], res.gs.FAIL, "C2 目标含探测腿 → 随探测")
+            tc.assert_equal(c2["verdict"], res.gs.FAIL,
+                            "C2b 高于引入界的目标仍由探测腿判红——降级只收'不适用'，"
+                            "不得把该拦的放过去")
             c3 = evaluate_with(res.gs.PASS, ("4.0.0", "fixture"), target="latest")
             tc.assert_equal([o for o in c3["outcomes"]
                              if o["name"] == "upgrade_target_allowed"][0]["status"],
                             res.gs.UNTESTED, "C3 目标版本号非法 → UNTESTED 而非猜测")
+            tc.assert_equal(c3["verdict"], res.gs.UNTESTED,
+                            "C3b 解析不出目标即无从裁定，不得回落到'其余腿干净'的 PASS")
+            c5 = evaluate_with(res.gs.PASS, (None, "npm root -g 不可用"), target="7.0.0")
+            tc.assert_equal(c5["verdict"], res.gs.PASS,
+                            "C5 被问的是'升到该目标安不安全'，探测秒回即 PASS；"
+                            "已装版本读不回属机器事实，不改变该问的答案")
+            tc.assert_true("npm root -g 不可用" in c5["outcomes"][1]["reason"],
+                           "C5b 该读数不得被静默丢弃，报告面仍可取到归因")
             tc.assert_true("upgrade_target_allowed" not in [o["name"] for o in
                             evaluate_with(res.gs.PASS, ("4.0.0", "fixture"))["outcomes"]],
                            "C4 未给 --target 时不凭空造节（无对象即不报）")
 
             # ── D：退出码映射，走 main() 真跑（每轮重新桩定，否则三轮读到同一读数＝空跑）──
             tc.assert_equal(sorted(res.EXIT_BY_VERDICT), sorted(
-                [res.gs.PASS, res.gs.FAIL, res.gs.UNTESTED]), "D1 三态映射键齐备")
-            for st, want in ((res.gs.PASS, 0), (res.gs.FAIL, 1), (res.gs.UNTESTED, 2)):
-                installed = (None, "npm root -g 不可用") if st == res.gs.UNTESTED \
-                    else ("4.0.0", "fixture")
-                probe_st = res.gs.FAIL if st == res.gs.FAIL else res.gs.PASS
-                if st == res.gs.UNTESTED:
-                    probe_st = res.gs.PASS
-                evaluate_with(probe_st, installed)          # 装配本轮桩
+                [res.gs.PASS, res.gs.NOT_APPLICABLE, res.gs.FAIL, res.gs.UNTESTED]),
+                "D1 四态映射键齐备（缺 NOT_APPLICABLE 键则 main() 取映射直接 KeyError）")
+            for probe_st, tgt, want_rc, want_v in (
+                    (res.gs.PASS, "9.0.0", 0, res.gs.PASS),
+                    (res.gs.FAIL, "9.0.0", 1, res.gs.FAIL),
+                    (res.gs.UNTESTED, "9.0.0", 2, res.gs.UNTESTED),
+                    (res.gs.FAIL, "4.9.9", 0, res.gs.NOT_APPLICABLE)):
+                evaluate_with(probe_st, ("4.0.0", "fixture"))   # 装配本轮桩
                 buf = _io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    rc = res.main(["--target", "9.0.0"])
-                tc.assert_equal(rc, want, f"D2 verdict={st} → 退出码 {want}")
-                if st == res.gs.UNTESTED:
-                    tc.assert_equal(buf.getvalue().count("verdict=UNTESTED"), 1,
-                                    "D3 UNTESTED 轮确实走到未测结论（非短路成 PASS 后退出码硬凑）")
+                    rc = res.main(["--target", tgt])
+                tc.assert_equal(rc, want_rc, f"D2 探测={probe_st} 目标={tgt} → 退出码 {want_rc}")
+                tc.assert_equal(buf.getvalue().count(f"verdict={want_v}"), 1,
+                                f"D3 本轮确实走到 verdict={want_v}"
+                                f"（非短路成别的结论后把退出码硬凑成期望值）")
+            evaluate_with(res.gs.FAIL, ("4.0.0", "fixture"))
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = res.main([])
+            tc.assert_equal(rc, 1,
+                            "D5 未给 --target 时问的是'本机能否安全升级'，探测 FAIL 即进场判红"
+                            "（C 段的降级不得把这半边也放过去）")
+            tc.assert_true("(advisory，不进裁定)" not in buf.getvalue(),
+                           "D5b 未给 --target 时不出现降级标记——进场面只由 --target 触发")
 
             # ── G：报告面 ──
             buf = _io.StringIO()
@@ -10755,6 +10785,20 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
             tc.assert_equal(sorted(cnt), sorted([res.gs.PASS, res.gs.FAIL,
                                                  res.gs.UNTESTED, res.gs.NOT_APPLICABLE]),
                             "G3 counts 四键齐备（含零计数项，供报告直读）")
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                res.print_report(evaluate_with(res.gs.FAIL, ("4.0.0", "fixture"),
+                                               target="4.9.9"))
+            g5 = buf.getvalue()
+            tc.assert_true("不得读成本次动作被拒" in g5,
+                           "G5 NOT_APPLICABLE 态必须自陈'不阻断'——只印状态不印这句，"
+                           "红色 counts 行会被读成拒绝")
+            tc.assert_true("5.0.0" in g5,
+                           "G5b 该说明里的引入界数字取自配置（夹具阈值 5.0.0，非源码字面量）")
+            # 只数逐条腿行上的标记，不数"advisory"这个单词——N/A 说明行本身也要提它，
+            # 按单词计数会把 2 条腿读成 3 处（本批实跑第一次就中招）
+            tc.assert_equal(g5.count("(advisory，不进裁定)"), 2,
+                            "G6 被降级的两条腿各自点名标记（漏标＝读者无从知道该行不参与裁定）")
         finally:
             res.resolve_probe_target = REAL["resolve"]
             res.probe_chrome_version = REAL["probe"]

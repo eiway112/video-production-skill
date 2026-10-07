@@ -11,9 +11,13 @@
 本哨兵回答的是"能否安全升级"，不是"当前能否渲染"：当前安装版本低于探测引入界时该项判
 NOT_APPLICABLE——不得计成升级安全，也不得读成阻断。
 
+给出 `--target` 时被问的是"这次安装/升级动作可否做"，裁定只由 `upgrade_target_allowed` 给，
+探测腿与安装腿降为 advisory（照常点名、不进裁定）。理由见 evaluate() 内 2026-10-07 A 批注记。
+
 用法：
     python render_env_sentinel.py [--target 0.8.140] [--json <绝对路径>]
-退出码：0=PASS，1=FAIL，2=UNTESTED（不得读成通过）。
+退出码：0=PASS 或 NOT_APPLICABLE（判据对本次动作不适用，不阻断），1=FAIL，2=UNTESTED
+（不得读成通过）。
 
 覆盖面局限（登记，不预先分叉代码路径）：本哨兵按"环境变量指向的二进制 → 系统 Chrome 候选表"
 取探测对象，未把渲染器解析链里的"托管浏览器缓存"那一档纳入探测。后果是单向的：若某机器缓存里
@@ -181,17 +185,32 @@ def evaluate(rules=None, target=None):
             upgrade["status"] = gs.UNTESTED
             upgrade["reason"] = f"--target 无法解析为版本号：{target!r}"
         elif target_v < gate:
-            upgrade["status"] = gs.PASS
+            upgrade["status"] = gs.NOT_APPLICABLE
             upgrade["reason"] = f"目标 {target} 无探测腿，不受本判据约束"
         else:
             upgrade["status"] = probe["status"]
             upgrade["reason"] = f"目标 {target} 含探测腿，裁定随探测"
         outcomes.append(upgrade)
 
-    violations = [o for o in outcomes if o["status"] == gs.FAIL]
-    untested = [o for o in outcomes if o["status"] == gs.UNTESTED]
+        # 裁定面收口到被问的那个问题（2026-10-07 A 批）。旧实现把三条腿一并喂给 verdict()，
+        # 于是 `--target <钉住版本>` 在探测失败的机器上整体判 FAIL、退出码 1——而 FAIL 说的是
+        # "本机不能升到 0.8.x"，调用方只看退出码会读成"连钉住版本也不许装"，与本报告给出的
+        # 处置指令正好相反。探测腿与安装腿属机器事实，给出 --target 时降为 advisory：照常点名，
+        # 不进裁定。
+        for o in outcomes:
+            if o["name"] != "upgrade_target_allowed":
+                o["adjudicates"] = False
+
+    deciding = [o for o in outcomes if o.get("adjudicates", True)]
+    violations = [o for o in deciding if o["status"] == gs.FAIL]
+    untested = [o for o in deciding if o["status"] == gs.UNTESTED]
+    verdict = gs.verdict(violations, untested)
+    if verdict == gs.PASS and deciding and all(
+            o["status"] == gs.NOT_APPLICABLE for o in deciding):
+        # 全部裁定腿都不适用时不得印成 PASS（四态纪律：N/A 不计通过）
+        verdict = gs.NOT_APPLICABLE
     return {
-        "verdict": gs.verdict(violations, untested),
+        "verdict": verdict,
         "rules": rules,
         "outcomes": outcomes,
         "counts": gs.count_statuses(outcomes),
@@ -207,7 +226,8 @@ def print_report(result, stream=None):
           f"gate_since={result['rules']['probe_gate_since_version']} "
           f"probe_timeout={result['rules']['timeout_seconds']}s", file=stream)
     for o in result["outcomes"]:
-        print(f"  [{o['status']:<14}] {o['name']}: {o['reason']}", file=stream)
+        role = "" if o.get("adjudicates", True) else " (advisory，不进裁定)"
+        print(f"  [{o['status']:<14}] {o['name']}: {o['reason']}{role}", file=stream)
     c = result["counts"]
     print(f"  counts: PASS={c[gs.PASS]} FAIL={c[gs.FAIL]} UNTESTED={c[gs.UNTESTED]} "
           f"N/A={c[gs.NOT_APPLICABLE]}", file=stream)
@@ -219,9 +239,17 @@ def print_report(result, stream=None):
               f"{result['rules']['pinned_version']}", file=stream)
     elif result["verdict"] == gs.UNTESTED:
         print("  未测不得读成通过：先修取数腿（Chrome 路径 / npm root -g）再复跑。", file=stream)
+    elif result["verdict"] == gs.NOT_APPLICABLE:
+        gate = result["rules"]["probe_gate_since_version"]
+        print(f"  本次动作不在本判据射程内（目标低于探测引入界 {gate}）——不阻断。"
+              f"上方 advisory 行的探测读数属机器事实，只供'要不要升到 {gate} 及以上'"
+              f"决策参考，不得读成本次动作被拒。", file=stream)
 
 
-EXIT_BY_VERDICT = {gs.PASS: 0, gs.FAIL: 1, gs.UNTESTED: 2}
+# NOT_APPLICABLE 与 PASS 同为 0：本判据对本次动作不适用＝不阻断，不是拒绝。
+# 报告面已分列打印（verdict=N/A 与 verdict=PASS 的措辞不同），调用方要区分结论就读 stdout，
+# 只按退出码分支时不得把 0 读成"探测干净"。
+EXIT_BY_VERDICT = {gs.PASS: 0, gs.NOT_APPLICABLE: 0, gs.FAIL: 1, gs.UNTESTED: 2}
 
 
 def main(argv=None):
