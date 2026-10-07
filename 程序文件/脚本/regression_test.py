@@ -10554,6 +10554,305 @@ def test_consumer_feedback_intake_replays_claims() -> RegressionTestCase:
     return tc
 
 
+def test_render_env_upgrade_sentinel() -> RegressionTestCase:
+    """用例78：渲染器升级哨兵的四态裁定、阈值单源与清单接线（2026-10-07，据消费端反馈）
+
+    背景：hyperframes 0.8.x 起 `render` 入口无条件跑 `runEnvironmentChecks({includeBrowser:
+    true})`，其中 `chromeLaunchOutcome()` 以 `timeoutMs: 5e3`（字面量、无环境变量、无命令行
+    开关）执行 `<browser> --version` 取 versionMajor，探测失败即返回 `Chrome cannot start`
+    并由 `resolveRenderBrowser` 抛错。`HYPERFRAMES_BROWSER_PATH` 显式给出时照样跑该探测。
+    在 Chrome 进程创建病态的机器上（本仓 AGENTS.md 2026-08-07 已记 Todesk/GPU 栈挂起；
+    2026-10-07 本机实测 `chrome --version` 三次各 60s 未返回），按"安装最新"指引装 0.8.x
+    等于必然渲染失败。本仓此前从未暴露，纯因全局 npm 装的是 0.7.52（其 checkChrome 只做
+    existsSync、不跑 --version）——**属版本侥幸，不是本仓免疫**。
+
+    本用例锁定（全部走桩，套件零 Chrome 子进程、零 npm 调用）：
+    A 探测腿三态：秒回=PASS／超时=FAIL 且归因点名生效阈值／不可执行=FAIL／非零退出=FAIL／
+      取不到版本串=UNTESTED（渲染器只在进程调用抛错时报 cannot start，解析失败不抛，
+      判成 FAIL 会拦下渲染器自己不会拦的形态）／二进制缺失=UNTESTED
+    B 已装版本分档：低于引入界判 NOT_APPLICABLE（当前能跑≠升级安全，不得计 PASS）；
+      高于引入界随探测；读不回判 UNTESTED 且整体不得读成通过
+    C --target 三态：目标无探测腿=PASS、有探测腿随探测、版本号非法=UNTESTED
+    D 退出码：0/1/2 与四态一一对应，走 main() 真跑一遍（摘映射即红）
+    E 阈值 fail-closed：缺文件/缺节/缺键/值非法一律 RuntimeError，**不得回退内置默认**；
+      并以 AST 字面量集合证明三个判据值不住源码（改配置即改裁定，A06/§12 同族）
+    F 清单接线（"是否落地"的机算面）：§6 该行点名脚本、§2.1 登记该脚本为导出项、
+      §6 声明的钉住版本号 == render_rules.json 的 pinned_version（文档承诺与代码事实对撞）、
+      §6 该行不得复述阈值数字（复述＝第二份转述，改配置后文档会静默说谎）
+    G 报告面：FAIL 时打印留在钉住版的完整命令（版本号取自配置），UNTESTED 时点名
+      "不得读成通过"
+
+    发布仓侧：导出清单按 §2.3/§3.3 属"明确不导出"，故 F 段在清单缺席时切成"确认缺席 +
+    本脚本自身须在位"（render_env_sentinel.py 是 §2.1 导出项，缺它则 §6 那条约束在消费侧
+    无载体），与用例67/71/72 同手法。
+
+    变异（驱动 `过程产物/临时产物/_取证/20261007/mutate_case78.py`，复位按 sha256 核对）：
+    M1 超时分支改判 PASS（A2 抓）/ M2 解析不到版本串改判 PASS（A5 抓）/
+    M3 已装版本低于引入界时改判 PASS（B1 抓）/ M4 installed 读不回短路成 PASS（B4 抓）/
+    M5 阈值写死进源码（E5 的 AST 字面量集合抓）/ M6 缺键时回退内置默认（E2 抓）/
+    M7 EXIT_BY_VERDICT 把 UNTESTED 映射成 0（D2 抓）/ M8 FAIL 分支不打印处置命令（G1 抓）/
+    M9 §6 补一句"超时 3 秒"（F10 抓）/ M10 §2.1 把脚本名改成 `.bak`（F5 抓）/
+    M11 §6 安装命令钉成另一个版本号（F8 文档↔配置对撞抓）。
+
+    两处**首版存活、补强后转红**，留痕防再犯（同 A12"子串匹配放过改名变异"一族）：
+    ① F5 原写作 `"render_env_sentinel.py" in seg21`——`render_env_sentinel.py.bak` 含该子串，
+      M10 当场存活；改为整词行级正则 `^\\|\\s*`名字`\\s*\\|`。
+    ② G4 不是设计出来的变异，是**落地时自然踩到**：`print_report(result, stream=sys.stdout)`
+      的 def 期默认值冻结原始流，`redirect_stdout` 捕不到报告，用例首跑即红（且污染控制台输出）
+      ——与用例76"行宽不绑死在签名默认值"同因；现以签名默认 None + 原位注释锁定。
+    """
+    tc = RegressionTestCase(
+        "render_env_upgrade_sentinel",
+        "验证渲染器升级哨兵：探测腿三态与四态退出码、阈值 fail-closed 单源、清单 §6/§2.1 接线对撞"
+    )
+    import ast
+    import contextlib
+    import io as _io
+    import json as _json
+    import subprocess as _sp
+    import types
+
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import render_env_sentinel as res
+
+        # 合成版本：真实阈值只从配置文件读（E 段），夹具不得复述，否则 M5 型变异照样绿
+        RULES = {"pinned_version": "1.2.3", "probe_gate_since_version": "5.0.0",
+                 "timeout_seconds": 3.0}
+        REAL = {"resolve": res.resolve_probe_target,
+                "probe": res.probe_chrome_version,
+                "installed": res.installed_hyperframes_version,
+                "load": res.load_sentinel_rules,
+                "subprocess": res.subprocess}
+
+        def probe_status(rules, behavior):
+            """在桩化 subprocess 后跑一次探测腿，返回 outcome dict。"""
+            fake = types.SimpleNamespace(TimeoutExpired=_sp.TimeoutExpired)
+
+            def run(cmd, **kw):
+                return behavior(cmd, kw)
+            fake.run = run
+            res.subprocess = fake
+            try:
+                return res.probe_chrome_version(Path("fake-chrome.exe"),
+                                                rules["timeout_seconds"])
+            finally:
+                res.subprocess = REAL["subprocess"]
+
+        def OK(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="Google Chrome 141.0.2\n",
+                                         stderr="")
+
+        def SLOW(*a, **k):
+            raise _sp.TimeoutExpired(cmd="fake-chrome", timeout=1)
+
+        def OSE(*a, **k):
+            raise OSError(2, "no such file")
+
+        def NOVER(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="chrome: ok\n", stderr="")
+
+        def BADRC(*a, **k):
+            return types.SimpleNamespace(returncode=3, stdout="", stderr="boom")
+
+        # ── A：探测腿三态 ──
+        a1 = probe_status(RULES, OK)
+        tc.assert_equal(a1["status"], res.gs.PASS, "A1 秒回且解析出版本 → PASS")
+        a2 = probe_status(RULES, SLOW)
+        tc.assert_equal(a2["status"], res.gs.FAIL, "A2 超时 → FAIL（渲染器会在 5s 处同样抛错）")
+        tc.assert_true("3.0" in a2["reason"],
+                       "A2b 超时归因点名**生效阈值数字**（来自配置，非硬编码 5）")
+        a3 = probe_status(RULES, OSE)
+        tc.assert_equal(a3["status"], res.gs.FAIL, "A3 二进制不可执行 → FAIL")
+        a4 = probe_status(RULES, BADRC)
+        tc.assert_equal(a4["status"], res.gs.FAIL, "A4 非零退出 → FAIL")
+        a5 = probe_status(RULES, NOVER)
+        tc.assert_equal(a5["status"], res.gs.UNTESTED,
+                        "A5 跑通但取不到版本串 → UNTESTED（渲染器不因此报 cannot start）")
+        a6 = res.probe_chrome_version(None, 3.0)
+        tc.assert_equal(a6["status"], res.gs.UNTESTED, "A6 找不到二进制 → UNTESTED 而非 FAIL")
+
+        # ── B/C/D 共用装配：探测腿与取数腿分别桩定 ──
+        def evaluate_with(probe_st, installed, target=None, rules=RULES):
+            res.resolve_probe_target = lambda: (Path("fake-chrome.exe"), "fixture")
+            res.probe_chrome_version = lambda exe, t: {"status": probe_st, "reason": "stub"}
+            res.installed_hyperframes_version = lambda: installed
+            return res.evaluate(rules=dict(rules), target=target)
+
+        res.load_sentinel_rules = lambda *a, **k: dict(RULES)
+        try:
+            b1 = evaluate_with(res.gs.PASS, ("4.9.0", "fixture"))
+            cur = [o for o in b1["outcomes"] if o["name"] == "installed_version_within_gate"][0]
+            tc.assert_equal(cur["status"], res.gs.NOT_APPLICABLE,
+                            "B1 已装 < 引入界 → NOT_APPLICABLE（不得计成升级安全）")
+            tc.assert_equal(b1["verdict"], res.gs.PASS, "B2 N/A 不阻断，探测腿干净即 PASS")
+
+            b3 = evaluate_with(res.gs.FAIL, ("6.1.0", "fixture"))
+            cur3 = [o for o in b3["outcomes"] if o["name"] == "installed_version_within_gate"][0]
+            tc.assert_equal(cur3["status"], res.gs.FAIL, "B3 已装 ≥ 引入界时该项随探测判红")
+            tc.assert_equal(b3["verdict"], res.gs.FAIL, "B3b 整体 FAIL")
+
+            b4 = evaluate_with(res.gs.PASS, (None, "npm root -g 不可用：timeout"))
+            cur4 = [o for o in b4["outcomes"] if o["name"] == "installed_version_within_gate"][0]
+            tc.assert_equal(cur4["status"], res.gs.UNTESTED, "B4 版本读不回 → UNTESTED")
+            tc.assert_equal(b4["verdict"], res.gs.UNTESTED,
+                            "B4b 取数断链不得读成通过（四态纪律）")
+
+            c1 = evaluate_with(res.gs.FAIL, ("4.0.0", "fixture"), target="4.9.9")
+            up1 = [o for o in c1["outcomes"] if o["name"] == "upgrade_target_allowed"][0]
+            tc.assert_equal(up1["status"], res.gs.PASS,
+                            "C1 目标版本无探测腿 → 允许（探测 FAIL 不得连坐）")
+            c2 = evaluate_with(res.gs.FAIL, ("4.0.0", "fixture"), target="7.0.0")
+            up2 = [o for o in c2["outcomes"] if o["name"] == "upgrade_target_allowed"][0]
+            tc.assert_equal(up2["status"], res.gs.FAIL, "C2 目标含探测腿 → 随探测")
+            c3 = evaluate_with(res.gs.PASS, ("4.0.0", "fixture"), target="latest")
+            tc.assert_equal([o for o in c3["outcomes"]
+                             if o["name"] == "upgrade_target_allowed"][0]["status"],
+                            res.gs.UNTESTED, "C3 目标版本号非法 → UNTESTED 而非猜测")
+            tc.assert_true("upgrade_target_allowed" not in [o["name"] for o in
+                            evaluate_with(res.gs.PASS, ("4.0.0", "fixture"))["outcomes"]],
+                           "C4 未给 --target 时不凭空造节（无对象即不报）")
+
+            # ── D：退出码映射，走 main() 真跑（每轮重新桩定，否则三轮读到同一读数＝空跑）──
+            tc.assert_equal(sorted(res.EXIT_BY_VERDICT), sorted(
+                [res.gs.PASS, res.gs.FAIL, res.gs.UNTESTED]), "D1 三态映射键齐备")
+            for st, want in ((res.gs.PASS, 0), (res.gs.FAIL, 1), (res.gs.UNTESTED, 2)):
+                installed = (None, "npm root -g 不可用") if st == res.gs.UNTESTED \
+                    else ("4.0.0", "fixture")
+                probe_st = res.gs.FAIL if st == res.gs.FAIL else res.gs.PASS
+                if st == res.gs.UNTESTED:
+                    probe_st = res.gs.PASS
+                evaluate_with(probe_st, installed)          # 装配本轮桩
+                buf = _io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = res.main(["--target", "9.0.0"])
+                tc.assert_equal(rc, want, f"D2 verdict={st} → 退出码 {want}")
+                if st == res.gs.UNTESTED:
+                    tc.assert_equal(buf.getvalue().count("verdict=UNTESTED"), 1,
+                                    "D3 UNTESTED 轮确实走到未测结论（非短路成 PASS 后退出码硬凑）")
+
+            # ── G：报告面 ──
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                res.print_report(evaluate_with(res.gs.FAIL, ("4.0.0", "fixture")))
+            tc.assert_true("hyperframes@1.2.3" in buf.getvalue(),
+                           "G1 FAIL 态打印留在钉住版的完整命令（版本号取自配置）")
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                res.print_report(evaluate_with(res.gs.PASS, (None, "npm 不可用")))
+            tc.assert_true("不得读成通过" in buf.getvalue(),
+                           "G2 UNTESTED 态必须点名未测不得读成通过")
+            tc.assert_true("npm 不可用" in buf.getvalue(),
+                           "G2b 未测归因要转述到报告面（只印状态不印原因＝无从整改）")
+            cnt = evaluate_with(res.gs.PASS, ("4.0.0", "fixture"))["counts"]
+            import inspect as _ins
+            tc.assert_true(
+                _ins.signature(res.print_report).parameters["stream"].default is None,
+                "G4 stream 不得绑 def 期 sys.stdout（本批落地时实测踩到：def 期求值冻结原始流，"
+                "调用方 redirect_stdout 之后报告仍写到旧 fd，捕获面为空即断言空跑）")
+            tc.assert_equal(sorted(cnt), sorted([res.gs.PASS, res.gs.FAIL,
+                                                 res.gs.UNTESTED, res.gs.NOT_APPLICABLE]),
+                            "G3 counts 四键齐备（含零计数项，供报告直读）")
+        finally:
+            res.resolve_probe_target = REAL["resolve"]
+            res.probe_chrome_version = REAL["probe"]
+            res.installed_hyperframes_version = REAL["installed"]
+            res.load_sentinel_rules = REAL["load"]
+
+        # ── E：阈值 fail-closed + 单源 ──
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            p = Path(td) / "render_rules.json"
+            tc.assert_equal(isinstance(res.load_sentinel_rules(res.RULES_PATH), dict), True,
+                           "E0 真实配置文件可加载且三键齐（现读，非夹具）")
+            p.write_text(_json.dumps({"watchdog": {}}), encoding="utf-8")
+            try:
+                res.load_sentinel_rules(p); e1 = False
+            except RuntimeError:
+                e1 = True
+            tc.assert_true(e1, "E1 缺 upgrade_sentinel 节 → 报错，不得回退内置默认")
+            p.write_text(_json.dumps({res.RULES_SECTION: {"pinned_version": "1.2.3"}}),
+                         encoding="utf-8")
+            try:
+                res.load_sentinel_rules(p); e2 = ""
+            except RuntimeError as ex:
+                e2 = str(ex)
+            tc.assert_true("probe_gate_since_version" in e2 and
+                           "chrome_version_probe_timeout_seconds" in e2,
+                           f"E2 缺键报错须点名缺失键（实得：{e2[:60]}）")
+            for bad in (0, -1, "3.0", None):
+                p.write_text(_json.dumps({res.RULES_SECTION: {
+                    "pinned_version": "1.2.3", "probe_gate_since_version": "5.0.0",
+                    "chrome_version_probe_timeout_seconds": bad}}), encoding="utf-8")
+                try:
+                    res.load_sentinel_rules(p); ok = False
+                except RuntimeError:
+                    ok = True
+                tc.assert_true(ok, f"E3 非法阈值 {bad!r} 必须拒收")
+            try:
+                res.load_sentinel_rules(Path(td) / "nope.json"); e4 = False
+            except RuntimeError:
+                e4 = True
+            tc.assert_true(e4, "E4 阈值文件缺失 → 报错（断链不得读成'阈值恰好等于旧值'）")
+
+        src = (script_dir / "render_env_sentinel.py").read_text(encoding="utf-8")
+        literals = {n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant)}
+        for banned in (RULES["pinned_version"], RULES["probe_gate_since_version"],
+                       RULES["timeout_seconds"], 5e3, 5.0):
+            tc.assert_true(banned not in literals,
+                           f"E5 判据值 {banned!r} 不住源码（唯一住在 render_rules.json）")
+        tc.assert_true(set(res.REQUIRED_KEYS) == {
+            "pinned_version", "probe_gate_since_version", "chrome_version_probe_timeout_seconds"},
+            "E6 必需键清单与配置节同形（改名即红）")
+
+        # ── F：清单接线（发布仓侧清单按 §2.3 缺席，切"缺席即锁"分支）──
+        manifest_path = (script_dir.parent.parent / "AI视频制作工作流模板" /
+                         "发布仓导出清单_方案B.md")
+        if not manifest_path.exists():
+            tc.assert_true((script_dir / "render_env_sentinel.py").exists(),
+                           "F0-发布仓 本脚本须在位（§2.1 导出项），否则 §6 约束无载体")
+            tc.assert_true(not manifest_path.exists(),
+                           "F0-发布仓 导出清单不在发布仓（清单入公开面＝内部标识一并公开）")
+            tc.mark_passed()
+            return tc
+
+        manifest = manifest_path.read_text(encoding="utf-8")
+        import re as _re
+        seg6 = manifest[manifest.index("## 6. 外部依赖声明"):manifest.index("## 7. ")]
+        seg21 = manifest[manifest.index("### 2.1"):manifest.index("### 2.2")]
+        lines6 = [l for l in seg6.splitlines() if "render_env_sentinel.py" in l]
+        tc.assert_equal(len(lines6), 1, f"F1 §6 恰有一行点名哨兵脚本（实得 {len(lines6)}）")
+        tc.assert_true("--target" in lines6[0], "F2 §6 该行给出可执行入口（含 --target）")
+        hr = [l for l in seg6.splitlines() if "hyperframes 渲染器" in l]
+        tc.assert_equal(len(hr), 1, f"F3 §6 恰有一行声明渲染器版本（实得 {len(hr)}）")
+        tc.assert_true("render_rules.json" in hr[0] and "upgrade_sentinel" in hr[0],
+                       "F4 判据住指针不复述（§6 指向 render_rules.json→upgrade_sentinel）")
+        tc.assert_true(_re.search(r"^\|\s*`render_env_sentinel\.py`\s*\|", seg21, _re.M) is not None,
+                       "F5 §2.1 已登记为导出项（缺它则消费侧无该脚本可跑）")
+        row6 = [l for l in seg6.splitlines() if "hyperframes@" in l]
+        tc.assert_equal(len(row6), 1, f"F6 §6 恰有一行写安装命令（实得 {len(row6)}）")
+        m = _re.search(r"hyperframes@(\d+\.\d+\.\d+)", row6[0])
+        tc.assert_true(bool(m), "F7 §6 安装命令钉的是具体版本号")
+        live = res.load_sentinel_rules(res.RULES_PATH)
+        tc.assert_equal(m.group(1), live["pinned_version"],
+                        f"F8 文档承诺 == 配置事实（§6 写 {m.group(1)}，"
+                        f"render_rules.json 写 {live['pinned_version']}）——改一处即红")
+        tc.assert_true("| 最新 |" not in seg6,
+                       "F9 §6 不得再把'最新'当现行安装指引")
+        for probe_val in ("3.0", "5s", "5 秒"):
+            tc.assert_true(probe_val not in hr[0] and probe_val not in lines6[0],
+                           f"F10 阈值 {probe_val!r} 不得在 §6 出现第二份（复述即双源）")
+        tc.assert_true(res.parse_version(live["pinned_version"]) is not None,
+                       "F11 配置里的版本号可被解析（写错格式即红）")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"render_env_sentinel fixture error: {e}")
+    return tc
+
+
 class RegressionTestRunner:
 
     """回归测试运行器"""
@@ -10637,6 +10936,7 @@ class RegressionTestRunner:
             test_product_state_consistency_three_legs,
             test_subtitle_display_style_resolution_tier,
             test_consumer_feedback_intake_replays_claims,
+            test_render_env_upgrade_sentinel,
         ]
         self.results = []
     

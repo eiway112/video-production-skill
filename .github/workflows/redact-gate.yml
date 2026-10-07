@@ -1,7 +1,9 @@
 # 发布面脱敏门禁 · 服务端 required check
 #
-# 母本住根仓 `_工具/ci/redact-gate.yml`；安装＝逐仓一条：
-#   cp "_工具/ci/redact-gate.yml" <公开仓>/.github/workflows/redact-gate.yml
+# 母本住根仓 `_工具/hooks/redact-gate.yml`；接入新公开仓三步，第 3 步漏了旧回执自动失效（假红）：
+#   1. cp "_工具/hooks/redact-gate.yml" <公开仓>/.github/workflows/redact-gate.yml
+#   2. 该仓 Settings → Secrets and variables → Actions 建下面两个 secret
+#   3. python _工具/发布回执.py sign --repo <公开仓路径>   # 新增 workflow 即改了被扫面
 #
 # 存在理由：本机 `pre-push` 钩子只是反馈层——可被 `--no-verify` 绕过，也被实测过另一种绕过：
 # `git push ... 2>&1 | head -40` 这类截断式管道让钩子收 SIGPIPE 死亡、git 拿不到它的 exit 1 照推

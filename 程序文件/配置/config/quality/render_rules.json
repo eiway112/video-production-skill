@@ -13,5 +13,14 @@
     "max_full_renders": 3,
     "enforcement": "soft",
     "description": "渲染成本预算门禁（2026-08-19，P1 渲染成本治理）：单项目生命周期内全量渲染次数（含失败/中断，按尝试计）达到该值后拦截。soft（默认）：阻断并要求 --accept-over-render 显式放行，决策留痕 state.render_budget_decision；hard：直接 FAIL。阈值来源非拍脑袋：prefab 批次复盘实证'裸渲染覆盖、3 次 40 分钟级重渲、9 小时失败收尾'——第 3 次全量重渲之后问题已不是渲染能解决的，必须停下来诊断。计数器在 pipeline_state.render_metrics.full_render_attempts，--fresh 重置（真实重跑语义）。scene-patch/quick-fix 不计入。真实基线数据由 render_metrics 度量积累后再校准本阈值。"
+  },
+  "upgrade_sentinel": {
+    "$schema": "Upgrade-sentinel thresholds for render_env_sentinel.py",
+    "pinned_version": "0.7.52",
+    "probe_gate_since_version": "0.8.0",
+    "chrome_version_probe_timeout_seconds": 3.0,
+    "description": "渲染器升级哨兵阈值（2026-10-07，据消费端反馈实测）。威胁模型：hyperframes 0.8.x 起 render 入口无条件跑 runEnvironmentChecks({includeBrowser:true})，其中 chromeLaunchOutcome() 以 timeoutMs:5e3 的字面量超时执行 `<browser> --version` 取 versionMajor；探测失败即返回 title='Chrome cannot start' 并由 resolveRenderBrowser 抛错——设 HYPERFRAMES_BROWSER_PATH 也绕不过（显式路径分支照样调 chromeLaunchOutcome）。本机 Chrome 属病态机（AGENTS.md 2026-08-07 已记 Todesk/GPU 栈致 Chrome 进程创建挂起）：2026-10-07 实测 chrome --version 三次各 60s 未返回，远超 5s → 任何按'安装最新'指引装 0.8.x 的环境在本机出不了片。本仓从未暴露纯属版本侥幸（全局 npm 装的是 0.7.52，其 checkChrome 只做 existsSync、不跑 --version）。",
+    "threshold_semantics": "chrome_version_probe_timeout_seconds 取 3.0 而非渲染器自带的 5.0，留 40% 余量。判据是'这台机器能否安全升级到 >= probe_gate_since_version'，不是'当前能否渲染'——当前版本无探测腿时该项判 NOT_APPLICABLE，不得计成升级安全。",
+    "boundary_evidence": "probe_gate_since_version=0.8.0 是保守下界：实测锚点只有两个（0.7.52 无探测 / 0.8.140 有探测），0.8.0 至 0.8.139 之间未逐版验证，故不得写成'精确引入版本'。取 0.8.0 的含义是'整个 0.8 线一律按有探测处理'。"
   }
 }
