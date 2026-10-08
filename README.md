@@ -2,6 +2,19 @@
 
 从旁白脚本到成片的自动化视频生产流水线：单一权威源、真实性门禁、时间轴自动收敛。以 `AGENTS.md` 为通用协作规范，任何能读写文件的 AI 编码智能体（或纯手工命令行）均可端到端驱动；仓内附带跨平台智能体使用指南与可移植 Skill 定义。
 
+## 获取本仓库（安装对象＝默认分支 `main`）
+
+本仓按导出批次滚动更新，**安装路径只有默认分支 `main`**：
+
+```bash
+git clone https://github.com/eiway112/video-production-skill.git
+# 国内网络可用同一内容的镜像：https://gitee.com/eiway112/video-production-skill
+```
+
+GitHub 页面的 `Code → Download ZIP` 取到的也是 `main`。依赖表、门禁与升级前哨兵以它为准，落地即生效，不需要等版本标签。
+
+**一个必须避开的坑**：不要按 Releases 页上的 `v1.0.0` 安装。那是 2026-09 的历史快照，它的环境依赖表仍写“安装最新”，照做会装上 0.8.x 渲染器——而 0.8.x 起 `render` 入口无条件跑浏览器 `--version` 探测，探测不回来就报 `Chrome cannot start` 并直接失败。该快照按“不改写历史”的裁定保留，不随后续批次更新。
+
 ## 功能特性
 
 - **HyperFrames HTML → MP4**：GSAP 动画场景 + TTS 旁白 + 字幕，一条命令出片
