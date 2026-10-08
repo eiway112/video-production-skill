@@ -17,7 +17,7 @@
 | Python | ≥ 3.10 | 官方安装包 | `pip install -r 程序文件/requirements.txt` |
 | FFmpeg（含 ffprobe） | ≥ 4.4 | 需在 PATH | silencedetect 过滤器必需 |
 | Node.js | ≥ 18 LTS | 官方安装包 | |
-| hyperframes 渲染器 | 最新 | `npm install -g hyperframes` | 全局 npm 包，流水线经 `npx hyperframes render` 调用 |
+| hyperframes 渲染器 | **0.7.52（钉住）** | `npm install -g hyperframes@0.7.52` | 全局 npm 包，流水线经 `npx hyperframes render` 调用。**不要装 0.8.x**：0.8.x 起 `render` 入口无条件跑 `<browser> --version` 探测（超时上限写死在渲染器内，无开关、无环境变量可绕，`HYPERFRAMES_BROWSER_PATH` 显式给出也绕不过），探测失败即报 `Chrome cannot start` 并中断渲染。升级前先跑 `python 程序文件/脚本/render_env_sentinel.py --target <拟升版本>` 裁定本机可否安全升级（退出码 0 才继续）。版本权威值是 `程序文件/配置/config/quality/render_rules.json` → `upgrade_sentinel.pinned_version`，本行是它的同形复述，由回归用例对撞。 |
 | Chrome | 稳定版 | 官方安装包 | 预览与渲染载体 |
 | DashScope API Key | — | 用户自备（可选） | qwen TTS 主引擎，正式交付必需；无 Key 时可显式声明 Edge-TTS 做零成本环境自检 |
 | GSAP（随仓 vendored） | 3.14.2 | 无需安装，随仓携带于 `程序文件/源码/hyperframes/quickstart-demo/gsap.min.js` | GreenSock Standard License（https://gsap.com/standard-license ），允许开源项目随附使用 |
@@ -38,8 +38,12 @@ DASHSCOPE_API_KEY=<阿里云百炼控制台获取的 API Key>
 # 1. 安装 Python 依赖
 pip install -r 程序文件/requirements.txt
 
-# 2. 安装渲染器
-npm install -g hyperframes
+# 2. 安装渲染器（版本钉住，勿用 latest）
+npm install -g hyperframes@0.7.52
+# 若你的宿主环境（IDE/编辑器自带的 node workspace）已在本地 node_modules 里带了一份
+# hyperframes，`npx` 会优先解析那份本地副本，`npm install -g` 覆盖不到它。先自证解析路径：
+#   node -e "const{createRequire}=require('module');console.log(createRequire(process.cwd()+'/x.js').resolve('hyperframes/package.json'))"
+# 结果指向全局包才算装到位；指向别处则该份本地件才是实际被调用的渲染器，须按上面表格的说明处理版本。
 
 # 3. 跑回归测试验证环境（预期全部通过、0 失败）
 python 程序文件/脚本/regression_test.py --run-all

@@ -10859,6 +10859,31 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
                            "F0-发布仓 本脚本须在位（§2.1 导出项），否则 §6 约束无载体")
             tc.assert_true(not manifest_path.exists(),
                            "F0-发布仓 导出清单不在发布仓（清单入公开面＝内部标识一并公开）")
+            # 发布仓侧 README.md 是消费者唯一会读的依赖表，而导出清单按 never_in_target 不进公开面。
+            # 2026-10-08 实测：清单 §6 已改钉住版本，README 却仍写"最新 / npm install -g hyperframes"
+            # ——即本批 P0 在公开面上根本没修到，而 F8/F9 那两条对撞只读开发仓清单，结构上够不到它。
+            # 故把对撞扩到 README；判据仍住 render_rules.json，本段不复述任何阈值数字。
+            import re as _rp
+            rd = script_dir.parent.parent / "README.md"
+            tc.assert_true(rd.exists(), "F12-发布仓 README.md 须在位（面向消费者的依赖表载体）")
+            rtxt = rd.read_text(encoding="utf-8")
+            rl = res.load_sentinel_rules()
+            # 逐条对撞而非"任一处出现即绿"：README 里安装命令有多处（依赖表一行、快速开始一行），
+            # 只查存在性时漏改任一处都判不出（本批变异 R2 首版即因此存活，改成取全部后缀）。
+            suffixes = _rp.findall(r"npm install -g hyperframes([^\s`]*)", rtxt)
+            tc.assert_true(bool(suffixes) and all(
+                    s == "@" + rl["pinned_version"] for s in suffixes),
+                    f"F13 README 每条渲染器安装命令都必须钉住配置里的版本"
+                    f"（现读 {rl['pinned_version']}，实得后缀 {suffixes}，共 {len(suffixes)} 条）"
+                    "——改配置不改 README、或漏改其中一条，即红")
+            tc.assert_true("| 最新 |" not in rtxt and "npm install -g hyperframes`" not in rtxt,
+                           "F14 README 不得再把'最新'当现行安装指引（开发仓侧 F9 的发布面同形判据）")
+            tc.assert_true("render_env_sentinel.py" in rtxt,
+                           "F15 README 须点名升级前哨兵，否则'升级前先过哨兵'在消费侧无载体")
+            tc.assert_true("resolve('hyperframes" in rtxt,
+                           "F16 README 须含'宿主本地 node_modules 副本优先、npm -g 覆盖不到'的自证命令"
+                           "（取数锚＝命令里的 resolve('hyperframes …），本批首跑即因锚写错转红）"
+                           "——缺它则消费者照着装全局仍失败，且会把成因误归到技能本身")
             tc.mark_passed()
             return tc
 
