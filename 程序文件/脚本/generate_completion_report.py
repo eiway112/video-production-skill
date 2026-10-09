@@ -777,7 +777,11 @@ def generate_report(
                                      # 不得只活在 state（temp/日志均不入 git），同 render_budget_decision
                                      # 先例只透传不裁定，裁定归内容门禁与 step_verify。
                                      ("render_deadline_salvage",
-                                      "render_deadline_salvage")):
+                                      "render_deadline_salvage"),
+                                     # 渲染副本实测门禁的结论与放行面（2026-10-09）：state/temp 均不入
+                                     # git，"这轮渲染前问过副本可不可用、谁放的行"须进 git 可追溯面。
+                                     # 同 render_budget_decision 口径——只透传不裁定。
+                                     ("render_env_check", "render_env_check")):
                     _val = pipeline_state.get(_skey)
                     if isinstance(_val, dict):
                         report["data_sources"][_dkey] = _val

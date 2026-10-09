@@ -19,6 +19,8 @@
     "pinned_version": "0.7.52",
     "probe_gate_since_version": "0.8.0",
     "chrome_version_probe_timeout_seconds": 3.0,
+    "render_copy_probe_timeout_seconds": 60,
+    "render_copy_description": "渲染副本实测腿（2026-10-09 增，据消费侧 10-09 两份致命日志）。威胁形态：宿主重置托管 Node 目录后，npx 解析到的那份 hyperframes 可能整包缺原生依赖，`--version` 照印而渲染在 import 期即崩——版本面读不到它。三条腿分工：入口可加载（与渲染命令同款解析链跑一次 --version）、版本随探测（非钉住版本不冒充安全；≥ 探测引入界时随 Chrome 探测裁定）、平台原生包可 require（候选由该副本自己的 optionalDependencies 的 os/cpu 形态推导，脚本内不写死包名）。分档不得混读：整包缺失＝import 崩＝致命；原生二进制空壳＝非致命（本仓全局 0.7.52 的 @esbuild/win32-x64 即空壳，同一副本 10-07 22:03 完成发布仓全量渲染出片、当轮日志 esbuild 命中 0），故二进制在位只作 advisory——写成门禁会把自家已实证能出片的基线判成不合格。本值只约束取数上限（npx／node 子进程墙钟），不是判据阈值，判据阈值仍是 pinned_version 与 probe_gate_since_version。",
     "description": "渲染器升级哨兵阈值（2026-10-07，据消费端反馈实测）。威胁模型：hyperframes 0.8.x 起 render 入口无条件跑 runEnvironmentChecks({includeBrowser:true})，其中 chromeLaunchOutcome() 以 timeoutMs:5e3 的字面量超时执行 `<browser> --version` 取 versionMajor；探测失败即返回 title='Chrome cannot start' 并由 resolveRenderBrowser 抛错——设 HYPERFRAMES_BROWSER_PATH 也绕不过（显式路径分支照样调 chromeLaunchOutcome）。本机 Chrome 属病态机（AGENTS.md 2026-08-07 已记 Todesk/GPU 栈致 Chrome 进程创建挂起）：2026-10-07 实测 chrome --version 三次各 60s 未返回，远超 5s → 任何按'安装最新'指引装 0.8.x 的环境在本机出不了片。本仓从未暴露纯属版本侥幸（全局 npm 装的是 0.7.52，其 checkChrome 只做 existsSync、不跑 --version）。",
     "threshold_semantics": "chrome_version_probe_timeout_seconds 取 3.0 而非渲染器自带的 5.0，留 40% 余量。判据是'这台机器能否安全升级到 >= probe_gate_since_version'，不是'当前能否渲染'——当前版本无探测腿时该项判 NOT_APPLICABLE，不得计成升级安全。",
     "boundary_evidence": "probe_gate_since_version=0.8.0 是保守下界：实测锚点只有两个（0.7.52 无探测 / 0.8.140 有探测），0.8.0 至 0.8.139 之间未逐版验证，故不得写成'精确引入版本'。取 0.8.0 的含义是'整个 0.8 线一律按有探测处理'。"

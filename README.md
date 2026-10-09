@@ -30,7 +30,7 @@ GitHub 页面的 `Code → Download ZIP` 取到的也是 `main`。依赖表、�
 | Python | ≥ 3.10 | 官方安装包 | `pip install -r 程序文件/requirements.txt` |
 | FFmpeg（含 ffprobe） | ≥ 4.4 | 需在 PATH | silencedetect 过滤器必需 |
 | Node.js | ≥ 18 LTS | 官方安装包 | |
-| hyperframes 渲染器 | **0.7.52（钉住）** | `npm install -g hyperframes@0.7.52` | 全局 npm 包，流水线经 `npx hyperframes render` 调用。**不要装 0.8.x**：0.8.x 起 `render` 入口无条件跑 `<browser> --version` 探测（超时上限写死在渲染器内，无开关、无环境变量可绕，`HYPERFRAMES_BROWSER_PATH` 显式给出也绕不过），探测失败即报 `Chrome cannot start` 并中断渲染。升级前先跑 `python 程序文件/脚本/render_env_sentinel.py --target <拟升版本>` 裁定本机可否安全升级（退出码 0 才继续）。版本权威值是 `程序文件/配置/config/quality/render_rules.json` → `upgrade_sentinel.pinned_version`，本行是它的同形复述，由回归用例对撞。 |
+| hyperframes 渲染器 | **0.7.52（钉住）** | `npm install -g hyperframes@0.7.52` | 全局 npm 包，流水线经 `npx hyperframes render` 调用。**不要装 0.8.x**：0.8.x 起 `render` 入口无条件跑 `<browser> --version` 探测（超时上限写死在渲染器内，无开关、无环境变量可绕，`HYPERFRAMES_BROWSER_PATH` 显式给出也绕不过），探测失败即报 `Chrome cannot start` 并中断渲染。升级前先跑 `python 程序文件/脚本/render_env_sentinel.py --target <拟升版本>` 裁定本机可否安全升级（退出码 0 才继续）。**版本号可读 ≠ 渲染入口可加载**：一份 `package.json` 印着版本号、`--version` 照回显的副本，仍可能在入口 import 期即崩（缺 `esbuild` 包体，或 `sharp` 的原生二进制与本平台不符），故渲染前用 `python 程序文件/脚本/render_env_sentinel.py --check-render-env` 实测解析到的那份副本能否加载（流水线在渲染步起跑前也会自动跑这一条，FAIL 即拦下，不会把整轮渲染跑完才发现）。版本权威值是 `程序文件/配置/config/quality/render_rules.json` → `upgrade_sentinel.pinned_version`，本行是它的同形复述，由回归用例对撞。 |
 | Chrome | 稳定版 | 官方安装包 | 预览与渲染载体 |
 | DashScope API Key | — | 用户自备（可选） | qwen TTS 主引擎，正式交付必需；无 Key 时可显式声明 Edge-TTS 做零成本环境自检 |
 | GSAP（随仓 vendored） | 3.14.2 | 无需安装，随仓携带于 `程序文件/源码/hyperframes/quickstart-demo/gsap.min.js` | GreenSock Standard License（https://gsap.com/standard-license ），允许开源项目随附使用 |
@@ -57,6 +57,8 @@ npm install -g hyperframes@0.7.52
 # hyperframes，`npx` 会优先解析那份本地副本，`npm install -g` 覆盖不到它。先自证解析路径：
 #   node -e "const{createRequire}=require('module');console.log(createRequire(process.cwd()+'/x.js').resolve('hyperframes/package.json'))"
 # 结果指向全局包才算装到位；指向别处则该份本地件才是实际被调用的渲染器，须按上面表格的说明处理版本。
+# 解析到的那份能不能真正加载（版本号可读 ≠ 渲染入口可加载），再自证一次：
+#   python 程序文件/脚本/render_env_sentinel.py --check-render-env   （退出码 0 才可进入渲染）
 
 # 3. 跑回归测试验证环境（预期全部通过、0 失败）
 python 程序文件/脚本/regression_test.py --run-all

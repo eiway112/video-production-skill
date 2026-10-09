@@ -3797,6 +3797,12 @@ def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
                     # A04 末端终检的接线与裁定由用例53专门锁定；本夹具的槽位
                     # 判据测试不驱动真实 MediaQAGate（假文件必然 FAIL）
                     r._final_media_qa = lambda: True
+                    # 同上分工：渲染副本实测门禁（2026-10-09）由用例78 的 I 段专门锁定。
+                    # 本夹具驱动真实 step_render，若放它去跑真实 npx 探测，"宿主装了哪一版渲染器"
+                    # 就成了槽位用例的前置——2026-10-09 云端 gate 首跑正是这个形状：runner 上解析到
+                    # 0.8.143 → 判 FAIL → 本用例 D2"渲染成功"被别人的门禁拦掉（且第一次因缺属性直接
+                    # AttributeError）。桩在此处＝本用例只答"谁有权写交付槽位"，渲染环境面另有归属。
+                    r._render_env_gate_ok = lambda: True
                     r._can_skip = lambda name: False
                     r._gate_satisfied = lambda name: True
                     r._fingerprint = lambda name: "fixture"
@@ -9562,6 +9568,10 @@ def test_render_post_capture_deadline_guard() -> RegressionTestCase:
                 r._scene_patch_route = lambda: (False, "FULL", "no-baseline")
                 r._record_scene_patch = lambda *a, **k: None
                 r._render_budget_gate_ok = lambda: True
+                # 渲染副本实测门禁（2026-10-09 接入 step_render）由用例78 的 I 段专门锁定；
+                # 本段锁的是看门狗收尾上限与产物保留，放它真跑 npx 探测会把"宿主装了哪版渲染器"
+                # 变成本用例前置（与同段 _render_budget_gate_ok 桩同一分工理由）。
+                r._render_env_gate_ok = lambda: True
                 r._fingerprint = lambda step: "stable-fp"
                 r._log_seq = 0
                 r._current_step = None
@@ -10582,6 +10592,18 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
     G 报告面：FAIL 时打印留在钉住版的完整命令（版本号取自配置），UNTESTED 时点名
       "不得读成通过"
 
+    2026-10-09 本批追加（据消费侧《哨兵空壳识别缺口》裁定件；版本面读不到"入口 import 期即崩"）：
+    H 副本四腿：入口可加载三态（rc≠0 归因转述首行／超时与 npx 不可用判 UNTESTED 不判可用）、
+      版本随探测（非钉住且 ≥ 引入界时随 Chrome 探测；介于钉住与引入界之间判 UNTESTED 而非 PASS）、
+      平台原生包候选**由包自己的 optionalDependencies 的 os/cpu 形态推导**（脚本内不写死包名，
+      换一个原生依赖照样看得见）、require 无读数＝取数断链判 UNTESTED（不得读成"没失败即通过"）、
+      空壳二进制只 advisory——**同一夹具下"空壳在场"而 verdict 仍 PASS** 这条正面挡住
+      "把 esbuild 二进制在位写成门禁"的误判形态（本仓全局 0.7.52 即带空壳，同一副本出过片）
+    I pipeline_runner 接线：只由 FAIL 阻断、UNTESTED/阈值断链/模块取不回一律放行且留痕归因、
+      放行必须留痕（--accept-render-env / --force 两形分开）、state 真的落盘（重读文件）、
+      调用点在 step_render 源码区间内（防"建而未接"）
+    J 完工报告透出 render_env_check：有键即透传、缺键不造节（只透传不裁定）
+
     发布仓侧：导出清单按 §2.3/§3.3 属"明确不导出"，故 F 段在清单缺席时切成"确认缺席 +
     本脚本自身须在位"（render_env_sentinel.py 是 §2.1 导出项，缺它则 §6 那条约束在消费侧
     无载体），与用例67/71/72 同手法。
@@ -10593,6 +10615,12 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
     M7 EXIT_BY_VERDICT 把 UNTESTED 映射成 0（D2 抓）/ M8 FAIL 分支不打印处置命令（G1 抓）/
     M9 §6 补一句"超时 3 秒"（F10 抓）/ M10 §2.1 把脚本名改成 `.bak`（F5 抓）/
     M11 §6 安装命令钉成另一个版本号（F8 文档↔配置对撞抓）。
+    2026-10-09 批新增：M12 把空壳腿升进场（H8 抓）/ M13 require 无读数当通过（H7 抓）/
+    M14 平台候选改成写死包名清单（H5/H6 抓）/ M15 副本腿在默认模式也进场裁定（D5d 抓）/
+    M16 门禁把 UNTESTED 也阻断（I2 抓）/ M17 放行不留痕（I4 抓）/ M18 接线从 step_render
+    摘掉（I8 抓）/ M19 完工报告缺键也造节（J2 抓）/ M20 版本腿对"非钉住且低于引入界"直接
+    给 PASS（H16 抓）/ M21 新增阈值键不校验（E3b 抓）/ M22 调用点把取数上限写死回源码
+    （H25 抓）。
 
     两处**首版存活、补强后转红**，留痕防再犯（同 A12"子串匹配放过改名变异"一族）：
     ① F5 原写作 `"render_env_sentinel.py" in seg21`——`render_env_sentinel.py.bak` 含该子串，
@@ -10600,6 +10628,18 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
     ② G4 不是设计出来的变异，是**落地时自然踩到**：`print_report(result, stream=sys.stdout)`
       的 def 期默认值冻结原始流，`redirect_stdout` 捕不到报告，用例首跑即红（且污染控制台输出）
       ——与用例76"行宽不绑死在签名默认值"同因；现以签名默认 None + 原位注释锁定。
+    ③ 同族的第三处，本批按 ②与用例76 的既有教训**预先避开**（未重演缺陷，故不作"当场抓到"记）：
+      副本腿若把 `runner=subprocess.run` 写进签名默认值，回归换 `res.subprocess` 替身对它无效——
+      四腿会去真跑 npx，套件"零 npm 子进程"的前提静默失效，读数还看着全绿。现签名默认 None +
+      函数体内取真身，H 段以 runner 注入。
+    ④ **M22 首版存活**（夹具与写死值同数即恒真）：夹具 `copy_timeout_seconds` 原取 60.0，与变异体
+      在调用点写死的 `60` 数值相等（Python 里 `60 == 60.0`），"参数真从配置传入"的 H25 断言当场
+      为真，变异跑完照样全绿。夹具阈值改 77.0 后 M22 转红。判据：**夹具里用来验证"值是从配置流过来"
+      的数，必须与任何可能被写死进源码的候选值不同**——同 [[feedback-guard-must-still-fail]]，
+      这次是"注入值不得等于被替换值"。
+    ⑤ **M16 首版锚写反**：原变异把 `!= gs.FAIL` 改成 `!= gs.PASS`，实际语义是"连 FAIL 也放行"，
+      被 I1 抓到而不是 I2——标签与变异体不符即视为未验证。改成 `== gs.PASS`（真"把 UNTESTED 也阻断"）
+      后由 I2 抓回。判据：变异要证的是**标签那句语义**，落红不等于落对位置。
     """
     tc = RegressionTestCase(
         "render_env_upgrade_sentinel",
@@ -10618,13 +10658,20 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
             sys.path.insert(0, str(script_dir))
         import render_env_sentinel as res
 
-        # 合成版本：真实阈值只从配置文件读（E 段），夹具不得复述，否则 M5 型变异照样绿
+        # 合成版本：真实阈值只从配置文件读（E 段），夹具不得复述，否则 M5 型变异照样绿。
+        # copy_timeout_seconds 刻意取 77.0 而不是配置里的真值 60——夹具值若与"可能被写死进源码"
+        # 的那个数字相同，H25 型"参数真从配置传入"的断言就与"调用点写死 60"在数值上不可分辨
+        # （M22 首版即因此存活：evaluate 传 60、夹具也是 60，断言恒真）。
         RULES = {"pinned_version": "1.2.3", "probe_gate_since_version": "5.0.0",
-                 "timeout_seconds": 3.0}
+                 "timeout_seconds": 3.0, "copy_timeout_seconds": 77.0}
         REAL = {"resolve": res.resolve_probe_target,
                 "probe": res.probe_chrome_version,
                 "installed": res.installed_hyperframes_version,
                 "load": res.load_sentinel_rules,
+                "entry": res.render_copy_entry,
+                "cands": res.native_dep_candidates,
+                "native": res.load_native_deps,
+                "shells": res.native_binary_presence,
                 "subprocess": res.subprocess}
 
         def probe_status(rules, behavior):
@@ -10675,10 +10722,33 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
         tc.assert_equal(a6["status"], res.gs.UNTESTED, "A6 找不到二进制 → UNTESTED 而非 FAIL")
 
         # ── B/C/D 共用装配：探测腿与取数腿分别桩定 ──
-        def evaluate_with(probe_st, installed, target=None, rules=RULES):
+        def evaluate_with(probe_st, installed, target=None, rules=RULES,
+                          entry_st=None, entry_ver=None, cands="DEFAULT",
+                          native_st=None, hollow=None):
+            # 副本四腿默认装成健康。理由：advisory 腿照常计入 counts，把 B/C/D/G 段的夹具装成
+            # 坏值等于**静默改写旧断言锁的读数**（旧段锁的是升级面，与副本坏不坏无关）。
+            os_tag, cpu = res.platform_tags()
+            plat_key = f"@fns/{os_tag}-{cpu}"
+
+            def _cands(pkg):
+                if cands == "BROKEN":
+                    return None, "fixture：副本 package.json 不可解析"
+                if cands == "DEFAULT":
+                    return [{"dependency": "fake-native", "platform_packages": [plat_key]}], f"{os_tag}/{cpu}"
+                return cands, f"{os_tag}/{cpu}"
+
             res.resolve_probe_target = lambda: (Path("fake-chrome.exe"), "fixture")
             res.probe_chrome_version = lambda exe, t: {"status": probe_st, "reason": "stub"}
-            res.installed_hyperframes_version = lambda: installed
+            res.installed_hyperframes_version = lambda *a, **k: installed
+            res.render_copy_entry = lambda t, runner=None, cwd=None: {
+                "status": entry_st or res.gs.PASS,
+                "version": entry_ver if entry_ver is not None else rules["pinned_version"],
+                "reason": "entry-stub"}
+            res.native_dep_candidates = _cands
+            res.load_native_deps = lambda c, p, t, runner=None: (
+                {"status": res.gs.NOT_APPLICABLE, "reason": "无本平台原生依赖候选"}
+                if not c else {"status": native_st or res.gs.PASS, "reason": "native-stub"})
+            res.native_binary_presence = lambda c, p: list(hollow or [])
             return res.evaluate(rules=dict(rules), target=target)
 
         res.load_sentinel_rules = lambda *a, **k: dict(RULES)
@@ -10760,8 +10830,24 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
             tc.assert_equal(rc, 1,
                             "D5 未给 --target 时问的是'本机能否安全升级'，探测 FAIL 即进场判红"
                             "（C 段的降级不得把这半边也放过去）")
-            tc.assert_true("(advisory，不进裁定)" not in buf.getvalue(),
-                           "D5b 未给 --target 时不出现降级标记——进场面只由 --target 触发")
+            d5 = buf.getvalue()
+
+            def leg_line(text, name):
+                return next(l for l in text.splitlines() if name in l)
+
+            tc.assert_true("(advisory，不进裁定)" not in leg_line(d5, "chrome_version_probe")
+                           and "(advisory，不进裁定)" not in leg_line(d5, "installed_version_within_gate"),
+                           "D5b 未给 --target 时升级面两腿照常进场（本批不得把既有裁定面静默降级）")
+            tc.assert_true("(advisory，不进裁定)" in leg_line(d5, "render_copy_entry_loadable"),
+                           "D5c 副本腿在升级模式点名 advisory——读者无从知道某行进不进裁定＝"
+                           "与'漏标'同害，降级标记必须逐条落打印面")
+            d5x = evaluate_with(res.gs.PASS, ("1.2.3", "fixture"), entry_st=res.gs.FAIL)
+            tc.assert_equal(d5x["verdict"], res.gs.PASS,
+                            "D5d 副本判坏**不改升级裁定**（默认模式既有契约零变化）：升级面问的是"
+                            "'这台机器能否升到引入界'，与'现在这份副本坏没坏'是两个问题；"
+                            "若副本腿在默认模式也进场，M15 型变异（把 advisory 改回裁定）当场转红")
+            tc.assert_equal(d5x["counts"][res.gs.FAIL], 1,
+                            "D5e 降级的是裁定权不是读数：副本 FAIL 仍计入 counts 并打印（同 C1c）")
 
             # ── G：报告面 ──
             buf = _io.StringIO()
@@ -10797,20 +10883,35 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
                            "G5b 该说明里的引入界数字取自配置（夹具阈值 5.0.0，非源码字面量）")
             # 只数逐条腿行上的标记，不数"advisory"这个单词——N/A 说明行本身也要提它，
             # 按单词计数会把 2 条腿读成 3 处（本批实跑第一次就中招）
-            tc.assert_equal(g5.count("(advisory，不进裁定)"), 2,
-                            "G6 被降级的两条腿各自点名标记（漏标＝读者无从知道该行不参与裁定）")
+            tc.assert_equal(g5.count("(advisory，不进裁定)"), 6,
+                            "G6 被降级的六条腿各自点名标记（漏标＝读者无从知道该行不参与裁定）。"
+                            "2026-10-07 本用例立起时为 2 条（探测腿＋安装腿），2026-10-09 批新增"
+                            "四条副本腿在 --target 模式下同降 advisory；写死条数是刻意的——"
+                            "多一条腿漏标即红")
         finally:
             res.resolve_probe_target = REAL["resolve"]
             res.probe_chrome_version = REAL["probe"]
             res.installed_hyperframes_version = REAL["installed"]
             res.load_sentinel_rules = REAL["load"]
+            res.render_copy_entry = REAL["entry"]
+            res.native_dep_candidates = REAL["cands"]
+            res.load_native_deps = REAL["native"]
+            res.native_binary_presence = REAL["shells"]
 
         # ── E：阈值 fail-closed + 单源 ──
         import tempfile as _tf
         with _tf.TemporaryDirectory() as td:
             p = Path(td) / "render_rules.json"
-            tc.assert_equal(isinstance(res.load_sentinel_rules(res.RULES_PATH), dict), True,
-                           "E0 真实配置文件可加载且三键齐（现读，非夹具）")
+            _live0 = res.load_sentinel_rules(res.RULES_PATH)
+            tc.assert_equal(isinstance(_live0, dict), True,
+                            "E0 真实配置文件可加载且必需键齐（现读，非夹具）")
+            tc.assert_equal(sorted(_live0), sorted(["pinned_version", "probe_gate_since_version",
+                                                    "timeout_seconds", "copy_timeout_seconds"]),
+                            "E0b 返回键集合恰为四键——多一个阈值少一条映射，副本腿就按 KeyError "
+                            "或内置默认跑，而配置里明明写着别的值（A06 登记面≠读取面同族）")
+            tc.assert_true(isinstance(_live0["copy_timeout_seconds"], float)
+                           and _live0["copy_timeout_seconds"] > 0,
+                           "E0c 副本取数上限在真实配置里可达（本批新增键的接线证据）")
             p.write_text(_json.dumps({"watchdog": {}}), encoding="utf-8")
             try:
                 res.load_sentinel_rules(p); e1 = False
@@ -10824,17 +10925,35 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
             except RuntimeError as ex:
                 e2 = str(ex)
             tc.assert_true("probe_gate_since_version" in e2 and
-                           "chrome_version_probe_timeout_seconds" in e2,
-                           f"E2 缺键报错须点名缺失键（实得：{e2[:60]}）")
+                           "chrome_version_probe_timeout_seconds" in e2 and
+                           "render_copy_probe_timeout_seconds" in e2,
+                           f"E2 缺键报错须点名**全部**缺失键，含本批新增的副本阈值"
+                           f"（实得：{e2[:90]}）——漏点名即调用方不知道该补哪一条")
             for bad in (0, -1, "3.0", None):
+                # 夹具必须带齐其余必需键：否则循环体因"缺 render_copy_probe_timeout_seconds"
+                # 而抛错，本段宣称的"非法值被拒收"会静默变成"缺键被拒收"的恒真复读
+                # （本批新增必需键时当场查到此风险）。
                 p.write_text(_json.dumps({res.RULES_SECTION: {
                     "pinned_version": "1.2.3", "probe_gate_since_version": "5.0.0",
-                    "chrome_version_probe_timeout_seconds": bad}}), encoding="utf-8")
+                    "chrome_version_probe_timeout_seconds": bad,
+                    "render_copy_probe_timeout_seconds": 60}}), encoding="utf-8")
                 try:
                     res.load_sentinel_rules(p); ok = False
                 except RuntimeError:
                     ok = True
                 tc.assert_true(ok, f"E3 非法阈值 {bad!r} 必须拒收")
+            for bad2 in (0, -1, "60", None):
+                p.write_text(_json.dumps({res.RULES_SECTION: {
+                    "pinned_version": "1.2.3", "probe_gate_since_version": "5.0.0",
+                    "chrome_version_probe_timeout_seconds": 3.0,
+                    "render_copy_probe_timeout_seconds": bad2}}), encoding="utf-8")
+                try:
+                    res.load_sentinel_rules(p); ok2 = ""
+                except RuntimeError as ex2:
+                    ok2 = str(ex2)
+                tc.assert_true("render_copy_probe_timeout_seconds" in ok2,
+                               f"E3b 副本取数上限非法值 {bad2!r} 必须**点名该键**拒收（M21 靶子："
+                               f"不校验新键则整段静默绿）")
             try:
                 res.load_sentinel_rules(Path(td) / "nope.json"); e4 = False
             except RuntimeError:
@@ -10847,9 +10966,499 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
                        RULES["timeout_seconds"], 5e3, 5.0):
             tc.assert_true(banned not in literals,
                            f"E5 判据值 {banned!r} 不住源码（唯一住在 render_rules.json）")
+        # 取数上限单独用**接线位点**判，而不是混进上面的字面量全集：本文件里有
+        # `{...[:60]!r}` 这类输出截断常量，与配置里的 60 在数值上相等（Python 里 60 == 60.0），
+        # 按全集比对会把无关截断读成"阈值写死"——判据一旦误报，下一轮就有人放宽它。
+        # 真正的缺陷形态是"子进程 timeout= 收数字字面量"，那就只扫那一个位置（M5/M21 的共同靶子）。
+        _timeouts = [k.value.value
+                     for node in ast.walk(ast.parse(src)) if isinstance(node, ast.Call)
+                     for k in node.keywords
+                     if k.arg == "timeout" and isinstance(k.value, ast.Constant)
+                     and isinstance(k.value.value, (int, float))]
+        tc.assert_equal(_timeouts, [],
+                        f"E5b 任何子进程 timeout= 的实参都不得是数字字面量（现读 {_timeouts}）——"
+                        "墙钟上限住在 render_rules.json→upgrade_sentinel，"
+                        "写死即'配置断链'与'配置恰好等于旧值'不可分辨")
         tc.assert_true(set(res.REQUIRED_KEYS) == {
-            "pinned_version", "probe_gate_since_version", "chrome_version_probe_timeout_seconds"},
-            "E6 必需键清单与配置节同形（改名即红）")
+            "pinned_version", "probe_gate_since_version", "chrome_version_probe_timeout_seconds",
+            "render_copy_probe_timeout_seconds"},
+            "E6 必需键清单与配置节同形（改名即红；本批新增键必须在这两处同时在场）")
+
+        # ── H：渲染副本四腿（2026-10-09 批。版本面读不到"入口 import 期即崩"，消费侧两份
+        #        致命日志即此形态；全部走桩与夹具目录，套件零 npx／零 node／零 Chrome）──
+        def entry_status(behavior, timeout=60.0, cwd=None):
+            captured = {}
+
+            def run(cmd, **kw):
+                captured["cmd"] = cmd
+                captured["kw"] = kw
+                return behavior(cmd, kw)
+            fake = types.SimpleNamespace(TimeoutExpired=_sp.TimeoutExpired, run=run)
+            res.subprocess = fake
+            try:
+                out = res.render_copy_entry(timeout, cwd=cwd)
+            finally:
+                res.subprocess = REAL["subprocess"]
+            out["_cmd"] = captured.get("cmd", [])
+            out["_kw"] = captured.get("kw", {})
+            return out
+
+        def ENTRY_OK(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="0.7.52\n", stderr="")
+
+        def ENTRY_CRASH(*a, **k):
+            return types.SimpleNamespace(
+                returncode=1, stdout="",
+                stderr="Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'esbuild' "
+                       "imported from …\\node_modules\\hyperframes\\dist\\cli.js\n")
+
+        def ENTRY_NOVER(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="no version here\n", stderr="")
+
+        def ENTRY_SLOW(*a, **k):
+            raise _sp.TimeoutExpired(cmd="npx.cmd", timeout=1)
+
+        def ENTRY_OSE(*a, **k):
+            raise OSError(2, "npx.cmd not found")
+
+        h1 = entry_status(ENTRY_OK)
+        tc.assert_equal(h1["status"], res.gs.PASS, "H1 入口秒回且带版本号 → PASS")
+        tc.assert_equal(h1["version"], "0.7.52", "H1b 版本号取回（版本腿的唯一数据源）")
+        tc.assert_equal(h1["_cmd"], ["npx.cmd", "--no-install", "hyperframes", "--version"],
+                        "H1c 取数走渲染命令同款解析链（npx 而非 npm root -g），且整条命令逐位对撞"
+                        "——换第二份副本读取即 A06'登记面≠真实读取路径'同族缺陷")
+        h2 = entry_status(ENTRY_CRASH)
+        tc.assert_equal(h2["status"], res.gs.FAIL,
+                        "H2 入口 import 期即崩 → FAIL，版本号在场也不放过（消费侧 10-09 形态）")
+        tc.assert_true("ERR_MODULE_NOT_FOUND" in h2["reason"],
+                       "H2b 归因转述子进程首行（只印状态不印原因＝无从整改）")
+        h3 = entry_status(ENTRY_NOVER)
+        tc.assert_equal(h3["status"], res.gs.UNTESTED, "H3 跑通但读不到版本号 → UNTESTED 而非猜测")
+        h4 = entry_status(ENTRY_SLOW)
+        tc.assert_equal(h4["status"], res.gs.UNTESTED,
+                        "H4 探测超时判 UNTESTED 而非 FAIL——取数未成不得当成“副本坏了”，"
+                        "否则网络/宿主抖动会阻断一次本来能成功的渲染")
+        h5 = entry_status(ENTRY_OSE)
+        tc.assert_equal(h5["status"], res.gs.UNTESTED, "H5 npx 不可用 → UNTESTED")
+        tc.assert_equal(entry_status(ENTRY_OK, timeout=7.0)["_kw"]["timeout"], 7.0,
+                        "H5b 取数上限由调用方传入（阈值住配置，非源码字面量）")
+
+        # 候选推导：夹具用**当前机器**的 os/cpu 标签构造，换平台照样判得动
+        os_tag, cpu_tag = res.platform_tags()
+        plat_hollow = f"@fns/{os_tag}-{cpu_tag}"
+        plat_full = f"@gns/{os_tag}-{cpu_tag}"
+        plat_absent = f"@hns/{os_tag}-{cpu_tag}"
+        other_plat = "@fns/other-plat-x99"
+        with _tf.TemporaryDirectory() as td3:
+            copy = Path(td3) / "hyperframes"
+            for sub in (plat_hollow, plat_full, "fake-native", "plain-dep"):
+                (copy / "node_modules" / sub).mkdir(parents=True)
+            (copy / "package.json").write_text(_json.dumps({
+                "name": "hyperframes", "version": "1.2.3",
+                "dependencies": {"fake-native": "1.0.0", "plain-dep": "1.0.0",
+                                "absent-dep": "1.0.0"}}), encoding="utf-8")
+            (copy / "node_modules" / "fake-native" / "package.json").write_text(_json.dumps({
+                "name": "fake-native",
+                "optionalDependencies": {plat_hollow: "1.0.0", plat_full: "1.0.0",
+                                         plat_absent: "1.0.0", other_plat: "1.0.0"}}),
+                encoding="utf-8")
+            (copy / "node_modules" / "plain-dep" / "package.json").write_text(
+                _json.dumps({"name": "plain-dep"}), encoding="utf-8")
+            (copy / "node_modules" / plat_hollow / "README.md").write_text("stub", encoding="utf-8")
+            (copy / "node_modules" / plat_hollow / "package.json").write_text("{}", encoding="utf-8")
+            (copy / "node_modules" / plat_full / "native-thing.node").write_bytes(b"\x7fELF")
+            hc, hn = res.native_dep_candidates(copy)
+            tc.assert_equal([x["dependency"] for x in hc], ["fake-native"],
+                            "H6 候选由包自己的 optionalDependencies 推导——纯 JS 依赖不入选，"
+                            "脚本内不写死包名（换一个原生依赖照样看得见）")
+            tc.assert_equal(hc[0]["platform_packages"], [plat_hollow, plat_full, plat_absent],
+                            f"H6b 只选与当前 {os_tag}/{cpu_tag} 匹配的平台包，"
+                            "other-plat-x99 不得混入（顺序按 sorted，夹具里三个平台包声明次序随机）")
+            tc.assert_true("absent-dep" not in _json.dumps(hc),
+                           "H6c 整包缺失的依赖不在本腿重复裁定（由入口腿的 import 崩溃裁，"
+                           "同一缺陷两处裁定＝双源且 counts 虚高）")
+            hl = res.native_binary_presence(hc, copy)
+            tc.assert_true(any(plat_hollow in s for s in hl) and
+                           not any(plat_full in s for s in hl),
+                           "H7 空壳（无二进制文件）被点名、含 .node 真身的不被点名——"
+                           "该腿只作 advisory，永不进裁定")
+            tc.assert_true(any(plat_absent in s and "未安装" in s for s in hl),
+                           "H7b 声明了却没装的平台包另归一类点名（与'装了但是空壳'分开）")
+            h_missing = res.native_dep_candidates(Path(td3) / "nope")
+            tc.assert_true(h_missing[0] is None and "不可解析" in h_missing[1],
+                           "H7c 副本 package.json 取不回 → (None, 归因)，不得返回空表当'无候选'"
+                           "（空表在腿里判 NOT_APPLICABLE，等于把断链读成'这机器没有原生依赖'）")
+
+        def REQ_OK(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="fake-native=OK\n", stderr="")
+
+        def REQ_BAD(*a, **k):
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="fake-native=FAIL:Could not load the \"sharp\" module using the "
+                       "win32-x64 runtime\n", stderr="")
+
+        def REQ_SILENT(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def REQ_KILLED(*a, **k):
+            return types.SimpleNamespace(returncode=7, stdout="", stderr="node crashed")
+
+        def req_status(behavior, cands=None):
+            fake = types.SimpleNamespace(TimeoutExpired=_sp.TimeoutExpired, run=behavior)
+            res.subprocess = fake
+            try:
+                return res.load_native_deps(cands if cands is not None else
+                                            [{"dependency": "fake-native",
+                                              "platform_packages": ["@fns/x"]}],
+                                            Path("fixture-copy"), 60.0)
+            finally:
+                res.subprocess = REAL["subprocess"]
+
+        tc.assert_equal(req_status(REQ_OK)["status"], res.gs.PASS, "H8 require 全过 → PASS")
+        rb = req_status(REQ_BAD)
+        tc.assert_equal(rb["status"], res.gs.FAIL,
+                        "H9 '目录在但加载即抛'判 FAIL（消费侧 10-09 第二份日志形态）")
+        tc.assert_true("win32-x64" in rb["reason"] and "fake-native" in rb["reason"],
+                       "H9b 失败归因带包名与首行——只报'有一个坏了'等于无从整改")
+        tc.assert_equal(req_status(REQ_SILENT)["status"], res.gs.UNTESTED,
+                        "H10 子进程没给任何读数 → UNTESTED，不得由'没有 FAIL'反推通过")
+        tc.assert_equal(req_status(REQ_KILLED)["status"], res.gs.FAIL,
+                        "H11 require 进程非零退出且无读数 → FAIL（渲染同样起不来）")
+        tc.assert_equal(res.load_native_deps([], Path("x"), 60.0)["status"],
+                        res.gs.NOT_APPLICABLE,
+                        "H12 无候选判 NOT_APPLICABLE 而非 PASS（N/A 不计通过，四态纪律）")
+
+        res.load_sentinel_rules = lambda *a, **k: dict(RULES)
+        try:
+            he1 = evaluate_with(res.gs.PASS, ("1.2.3", "fixture/package.json"),
+                                entry_st=res.gs.FAIL)
+            v1 = he1["verdict"]        # 默认模式＝升级面的裁定
+            tc.assert_equal(he1["mode"], "upgrade", "H13a 未给模式时标记为升级面")
+            # 同一装配只换问法：升级面不受副本腿影响（D5d 已从裁定侧锁），渲染面必须由副本腿判红，
+            # 且 Chrome 探测腿降为 advisory。
+            he3 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            tc.assert_equal(he3["verdict"], res.gs.FAIL, "H13 副本入口崩 → 渲染面 FAIL")
+            tc.assert_true(all(o.get("adjudicates") is False for o in he3["outcomes"]
+                               if o["name"] in ("chrome_version_probe",
+                                                "installed_version_within_gate")),
+                           "H13b 渲染面里升级两腿降 advisory——两问各自要有答案")
+            tc.assert_equal(v1, res.gs.PASS, "H13c 同读数下升级面裁定不变（模式分岔不串味）")
+            evaluate_with(res.gs.PASS, ("1.2.3", "fixture/path/package.json"),
+                          hollow=[f"{plat_hollow}(仅 2 个非二进制文件)"])
+            he4 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            tc.assert_equal(he4["verdict"], res.gs.PASS,
+                            "H14 **同一夹具下空壳在场而渲染面仍 PASS**——正面挡住"
+                            "'把 esbuild 二进制在位写成门禁'的误判形态（本仓全局 0.7.52 即带空壳、"
+                            "同一副本 10-07 出过片；消费侧建议判据在本机的反证）")
+            tc.assert_equal(he4["counts"][res.gs.FAIL], 1,
+                            "H14b 空壳仍照常计数并打印（降级的是裁定权不是读数）")
+            evaluate_with(res.gs.FAIL, ("1.2.3", "f/package.json"), entry_ver="9.9.9")
+            he5 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            tc.assert_equal([o for o in he5["outcomes"]
+                             if o["name"] == "render_copy_version_within_gate"][0]["status"],
+                            res.gs.FAIL,
+                            "H15 解析到 ≥ 引入界的非钉住版本时，版本腿随 Chrome 探测判红")
+            evaluate_with(res.gs.PASS, ("1.2.3", "f/package.json"), entry_ver="9.9.9")
+            he6 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            tc.assert_equal([o for o in he6["outcomes"]
+                             if o["name"] == "render_copy_version_within_gate"][0]["status"],
+                            res.gs.PASS,
+                            "H15b 同版本在探测健康的机器上判 PASS——本判据不禁止非钉住版，"
+                            "只禁止'在本机必崩'的那一档")
+            evaluate_with(res.gs.PASS, ("1.2.3", "f/package.json"), entry_ver="2.0.0")
+            he7 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            hv7 = [o for o in he7["outcomes"]
+                   if o["name"] == "render_copy_version_within_gate"][0]
+            tc.assert_equal(hv7["status"], res.gs.UNTESTED,
+                            "H16 既非钉住又低于引入界 → UNTESTED 而非 PASS（M20 靶子：无实证数据"
+                            "不得写成已验证，也不得判红——那是本仓未观测的形态）")
+            tc.assert_equal(he7["verdict"], res.gs.UNTESTED,
+                            "H16b 该 UNTESTED 进裁定（渲染面），但流水线侧只由 FAIL 阻断（I2 锁）")
+            evaluate_with(res.gs.PASS, (None, "npm root -g 不可用：timeout"))
+            he8 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            hn8 = [o for o in he8["outcomes"] if o["name"] == "render_copy_native_deps"][0]
+            tc.assert_equal(hn8["status"], res.gs.UNTESTED,
+                            "H17 副本位置取不回 → 原生依赖腿 UNTESTED（不得读成'无原生依赖即健康'）")
+            tc.assert_true("npm root -g" in hn8["reason"], "H17b 未测归因转述到读数面")
+            evaluate_with(res.gs.PASS, ("1.2.3", "f/package.json"), cands="BROKEN")
+            he9 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            tc.assert_equal([o for o in he9["outcomes"]
+                             if o["name"] == "render_copy_native_deps"][0]["status"],
+                            res.gs.UNTESTED, "H18 候选推导断链 → UNTESTED，不得短路成空表判干净")
+            evaluate_with(res.gs.PASS, ("4.0.0", "f/package.json"), entry_ver="1.2.3")
+            he10 = res.evaluate(rules=dict(RULES), check_render_env=True)
+            hn10 = [o for o in he10["outcomes"] if o["name"] == "render_copy_native_deps"][0]
+            tc.assert_true(hn10.get("copy_source_mismatch") is True and
+                           "两非同一副本" in hn10["reason"],
+                           "H19 腿C 取 npm root -g、腿A 取 npx 解析那份；两者版本不一致时本腿读数"
+                           "必须点名'描述的是另一副本'（A06 同族：不点名就会被读成对渲染那份的裁定）")
+            buf = _io.StringIO()
+            errbuf = _io.StringIO()
+            evaluate_with(res.gs.PASS, ("1.2.3", "f/package.json"))
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(errbuf):
+                rc_h = res.main(["--check-render-env", "--target", "9.0.0"])
+            tc.assert_equal(rc_h, 2,
+                            "H20 两问不得同时问：--check-render-env 与 --target 互斥，"
+                            "合并裁定会让退出码说不出它答的是哪个问题")
+            tc.assert_true("--check-render-env" in errbuf.getvalue(),
+                           "H20b 互斥归因印到 stderr（只改退出码＝读者不知道自己做错了什么）")
+            buf = _io.StringIO()
+            # 渲染面 FAIL 的现场＝入口腿判坏（消费侧形态），Chrome 探测腿照常秒回，
+            # 否则这条断言会在"升级面判红"上偶然变绿——两种坏法给出的处置完全不同。
+            evaluate_with(res.gs.PASS, ("1.2.3", "f/package.json"),
+                          entry_st=res.gs.FAIL, entry_ver="1.2.3")
+            with contextlib.redirect_stdout(buf):
+                rc_he = res.main(["--check-render-env"])
+            he_txt = buf.getvalue()
+            tc.assert_equal(rc_he, 1, "H21 渲染面 FAIL → 退出码 1")
+            tc.assert_true("npm install -g hyperframes@1.2.3" in he_txt,
+                           "H22 渲染面 FAIL 的处置落回副本本身（版本号取自配置夹具 1.2.3），"
+                           "不得沿用升级面那句'别升到 ≥ 引入界'——那是另一个问题的答案")
+            tc.assert_true("渲染副本实测裁定" in he_txt,
+                           "H23 标题点名本次问的是哪个问题（同读数两种问法结论不同，"
+                           "不写清就会有人拿渲染面结论去做升级决策）")
+            buf = _io.StringIO()
+            evaluate_with(res.gs.PASS, ("1.2.3", "f/package.json"), entry_st=res.gs.UNTESTED)
+            with contextlib.redirect_stdout(buf):
+                rc_hu = res.main(["--check-render-env"])
+            tc.assert_equal(rc_hu, 2, "H24 副本腿取数未成 → 退出码 2（UNTESTED 不映射成 0）")
+            _seen = {}
+
+            def _inst(t=None):
+                _seen["t"] = t
+                return ("1.2.3", "f/package.json")
+
+            res.installed_hyperframes_version = _inst
+            res.evaluate(rules=dict(RULES))
+            tc.assert_equal(_seen.get("t"), RULES["copy_timeout_seconds"],
+                            "H25 npm 取数腿的墙钟上限由调用方从配置传入——本批把源码里写死的 60 "
+                            "收归配置（E5 的机算检查当场逮到它）。留内置默认等于让'配置断链'与"
+                            "'配置恰好写着同一个值'在读数面上不可分辨（A06/A10 同族）")
+
+            # H26/H27：2026-10-09 云端 gate 首跑抓到的两条取数面缺陷（本机因装了钉住版看不见）。
+            # 此处必须先退回真身：上面若干 evaluate_with(...) 已把 render_copy_entry 换成夹具替身，
+            # 拿替身量 argv/cwd 会得到"断言读不到东西"的假红（H1c 在段首跑时真身还在，故当时能过）。
+            res.render_copy_entry = REAL["entry"]
+            h26 = entry_status(ENTRY_OK)
+            _c = list(h26["_cmd"])
+            tc.assert_true(res.NPX_NO_INSTALL in _c and _c.index(res.NPX_NO_INSTALL) < _c.index("hyperframes"),
+                           f"H26 入口探测必须带 {res.NPX_NO_INSTALL} 且在包名之前——runner 实测裸 npx "
+                           "会去 registry 把最新版装上再执行（解析到 0.8.143、耗满 60s），"
+                           "自称只读的探测不该亲手装上本判据要防的危险版本（M23 靶子：摘掉该位即红）")
+            h27 = entry_status(ENTRY_OK, cwd=r"D:\fixture\html_project")
+            tc.assert_equal(h27["_kw"].get("cwd"), r"D:\fixture\html_project",
+                            "H27 探测必须跑在渲染命令将来用的 cwd 上——npx 解析随 cwd 变"
+                            "（项目内 node_modules 优先），不传就是问 A 处答 B 处（A06 同族）")
+            tc.assert_equal(entry_status(ENTRY_OK)["_kw"].get("cwd", "缺席"), None,
+                            "H27b 未给 cwd 时显式传 None（键缺席与 None 两种形态在替身读数上"
+                            "不可分辨，写死一种＝变异摘掉参数也能绿）")
+        finally:
+            # 本段用到的桩全部退回真身：F/J 段在后面还要读真实配置与真实模块，
+            # 留着上一条的替身会让"下一轮新增的断言"读到夹具值却自称实测。
+            res.load_sentinel_rules = REAL["load"]
+            res.resolve_probe_target = REAL["resolve"]
+            res.probe_chrome_version = REAL["probe"]
+            res.installed_hyperframes_version = REAL["installed"]
+            res.render_copy_entry = REAL["entry"]
+            res.native_dep_candidates = REAL["cands"]
+            res.load_native_deps = REAL["native"]
+            res.native_binary_presence = REAL["shells"]
+
+        # ── I：pipeline_runner 接线（"条文在位但没人调用"是本批要消除的形态本身）──
+        import pipeline_runner as pr
+
+        class _GateSelf:
+            _record_render_env_check = pr.PipelineRunner._record_render_env_check
+            _render_env_gate_ok = pr.PipelineRunner._render_env_gate_ok
+
+            def __init__(self, state, force=False, accept=False, source_dir=None):
+                self.state = state
+                self.force = force
+                self.accept_render_env = accept
+                # 腿A 的取数目录：真实 runner 上它是 HTML 项目目录（step_render 用它起渲染）
+                self.source_dir = source_dir
+
+        def mk_result(verdict, entry_reason="entry stub", resolved="1.2.3",
+                      hollow=(), mismatch=False, native_st=None):
+            return {"verdict": verdict, "mode": "check_render_env",
+                    "rules": {"pinned_version": "1.2.3"},
+                    "counts": {},
+                    "outcomes": [
+                        {"name": "chrome_version_probe", "status": res.gs.PASS,
+                         "adjudicates": False, "reason": "adv"},
+                        {"name": "render_copy_entry_loadable", "status": verdict,
+                         "adjudicates": True, "reason": entry_reason, "version": resolved},
+                        {"name": "render_copy_native_deps", "status": native_st or res.gs.PASS,
+                         "adjudicates": True, "reason": "native stub",
+                         "copy_source_mismatch": mismatch},
+                        {"name": "render_copy_native_binaries", "status": res.gs.FAIL,
+                         "adjudicates": False, "reason": "hollow stub", "hollow": list(hollow)}]}
+
+        _real_sentinel_mod = sys.modules.get("render_env_sentinel")
+        with _tf.TemporaryDirectory() as td4, contextlib.ExitStack() as _stack:
+            # 桩模块与夹具同生命周期退出：本段存在抛错路径（夹具装配失败即整案红），
+            # 裸 restore 会把假模块留给同进程后续用例——那之后的"绿"就不作数了。
+            _stack.callback(sys.modules.__setitem__, "render_env_sentinel", _real_sentinel_mod)
+            def gate(verdict, **kw):
+                force = kw.pop("force", False)
+                accept = kw.pop("accept_render_env", False)
+                src = kw.pop("source_dir", None)
+                fake = types.ModuleType("render_env_sentinel")
+                fake.gs = res.gs
+                payload = mk_result(verdict, **kw)
+                seen = {}
+
+                def _ev(**k):
+                    seen.update(k)   # 门禁把哪些参数交给哨兵＝取数面的实际形状（I10 取此裁定）
+                    return payload
+                fake.evaluate = _ev
+                gate.seen = seen
+                sys.modules["render_env_sentinel"] = fake
+                st = pr.PipelineState(Path(td4) / "pipeline_state.json")
+                st.data["steps"] = {}
+                st.mark_started("render")   # 真实时序：step_render 先 mark_started 再过本门禁，
+                                            # mark_failed 依赖该步条目已在（跳过这步会 KeyError 假红）
+                obj = _GateSelf(st, force=force, accept=accept,
+                                source_dir=src or (Path(td4) / "html_project"))
+                buf = _io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    ok = obj._render_env_gate_ok()
+                on_disk = _json.loads((Path(td4) / "pipeline_state.json").read_text(encoding="utf-8"))
+                return ok, st, on_disk, buf.getvalue()
+
+            ok1, st1, disk1, txt1 = gate(res.gs.FAIL, entry_reason="ERR_MODULE_NOT_FOUND")
+            tc.assert_equal(ok1, False, "I1 副本入口判坏 → 阻断渲染起跑")
+            tc.assert_equal(disk1["render_env_check"]["decision"], "blocked",
+                            "I1b 结论真的落盘（重读 state 文件；摘掉 state.save() 即红）")
+            tc.assert_equal(st1.data["steps"]["render"]["error_code"], pr.GATE_BLOCKED,
+                            "I1c 失败码用 GATE_BLOCKED 而非随手 VERIFY_FAILED（错误码是归因面）")
+            tc.assert_true("npm install -g hyperframes@1.2.3" in txt1,
+                           "I1d 阻断时给出可执行的处置命令（版本号来自哨兵读数，不在本仓复述）")
+            ok2, st2, disk2, _t2 = gate(res.gs.UNTESTED)
+            tc.assert_equal(ok2, True,
+                            "I2 取数未成**不阻断**——把'没测成'当'不合格'会把离线/异机环境一律拦死")
+            tc.assert_equal(disk2["render_env_check"]["decision"], "not_adjudicated",
+                            "I2b 未测仍留痕并点名，不得静默跳过")
+            ok3, _s3, disk3, txt3 = gate(res.gs.PASS, hollow=[f"{plat_hollow}(仅 2 个非二进制文件)"],
+                                          mismatch=True)
+            tc.assert_equal(ok3, True, "I3 空壳在场（advisory）不阻断：本仓健康基线的行为断言")
+            tc.assert_equal(disk3["render_env_check"]["hollow_native_packages"],
+                            [f"{plat_hollow}(仅 2 个非二进制文件)"],
+                            "I3b 空壳读数进留痕（放行面可追溯，不得只活在控制台）")
+            tc.assert_equal(disk3["render_env_check"]["copy_source_mismatch"], True,
+                            "I3c 两取数面指向不同副本的事实随留痕透出")
+            tc.assert_true("advisory" in txt3, "I3d advisory 腿在流水线打印面也点名，不静默")
+            ok4, _s4, disk4, txt4 = gate(res.gs.FAIL, accept_render_env=True)
+            tc.assert_equal(ok4, True, "I4 --accept-render-env 显式放行")
+            tc.assert_equal(disk4["render_env_check"]["decision"], "accepted",
+                            "I4b 放行必须留痕（M17 靶子：放行改回静默 return True 即红）")
+            tc.assert_true("--accept-render-env" in txt4, "I4c 放行原因点名旗标")
+            ok5, _s5, disk5, _t5 = gate(res.gs.FAIL, force=True)
+            tc.assert_equal(disk5["render_env_check"]["decision"], "bypassed_via_force",
+                            "I5 --force 与 --accept-render-env 两种放行分开留痕（同键混记＝"
+                            "审计时分不清是谁越过的）")
+            tc.assert_equal(ok5, True, "I5b --force 照常放行")
+            tc.assert_equal(gate.seen.get("copy_cwd"), str(Path(td4) / "html_project"),
+                            "I10 门禁把渲染将用的目录（source_dir）作为 copy_cwd 交给哨兵——"
+                            "npx 解析随 cwd 变，不传就是问 A 处答 B 处（A06 同族；2026-10-09 "
+                            "云端首跑另证：不传时探测在流水线工作目录里跑）")
+
+            fake_broken = types.ModuleType("render_env_sentinel")
+            fake_broken.gs = res.gs
+
+            def _boom(**k):
+                raise RuntimeError("upgrade_sentinel 缺键：['render_copy_probe_timeout_seconds']")
+            fake_broken.evaluate = _boom
+            sys.modules["render_env_sentinel"] = fake_broken
+            st6 = pr.PipelineState(Path(td4) / "state6.json")
+            buf6 = _io.StringIO()
+            with contextlib.redirect_stdout(buf6):
+                ok6 = _GateSelf(st6)._render_env_gate_ok()
+            tc.assert_equal(ok6, True,
+                            "I6 阈值权威源断链按未测处理，不阻断——判据读不回时不得由流水线"
+                            "自带的第二份默认值裁定（A06/A10 同族）")
+            tc.assert_true("rules:" in st6.data["render_env_check"]["reason"],
+                           "I6b 未测归因区分'哨兵抛错'与'副本真坏'")
+
+            sys.modules["render_env_sentinel"] = None   # import 即 ImportError
+            st7 = pr.PipelineState(Path(td4) / "state7.json")
+            with contextlib.redirect_stdout(_io.StringIO()):
+                ok7 = _GateSelf(st7)._render_env_gate_ok()
+            tc.assert_equal(ok7, True, "I7 哨兵模块取不回（半导出/异机缺件）→ 不阻断")
+            tc.assert_equal(st7.data["render_env_check"]["decision"], "not_adjudicated",
+                            "I7b 该形态同样留痕，不得由'没跑成'退化为'没有这条检查'")
+
+        pr_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        _sr = pr_src[pr_src.index("    def step_render(self):"):
+                     pr_src.index("    def step_verify")] if ("def step_render" in pr_src
+                                                              and "def step_verify" in pr_src) else ""
+        tc.assert_true("_render_env_gate_ok()" in _sr,
+                       "I8 调用点在 step_render 源码区间内（建而未接＝本批要消除的形态本身；"
+                       "M18 靶子：把接线挪出区间即红）")
+        tc.assert_true(0 < _sr.index("_render_env_gate_ok()") < _sr.index("_scene_patch_route()"),
+                       "I8b 接在场景级增量路由**之前**——PATCH 段渲染同样经 npx 解析那份副本，"
+                       "接在之后等于给增量路径留了个不检查的口子")
+        tc.assert_true('add_argument("--accept-render-env"' in pr_src,
+                       "I9 放行旗标在 CLI 上有载体（只在函数里读 self.accept_render_env 而 argparse "
+                       "未注册＝旗标无从给出）")
+        tc.assert_true("accept_render_env=args.accept_render_env" in pr_src,
+                       "I9b 旗标从 args 接到构造参数（建了旗标不接线＝A06 第三类断点）")
+
+        # I11：2026-10-09 云端 gate 的真实崩溃形态——回归夹具用 `__new__` ＋手工挂属性构造部分
+        # 实例（槽位用例即此），新门禁在 FAIL 分支读 self.accept_render_env 时 AttributeError，
+        # 崩在别人的用例里；本机因渲染器＝钉住版走 PASS 分支而完全看不见。类级默认值＝
+        # "没显式放行就是没放行"，本条锁它真的在类上而不是只写在 __init__ 里。
+        with _tf.TemporaryDirectory() as td6:
+            _st11 = pr.PipelineState(Path(td6) / "state11.json")
+            _st11.data["steps"] = {}
+            _st11.mark_started("render")
+            partial = pr.PipelineRunner.__new__(pr.PipelineRunner)   # 故意不经过 __init__
+            partial.state = _st11
+            partial.force = False
+            partial.source_dir = Path(td6)
+            assert not ("accept_render_env" in partial.__dict__), "夹具须真的没设这个属性"
+            _fake11 = types.ModuleType("render_env_sentinel")
+            _fake11.gs = res.gs
+            _fake11.evaluate = lambda **k: mk_result(res.gs.FAIL)
+            _real11 = sys.modules.get("render_env_sentinel")
+            sys.modules["render_env_sentinel"] = _fake11
+            try:
+                with contextlib.redirect_stdout(_io.StringIO()):
+                    ok11 = pr.PipelineRunner._render_env_gate_ok(partial)
+            finally:
+                sys.modules["render_env_sentinel"] = _real11
+            tc.assert_equal(ok11, False,
+                            "I11 部分构造的实例在 FAIL 载荷下走完整裁定并阻断，而不是 AttributeError"
+                            "（M24 靶子：删掉类级默认值即红——崩在别人的用例里＝门禁自己制造失败）")
+            tc.assert_equal(_st11.data["render_env_check"]["decision"], "blocked",
+                            "I11b 该路径照常留痕，不得因夹具形态退化成静默放行")
+
+        # ── J：完工报告透出（只透传不裁定；缺键不造节）──
+        from generate_completion_report import generate_report as _gen_report
+        with _tf.TemporaryDirectory() as td5:
+            vfile = Path(td5) / "v.mp4"
+            vfile.write_bytes(b"\x00" * 100000)
+
+            def run_rep(state, tag):
+                sf = Path(td5) / f"state_{tag}.json"
+                sf.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                with contextlib.redirect_stdout(_io.StringIO()):
+                    return _gen_report(project_name=f"Case78_{tag}", video_file=str(vfile),
+                                       subtitle_file=None, state_file=str(sf))
+
+            base = {"steps": {s: {"status": "passed", "completed": "2026-10-09T10:00:00"}
+                              for s in ("preflight", "tts", "timeline", "render", "verify",
+                                        "postprocess")}}
+            s_with = dict(base)
+            s_with["render_env_check"] = {"decision": "accepted", "resolved_version": "0.7.52",
+                                          "pinned_version": "0.7.52", "verdict": res.gs.FAIL}
+            ds_with = run_rep(s_with, "with")["data_sources"]
+            tc.assert_equal(ds_with["render_env_check"]["decision"], "accepted",
+                            "J1 渲染副本检查点结论透出到 git 可追溯面（temp/state 均不入 git，"
+                            "不透出则'这轮问过没有'只能靠现场记忆）")
+            tc.assert_true("render_env_check" not in run_rep(dict(base), "without")["data_sources"],
+                           "J2 缺键不造节（M19 靶子：把'没有该键'写成空节会让历史项目读成跑过）")
 
         # ── F：清单接线（发布仓侧清单按 §2.3 缺席，切"缺席即锁"分支）──
         manifest_path = (script_dir.parent.parent / "AI视频制作工作流模板" /
@@ -10919,6 +11528,140 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
         tc.mark_passed()
     except Exception as e:
         tc.mark_failed(f"render_env_sentinel fixture error: {e}")
+    return tc
+
+
+def test_light_theme_content_pixel_caliber() -> RegressionTestCase:
+    """用例79：视觉边界判据的浅色主题分支（2026-10-09，浅色背景交付视频首跑受阻复盘）
+
+    背景：measure_content_bottom 原按"亮像素"（R/G>80 或 B>100）裁内容，该口径把
+    "深底亮字"当默认前提。首个暖白纸底（#f6f4ef，R=246）项目在预览门禁 11/11 场
+    全部报 content_bottom=y1079 OVERFLOW 219px——背景每一行都超 CONTENT_PIXEL_THRESHOLD，
+    与排版无关，属**判据对浅底整幅失效**（无论内容摆在哪都命中底行）。判据不放宽：
+    深色分支阈值一格未动，浅色背景按"与背景色的通道距离"另立口径——暗字/彩色构件
+    为内容，白卡与**同底色**字幕遮罩距离≈0 不计（遮罩若配深灰则会被计为内容，
+    本仓浅色模板的 subtitle-safe 一律用背景同色，与深色主题"遮罩随底色"惯例同构）。
+
+    本用例锁定：
+    A 浅底帧：content_bottom 落在真实内容行底沿，而非画布底行（旧口径必 1079 的正反对照）
+    B 浅底真溢出仍被抓到（y940 彩色条 → bottom≥940），"救误报"不得变成"漏真溢出"
+    C 同底色遮罩不计内容；深灰遮罩（与背景距离>60）会命中——口径差异属设计，点名之
+    D 深色帧新旧口径逐像素等值（把旧内联公式在用例里独立重放一遍对撞，防浅色分支
+      接管深色帧）
+    E is_light_background 边界：#4b5563（g=85）判深色，#f6f4ef 判浅色——中间灰不构成
+      浅色（若把深灰读成浅底，暗色主题内容会被距离口径漏掉）
+    F 覆盖率函数走同一掩码（content_vacuum 不得继续用亮度口径——浅底上会恒 1.0 空转）
+    G 唯一生成点接线：亮度公式在 measure_content_bottom/measure_content_coverage 源码
+      区间内不得再出现（必须经 content_pixel_mask），深浅判定只住 is_light_background
+    变异：M1 浅色判定退回只看 R 单通道（E 抓）/ M2 深色分支阈值顺手"归一"成距离口径
+    （D 抓）/ M3 覆盖率继续内联亮度公式（F/G 抓）/ M4 遮罩不计做成"跳过底 130px"
+    （B 抓：真溢出被吞）/ M5 距离阈值写死进两处（G 抓）。
+    """
+    tc = RegressionTestCase(
+        "light_theme_content_pixel_caliber",
+        "验证视觉边界判据浅色分支：浅底不再恒报满幅溢出、真溢出照抓、深色帧新旧口径逐像素等值、覆盖率同掩码"
+    )
+    try:
+        import inspect
+        import re as _re
+        import tempfile
+        import numpy as _np
+        from PIL import Image as _Image
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import visual_boundary_check as vbc
+
+        LIGHT_BG = (246, 244, 239)   # 暖白纸底 #f6f4ef
+        DARK_BG = (15, 23, 42)       # 既有深底 #0f172a
+        INK = (30, 41, 59)
+        SPILL_BLUE = (37, 99, 235)
+
+        def mk(path, bg, rows):
+            arr = _np.zeros((1080, 1920, 3), dtype=_np.uint8)
+            arr[:] = bg
+            for y0, y1, c in rows:
+                arr[y0:y1, 100:1800] = c
+            _Image.fromarray(arr).save(path)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            # A 浅底：内容行 780-830，底 130px 同底色遮罩 → 旧口径必 1079，新口径应在 820~835
+            p = tmp / "light.png"
+            mk(p, LIGHT_BG, [(780, 830, INK), (950, 1080, LIGHT_BG)])
+            b = vbc.measure_content_bottom(str(p))
+            tc.assert_true(820 <= b <= 835, f"A 浅底 content_bottom 应落在内容行底沿，实测 {b}")
+            tc.assert_true(b != 1079, "A2 旧缺陷形态（背景整行计内容→恒 1079）不得复现")
+
+            # B 浅底真溢出：y940-950 彩色条 → 必须抓到
+            p2 = tmp / "light_spill.png"
+            mk(p2, LIGHT_BG, [(780, 830, INK), (940, 950, SPILL_BLUE)])
+            b2 = vbc.measure_content_bottom(str(p2))
+            tc.assert_true(b2 >= 940, f"B 浅底真溢出必须被抓到，实测 {b2}")
+
+            # C 同底色遮罩不计；深灰遮罩（距离>60）会被计——口径差异属设计，点名固化
+            p3 = tmp / "light_darkband.png"
+            mk(p3, LIGHT_BG, [(780, 830, INK), (950, 1080, (150, 148, 142))])
+            b3 = vbc.measure_content_bottom(str(p3))
+            tc.assert_true(b3 >= 1070,
+                           f"C 与背景距离>60 的深色带应被计为内容（模板须用同底色遮罩），实测 {b3}")
+
+            # D 深色帧：新旧口径逐像素等值（旧公式在用例内独立重放，不复用被测函数）
+            p4 = tmp / "dark.png"
+            mk(p4, DARK_BG, [(780, 830, (226, 232, 240)), (400, 420, (96, 165, 250))])
+            arr = _np.array(_Image.open(p4).convert("RGB"))
+            h, w = arr.shape[:2]
+            legacy = 0
+            for y in range(h - 1, 50, -1):
+                row = arr[y, 20:w - 20, :]
+                r_, g_, b_ = row[:, 0].astype(int), row[:, 1].astype(int), row[:, 2].astype(int)
+                bright = (r_ > vbc.BRIGHTNESS_THRESHOLD) | (g_ > vbc.BRIGHTNESS_THRESHOLD) | (b_ > vbc.BLUE_THRESHOLD)
+                if bright.sum() > vbc.CONTENT_PIXEL_THRESHOLD:
+                    legacy = y
+                    break
+            tc.assert_equal(vbc.measure_content_bottom(str(p4)), legacy,
+                            "D 深色帧新口径必须与旧内联公式逐位一致（阈值一格未动）")
+            tc.assert_true(legacy > 0, "D2 深色夹具本身须有内容行（防空跑）")
+
+            # E is_light_background 边界
+            tc.assert_true(vbc.is_light_background(_np.array(_Image.open(p))), "E #f6f4ef 判浅色")
+            tc.assert_equal(vbc.is_light_background(arr), False, "E2 #0f172a 判深色")
+            mid = _np.zeros((1080, 1920, 3), dtype=_np.uint8)
+            mid[:] = (75, 85, 99)  # #4b5563 深灰
+            tc.assert_equal(vbc.is_light_background(mid), False,
+                            "E3 中间灰（g=85）不得判浅色——否则暗字内容会被距离口径漏掉")
+
+            # F 覆盖率与 content_bottom 同掩码：纯浅底无内容行 → 覆盖率应低，而非旧口径的恒 1.0
+            p5 = tmp / "light_empty.png"
+            mk(p5, LIGHT_BG, [])
+            cov = vbc.measure_content_coverage(str(p5))
+            tc.assert_true(cov < 0.05, f"F 纯浅底帧覆盖率应≈0（旧亮度口径会恒 1.0 空转），实测 {cov:.3f}")
+            p6 = tmp / "light_rich.png"
+            rows = [(y0, y0 + 10, INK) for y0 in range(200, 800, 40)]
+            mk(p6, LIGHT_BG, rows)
+            cov2 = vbc.measure_content_coverage(str(p6))
+            tc.assert_true(cov2 > cov + 0.1, "F2 有内容行帧覆盖率须显著高于空帧（判据仍有区分度）")
+
+            # G 唯一生成点：measure_content_bottom / measure_content_coverage 源码区间
+            #   不得再内联亮度公式；深浅判定只住 is_light_background
+            src_bottom = _re.sub(r"\s+", " ", inspect.getsource(vbc.measure_content_bottom))
+            src_cov = _re.sub(r"\s+", " ", inspect.getsource(vbc.measure_content_coverage))
+            tc.assert_true("content_pixel_mask" in src_bottom and "content_pixel_mask" in src_cov,
+                           "G1 两位点必须经 content_pixel_mask 取掩码")
+            for frag, who in (("BRIGHTNESS_THRESHOLD", "measure_content_bottom"),
+                              ("BRIGHTNESS_THRESHOLD", "measure_content_coverage")):
+                tc.assert_true(frag not in src_bottom if who == "measure_content_bottom" else True,
+                               f"G2 {who} 不得内联 {frag}（已收敛到唯一生成点）")
+            tc.assert_true("BRIGHTNESS_THRESHOLD" not in src_cov, "G3 覆盖率不得内联亮度公式")
+            src_mask = _re.sub(r"\s+", " ", inspect.getsource(vbc.content_pixel_mask))
+            # 亮度公式整条只住掩码函数内；该式对 R/G 各引用一次阈值常量（同一条语句）
+            tc.assert_equal(src_mask.count("BRIGHTNESS_THRESHOLD"), 2,
+                            "G4 亮度公式在掩码函数内恰一条（R/G 各引用一次，共两处）")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"light_theme_content_pixel_caliber fixture error: {e}")
     return tc
 
 
@@ -11006,6 +11749,7 @@ class RegressionTestRunner:
             test_subtitle_display_style_resolution_tier,
             test_consumer_feedback_intake_replays_claims,
             test_render_env_upgrade_sentinel,
+            test_light_theme_content_pixel_caliber,
         ]
         self.results = []
     

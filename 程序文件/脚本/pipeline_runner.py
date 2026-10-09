@@ -585,7 +585,7 @@ class PipelineState:
         "fresh → 重渲 → fresh → 重渲"可无限绕开门禁，而 --fresh 恰是被推荐给
         "怀疑状态不可信"一方的恢复路径（A10，2026-09-19）。其余顶层节
         （verifications/verifications_expected/duration_budget_check/duration_check/
-        scene_patch/…）属上一轮
+        scene_patch/render_env_check/…）属上一轮
         运行的证据，全量重置后即为陈旧，随步骤状态一并作废。
         """
         ledger = self.data.get("render_metrics")
@@ -817,7 +817,24 @@ class PipelineLock:
 
 
 class PipelineRunner:
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False):
+    # 放行/模式开关的**类级默认值**：本仓回归套件里有若干用例以 `PipelineRunner.__new__` ＋
+    # 手工挂属性构造部分实例（夹具不想吃 __init__ 的 config 解析与目录副作用），因此任何
+    # "步骤方法读实例属性"都可能在那些实例上 AttributeError。2026-10-09 云端 gate 首跑即此形态：
+    # 新接入的副本门禁在 FAIL 分支读 self.accept_render_env，槽位用例（用例62）的夹具没这个属性，
+    # 崩在别人的用例里（本机因渲染器＝钉住版走 PASS 分支而看不见）。默认值放类上＝"没显式放行
+    # 就是没放行"，与 __init__ 的默认一致，不改变任何正式调用路径的行为。
+    quick_fix = False
+    force = False
+    shrink = True
+    no_scene_patch = False
+    confirm_fresh = False
+    accept_over_budget = False
+    accept_over_render = False
+    accept_media_untested = False
+    take_over_lock = False
+    accept_render_env = False
+
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -872,6 +889,8 @@ class PipelineRunner:
         self.accept_media_untested = accept_media_untested
         # 同项目并发运行守卫的显式接管开关（2026-10-02，见 PipelineLock.acquire）
         self.take_over_lock = take_over_lock
+        # 渲染副本判坏时的显式放行开关（2026-10-09，见 _render_env_gate_ok）
+        self.accept_render_env = accept_render_env
         self.lock = None
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
@@ -1784,6 +1803,122 @@ class PipelineRunner:
             return False
         return True
 
+    def _record_render_env_check(self, entry: Dict[str, Any]) -> None:
+        """渲染副本实测检查点的唯一写盘点（三态：ok / not_adjudicated / blocked|accepted）。
+
+        与 `_record_duration_check`/`_record_budget_check` 同族——通过路径也留痕，使"这个检查点
+        跑过且结论为何"成为 state 里的正证据，而不是由"查不到记录"反推（该反推分不清
+        "跑过且干净"与"没跑成"，2026-09-01 与 2026-09-21 两次同族修复即为此）。
+        """
+        entry.setdefault("at", datetime.now().isoformat(timespec="seconds"))
+        self.state.data["render_env_check"] = entry
+        self.state.save()
+
+    def _render_env_gate_ok(self) -> bool:
+        """渲染副本实测门禁（2026-10-09，据消费侧两份致命日志；判据住 render_env_sentinel.py）。
+
+        存在理由：宿主重置托管 Node 目录后，`npx hyperframes` 解析到的那份副本可能整包缺原生
+        依赖——`dist/cli.js` 静态 import esbuild，import 期即崩，而版本号照印。一手证据（消费侧
+        10-09）：`ERR_MODULE_NOT_FOUND: Cannot find package 'esbuild' …`、`Could not load the
+        "sharp" module using the win32-x64 runtime`，两次均在 3s 内 exit 1。此前本仓看见该形态的
+        唯一时刻是渲染子进程退出之后——一次 30-40 分钟白跑；哨兵脚本虽在位，却没有任何常驻消费者
+        （2026-10-09 现读：`render_env_sentinel` 在 pipeline_runner/preflight_check/
+        enhance_video_audio 内命中 0 处，条文属"记得跑"式约束）。
+
+        位点选 step_render 起跑前而非 preflight_check：render 步指纹登记面＝config＋html＋
+        render_rules.json，**不含 pipeline_runner.py 自身**，故本接线零指纹冲击；而 preflight
+        的指纹登记了脚本自身，接入即触发全仓预检重跑（代价更高，且默认模式那句 FAIL 说的是
+        "别升 0.8.x"，照字面接会误拦正常交付——本门禁只消费 `--check-render-env` 模式的裁定）。
+
+        阻断范围：只由 FAIL 阻断（副本坏＝渲染必炸，修复动作明确＝重装钉住版）。UNTESTED 属
+        取数未成（npx／npm／node 有一条不通），按四态纪律点名不阻断——把"没测成"当成"不合格"
+        会把离线与异机环境一律拦死，那不在本判据射程内。空壳原生二进制（advisory 腿）同样不阻断：
+        本仓全局 0.7.52 即带空壳 esbuild，同一副本 10-07 22:03 完成过全量渲染出片。
+        """
+        detail: Dict[str, Any] = {"source": "render_env_sentinel --check-render-env"}
+        try:
+            import render_env_sentinel as res
+        except (ImportError, OSError) as e:
+            print(f"  [RENDER-ENV] 未测：哨兵模块取不回（{type(e).__name__}: {e}）——不阻断，点名即可")
+            detail.update({"decision": "not_adjudicated", "reason": f"import:{e}"})
+            self._record_render_env_check(detail)
+            return True
+        try:
+            # copy_cwd＝渲染命令将来用的那个目录（下方 step_render 的 _run(cwd=self.source_dir)）。
+            # npx 的解析结果随 cwd 变，不传就成了"在流水线的工作目录问、在 HTML 项目目录渲染"，
+            # 两份副本可能不同名——那正是本判据要抓的形态，不能由取数面自己造出来。
+            result = res.evaluate(check_render_env=True, copy_cwd=str(self.source_dir))
+        except (RuntimeError, ValueError, OSError) as e:
+            # 阈值权威源断链（缺节缺键）按未测处理：判据读不回时不得由流水线自带的第二份
+            # 默认值裁定，那等于把配置断链读成"阈值恰好等于旧值"（A06 同族）。
+            print(f"  [RENDER-ENV] 未测：哨兵阈值源不可用（{e}）——不阻断")
+            detail.update({"decision": "not_adjudicated", "reason": f"rules:{e}"})
+            self._record_render_env_check(detail)
+            return True
+
+        legs = {o["name"]: o for o in result["outcomes"]}
+        deciding = [o for o in result["outcomes"] if o.get("adjudicates", True)]
+        entry_leg = legs.get("render_copy_entry_loadable") or {}
+        detail.update({
+            "verdict": result["verdict"],
+            "resolved_version": entry_leg.get("version"),
+            "probe_cwd": entry_leg.get("probe_cwd"),
+            "pinned_version": result["rules"]["pinned_version"],
+            "leg_status": {o["name"]: o["status"] for o in deciding},
+            "hollow_native_packages": list(
+                (legs.get("render_copy_native_binaries") or {}).get("hollow") or []),
+            "copy_source_mismatch": bool(
+                (legs.get("render_copy_native_deps") or {}).get("copy_source_mismatch")),
+        })
+        for o in deciding:
+            print(f"  [RENDER-ENV] {o['name']}: {o['status']} — {o['reason']}")
+        hollow = detail["hollow_native_packages"]
+        if hollow:
+            print(f"  [RENDER-ENV] advisory 空壳原生包：{', '.join(hollow)}"
+                  f"（不影响 render 的 import 面，影响调用它的子命令）")
+        if detail["copy_source_mismatch"]:
+            print("  [RENDER-ENV] 注：原生依赖腿取的是 npm root -g 那份，与渲染解析到的那份"
+                  "不同名——两非同一副本，该腿读数只描述前者")
+
+        if result["verdict"] != gs.FAIL:
+            detail["decision"] = "ok" if result["verdict"] == gs.PASS else "not_adjudicated"
+            self._record_render_env_check(detail)
+            if detail["decision"] == "ok":
+                print(f"  [RENDER-ENV] OK：渲染副本可用（{detail['resolved_version']}"
+                      f"＝pinned），开始渲染")
+            else:
+                print(f"  [RENDER-ENV] 裁定随 {result['verdict']}：本判据对本次渲染无从裁定，"
+                      f"照常继续（不得读成已验证）")
+            return True
+
+        msg = (f"Render copy unusable: {entry_leg.get('reason') or result['verdict']} "
+               f"(resolved={detail['resolved_version']}, pinned={detail['pinned_version']})")
+        if self.force:
+            print(f"  WARNING: {msg} — bypassed via --force")
+            detail["decision"] = "bypassed_via_force"
+            self._record_render_env_check(detail)
+            return True
+        if self.accept_render_env:
+            prev = self.state.data.get("render_env_check") or {}
+            if (isinstance(prev, dict) and prev.get("decision") == "accepted"
+                    and prev.get("resolved_version") == detail.get("resolved_version")):
+                return True   # 同一副本本轮已放行（--resume 复用结论），不重复留痕
+            detail.update({"decision": "accepted", "reason": "explicit --accept-render-env"})
+            self._record_render_env_check(detail)
+            print(f"  [RENDER-ENV] {msg} — --accept-render-env 显式放行，决策已记录")
+            return True
+        detail["decision"] = "blocked"
+        self._record_render_env_check(detail)
+        print(f"  BLOCKED: {msg} [verdict=FAIL]")
+        print(f"  渲染副本的入口加载不了，跑满全量渲染也只会得到一次失败退出。处置：")
+        print(f"    1. 在 `npm root -g` 指向的那份上重装钉住版 → "
+              f"npm install -g hyperframes@{detail['pinned_version']}")
+        print("    2. 崩的是 import 期（ERR_MODULE_NOT_FOUND／原生模块抛错）时，先确认宿主"
+              "托管 Node 目录未被重置，再重装")
+        print("    3. 明知副本有问题仍要继续 → 追加 --accept-render-env（决策留痕）")
+        self.state.mark_failed("render", msg, error_code=GATE_BLOCKED)
+        return False
+
     def _render_budget_gate_ok(self) -> bool:
         """渲染成本预算门禁（2026-08-19，P1 渲染成本治理）。
 
@@ -1972,6 +2107,13 @@ class PipelineRunner:
         #    O(1) 拦截 HTML/config 时长分叉，防 timeline 静默回退直达全量渲染
         #    （见 _pre_render_duration_consistent，45 分钟渲染浪费事故）──
         if not self._pre_render_duration_consistent():
+            return False
+
+        # ── 渲染副本实测门禁（2026-10-09，据消费侧两份致命日志）：
+        #    副本入口在 import 期即崩时，跑满全量渲染只会得到一次失败退出。O(秒) 拦在
+        #    场景级增量路由之前（PATCH 段渲染同样经 npx 解析那份副本，不例外）。
+        #    只由 FAIL 阻断，UNTESTED 点名放行——见 _render_env_gate_ok 的裁定归属。──
+        if not self._render_env_gate_ok():
             return False
 
         # ── 场景级增量渲染（2026-09-03 起默认尝试，--no-scene-patch 退出）：
@@ -3003,6 +3145,13 @@ Examples:
                              "pipeline_state.render_budget_decision for audit. Without this flag "
                              "a full render is blocked once full-render attempts reach the limit — "
                              "diagnose first; scene-patch/quick-fix are never budgeted.")
+    parser.add_argument("--accept-render-env", dest="accept_render_env", action="store_true",
+                        help="Explicitly proceed when the render copy itself fails "
+                             "render_env_sentinel --check-render-env (entry cannot load, or the "
+                             "resolved copy is not the pinned version). The decision is recorded "
+                             "in pipeline_state.render_env_check. Only a FAIL verdict blocks; "
+                             "UNTESTED never blocks. Repair instead of accepting: "
+                             "npm install -g hyperframes@<pinned_version>.")
     parser.add_argument("--accept-media-untested", action="store_true",
                         help="Explicitly accept a final video whose media QA gate could not "
                              "complete some checks (verdict UNTESTED — scan tool failure or too "
@@ -3083,6 +3232,7 @@ Examples:
         accept_over_render=args.accept_over_render,
         accept_media_untested=args.accept_media_untested,
         take_over_lock=args.take_over_lock,
+        accept_render_env=args.accept_render_env,
     )
 
     if args.status:

@@ -68,6 +68,9 @@ CONTENT_PIXEL_THRESHOLD = 20
 BRIGHTNESS_THRESHOLD = 80  # for R/G channels
 BLUE_THRESHOLD = 100       # for B channel (dark blue background)
 
+# 浅色主题内容像素的通道距离阈值（判据源码见 content_pixel_mask 的 docstring）
+LIGHT_CONTENT_DISTANCE = 60
+
 # ── Content vacuum detection (有声无画门禁) ──────────────────────
 # 与 dead-air 门禁对称：那个拦“有画没声”，这个拦“有声没画”。
 # 成片反馈：旁白已开始念主体内容，但主视觉元素晚入场 8s+，画面长时间
@@ -110,12 +113,9 @@ def measure_content_coverage(image_path, subtitle_lines=2):
     h, w = arr.shape[:2]
     y0 = round(h * VACUUM_CONTENT_TOP_RATIO)
     y1 = min(subtitle_safety_line(h, subtitle_lines), h - 1)
-    band = arr[y0:y1, 20:w-20, :]
-    r = band[:, :, 0].astype(int)
-    g = band[:, :, 1].astype(int)
-    b = band[:, :, 2].astype(int)
-    bright = (r > BRIGHTNESS_THRESHOLD) | (g > BRIGHTNESS_THRESHOLD) | (b > BLUE_THRESHOLD)
-    rows_with_content = (bright.sum(axis=1) > CONTENT_PIXEL_THRESHOLD).sum()
+    bright = content_pixel_mask(arr)
+    band = bright[y0:y1, 20:w-20]
+    rows_with_content = (band.sum(axis=1) > CONTENT_PIXEL_THRESHOLD).sum()
     total_rows = max(y1 - y0, 1)
     return rows_with_content / total_rows
 
@@ -148,6 +148,43 @@ def extract_frame(video_path, timestamp, output_path, ffmpeg_exe="ffmpeg"):
     return os.path.exists(output_path)
 
 
+def _bg_strip_median(arr):
+    """背景色取样：顶边左右两角 8px 条带的通道中位数（纯取数，不含判定）。"""
+    h, w = arr.shape[:2]
+    strip = np.concatenate([
+        arr[0:8, 0:8].reshape(-1, 3),
+        arr[0:8, max(w - 8, 1):w].reshape(-1, 3),
+    ])
+    return np.median(strip, axis=0)
+
+
+def is_light_background(arr):
+    """浅色主题帧判定：背景 R 与 G 同超 120（暖白纸底命中；深灰 #4b5563、
+    深藏青 #0f172a 均不命中——浅色分支只在"整幅背景即亮"时接管）。
+    显式返回 Python bool：numpy.bool_ 直存入回归 result 会在 --output 的
+    json.dump 处炸 TypeError（套件既有纪律的又一例）。"""
+    med = _bg_strip_median(arr)
+    return bool(med[0] > 120 and med[1] > 120)
+
+
+def content_pixel_mask(arr):
+    """"内容像素"掩码——深浅两套口径的唯一生成点（2026-10-09 浅色主题适配）。
+
+    深色背景沿用原亮度规则（阈值逐字不动）；浅色背景按与背景色的通道距离裁：
+    暗字/彩色构件为内容，白卡与同底色渐变遮罩距离≈0 不计。旧亮度口径在
+    浅色底上把整行背景计为内容，content_bottom 恒为画布底行（预览 11/11 场
+    y1079 即此形态），并非排版溢出。"""
+    r = arr[:, :, 0].astype(int)
+    g = arr[:, :, 1].astype(int)
+    b = arr[:, :, 2].astype(int)
+    if is_light_background(arr):
+        med = _bg_strip_median(arr)
+        dist = np.maximum(np.maximum(np.abs(r - med[0]), np.abs(g - med[1])),
+                          np.abs(b - med[2]))
+        return dist > LIGHT_CONTENT_DISTANCE
+    return (r > BRIGHTNESS_THRESHOLD) | (g > BRIGHTNESS_THRESHOLD) | (b > BLUE_THRESHOLD)
+
+
 def measure_content_bottom(image_path):
     """Measure the lowest y-coordinate with visible content.
 
@@ -157,14 +194,12 @@ def measure_content_bottom(image_path):
     img = Image.open(image_path).convert("RGB")
     arr = np.array(img)
     h, w = arr.shape[:2]
+    mask = content_pixel_mask(arr)
 
     # Scan from bottom to top, looking for content pixels
     # Skip 20px margins on left/right to avoid edge artifacts
     for y in range(h - 1, 50, -1):
-        row = arr[y, 20:w-20, :]
-        r, g, b = row[:, 0].astype(int), row[:, 1].astype(int), row[:, 2].astype(int)
-        bright = (r > BRIGHTNESS_THRESHOLD) | (g > BRIGHTNESS_THRESHOLD) | (b > BLUE_THRESHOLD)
-        if bright.sum() > CONTENT_PIXEL_THRESHOLD:
+        if mask[y, 20:w-20].sum() > CONTENT_PIXEL_THRESHOLD:
             return y
 
     return 0
