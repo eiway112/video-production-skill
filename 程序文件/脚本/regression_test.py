@@ -11510,6 +11510,20 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
                            "F18 README 不得写'结果指向全局包才算装到位'——createRequire 的解析路径"
                            "不含 npm 全局根，该判据在任何目录跑都永不成立；把'取数口径窄'写成"
                            "'事实反面'即本仓 A06 同族缺陷")
+            # F19/F20（2026-10-10 撤跟踪批）：`成果文件/交付登记.json` 退出版本跟踪后，
+            # **已有 tracked 修改**的克隆第一次 pull 会被自己的合法写入挡住（实测 rc=1、
+            # `Your local changes ... would be overwritten by merge`）。导出清单按 never_in_target
+            # 不进公开面，故该一次性手法只有 README 这一个能到达消费者的载体——不写就是让使用者
+            # 在一个无文档的报错前停住。反向纪律：`git stash` 手法实测会把一次性障碍变成长期障碍
+            # （pop 报 modify/delete、该件留在 DU 未合并态，此后每次 pull 都炸），故不得作为推荐路径。
+            tc.assert_true("成果文件/交付登记.json" in rtxt and ".bak" in rtxt
+                           and "git pull --ff-only" in rtxt,
+                           "F19 README 须点名该台账已退出跟踪并给出'改名让路→pull→改回'手法"
+                           "（内容不丢、迁后工作树干净，本批已实测）")
+            tc.assert_true(not any(l.strip().startswith("git stash")
+                                   for l in rtxt.splitlines()),
+                           "F20 README 不得把 `git stash` 写成迁移动作——stash pop 在该件被上游"
+                           "删除时留未合并态，把一次性障碍换成每次 pull 都挡住的长期障碍")
             tc.mark_passed()
             return tc
 
