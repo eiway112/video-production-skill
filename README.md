@@ -53,11 +53,14 @@ pip install -r 程序文件/requirements.txt
 
 # 2. 安装渲染器（版本钉住，勿用 latest）
 npm install -g hyperframes@0.7.52
-# 若你的宿主环境（IDE/编辑器自带的 node workspace）已在本地 node_modules 里带了一份
-# hyperframes，`npx` 会优先解析那份本地副本，`npm install -g` 覆盖不到它。先自证解析路径：
+# 先自证"渲染实际会调用哪一份、什么版本"（--no-install 保证这条命令不会顺手去装最新版）：
+#   npx --no-install hyperframes --version
+#   → 0.7.52＝对；0.8.x＝有一份本地副本抢先解析（宿主自带的 node workspace 常见），
+#     正确动作是把那份本地件改名/移走（可逆），不是再装一次全局；报 not found＝尚未安装。
+# 若上一条给出 0.8.x，用这条定位那份遮蔽副本住在哪个目录（须在被怀疑的那个目录里跑；
+# 在本仓目录跑必然 MODULE_NOT_FOUND——Node 的解析路径不含 npm 全局根，此命令只用于定位本地件）：
 #   node -e "const{createRequire}=require('module');console.log(createRequire(process.cwd()+'/x.js').resolve('hyperframes/package.json'))"
-# 结果指向全局包才算装到位；指向别处则该份本地件才是实际被调用的渲染器，须按上面表格的说明处理版本。
-# 解析到的那份能不能真正加载（版本号可读 ≠ 渲染入口可加载），再自证一次：
+# 版本与解析路径都对之后，再自证那份副本能否真正加载（版本号可读 ≠ 渲染入口可加载）：
 #   python 程序文件/脚本/render_env_sentinel.py --check-render-env   （退出码 0 才可进入渲染）
 
 # 3. 跑回归测试验证环境（预期全部通过、0 失败）

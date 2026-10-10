@@ -11493,6 +11493,21 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
                            "F16 README 须含'宿主本地 node_modules 副本优先、npm -g 覆盖不到'的自证命令"
                            "（取数锚＝命令里的 resolve('hyperframes …），本批首跑即因锚写错转红）"
                            "——缺它则消费者照着装全局仍失败，且会把成因误归到技能本身")
+            # F17/F18（2026-10-10，用户实跑本仓 README 那条自证命令后当场暴露）：原句写
+            # "结果指向全局包才算装到位"，实测在本仓目录与用户主目录**都**必然 MODULE_NOT_FOUND
+            # ——Node 的 require 解析路径不含 npm 全局根（本机反证：全局装的 0.7.52 在位、
+            # `npx --no-install hyperframes --version` 回 0.7.52，同一条 node 一行式却两处都报找不到）。
+            # 即该判据永不成立，消费者照做只会把"我环境没问题"读成"环境坏了"。判据改写为两条：
+            # 自证必须有一条不装包就能答"渲染实际用哪份"的命令（npx --no-install），
+            # 且不得再出现那句永不成立的断言。
+            tc.assert_true("npx" in rtxt and "--no-install" in rtxt,
+                           "F17 README 的解析自证须含 `npx --no-install hyperframes --version` 一条"
+                           "——它才真正回答'渲染会用哪一份'，且 --no-install 保证探测不装包"
+                           "（同 10-10 云端 gate 那枚红的成因）")
+            tc.assert_true("指向全局包才算装到位" not in rtxt,
+                           "F18 README 不得写'结果指向全局包才算装到位'——createRequire 的解析路径"
+                           "不含 npm 全局根，该判据在任何目录跑都永不成立；把'取数口径窄'写成"
+                           "'事实反面'即本仓 A06 同族缺陷")
             tc.mark_passed()
             return tc
 
