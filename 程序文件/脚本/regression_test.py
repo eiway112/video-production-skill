@@ -5736,13 +5736,11 @@ def test_publish_gate_drift_baseline() -> RegressionTestCase:
             "same.py": b"x = 1\n",
             "AGENTS.md": b"# pub rewrite\n",          # 本该不同（dev 侧索引名是小写）
             "LICENSE": b"MIT\n",                       # 发布仓原生件（与夹具名无关）
-            "成果文件/交付登记.json": b'{"pub": 1}\n',  # 本该不同
             "crlf.py": b"y = 2\r\n",                   # 与 dev 侧仅换行不同
         }
         CLEAN_DEV = {
             "same.py": b"x = 1\n",
             "agents.md": b"# dev original, longer\n",  # 大小写与内容都不同
-            "成果文件/交付登记.json": b'{"dev": 1, "business": 1}\n',
             "crlf.py": b"y = 2\n",
             "dev_only.py": b"z = 3\n",                 # 开发仓独有 → 一律不判
         }
@@ -5763,11 +5761,15 @@ def test_publish_gate_drift_baseline() -> RegressionTestCase:
             tc.assert_equal(probs, [], "A2 真实配置加载零问题")
             tc.assert_true(bool(fixtures),
                            "A2b fixtures 非空（空表下 C6 的正面侧恒真＝空跑）")
-            # 三个"本该不同"对象逐字对应清单 §4.2 表格三行；写死路径名而非从配置读，
-            # 否则成了配置自己证明自己。
-            for probe in ("AGENTS.md", ".gitignore", "成果文件/交付登记.json"):
+            # 两个"本该不同"对象逐字对应清单 §4.2 表格行；写死路径名而非从配置读，
+            # 否则成了配置自己证明自己。第三行原为 `成果文件/交付登记.json`，2026-10-10
+            # 随该对象退出公开面跟踪而**撤除**——豁免不得留着：留着即声明一个不存在的对象，
+            # 且诱使下次导出把它带回去（用例80 C1/C3 锁的是"改由类别禁区按路径形态裁定"）。
+            for probe in ("AGENTS.md", ".gitignore"):
                 tc.assert_true(peg._first_match(peg.drift_key(probe), exp_ed),
-                               f"A3 {probe} 命中 expected_different（§4.2 三行须全部代码化）")
+                               f"A3 {probe} 命中 expected_different（§4.2 各行须全部代码化）")
+            tc.assert_true(peg._first_match(peg.drift_key("成果文件/交付登记.json"), exp_ed) is None,
+                           "A3b 交付登记.json 的漂移豁免须已撤除（对象已不跟踪，豁免随撤）")
             fx0 = fixtures[0]
             for probe in ("LICENSE", "README.md", "readme.MD",
                           f"程序文件/源码/hyperframes/{fx0}/index.html",
@@ -5783,8 +5785,8 @@ def test_publish_gate_drift_baseline() -> RegressionTestCase:
             tc.assert_equal(r["drift"], [], "B1b 干净态零漂移")
             tc.assert_equal(r["unregistered"], [], "B1c 干净态无未登记对象")
             tc.assert_equal(r["pub_total"], len(CLEAN_PUB), "B2 pub_total 取发布仓 tracked 实测")
-            tc.assert_equal(r["compared"], 4,
-                            "B2b compared 只算两侧都有的对象（5 个发布仓对象里 LICENSE 属原生，"
+            tc.assert_equal(r["compared"], 3,
+                            "B2b compared 只算两侧都有的对象（4 个发布仓对象里 LICENSE 属原生，"
                             "故为 4）——计数错位说明匹配面没真跑")
             tracked_pub = peg.tracked_files(str(pub))
             tc.assert_true("dev_only.py" not in tracked_pub,
@@ -5838,7 +5840,7 @@ def test_publish_gate_drift_baseline() -> RegressionTestCase:
                             "B9 工作树缺文件判未测而非跳过（静默跳过＝把缺失读成一致）")
             tc.assert_true(any("crlf.py" in u for u in r3["untested"]),
                            "B9b 未测文案点名是哪个对象读不到")
-            tc.assert_equal(r3["compared"], 3,
+            tc.assert_equal(r3["compared"], 2,
                             "B9c 读不到的对象不计入 compared（计数不得把未测算成比过）")
 
             # 两侧不可枚举 / 空集合
@@ -11546,6 +11548,269 @@ def test_render_env_upgrade_sentinel() -> RegressionTestCase:
     return tc
 
 
+def test_skill_version_identity_and_ledger_off_public_face() -> RegressionTestCase:
+    """用例80：技能版本身份进必经节点 + 运行台账退出公开面跟踪（2026-10-10 根因批）
+
+    背景（两枚同源的结构性缺陷，不是操作失误）：
+    ① 本仓所有对齐判据（`--drift`／发布回执／双端点 `ls-remote`）都住在开发仓，**消费者侧
+       一个都没有**——"我用的是哪一版技能"在对方那里从未被定义，落后因此不可见，同步只能靠
+       记性。实测形态：WorkBuddy 克隆跑 `rev-list --left-right --count HEAD...origin/main`
+       得 `0  0`，看着像已同步，而那个 origin/main 是它上次 fetch 留下的陈旧缓存，真实落后
+       2 个提交。**把"没去取真值"读成"已确认一致"**正是 A04 四态契约要防的形态，故读数必须
+       与 upstream 缓存年龄同批给出，超阈即判 UNTESTED，不得由 0 推出"最新"。
+    ② `成果文件/交付登记.json` 在发布仓是 **tracked**，而它的语义是"每个仓各自自持的运行台账"
+       （开发仓记全部业务交付、发布仓只有夹具一条）。跟踪＝要求跨克隆一致，声明＝允许不同，
+       同一对象两种正面冲突的定位——后果是消费者每交付一次就把自己的登记改成 tracked diff，
+       下次 pull 被自己的合法写入挡住（本轮实测正是如此）。旧解法是在 `drift_baseline` 里加一条
+       "本该不同"豁免，那属"面由豁免清单逐对象追认"的补丁形态；本批按**类别**收口：该对象
+       进 `delivery_artifact_ban`（不公开、不跟踪），并**撤掉**那条豁免（对象没了，豁免留着即
+       叠加不撤）。
+
+    本用例锁定：
+    A 版本探针四态：非 git 安装＝NOT_APPLICABLE／**安装面被上层 git 仓覆盖＝NOT_APPLICABLE
+      （rev-parse 沿目录上溯会报出无关仓的 HEAD，此时"落后 0"是虚假置信，比无读数更糟）**／
+      与已取回 upstream 一致且缓存新鲜＝PASS／
+      确认落后＝FAIL 且点名 pull／**缓存超阈而落后读数为 0＝UNTESTED（关键负向，不得读成最新）**／
+      阈值断链＝UNTESTED／无 upstream＝UNTESTED／探针抛异常不得带崩流水线
+    B 落盘与接线：state.skill_version 真的写进文件（重读）；run() 内在并发守卫之后调用；
+      完工报告 data_sources 透出该节（只透传不裁定）
+    C 公开面对象集：词表 ban 规则按路径形态命中交付登记.json；夹具交付说明与技能本体脚本
+      不受牵连（白名单未被顺手伤到）；`expected_different` 里该对象的豁免已撤（撤豁免的正证据）
+    D 阈值住配置：stale 阈值取自 delivery_gate_rules.json → skill_version，调用点无字面量
+
+    变异：M1 缓存超阈仍按 behind==0 判 PASS（A4 抓）/ M2 探针异常往上抛（A8 抓）/
+    M3 run() 里摘掉 stamp 调用（B2 抓）/ M4 阈值写死进脚本（D 抓）/ M5 豁免只撤一半或
+    把 ban 规则改成按名字枚举夹具（C 抓）。M6 摘掉 toplevel 身份守卫（A2c 抓——摘掉后
+    那份"落后 0"直接判 PASS，正是本机制最该防的虚假置信形态）。
+    """
+    tc = RegressionTestCase(
+        "skill_version_identity_and_ledger_off_public_face",
+        "验证技能版本身份读数进流水线必经节点（四态含缓存年龄不作数）且运行台账按类别退出公开面跟踪",
+    )
+    try:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        import pipeline_runner as pr
+        import _gate_status as gs
+        # 三件套（门禁脚本／词表／导出清单）在发布仓按设计同时缺席（never_in_target），
+        # 故 C 段走"缺席即锁"分支——与用例67/71/72 同手法：只缺席一部分判 FAIL。
+        try:
+            import publish_export_gate as peg
+            _gate_present = True
+        except ImportError:
+            peg, _gate_present = None, False
+
+        class _StubState:
+            def __init__(self, d):
+                self.data = d
+                self.saved = 0
+
+            def save(self):
+                self.saved += 1
+
+        def make_git(gitmap, fail=False):
+            """替身 git：按子命令序列返回预置读数，同时记录被调用顺序。"""
+            calls = []
+
+            def run(cmd, *a, **kw):
+                calls.append(cmd)
+                if fail:
+                    raise RuntimeError("git 不可用")
+                # cmd = ["git","-C",repo, <子命令...>] —— 被裁掉的是前三段，含 -C 与仓路径
+                key = " ".join(cmd[3:]) if len(cmd) > 3 else ""
+                out, rc = gitmap.get(key, ("", 128))
+
+                class R:
+                    stdout, stderr, returncode = out, "", rc
+                return R()
+            return run, calls
+
+        def probe(gitmap, repo_root=None, hours=24, fail=False, toplevel="self"):
+            # 默认让每份夹具都是"独立仓"（toplevel＝自身目录），即新增的上层仓守卫在
+            # 正面侧照常放行；toplevel 传具体路径即模拟"技能被解到某个上层 git 仓里"。
+            gmap = dict(gitmap)
+            if toplevel is not None and "rev-parse --show-toplevel" not in gmap:
+                gmap["rev-parse --show-toplevel"] = (
+                    (str(repo_root) if toplevel == "self" else toplevel), 0)
+            run, calls = make_git(gmap, fail=fail)
+            old_scripts = pr.SCRIPTS
+            if repo_root is not None:
+                pr.SCRIPTS = Path(repo_root) / "程序文件" / "脚本"
+            try:
+                runner = pr.PipelineRunner.__new__(pr.PipelineRunner)
+                runner.state = _StubState({})
+                return runner._probe_skill_version(runner=run, stale_after_hours=hours), calls
+            finally:
+                pr.SCRIPTS = old_scripts
+
+        # A1 非 git 安装（zip 下载/复制目录）→ NOT_APPLICABLE，且不是"未测"也不是"最新"
+        with tempfile.TemporaryDirectory() as td:
+            r, _ = probe({}, repo_root=td)
+            tc.assert_equal(r["verdict"], gs.NOT_APPLICABLE,
+                            f"A1 非 git 安装面须 NOT_APPLICABLE 并说明成因：{r}")
+
+        # A1b 被上层 git 仓覆盖（zip 解到某个仓的目录树里）：rev-parse 会沿目录上溯，
+        # 报出那个**无关仓**的 HEAD/upstream。此时任何"落后 0 → PASS"都是虚假置信，
+        # 比没有读数更糟，故身份守卫先于裁定，判 NOT_APPLICABLE 并点名覆盖它的那个仓。
+        # 真实读数（非夹具）：本仓 _取证/20261010/failleg2/notgit 目录内跑探针，
+        # toplevel 回指开发仓根，verdict 由该守卫给出。
+        UP = "origin/main"
+        fresh = {"rev-parse --short HEAD": ("abc1234", 0),
+                 "log -1 --format=%ad --date=short": ("2026-10-10", 0),
+                 "rev-parse --abbrev-ref --symbolic-full-name @{u}": (UP, 0),
+                 "rev-list --count HEAD..@{u}": ("0", 0)}
+        # A2 缓存新鲜 + 落后 0 → PASS
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            (Path(td) / ".git" / "FETCH_HEAD").write_text("x", encoding="utf-8")
+            r, calls = probe(fresh, repo_root=td)
+            tc.assert_equal(r["verdict"], gs.PASS, f"A2 缓存新鲜且零落后应判 PASS：{r}")
+            tc.assert_true(any(c[3:] == ["rev-parse", "--show-toplevel"] for c in calls),
+                           "A2b 身份守卫须在裁定前真被查询（腿存在但从不执行＝零贡献）")
+        # A2c 同一份"落后 0"读数，安装面被上层仓覆盖时必须不作数
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            (Path(td) / ".git" / "FETCH_HEAD").write_text("x", encoding="utf-8")
+            r, _ = probe(fresh, repo_root=td, toplevel="D:/someone-else/repo")
+            tc.assert_equal(r["verdict"], gs.NOT_APPLICABLE,
+                            f"A2c 被上层仓覆盖不得给出 PASS/FAIL：{r}")
+            tc.assert_true("someone-else" in r["reason"],
+                           f"A2c 须点名是哪一个仓覆盖了它：{r['reason']}")
+        # A3 确认落后 → FAIL 且给出动作（点名 pull，不停在"落后 2"）
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            (Path(td) / ".git" / "FETCH_HEAD").write_text("x", encoding="utf-8")
+            g = dict(fresh, **{"rev-list --count HEAD..@{u}": ("2", 0)})
+            r, _ = probe(g, repo_root=td)
+            tc.assert_equal(r["verdict"], gs.FAIL, f"A3 落后应判 FAIL：{r}")
+            tc.assert_true("pull" in r["reason"], f"A3 FAIL 须给出可执行动作：{r['reason']}")
+            tc.assert_equal(r["behind"], 2, "A3 落后计数须原样带出")
+        # A4 关键负向：缓存超阈而落后读数为 0 —— 不得读成"已同步"
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            ff = Path(td) / ".git" / "FETCH_HEAD"
+            ff.write_text("x", encoding="utf-8")
+            import os as _os
+            import time as _t
+            old = _t.time() - 100 * 3600
+            _os.utime(ff, (old, old))
+            r, _ = probe(fresh, repo_root=td, hours=24)
+            tc.assert_equal(r["verdict"], gs.UNTESTED,
+                            f"A4 缓存过期时 0 落后属无从裁定，不得判 PASS：{r}")
+            tc.assert_true("fetch" in r["reason"] or "缓存" in r["reason"],
+                           f"A4 须点名缓存年龄这一成因：{r['reason']}")
+        # A5 阈值断链 → UNTESTED（fail-closed，不回落成"看起来最新"）
+        # 阈值断链的注入点＝配置读取本身（不是给参数传 None——传 None 会合法地回落到
+        # 真实配置值，那样这条断言恒真，写死阈值的变异照样绿）。
+        real_loader = pr._load_delivery_gate_rules
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            (Path(td) / ".git" / "FETCH_HEAD").write_text("x", encoding="utf-8")
+            pr._load_delivery_gate_rules = lambda: {"skill_version": {}}   # 节在、键缺
+            try:
+                r, _ = probe(fresh, repo_root=td, hours=None)
+            finally:
+                pr._load_delivery_gate_rules = real_loader
+            tc.assert_equal(r["verdict"], gs.UNTESTED,
+                            f"A5 缺阈值须整体未测（fail-closed，不得回落成'看起来最新'）：{r}")
+            tc.assert_true("upstream_stale_after_hours" in r["reason"],
+                           f"A5b 须点名断的是哪个键：{r['reason']}")
+        # A6 无 upstream → UNTESTED
+        g = {k: v for k, v in fresh.items()
+             if not k.endswith("@{u}") or "rev-list" in k}
+        g["rev-parse --abbrev-ref --symbolic-full-name @{u}"] = ("", 128)
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            r, _ = probe(g, repo_root=td)
+            tc.assert_equal(r["verdict"], gs.UNTESTED, f"A6 无 upstream 须未测而非通过：{r}")
+        # A7 探针内部抛异常（git 不可达）→ 不得冒到流水线
+        with tempfile.TemporaryDirectory() as td:
+            runner = pr.PipelineRunner.__new__(pr.PipelineRunner)
+            runner.state = _StubState({})
+
+            def boom(*a, **k):
+                raise RuntimeError("git 炸了")
+            runner._probe_skill_version = boom
+            try:
+                info = runner._skill_version_stamp()
+                raised = None
+            except Exception as e:                      # 信息面不得把流水线带崩
+                info, raised = None, e
+            tc.assert_true(raised is None and isinstance(info, dict)
+                           and info.get("verdict") == "UNTESTED",
+                           f"A7 探针异常须被信息面吞掉并归 UNTESTED，不得外抛：raised={raised} info={info}")
+            tc.assert_equal(runner.state.saved, 1, "A7b 版本读数须落 state（否则交付后无从追溯）")
+        # B1 落盘内容含四态字段与时刻
+        with tempfile.TemporaryDirectory() as td:
+            runner = pr.PipelineRunner.__new__(pr.PipelineRunner)
+            runner.state = _StubState({})
+            runner._probe_skill_version = lambda *a, **k: {"verdict": gs.FAIL, "behind": 3,
+                                                           "local_head": "dead123",
+                                                           "upstream": UP,
+                                                           "upstream_age_hours": 1.0,
+                                                           "reason": "确认落后 3 个提交：git pull --ff-only"}
+            old_scripts = pr.SCRIPTS
+            pr.SCRIPTS = Path(td) / "程序文件" / "脚本"
+            try:
+                runner._skill_version_stamp()
+            finally:
+                pr.SCRIPTS = old_scripts
+            sv = runner.state.data.get("skill_version") or {}
+            tc.assert_equal(sv.get("behind"), 3, "B1 state.skill_version 须原样落读数")
+            tc.assert_true(bool(sv.get("at")), "B1 须带取数时刻（无时刻即无法与当轮运行对齐）")
+        # B2 接线：run() 内在并发守卫之后调用（未过锁时不得写 state）
+        src = Path(pr.__file__).read_text(encoding="utf-8")
+        i_lock = src.index("acquired, held = self.lock.acquire")
+        i_exit = src.index("sys.exit(1)", i_lock)
+        tail = src[i_exit:]
+        tc.assert_true("self._skill_version_stamp()" in tail,
+                       "B2 版本读数须在并发守卫放行之后被调用（摘掉调用即红）——"
+                       "被 BLOCKED 的运行连 state 都不该写")
+        # B3 报告只透传不裁定
+        rep = (Path(pr.__file__).parent / "generate_completion_report.py").read_text(encoding="utf-8")
+        tc.assert_true('("skill_version", "skill_version")' in rep,
+                       "B3 完工报告 data_sources 须透出该节（同 render_env_check 口径）")
+        if not _gate_present:
+            tc.assert_true(not Path(pr.__file__).parent.joinpath("publish_export_gate.py").exists(),
+                           "C0-发布仓分支：门禁脚本缺席时 C 段无从裁定（半导出＝机制半生效，"
+                           "此处锁的是'确实整体缺席'）")
+        else:
+          # C1 词表按路径形态命中运行台账
+          terms = peg.default_terms_path()
+          rules, ban_problems = peg.load_ban(terms)
+          tc.assert_equal(ban_problems, [], "C0 词表 ban 区须完整可读（残缺即整体未测，不得继续裁定）")
+          hit = peg.scan_path_shape(["成果文件/交付登记.json"], rules)
+          tc.assert_true(any("成果文件/交付登记.json" in str(h.get("path", "")) for h in hit),
+                         f"C1 交付登记.json 须按类别命中公开面禁区：{hit}")
+          # C2 负向对照：夹具交付说明与技能本体脚本不得被顺手牵连
+          clean = peg.scan_path_shape(["成果文件/交付说明_quickstart-demo.md",
+                                       "程序文件/脚本/pipeline_runner.py",
+                                       "程序文件/配置/config/quality/delivery_gate_rules.json"], rules)
+          tc.assert_equal(len(clean), 0, f"C2 白名单与技能本体须零误伤：{clean}")
+          # C3 撤豁免的正证据：该对象不再出现在"本该不同"名单里
+          db = json.loads(Path(terms).read_text(encoding="utf-8"))["drift_baseline"]
+          tc.assert_true(not any("交付登记" in str(e.get("pattern", ""))
+                                 for e in db.get("expected_different") or []),
+                         "C3 对象已退出公开面跟踪，其漂移豁免须同批撤除（留着即叠加不撤）")
+        # D 阈值住配置且调用点不写死
+        cfg = json.loads((Path(pr.__file__).parent.parent / "配置" / "config" / "quality" /
+                          "delivery_gate_rules.json").read_text(encoding="utf-8"))
+        tc.assert_true(isinstance(cfg.get("skill_version", {}).get("upstream_stale_after_hours"),
+                                 (int, float)),
+                       "D1 stale 阈值须住 delivery_gate_rules.json → skill_version")
+        body = src[src.index("def _probe_skill_version"):src.index("def _skill_version_stamp")]
+        tc.assert_true("upstream_stale_after_hours" in body and
+                       not any(f"> {n}" in body for n in ("24", "48", "12")),
+                       "D2 探针内不得写死小时数（阈值写死即改配置不生效，A12 同族）")
+        tc.mark_passed()
+        return tc
+    except Exception as e:
+        tc.mark_failed(f"skill_version fixture error: {e}")
+        return tc
+
+
 def test_light_theme_content_pixel_caliber() -> RegressionTestCase:
     """用例79：视觉边界判据的浅色主题分支（2026-10-09，浅色背景交付视频首跑受阻复盘）
 
@@ -11765,6 +12030,7 @@ class RegressionTestRunner:
             test_consumer_feedback_intake_replays_claims,
             test_render_env_upgrade_sentinel,
             test_light_theme_content_pixel_caliber,
+            test_skill_version_identity_and_ledger_off_public_face,
         ]
         self.results = []
     

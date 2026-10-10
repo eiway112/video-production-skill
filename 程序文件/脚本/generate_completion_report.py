@@ -781,7 +781,12 @@ def generate_report(
                                      # 渲染副本实测门禁的结论与放行面（2026-10-09）：state/temp 均不入
                                      # git，"这轮渲染前问过副本可不可用、谁放的行"须进 git 可追溯面。
                                      # 同 render_budget_decision 口径——只透传不裁定。
-                                     ("render_env_check", "render_env_check")):
+                                     ("render_env_check", "render_env_check"),
+                                     # 技能版本身份（2026-10-10 根因批）：交付时"这份技能是哪一版、
+                                     # 当时是否落后"须与成片同批入 git——消费者侧的版本读数此前
+                                     # 无处可查，开发仓侧也无从复核对方报来的问题出在哪一版。
+                                     # 同 render_env_check 口径——只透传不裁定。
+                                     ("skill_version", "skill_version")):
                     _val = pipeline_state.get(_skey)
                     if isinstance(_val, dict):
                         report["data_sources"][_dkey] = _val

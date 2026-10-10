@@ -585,7 +585,7 @@ class PipelineState:
         "fresh → 重渲 → fresh → 重渲"可无限绕开门禁，而 --fresh 恰是被推荐给
         "怀疑状态不可信"一方的恢复路径（A10，2026-09-19）。其余顶层节
         （verifications/verifications_expected/duration_budget_check/duration_check/
-        scene_patch/render_env_check/…）属上一轮
+        scene_patch/render_env_check/skill_version/…）属上一轮
         运行的证据，全量重置后即为陈旧，随步骤状态一并作废。
         """
         ledger = self.data.get("render_metrics")
@@ -1972,6 +1972,106 @@ class PipelineRunner:
         self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
         return False
 
+    # ── 技能版本身份（2026-10-10 根因批）────────────────────────────────
+    # 存在理由：本仓所有对齐判据（--drift / 发布回执 / 双端点 ls-remote）都住在开发仓，
+    # 消费者侧一个都没有——"我用的是哪一版技能"在消费者侧从未被定义，因此"落后"不可见，
+    # 同步只能靠记性。实测形态：WorkBuddy 克隆的 `rev-list --left-right --count
+    # HEAD...origin/main` 报 0/0，看着像已同步，而它的 origin/main 是**上次 fetch 留下的
+    # 陈旧缓存**（真实落后 2 个提交）。只读本地缓存的落后计数会把"没去取真值"读成
+    # "已确认一致"，正是本仓 A04 四态契约要防的形态。故读数必须同时给出缓存年龄，
+    # 年龄超阈值即判 UNTESTED，不得由 0 推出"最新"。
+    # 面：信息面，**永不阻断**（离线/无网/zip 安装都是合法终态）；不得接进任何交付判据。
+    def _probe_skill_version(self, runner=None, stale_after_hours=None):
+        """返回 {verdict, local_head, local_date, upstream, behind, upstream_age_hours, reason}。
+
+        verdict 四态：PASS＝与已取回的 upstream 逐位一致且缓存新鲜；FAIL＝确认落后 N 提交；
+        UNTESTED＝无 upstream／取数断链／缓存年龄超阈；NOT_APPLICABLE＝非 git 安装（zip 下载）。
+        """
+        import os
+        # 四态词汇单源＝模块级 `import _gate_status as gs`（本文件 :53），不另取副本。
+        rules = _load_delivery_gate_rules().get("skill_version") or {}
+        if stale_after_hours is None:
+            stale_after_hours = rules.get("upstream_stale_after_hours")
+        if not isinstance(stale_after_hours, (int, float)) or stale_after_hours <= 0:
+            return {"verdict": gs.UNTESTED, "reason":
+                    "阈值断链：delivery_gate_rules.json → skill_version."
+                    "upstream_stale_after_hours 缺失或非法", "behind": None}
+        run = runner or subprocess.run
+        repo = str(SCRIPTS.parent.parent)
+
+        def git(*args):
+            try:
+                r = run(["git", "-C", repo, *args], capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=10)
+                return (r.stdout or "").strip(), (r.returncode or 0)
+            except Exception as e:                      # 无 git / 超时 / 平台差异
+                return f"__ERR__{e}", -1
+
+        head, rc = git("rev-parse", "--short", "HEAD")
+        if rc != 0 or head.startswith("__ERR__"):
+            return {"verdict": gs.NOT_APPLICABLE,
+                    "reason": "非 git 安装面（zip 下载或复制目录），版本身份无从按提交读取",
+                    "behind": None}
+        local_date, _ = git("log", "-1", "--format=%ad", "--date=short")
+        # 身份必须落在"这份技能自己那份仓"上：zip 解到某个上层 git 仓的目录树里时，
+        # rev-parse 会顺着目录上溯、报出那个**无关仓**的 HEAD 与 upstream，于是把别人的
+        # 提交印成本技能的版本，甚至给出一个自信的 PASS——虚假置信比无读数更糟。
+        top, rc = git("rev-parse", "--show-toplevel")
+        if rc == 0 and not top.startswith("__ERR__"):
+            if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(repo)):
+                return {"verdict": gs.NOT_APPLICABLE, "local_head": head,
+                        "reason": f"该目录被上层 git 仓覆盖（toplevel={top}），"
+                                  f"读数属那个仓而非本技能安装面", "behind": None}
+        up, rc = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        if rc != 0 or up.startswith("__ERR__"):
+            return {"verdict": gs.UNTESTED, "local_head": head,
+                    "reason": "未配置 upstream 跟踪分支，落后与否无从裁定", "behind": None}
+        behind_s, rc = git("rev-list", "--count", "HEAD..@{u}")
+        if rc != 0 or not str(behind_s).isdigit():
+            return {"verdict": gs.UNTESTED, "local_head": head, "upstream": up,
+                    "reason": f"落后计数取不回：{behind_s[:60]!r}", "behind": None}
+        behind = int(behind_s)
+        # 缓存年龄：FETCH_HEAD 的 mtime 是"上次向远端取数"的时刻；没有它就用 ref 文件 mtime。
+        age = None
+        for probe in (".git/FETCH_HEAD",):
+            p = os.path.join(repo, *probe.split("/"))
+            try:
+                age = (time.time() - os.path.getmtime(p)) / 3600.0
+                break
+            except OSError:
+                age = None
+        if age is None:
+            return {"verdict": gs.UNTESTED, "local_head": head, "upstream": up,
+                    "behind": behind,
+                    "reason": "upstream 缓存年龄取不回——0 落后可能只是没去取真值",
+                    "upstream_age_hours": None}
+        out = {"local_head": head, "local_date": local_date, "upstream": up,
+               "behind": behind, "upstream_age_hours": round(age, 1)}
+        if age > stale_after_hours:
+            out["verdict"] = gs.UNTESTED
+            out["reason"] = (f"upstream 缓存已 {age:.0f}h（阈值 {stale_after_hours:g}h）未更新，"
+                             f"落后读数 {behind} 不作数——先 git fetch 再判")
+        else:
+            out["verdict"] = gs.PASS if behind == 0 else gs.FAIL
+            out["reason"] = ("与已取回的 upstream 一致" if behind == 0
+                             else f"确认落后 {behind} 个提交：git pull --ff-only")
+        return out
+
+    def _skill_version_stamp(self):
+        try:
+            info = self._probe_skill_version()
+        except Exception as e:                          # 信息面不得把流水线带崩
+            info = {"verdict": "UNTESTED", "reason": f"探针异常：{e}", "behind": None}
+        self.state.data["skill_version"] = dict(info, at=datetime.now().isoformat(timespec="seconds"))
+        self.state.save()
+        print(f"  [VERSION] {info.get('verdict')} — 本地 {info.get('local_head', '?')}"
+              + (f"（{info.get('local_date')}）" if info.get('local_date') else "")
+              + (f" | upstream {info.get('upstream')} 落后 {info.get('behind')}"
+                 f" | 缓存年龄 {info.get('upstream_age_hours')}h"
+                 if info.get('behind') is not None else "")
+              + f" | {info.get('reason', '')}")
+        return info
+
     def _warn_previous_interrupted_runs(self):
         """启动扫描：历史日志缺尾行（疑似外部中断）时显式告警。
 
@@ -2951,6 +3051,9 @@ class PipelineRunner:
 
         # 中断可见性：上次运行若被外部中断（日志缺尾行），在此显式告警
         self._warn_previous_interrupted_runs()
+
+        # 技能版本身份（信息面，不阻断）：让"落后"在消费者侧第一次成为可见读数。
+        self._skill_version_stamp()
 
         # ── Hard gate prerequisite check when --step is used ──
         # Prevent jumping to render/postprocess without prerequisite steps passing.

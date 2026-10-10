@@ -17,8 +17,19 @@
     "description": "同项目并发运行守卫（2026-10-02，据外部 WorkBuddy 副本 build-expert-promo 2026-10-01 实证）：两个流水线进程共享同一 temp 目录时，A10 的原子写只保证'单文件不半截'，不保证跨进程一致——后写者以整表覆盖，读回来的一份 pipeline_state.json 会混合两个进程各自的 started/completed 时刻，使'N 步门禁全过'这种读数失去可复核性（实证形态：verify.started 与 visual_check.started 相差 206ms，而 render/verify/visual_check 三条 completed 挤在同一 17ms 内；render 记 passed 而其子进程日志尾行 exit_code: 1）。判据＝起跑时若锁的心跳距今 < stale_after_seconds 且 pid 非本进程，即 BLOCKED（不写 state、不跑步骤）；心跳由独立 daemon 线程按 heartbeat_interval_seconds 续写，故'活着但卡住'与'已死'可分：卡住者心跳仍新→按并发拦下，死掉者心跳超期→自动接管。锁文件住在项目 temp 目录（.pipeline_runner.lock），temp 不入 git，属运行时产物。急需与另一实例并行时用 --take-over-lock 显式放行并留痕 state.lock_takeover。"
   },
   "audit": {
-    "prohibited_terms": ["final", "v01", "render", "raw", "tmp", "draft"],
+    "prohibited_terms": [
+      "final",
+      "v01",
+      "render",
+      "raw",
+      "tmp",
+      "draft"
+    ],
     "require_srt_same_stem": true,
     "description": "交付审计（generate_completion_report.py --audit）权威参数，2026-08-19 新增。背景：SKILL.md 旧版自评量表由执行者自评（违反 agent-wiki 角色分离'模型不得给自己打分'），改为治具裁定。prohibited_terms 为交付文件名禁用技术词（config delivery.prohibited_terms 声明优先）；require_srt_same_stem 要求字幕与成片同基名。审计 5 维度：端到端真实性/门禁完整性/交付合规/分镜忠实度/收尾完成度，全部由真实数据推导，任一维度失败即 GATE_FAILURE。"
+  },
+  "skill_version": {
+    "description": "技能版本身份读数（2026-10-10 根因批）。消费者侧此前没有任何版本判据，\"我用的是哪一版\"从未被定义，落后因此不可见、同步只能靠记性；实测形态是本地 origin/main 缓存陈旧时 rev-list 报 0 落后、看着像已同步而真实落后 2 提交。故读数须同时给出该缓存年龄，年龄超本阈值即判 UNTESTED，不得由 0 推出\"最新\"。信息面，永不阻断（离线/无网/zip 安装都是合法终态），不得接进任何交付判据。",
+    "upstream_stale_after_hours": 24
   }
 }
