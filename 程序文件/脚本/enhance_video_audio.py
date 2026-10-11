@@ -120,7 +120,14 @@ SCENES = [
 
 VIDEO_DURATION = 70.0  # includes 3s cover scene
 COVER_DURATION = 0.0  # auto-detected from HTML data-cover-duration, or set via config
-BGM_ENABLED = True  # config 可用 "bgm_enabled": false 关闭合成 BGM（低频 drone 容易被感知为嗡嗡声）
+# BGM 缺省关闭（2026-10-10 用户常设裁定）：翻转前缺省为 True，其兜底实现是 ffmpeg
+# 合成的 65/98Hz 正弦 drone，用户三轮观感反馈点名"每次视频启动'嗡嗡'的背景音"。
+# 默认关之后：要 BGM 必须在 config 显式声明 "bgm_enabled": true（外部 BGM 另须声明
+# bgm_source）。与本键的另一消费者 media_qa_gate._config_bgm_declared（未声明按
+# False）自此一致——此前同一配置键在两个消费者处默认值分叉（True vs False），
+# 属单一权威源违反。
+BGM_ENABLED_DEFAULT = False
+BGM_ENABLED = BGM_ENABLED_DEFAULT
 SUBTITLE_DISPLAY_REPLACEMENTS = {}  # 字幕显示层替换（如 毫米→mm），不影响 TTS 朗读文本
 
 # 字幕烧录样式按画布宽分档。libass 对 SRT 用默认 PlayRes(384×288) 虚拟画布缩放，
@@ -131,6 +138,40 @@ SUBTITLE_STYLE_WIDE = {"font_size": 15, "margin_v": 25, "wrap_line_limit": 22}
 SUBTITLE_STYLE_NARROW = {"font_size": 10, "margin_v": 10, "wrap_line_limit": 14}
 SUBTITLE_NARROW_WIDTH_MAX = 1200
 SUBTITLE_STYLE = SUBTITLE_STYLE_WIDE  # load_config 按 config resolution 换档
+
+# ── 字幕色彩按**字幕带实测亮度**分档（2026-10-11，用例83）────────────────
+# 几何档（上面的画布宽分档）与本色彩档正交：一个管字号/边距/断行，一个管字色/底盒/描边色。
+#
+# 存在理由（不是新偏好，是两条实测）：2026-10-10 把样式从"纯描边+阴影"收为"白字+半透
+# 圆角底盒"时，理由是"浅底深底画面均稳定可读"——那是**可读性**口径。本批用户观感反馈
+# "浅色背景下字幕的灰色背景没必要，破坏画面整体视觉风格"，抽帧量测证实代价真实：
+# 已交付 修订03 字幕带底图实测中位亮度 242（浅色系画面），其上叠一条 &H73 半透黑盒后
+# 成为画面里唯一的深色大块，而画面自身墨色是 #0f172a。
+#
+# 但**不能只摘盒**：白字落在 242 的浅底上对比只剩 12/255（≈1.05:1，远低于可读下限），
+# 摘盒即等于把字幕擦掉。故浅底档同时换墨色，并给字周加**浅色**半透 halo——它在浅底上
+# 近乎不可见（不破坏画面），只在字幕压到深色图卡/照片时把字缘托出来。
+#
+# 深底档逐字等于 2026-10-10 既有形态（由用例83 B 段与用例76 G2 双向锁），历史深色主题
+# 项目重烧字幕零变化。
+SUBTITLE_PALETTE_DARK = {
+    "primary_colour": "&H00FFFFFF",     # 白字
+    "outline_colour": "&H96000000",     # 半透黑描边（10-10 由不透明 3 收为半透 1）
+    "back_colour": "&H73000000",        # 半透黑底盒（盒色 alpha 只住这个字段）
+    "border_style": "4",                # 圆角底盒
+    "outline": "1",
+}
+SUBTITLE_PALETTE_LIGHT = {
+    "primary_colour": "&H002A170F",     # = #0f172a，与画面标题同一墨色（ASS 为 AABBGGRR）
+    "outline_colour": "&H96FFFFFF",     # 半透白 halo：浅底近乎不可见，压深色块时托字缘
+    "back_colour": "&H00000000",        # 不画盒
+    "border_style": "1",                # 描边档（libass 对 1 不绘底盒）
+    "outline": "1",                     # 描边不归零：halo 归零即失去压深底时的兜底
+}
+# 分档阈值权威源 video_quality_rules.json → subtitle_style.light_band_median_min；
+# 此处仅为读不到时的回退。推导：深墨 #0f172a 相对亮度≈0.012，WCAG 4.5:1 要求底图
+# 线性亮度≥0.23（≈sRGB 135），取 160 留余量（浅底实测 242，深底主题实测≈15，两侧都远）。
+SUBTITLE_LIGHT_BAND_MEDIAN_MIN_DEFAULT = 160.0
 
 # === P0 类型体系（2026-07-29，一个纯 BGM 项目的逃逸教训） ===
 VIDEO_TYPE = ""         # config "video_type"：视频类型声明（如 product_showcase），日志/报告可读
@@ -680,7 +721,11 @@ def load_config(config_path):
         cfg = json.load(f)
     
     VIDEO_DURATION = float(cfg.get('video_duration', VIDEO_DURATION))
-    BGM_ENABLED = _coerce_bool(cfg.get('bgm_enabled', BGM_ENABLED))
+    # 未声明一律回缺省常量，不沿用上一次 load 残留在模块全局的值（与 SUBTITLE_STYLE
+    # 的"不做惰性赋值"同一判据：跨项目 in-process 调用时，前一个项目显式声明的
+    # bgm_enabled 会污染下一个未声明的项目）。JSON null 按未声明处理。
+    _bgm_raw = cfg.get('bgm_enabled')
+    BGM_ENABLED = BGM_ENABLED_DEFAULT if _bgm_raw is None else _coerce_bool(_bgm_raw)
 
     _res_raw = str(cfg.get('resolution', '') or '').strip()
     _res = re.match(r'(\d+)\s*[xX]\s*\d+', _res_raw)
@@ -715,6 +760,12 @@ def load_config(config_path):
                 print(f"[ERROR]   - {c}")
             print("[ERROR] 请修正 bgm_source 指针（禁止静默回退合成 BGM）。")
             sys.exit(1)
+    if cfg.get('bgm_source') and not BGM_ENABLED:
+        # BGM 默认翻转（2026-10-10）后，这条路径会把作者点名要的那条音轨静默摘掉。
+        # 处置与上方"指针找不到即报错"同一判据：声明即权威，不静默降级、也不静默丢弃。
+        print('[ERROR] config 声明了 bgm_source，但 bgm_enabled 未启用（该键缺省已为 false）——')
+        print('[ERROR] 请显式追加 "bgm_enabled": true，或删掉 bgm_source 指针。')
+        sys.exit(1)
     if not TTS_ENABLED:
         # 纯BGM路径门禁：无旁白时音频只能来自 BGM——必须显式声明来源，
         # 禁止"无 TTS 又无 BGM"的静音成片，也不用合成正弦 drone 兜底。
@@ -2431,6 +2482,127 @@ def step5_generate_subtitles(subtitle_path, temp_dir):
     return True
 
 
+def subtitle_force_style(geometry, palette):
+    """libass force_style 串的**唯一生成点**（几何档 × 色彩档两轴在此汇成一条串）。
+
+    字段字面量只在本函数出现一次；两档的差异全部走 palette 数据，故"给浅档补一个字段"
+    不会漏改深档（旧形态是整条串写死，改一处即两档分叉）。
+    """
+    return (
+        "FontName=Microsoft YaHei,"
+        f"FontSize={geometry['font_size']},"
+        f"PrimaryColour={palette['primary_colour']},"
+        f"OutlineColour={palette['outline_colour']},"
+        f"BackColour={palette['back_colour']},"
+        f"BorderStyle={palette['border_style']},"
+        f"Outline={palette['outline']},"
+        "Shadow=0,"
+        f"MarginV={geometry['margin_v']},"
+        "Alignment=2"
+    )
+
+
+def subtitle_band_luma_median(video_path, srt_path, samples: int = 8):
+    """实测**字幕落位区**的底色亮度（无字幕层的那份产物上量）。
+
+    返回 (median_luma 或 None, 归因文本)。取数面：SRT 逐条起点（等距抽至多 samples 条，
+    每条进窗 0.4s 保证字幕确实在屏）→ ffmpeg 抽帧 → 取画面**下方 22%** 条带（字幕带，
+    与字幕安全区同一"按画布高比例推导"口径，不写死像素）→ Rec.709 亮度中位数。
+
+    为什么量中位数而不是均值：底图常有渐变与图卡，均值会被少量深色元素拖走；中位数答的
+    是"字幕压在什么颜色的东西上"这个多数问题。
+
+    任一环节取不到（无 ffmpeg/PIL/抽帧全失败/SRT 无条目）即返回 None —— 调用方据此
+    **退回既有深底档**（＝今天的形态），不得由"测不出"推出"是浅底"。
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError as e:
+        return None, f"PIL/numpy 不可用（{e}）"
+    try:
+        entries = _parse_srt_start_offsets(srt_path)
+    except OSError as e:
+        return None, f"SRT 读取失败（{e}）"
+    if not entries:
+        return None, "SRT 无可用时间戳"
+    if len(entries) > samples:
+        step = (len(entries) - 1) / (samples - 1)
+        entries = [entries[round(i * step)] for i in range(samples)]
+
+    medians = []
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="subs_band_probe_") as td:
+        for idx, (t_start, t_dur) in enumerate(entries):
+            t = min(t_start + 0.4, t_start + max(0.0, t_dur) * 0.5)
+            png = Path(td) / f"band_{idx}.png"
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.3f}",
+                     "-i", str(video_path), "-frames:v", "1", str(png)],
+                    capture_output=True, timeout=60, check=True)
+            except (subprocess.SubprocessError, OSError):
+                continue
+            if not png.exists():
+                continue
+            try:
+                with Image.open(png) as im:
+                    arr = np.asarray(im.convert("RGB")).astype(float)
+            except OSError:
+                continue
+            h = arr.shape[0]
+            band = arr[int(round(h * 0.78)):, :, :]
+            luma = 0.2126 * band[..., 0] + 0.7152 * band[..., 1] + 0.0722 * band[..., 2]
+            medians.append(float(np.median(luma)))
+    if not medians:
+        return None, f"{len(entries)} 个采样点全部抽帧失败"
+    return float(np.median(medians)), (f"采样 {len(medians)}/{len(entries)} 帧，"
+                                       f"逐帧中位亮度 {['%.0f' % m for m in medians[:4]]}"
+                                       + ("…" if len(medians) > 4 else ""))
+
+
+def _parse_srt_start_offsets(srt_path):
+    """SRT → [(起点秒, 条目时长秒), ...]（按出现顺序）。"""
+    text = Path(srt_path).read_text(encoding="utf-8", errors="replace")
+    out = []
+    for m in re.finditer(
+            r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*"
+            r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})", text):
+        g = [int(x) for x in m.groups()]
+        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0
+        end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0
+        out.append((start, max(0.0, end - start)))
+    return out
+
+
+def _subtitle_light_band_min():
+    """分档阈值：只住 video_quality_rules.json → subtitle_style.light_band_median_min。"""
+    rules = _load_video_quality_rules()
+    section = rules.get("subtitle_style") if isinstance(rules, dict) else None
+    if isinstance(section, dict) and section.get("light_band_median_min") is not None:
+        try:
+            return float(section["light_band_median_min"])
+        except (TypeError, ValueError):
+            print(f"  [WARN] video_quality_rules.subtitle_style.light_band_median_min "
+                  f"不可解析（{section.get('light_band_median_min')!r}），"
+                  f"回退默认 {SUBTITLE_LIGHT_BAND_MEDIAN_MIN_DEFAULT}")
+    return SUBTITLE_LIGHT_BAND_MEDIAN_MIN_DEFAULT
+
+
+def pick_subtitle_palette(video_path, srt_path):
+    """按字幕带实测亮度选色彩档。返回 (palette, 档名, 归因文本)。
+
+    取不到即退回**深底档**（＝本批之前的形态）——下限安全，绝不由"测不出"猜"浅底"。
+    """
+    median, detail = subtitle_band_luma_median(video_path, srt_path)
+    threshold = _subtitle_light_band_min()
+    if median is None:
+        return SUBTITLE_PALETTE_DARK, "dark(退回)", f"字幕带无从裁定：{detail}；阈值 {threshold:g}"
+    if median >= threshold:
+        return SUBTITLE_PALETTE_LIGHT, "light", f"字幕带实测中位亮度 {median:.0f} ≥ {threshold:g}"
+    return SUBTITLE_PALETTE_DARK, "dark", f"字幕带实测中位亮度 {median:.0f} < {threshold:g}"
+
+
 def step6_burn_subtitles(video_path, subtitle_path, temp_dir):
     """Burn SRT subtitles into the temp working artifact.
 
@@ -2451,19 +2623,17 @@ def step6_burn_subtitles(video_path, subtitle_path, temp_dir):
     # Escape the colon after drive letter (D: -> D\:)
     srt_str = srt_str.replace(":", "\\:", 1)
 
-    # Subtitle style: compact, within safe zone, outline only (no opaque box)
-    # 字号/底边距按画布宽分档（见 SUBTITLE_STYLE_WIDE/NARROW），横屏维持既有值
-    style = (
-        "FontName=Microsoft YaHei,"
-        f"FontSize={SUBTITLE_STYLE['font_size']},"
-        "PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,"
-        "BorderStyle=1,"
-        "Outline=2,"
-        "Shadow=1,"
-        f"MarginV={SUBTITLE_STYLE['margin_v']},"
-        "Alignment=2"
-    )
+    # 字幕样式＝几何档（画布宽，见 SUBTITLE_STYLE_WIDE/NARROW）× 色彩档（字幕带实测亮度，
+    # 见 SUBTITLE_PALETTE_LIGHT/DARK）两轴正交，串的唯一生成点是 subtitle_force_style。
+    # 色彩档 2026-10-11 分档前的形态＝今天的深底档，其字段来历（修订01 盒色 alpha 住
+    # BackColour、修订02 描边由不透明 3 收为半透 1、Outline=0 候选被探针证伪）记在
+    # SUBTITLE_PALETTE_DARK 声明处与用例76 G2；浅底档的存在理由与实测读数记在
+    # SUBTITLE_PALETTE_LIGHT 声明处（一句话：浅底上灰盒是画面里唯一的深色大块，
+    # 而摘盒必须同时换墨色，否则白字对比只剩 12/255）。
+    # 测不出即退回深底档（＝本批之前的形态），不由"无从裁定"猜"浅底"。
+    palette, tier, tier_reason = pick_subtitle_palette(video_path, subtitle_path)
+    print(f"  [SUBTITLE-STYLE] 色彩档={tier}：{tier_reason}")
+    style = subtitle_force_style(SUBTITLE_STYLE, palette)
 
     cmd = [
         "ffmpeg", "-y",

@@ -10296,10 +10296,44 @@ def test_subtitle_display_style_resolution_tier() -> RegressionTestCase:
             tc.assert_equal(src.count("FontSize="), 1,
                             "G FontSize appears exactly once in source (no second hardcoded copy)")
             style_pos = src.find("FontSize=")
-            tc.assert_true("SUBTITLE_STYLE['font_size']" in src[style_pos - 20:style_pos + 60],
-                           "G the single site reads the tiered style, H style values live in one place")
+            tc.assert_true("geometry['font_size']" in src[style_pos - 20:style_pos + 60],
+                           "G the single site reads the tiered geometry dict, "
+                           "H style values live in one place")
+            tc.assert_true("FontSize={SUBTITLE_STYLE" not in src,
+                           "G 生成点不直接吃模块全局档位（跨项目惰性继承的旧缺陷形态）")
             tc.assert_equal(src.count('"font_size":'), 2,
                             "H tier values declared exactly twice (wide/narrow), nowhere else")
+
+            # ── G2：深底档逐字等于 2026-10-10 既有形态（两批实测教训的落点）──
+            # 旧形态（纯描边 2 + 阴影 1）经 libass 默认 PlayRes(384×288)→1080p 约 3.75 倍
+            # 放大后在浅色画面上糊成黑块；10-10 收为 BorderStyle=4 圆角底盒。盒色 alpha
+            # 必须住 BackColour——修订01 曾把 &H73000000 写进 OutlineColour，libass 底盒档
+            # 不读该字段 alpha，成片量出盒内 [5,5,5] 纯黑。描边由不透明 3 收为半透 1
+            # （修订02 字周黑胶，字幕带近黑 15.2%）；Outline=0 候选被探针证伪。
+            # 2026-10-11 起样式串改由 subtitle_force_style 单点生成、色彩值住 palette，
+            # 故本段两向都锁：模板里字段字面量各出现一次（无第二份拷贝）＋深底档数据值
+            # 逐字等于 10-10 形态（值被改动即红，与旧写法等价但不再依赖字面量位置）。
+            for _field, _tpl in (("BorderStyle=", "BorderStyle={palette['border_style']},"),
+                                 ("BackColour=", "BackColour={palette['back_colour']},"),
+                                 ("Shadow=", "Shadow=0,"),
+                                 ("OutlineColour=", "OutlineColour={palette['outline_colour']},")):
+                tc.assert_equal(src.count(_field), 1,
+                                f"G2 {_field.rstrip('=')} single generation point (no second copy)")
+                tc.assert_true(_tpl in src, f"G2 style template pins {_field.rstrip('=')}")
+            tc.assert_true("OutlineColour=&H73000000" not in src,
+                           "G2 the rejected 修订01 form must not come back")
+            tc.assert_equal(eva.SUBTITLE_PALETTE_DARK,
+                            {"primary_colour": "&H00FFFFFF",
+                             "outline_colour": "&H96000000",
+                             "back_colour": "&H73000000",
+                             "border_style": "4", "outline": "1"},
+                            "G2 深底档＝2026-10-10 既有形态（白字/半透黑盒/半透描边 1）")
+            _fn_blk = src[src.find("def subtitle_force_style"):src.find("def subtitle_band_luma_median")]
+            tc.assert_true("Outline=0" not in _fn_blk,
+                           "G2 模板不承载描边数字（写死即两档分叉）")
+            tc.assert_true(eva.SUBTITLE_PALETTE_LIGHT["outline"] != "0"
+                           and eva.SUBTITLE_PALETTE_DARK["outline"] != "0",
+                           "G2 两档描边均不归零（0 档已被 render_raw 探针证伪）")
 
         tc.mark_passed()
 
@@ -11959,6 +11993,812 @@ def test_light_theme_content_pixel_caliber() -> RegressionTestCase:
     return tc
 
 
+def test_bgm_default_off_and_declared_pointer_not_dropped() -> RegressionTestCase:
+    """用例81：BGM 缺省关闭 + 已声明音轨不得被静默摘掉（2026-10-10，用户三轮观感裁定代码化）
+
+    背景：`BGM_ENABLED` 原缺省 True，其兜底实现是 step2 用 ffmpeg 合成的低频正弦 drone。
+    用户对同批交付连续三轮点名"每次视频启动'嗡嗡'的背景音"，随后把三件事（无嗡嗡声、
+    浅色底、字幕样式）一并定为**常设要求**（"以后都按最新的要求统一执行"）。裁定分三层：
+      ① 要背景音是显式意图而非缺省——缺省关，键未声明时不配任何音乐；
+      ② 同一配置键在两个消费者处默认值分叉（本模块缺省 True，
+        `media_qa_gate._config_bgm_declared` 未声明按 False）＝单一权威源违反，
+        本次翻转使二者一致，不是新增行为而是消除分叉；
+      ③ 翻转引入的新风险：config 声明了 `bgm_source`（作者点名要的那条外部音轨）
+        却没声明 `bgm_enabled`，按缺省会**静默摘掉它**——与既有"指针找不到即报错、
+        禁止静默回退"同判据，故补 fail-loud 守卫。
+    浅色底属设计判据、无代码门禁，其常设默认住分镜模板；字幕样式住烧录串单一生成点
+    （用例76 G2 段）。本用例只裁缺省音轨。
+
+    本用例锁定：
+    A 缺省声明处为 False（源码锚定——翻转被改回 True 即红，这是本机制存在的理由）
+    B 键未声明 → 载入后判为关闭（行为面，不只源码面）
+    C 显式 true（含字符串 "true"）仍启用：要背景音的路径没被堵死
+    D 不惰性继承：显式 true 的项目之后，未声明的项目必须回缺省 False
+      （与用例76 C 段同判据族：模块全局跨项目泄漏。旧写法 cfg.get(k, BGM_ENABLED)
+       读的正是上一轮被改写的全局值，即缺陷形态）
+    E 声明 bgm_source 而未启用 → 退出码非零，且报错逐字点名两键（不得静默丢音轨）
+    F 纯 BGM 门禁未被翻转削弱：tts_enabled=false 且未启用 → 仍报错
+    G 两消费者一致：media_qa_gate._config_bgm_declared 对未声明 config 判 False
+    H 现网冲击面枚举：本仓任何 tts_enabled=false 的 config 必须显式声明 bgm_enabled=true。
+      发布仓若无此类 config，本条按"无对象"通过——功能面由 B/C/E/F 夹具承担，
+      不得据此把 H 读成"现网已验证"。
+    变异（实测逐枚归因，取证 _取证/20261010/mutation_bgm_attribution.json 与 M4 单枚件）：
+    M1 缺省改回 True → A+B 红（并连带 D/E/F：缺省为真时守卫与门禁无从触发）/
+    M2 载入退回 cfg.get(k, BGM_ENABLED) 惰性继承 → D 红 /
+    M3 摘掉 bgm_source 守卫 → E 两条全红（退出码归零 + 点名文案消失）/
+    M4 守卫降为 WARN 后继续跑 → E 的退出码断言红（静默丢音轨换了噪声形态，同样不得通过）/
+    M5 放宽纯 BGM 门禁 → F 红 / M6 终检侧缺省改 True → G 红（分叉复发）。
+    """
+    tc = RegressionTestCase(
+        "bgm_default_off_and_declared_pointer_not_dropped",
+        "验证 BGM 缺省关闭、显式声明仍生效、指针与开关分叉时 fail-loud 而非静默丢音轨"
+    )
+    try:
+        import io
+        import json as _json
+        import re as _re
+        import contextlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+        mq = _safe_import_rebinding_module("media_qa_gate")
+
+        _saved = (eva.BGM_ENABLED, eva.BGM_SOURCE, eva.TTS_ENABLED)
+        try:
+            SC = [{"scene_id": "s1", "type": "content", "start": 0.0, "end": 10.0,
+                   "duration": 10.0, "narration": "这是一段用于验证缺省音轨开关的旁白文本",
+                   "narration_required": True, "subtitle_required": True}]
+
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                fake_bgm = tmp / "ambient.wav"
+                fake_bgm.write_bytes(b"RIFF")  # 仅需 is_file() 成立，不解析音频
+
+                def load(tag, body):
+                    """载入一份 config 并返回 stdout；body 里没写的键即"未声明"。"""
+                    cfg = dict(video_duration=10.0, scenes=SC)
+                    cfg.update(body)
+                    p = tmp / f"{tag}.json"
+                    p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        eva.load_config(str(p))
+                    return buf.getvalue()
+
+                def load_exits(tag, body):
+                    """同 load，但断言其以非零退出码终止，返回 (退出码, stdout)。"""
+                    cfg = dict(video_duration=10.0, scenes=SC)
+                    cfg.update(body)
+                    p = tmp / f"{tag}.json"
+                    p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+                    buf = io.StringIO()
+                    try:
+                        with contextlib.redirect_stdout(buf):
+                            eva.load_config(str(p))
+                    except SystemExit as e:
+                        return (int(e.code or 0), buf.getvalue())
+                    return (0, buf.getvalue())
+
+                # ── A：缺省声明处（源码锚定，活值随用例顺序浮动故不读全局）──
+                src = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8")
+                _decl = _re.search(r'^BGM_ENABLED_DEFAULT\s*=\s*(\w+)', src, _re.M)
+                tc.assert_true(bool(_decl) and _decl.group(1) == "False",
+                               "A 缺省常量声明处必须为 False（改回 True 即本机制失效）")
+                tc.assert_true(_re.search(r'^BGM_ENABLED\s*=\s*BGM_ENABLED_DEFAULT', src, _re.M),
+                               "A 模块全局初值取自缺省常量，不是第三处字面量")
+                tc.assert_equal(len(_re.findall(r'^BGM_ENABLED_DEFAULT\s*=', src, _re.M)), 1,
+                                "A 缺省只声明一次（第二处即第二个真相源）")
+
+                # ── B：未声明 bgm_enabled → 关闭 ──
+                load("b_undeclared", {})
+                tc.assert_true(eva.BGM_ENABLED is False,
+                               "B 键未声明时缺省不配背景音")
+
+                # ── C：显式声明仍生效（布尔与字符串两形态）──
+                load("c_true", {"bgm_enabled": True})
+                tc.assert_true(eva.BGM_ENABLED is True, "C bgm_enabled=true 仍启用")
+                load("c_str", {"bgm_enabled": "true"})
+                tc.assert_true(eva.BGM_ENABLED is True, "C 字符串 true 同判启用")
+                load("c_false_str", {"bgm_enabled": "false"})
+                tc.assert_true(eva.BGM_ENABLED is False,
+                               "C 字符串 false 不得因 bool('false') 被读成启用")
+
+                # ── D：不惰性继承（上一轮 true 之后未声明必须回缺省）──
+                load("d_prev_true", {"bgm_enabled": True})
+                tc.assert_true(eva.BGM_ENABLED is True, "D 前置：上一项目显式启用")
+                load("d_undeclared", {})
+                tc.assert_true(eva.BGM_ENABLED is False,
+                               "D 未声明的项目回缺省，不得继承上一轮档位")
+
+                # ── E：声明指针而未启用 → fail-loud 且点名两键 ──
+                code_e, out_e = load_exits("e_pointer", {"bgm_source": str(fake_bgm)})
+                tc.assert_true(code_e != 0, "E 指针在场而开关缺省时不得静默通过")
+                tc.assert_true("bgm_source" in out_e and "bgm_enabled" in out_e,
+                               "E 报错逐字点名两键并给出可执行动作（不得只报音轨丢失这类结论）")
+                # 正向对照：指针 + 显式启用 → 正常载入并解析到该文件
+                load("e_ok", {"bgm_enabled": True, "bgm_source": str(fake_bgm)})
+                tc.assert_true(eva.BGM_ENABLED is True and eva.BGM_SOURCE == fake_bgm,
+                               "E 对照：显式启用的外部音轨路径未被本守卫误拦")
+
+                # ── F：纯 BGM 门禁未被削弱 ──
+                code_f, out_f = load_exits("f_pure_bgm_off", {"tts_enabled": False})
+                tc.assert_true(code_f != 0 and "纯BGM" in out_f,
+                               "F 无旁白且未启用背景音仍报错（缺省翻转不得放宽该门禁）")
+
+                # ── G：两消费者一致（未声明一律按 False）──
+                g_cfg = tmp / "g_undeclared.json"
+                g_cfg.write_text(_json.dumps({"video_duration": 10.0}, ensure_ascii=False),
+                                 encoding="utf-8")
+                tc.assert_true(mq._config_bgm_declared(str(g_cfg)) is False,
+                               "G 终检侧对未声明 config 判未启用（与缺省一致，分叉已消除）")
+                g_on = tmp / "g_on.json"
+                g_on.write_text(_json.dumps({"bgm_enabled": True}, ensure_ascii=False),
+                                encoding="utf-8")
+                tc.assert_true(mq._config_bgm_declared(str(g_on)) is True,
+                               "G 对照：显式启用时终检侧仍识别为启用")
+
+                # ── H：现网冲击面枚举（无对象时按无对象通过，见 docstring 限定）──
+                viol = []
+                cfg_root = script_dir.parent / "配置"
+                for p in (list(cfg_root.rglob("*.json")) if cfg_root.is_dir() else []):
+                    try:
+                        d = _json.loads(p.read_text(encoding="utf-8-sig"))
+                    except Exception:
+                        continue
+                    if isinstance(d, dict) and d.get('tts_enabled') is False \
+                            and d.get('bgm_enabled') is not True:
+                        viol.append(p.name)
+                tc.assert_equal(viol, [],
+                                "H 无旁白项目必须显式声明背景音开关（缺省翻转对现网零冲击）")
+        finally:
+            eva.BGM_ENABLED, eva.BGM_SOURCE, eva.TTS_ENABLED = _saved
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"bgm default fixture error: {e}")
+    return tc
+
+
+def test_scene_patch_cover_head_excluded_from_time_source() -> RegressionTestCase:
+    """用例82：封面 head 从时间源计数中摘出，但排除判据只认"没有 T 条目"（2026-10-11）
+
+    背景：`extract_scene_times` 旧判据是"scene div 数 == T-block 键数"。封面 div 按
+    模板契约存在（preflight_check 的 data-scene-entry="cover|gsap|static"，只有 scene0
+    可为 cover），其时间位由 root data-cover-duration 承载、**不进 T-block**，于是
+    "一切手写 HTML 项目恒有 T 数 = div 数 − 1"→ 恒判时间源不可信 → sidecar
+    scene_times=None → classify 永久 FULL → 场景级增量渲染对手写项目整体失效。
+    实测（本仓真实交付项目，2026-10-10）：改一场后 --resume 落盘
+    baseline-time-source-untrusted(scene-count-mismatch(T=13, div=14))，按全量渲染计费；
+    本仓含 T-block 的项目普查 37 个，其中 16 个即此形态。改动前后读数差集（16 放行 /
+    16 逐字零变化 / 0 由放行转拦下）登记于 `AI视频制作工作流模板/操作日志.md`
+    [2026-10-11] feat|增量渲染 条与 agents.md「封面 head 的时间源口径」段。
+
+    本用例锁定（**只把"无 T 条目的封面"从计数里摘出去，任何阈值一格未动**）：
+    A 封面 head 形态放行：times 只含有 T 条目的场景，首窗起点=封面时长，末窗收在
+      root data-duration；"div 数比 T 键数多 1"在本形态下不再是否决理由
+    B 哨兵/编译型封面零变化：T 块含 s0: 0.0 时封面自带时间条目，必须照常进 times。
+      排除判据取"没有 T 条目"而非"标了 cover"——按 entry 一律排除属过度修正，会把
+      已经可用的路径改坏（本条是 B 段存在的全部理由）
+    C head 的四条见证，任一不满足即点名退回全量：声明的封面时长须与首个 T 起点吻合、
+      data-cover-duration 必须声明、未映射 div 必须是 cover、cover 必须在 DOM 首位；
+      另锁"T 键编号须逐个落到 div 上"——旧实现按**位置**配对，数量恰好相等而编号
+      错位时会把窗口静默配到别的场景上（段渲染 seek 错时间），新判据点名退回全量
+    D classify 裁定面：未改 → no-scene-content-change；改一场 → PATCH 且 ctx 携
+      head_ids；分段计划首段是覆盖 [0, 首T起点×fps) 的 keep 段、整表连续收在基线
+      总帧数（不预置该段则每次 PATCH 少一段封面帧、白渲一遍再降级）；只改封面或
+      封面与内容同改 → FULL 点名 cover-head-changed（wrapper 必须剥掉
+      data-cover-duration，封面渲不出来，放行等于静默交付旧封面）；>50% 与"分母含
+      封面"两处的阈值一格未动；存量 scene_times=None 的旧 sidecar 不回溯
+    E 现网冲击面只读普查（发布仓无这些项目时按"无对象"通过）：恒差形态者新判据必须
+      放行；旧判据放行过的项目新判据给出**逐字相同**的 times；新拦下而旧放行的项目
+      为 0（正反对照内联旧公式，与用例75"新判据 PASS／退回旧判据必 FAIL"同手法）
+    F 接线：_patch_execute 真把 ctx["head_ids"] 传给 _plan_segments（用参数捕获的
+      功能断言证明这条腿真被执行，源码锚定不承载裁定——A06"取数断链"同族防线）
+
+    变异（实测逐枚归因，取证 _取证/20261011/mutation_cover_head.json）：
+    M1 排除判据退回"entry==cover 一律排除" → B1/B3 红（哨兵型封面被摘出时间源）/
+    M2 摘掉封面时长与首个 T 起点的吻合校验 → C1 红 /
+    M3 摘掉 data-cover-duration 缺失即否决 → C2 红 /
+    M4 摘掉"未映射 div 必须是 cover" → C3 红 /
+    M5 摘掉"cover 必须在首位" → C5 红 /
+    M6 摘掉"T 键须逐个落到 div"退回位置配对 → C6 红（错配的 times 被当成可信）/
+    M7 _plan_segments 不预置 head keep 段 → D3+D3b+F2 红（帧网格缺 75 帧）/
+    M8 摘掉 cover-head-changed 否决 → D4/D5 红（改封面被判 PATCH＝静默交付旧封面）/
+    M9 把 too-many 分母改成"仅内容场数" → D6 红（阈值被放宽）/
+    M10 _patch_execute 不传 head_ids（退回默认 ()） → F2 红（接线断链，本地再实证）。
+    """
+    tc = RegressionTestCase(
+        "scene_patch_cover_head_excluded_from_time_source",
+        "验证封面 head 从时间源计数摘出、哨兵型封面零变化、head 见证缺失即退回全量、"
+        "改封面不得出 PATCH"
+    )
+    try:
+        import re as _re
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        sp = _safe_import_rebinding_module("scene_patch_render")
+        from _gsap_time_utils import parse_t_block as _parse_t
+
+        FPS = 25
+        DUR = 12.0
+        # 手写封面形态：T-block 从 3.0 起（= data-cover-duration），s0 无 T 条目
+        ROWS = [("s1", 3.0), ("s2", 6.0), ("s3", 9.0)]
+        # 无封面/哨兵形态：T-block 从 0.0 起
+        ROWS0 = [("s1", 0.0), ("s2", 3.0), ("s3", 6.0)]
+        COVER_CFG = {"video_duration": DUR, "fps": FPS}
+        BASE_CFG = {"video_duration": 9.0, "fps": FPS}
+
+        def make_html(rows=ROWS, dur=DUR, cover="s0", sentinel=False, cover_dur="3",
+                      declare=True, entry="cover", first=True, extra_div=None,
+                      extra_t=None):
+            """合成含/不含封面、封面有无 T 条目两种形态的 HyperFrames 项目 HTML。"""
+            t_items = ([f"{cover}: 0.0"] if (cover and sentinel) else []) + \
+                      [f"{sid}: {st}" for sid, st in rows]
+            if extra_t:
+                t_items.append(extra_t)
+            cover_div = ""
+            if cover:
+                cover_div = (f'    <div data-scene-id="{cover}" data-scene-entry="{entry}" '
+                             f'data-scene-subtitle-safe="true">封面文案</div>\n')
+            scene_divs = "".join(
+                f'    <div data-scene-id="{sid}" data-scene-entry="gsap" '
+                f'data-scene-subtitle-safe="true">内容{sid}</div>\n' for sid, _ in rows)
+            extra = (f'    <div data-scene-id="{extra_div}" data-scene-entry="gsap" '
+                     f'data-scene-subtitle-safe="true">额外场</div>\n') if extra_div else ""
+            divs = ((cover_div + scene_divs + extra) if (first or not cover)
+                    else (scene_divs + extra + cover_div))
+            rc = f'data-cover-duration="{cover_dur}" ' if declare else ''
+            return ('<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+                    '<style>.card{color:#fff}</style></head>\n<body>\n'
+                    f'  <div data-composition-id="main" data-duration="{dur}" {rc}'
+                    'data-width="1080" data-height="1920">\n'
+                    f'{divs}  </div>\n  <script src="gsap.min.js"></script>\n  <script>\n'
+                    f'  var T = {{ {", ".join(t_items)} }};\n'
+                    '  var main = gsap.timeline();\n  main.to(".card", { opacity: 1 }, 0);\n'
+                    '  window.__timelines = { main: main };\n  </script>\n</body></html>\n')
+
+        def old_extract_scene_times(html, config):
+            """修复前判据的逐字复现（HEAD 版本 extract_scene_times 全部分支），仅供对照。
+
+            这是**判据**的对照实现，不是第二份生效路径：E 段用它证"零变化面"与
+            "无放行转拦下"，C6 用它证"旧公式会错配而新判据点名"。生效路径只有
+            sp.extract_scene_times 一处。复现必须完整（含 S-block end 自洽、config
+            交叉校验、sub-frame 守卫），否则旧公式会假放行，E3 变成假违例。
+            """
+            script_all = "\n".join(_re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html))
+            t_map = _parse_t(script_all)
+            if not t_map:
+                return None, "no-T-block"
+            root = sp.extract_root_attrs(html)
+            try:
+                duration = float(root.get("duration", 0))
+            except ValueError:
+                return None, "bad-data-duration"
+            if duration <= 0:
+                return None, "no-data-duration"
+            blocks = sp.extract_scene_blocks(html)
+            if len(blocks) != len(t_map):
+                return None, f"scene-count-mismatch(T={len(t_map)}, div={len(blocks)})"
+            starts = [t_map[k] for k in sorted(t_map)]
+            if starts != sorted(starts) or starts[0] != 0.0:
+                return None, "T-block-not-monotonic"
+            ends = [float(v) for v in _re.findall(r'\bend:\s*([\d.]+)', script_all)]
+            if ends and abs(max(ends) - duration) > 0.05:
+                return None, f"S-block-end({max(ends)}) != data-duration({duration})"
+            cfg_dur = float(config.get("video_duration", 0))
+            if abs(cfg_dur - duration) > 0.05:
+                return None, f"config video_duration({cfg_dur}) != data-duration({duration})"
+            try:
+                fps = float(config.get("fps", 25)) or 25.0
+            except (TypeError, ValueError):
+                fps = 25.0
+            out = []
+            for i, (sid, _, _, _) in enumerate(blocks):
+                end = starts[i + 1] if i + 1 < len(starts) else duration
+                if round(end * fps) - round(starts[i] * fps) < 1:
+                    return None, f"scene-window-sub-frame({sid}: {starts[i]}-{end} @ {fps}fps)"
+                out.append({"id": sid, "start": starts[i], "end": end})
+            return out, None
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            saved_bases = (sp.HTML_BASE, sp.TEMP_BASE)
+            sp.HTML_BASE = td / "hyperframes"
+            sp.TEMP_BASE = td / "临时产物"
+            try:
+                proj = "cover-head-fixture"
+                src_dir = sp.HTML_BASE / proj
+                tmp_dir = sp.TEMP_BASE / f"{proj}_audio"
+                src_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                cfg_path = td / f"{proj}.json"
+                cfg_path.write_text(json.dumps({
+                    "fps": FPS, "video_duration": DUR, "resolution": "1080x1920",
+                    "paths": {"html_project": proj, "temp_subdir": f"{proj}_audio"},
+                }, ensure_ascii=False), encoding="utf-8")
+                pr = sp.PatchRenderer(cfg_path)
+                pr.render_raw.write_bytes(b"\x00" * 64)
+
+                # ── A 封面 head 形态放行 ──
+                html_cover = make_html()
+                times, err = sp.extract_scene_times(html_cover, COVER_CFG)
+                tc.assert_true(err is None, f"A1 封面 head 形态不再判时间源不可信 (err={err})")
+                tc.assert_equal([t["id"] for t in (times or [])], ["s1", "s2", "s3"],
+                                "A2 times 只含有 T 条目的场景（封面不进时间源）")
+                tc.assert_equal(times[0]["start"] if times else None, 3.0,
+                                "A3 首窗起点即声明的封面时长")
+                tc.assert_equal(times[-1]["end"] if times else None, DUR,
+                                "A4 末窗收在 root data-duration")
+                _blocks = sp.extract_scene_blocks(html_cover)
+                _t = _parse_t(html_cover)
+                tc.assert_true(len(_blocks) == len(_t) + 1,
+                               f"A5 恒差 1 的形态确实存在 (div={len(_blocks)}, T={len(_t)})")
+                mapped, head_id, err2 = sp.split_cover_head(_blocks, _t)
+                tc.assert_equal(([sid for sid, _ in mapped], head_id, err2),
+                                (["s1", "s2", "s3"], "s0", None),
+                                "A6 split_cover_head 三值：映射表 / head id / 无错")
+
+                # ── B 哨兵/编译型封面零变化 ──
+                # 该形态 T 块含 s0: 0.0（封面自己就是首个时间位），余下场景依次后移
+                html_sent = make_html(sentinel=True)
+                ts, es = sp.extract_scene_times(html_sent, COVER_CFG)
+                tc.assert_true(es is None, f"B1 封面自带 T 条目 → 不误拦 (err={es})")
+                tc.assert_equal([t["id"] for t in (ts or [])], ["s0", "s1", "s2", "s3"],
+                                "B2 哨兵型封面照常进 times（排除判据取「没有 T 条目」）")
+                tc.assert_equal(ts[0]["id"] if ts else None, "s0",
+                                "B3 反断言：标了 cover 且有 T 条目的封面不得被摘出")
+                tc.assert_equal(ts[0]["start"] if ts else None, 0.0,
+                                "B3b 该形态时间轴仍从 0 起（与修复前同读数）")
+                html_plain = make_html(rows=ROWS0, dur=9.0, cover=None, declare=False)
+                tp, ep = sp.extract_scene_times(html_plain, BASE_CFG)
+                tc.assert_true(ep is None and [t["id"] for t in tp] == ["s1", "s2", "s3"],
+                               f"B4 无封面项目零变化 (err={ep})")
+                # 无 head 时"首个 T 起点必须为 0"这条既有判据逐字保留（未放宽）
+                tp2, ep2 = sp.extract_scene_times(make_html(cover=None), COVER_CFG)
+                tc.assert_true(tp2 is None and ep2 == "T-block-not-monotonic",
+                               f"B5 无封面而首起点非 0 → 仍按既有判据否决 (err={ep2})")
+
+                # ── C head 的见证条件 ──
+                _, ec1 = sp.extract_scene_times(make_html(cover_dur="5"), COVER_CFG)
+                tc.assert_true(ec1 and ec1.startswith("cover-head(s0)"),
+                               f"C1 声明封面时长≠首个 T 起点 → 点名两值 (err={ec1})")
+                _, ec2 = sp.extract_scene_times(make_html(declare=False), COVER_CFG)
+                tc.assert_true(ec2 and ec2.startswith("cover-head-duration-undeclared(s0"),
+                               f"C2 有 head 而未声明 data-cover-duration → 点名 (err={ec2})")
+                _, ec3 = sp.extract_scene_times(make_html(entry="gsap"), COVER_CFG)
+                tc.assert_true(ec3 and ec3.startswith("scene-without-T-entry(s0"),
+                               f"C3 未映射 div 不是 cover → 点名 (err={ec3})")
+                _, ec4 = sp.extract_scene_times(make_html(extra_div="s9"), COVER_CFG)
+                tc.assert_true(ec4 and ec4 == "scenes-without-T-entry(s0,s9)",
+                               f"C4 两个 div 无 T 条目 → 逐个点名 (err={ec4})")
+                _, ec5 = sp.extract_scene_times(make_html(first=False), COVER_CFG)
+                tc.assert_true(ec5 and ec5.startswith("cover-head-not-first(s0)"),
+                               f"C5 cover 不在 DOM 首位 → 点名 (err={ec5})")
+                html_orphan = make_html(rows=ROWS0, dur=9.0, extra_t="s7: 8.0")
+                _, ec6 = sp.extract_scene_times(html_orphan, BASE_CFG)
+                tc.assert_true(ec6 and ec6.startswith("T-keys-without-scene-div(7"),
+                               f"C6 有 T 键无对应 div → 点名编号 (err={ec6})")
+                old_ts6, old_es6 = old_extract_scene_times(html_orphan, BASE_CFG)
+                tc.assert_true(old_ts6 is not None and old_es6 is None,
+                               "C6b 同一 HTML 旧公式（位置配对）判为可信 → 本条是真拦截")
+                tc.assert_equal([t["id"] for t in (old_ts6 or [])],
+                                ["s0", "s1", "s2", "s3"],
+                                "C6c 旧公式把 s7 的窗口位置配到了 s3 上（封面被当有时长场景）")
+
+                # ── D classify 裁定面 ──
+                def write_fx_sidecar(html, **over):
+                    fp = sp.extract_fingerprints(html, pr.config,
+                                                 pr.source_dir / "narration.json")
+                    ts_, er = sp.extract_scene_times(html, pr.config)
+                    side = {"version": sp.SIDECAR_VERSION, "fps": FPS,
+                            "width": 1080, "height": 1920,
+                            "total_frames": int(round(DUR * FPS)), "has_audio": False,
+                            "scene_times": ts_, "scene_times_error": er,
+                            "scene_times_witness":
+                                sp.scene_time_witness(html) if ts_ else None}
+                    side.update(fp)
+                    side.update(over)
+                    pr.sidecar_path.write_text(json.dumps(side, ensure_ascii=False),
+                                               encoding="utf-8")
+
+                pr.html_path.write_text(html_cover, encoding="utf-8")
+                write_fx_sidecar(html_cover)
+                tc.assert_equal(pr.classify()[2], "no-scene-content-change",
+                                "D1 未改 → 不构成一次命中")
+
+                html_edit = html_cover.replace("内容s2", "内容s2（修订：隔声 45dB）")
+                pr.html_path.write_text(html_edit, encoding="utf-8")
+                v, ch, r, ctx = pr.classify()
+                tc.assert_equal((v, ch, r), ("PATCH", ["s2"], ""),
+                                f"D2 改一场内容 → PATCH 该场 (verdict={v}, reason={r})")
+                tc.assert_equal(ctx.get("head_ids"), ["s0"],
+                                "D2b ctx 携 head id，供分段计划预置 keep 段")
+
+                segs = pr._plan_segments(ctx["times"], ["s2"], ctx["head_ids"])
+                # 封面 keep 段与相邻的 s1 keep 段合并（既有"相邻同类段合并"口径），
+                # 本批只保证"计划从第 0 帧起覆盖封面 head"，不改合并口径
+                tc.assert_equal(segs, [("keep", 0, 150, ["s0", "s1"]),
+                                       ("render", 150, 225, ["s2"]),
+                                       ("keep", 225, 300, ["s3"])],
+                                "D3 计划含封面 head 的 keep 帧段，整表连续收在总帧 300")
+                tc.assert_equal(segs[0][1], 0, "D3b 计划从第 0 帧起（缺这段即少 75 帧）")
+                tc.assert_equal(segs[-1][2], int(round(DUR * FPS)),
+                                "D3b2 末段终点==基线总帧，拼接帧数必然相等")
+                no_head_arg = pr._plan_segments(ctx["times"], ["s2"])
+                tc.assert_equal(no_head_arg[0], ("keep", 0, 150, ["cover-head", "s1"]),
+                                "D3c 帧网格覆盖不依赖封面 id：未传 head 仍从 0 帧补齐、"
+                                "只退化标签")
+
+                pr.html_path.write_text(
+                    html_cover.replace("封面文案", "封面文案（改的是封面）"), encoding="utf-8")
+                tc.assert_equal(pr.classify()[2], "cover-head-changed(s0)",
+                                "D4 只改封面 → FULL（放行等于静默交付旧封面）")
+                both = html_cover.replace("封面文案", "封面文案改").replace("内容s2", "内容s2改")
+                pr.html_path.write_text(both, encoding="utf-8")
+                tc.assert_equal(pr.classify()[2], "cover-head-changed(s0)",
+                                "D5 封面与内容同改 → 仍 FULL，不得只渲内容场")
+
+                pr.html_path.write_text(html_cover, encoding="utf-8")
+                write_fx_sidecar(html_cover)
+                three = (html_cover.replace("内容s1", "内容s1改")
+                         .replace("内容s2", "内容s2改").replace("内容s3", "内容s3改"))
+                pr.html_path.write_text(three, encoding="utf-8")
+                tc.assert_equal(pr.classify()[2], "too-many-scenes-changed(3/4)",
+                                "D6 阈值一格未动：分母含封面（3/4 而非 3/3）")
+
+                write_fx_sidecar(html_cover, scene_times=None,
+                                 scene_times_error="scene-count-mismatch(T=3, div=4)")
+                pr.html_path.write_text(html_edit, encoding="utf-8")
+                tc.assert_true(pr.classify()[2].startswith("baseline-time-source-untrusted("),
+                               "D7 存量旧 sidecar 不回溯：仍需一次全量渲染重建可信基线")
+
+                # ── F 接线（功能断言，非源码文本锚定）──
+                write_fx_sidecar(html_cover)
+                pr.html_path.write_text(html_edit, encoding="utf-8")
+                v, ch, r, ctx = pr.classify()
+                tc.assert_equal(v, "PATCH", f"F1 接线前 classify 判 PATCH (reason={r})")
+                captured = {}
+
+                def _probe_plan(times_arg, changed_arg, head_ids=()):
+                    captured["head_ids"] = list(head_ids)
+                    raise RuntimeError("_plan_segments probe")
+
+                _real_plan = pr._plan_segments
+                pr._plan_segments = _probe_plan
+                try:
+                    pr._patch_execute(ctx, ch, ctx["times"])
+                    tc.assert_true(False, "F2 _patch_execute 未走到分段计划（提前返回）")
+                except RuntimeError as e:
+                    tc.assert_equal(str(e), "_plan_segments probe",
+                                    "F2 分段计划确实由 _patch_execute 调用")
+                finally:
+                    del pr._plan_segments
+                tc.assert_equal(captured.get("head_ids"), ["s0"],
+                                "F3 ctx 里的 head_ids 真传到 _plan_segments（取数未断链）")
+                pr._plan_segments = _real_plan
+
+                # ── E 现网冲击面只读普查（发布仓无这些项目时按"无对象"通过）──
+                html_root = sp.ROOT / "程序文件" / "源码" / "hyperframes"
+                projs = sorted(p for p in (html_root.glob("*/index.html")) if p.is_file()) \
+                    if html_root.exists() else []
+                opened, same, newly_vetoed, cover_left_out = [], [], [], []
+                for hp in projs:
+                    html = hp.read_text(encoding="utf-8", errors="replace")
+                    root = sp.extract_root_attrs(html)
+                    try:
+                        d = float(root.get("duration", 0))
+                    except ValueError:
+                        continue
+                    if d <= 0:
+                        continue
+                    cfg_probe = {"video_duration": d, "fps": FPS}
+                    t_map = _parse_t("\n".join(
+                        _re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html)))
+                    blocks = sp.extract_scene_blocks(html)
+                    n_times, n_err = sp.extract_scene_times(html, cfg_probe)
+                    o_times, o_err = old_extract_scene_times(html, cfg_probe)
+                    if o_times is None and n_times is not None:
+                        opened.append(hp.parent.name)
+                        head_ids = [sid for sid, _, _, _ in blocks
+                                    if sid not in {t["id"] for t in n_times}]
+                        if not head_ids:
+                            cover_left_out.append(hp.parent.name)
+                    if o_times is not None and n_times is not None and o_times != n_times:
+                        same.append(hp.parent.name)
+                    if o_times is not None and n_times is None:
+                        newly_vetoed.append(hp.parent.name)
+                tc.assert_equal(cover_left_out, [],
+                                f"E1 放行的恒差项目仍把封面留在时间源外 (违例={cover_left_out})")
+                tc.assert_equal(same, [],
+                                f"E2 旧判据放行过的项目 times 逐字不变 (违例={same})")
+                tc.assert_equal(newly_vetoed, [],
+                                f"E3 无项目由放行转为拦下（下限安全）(违例={newly_vetoed})")
+                if not projs:
+                    tc.assert_true(True, "E4 发布仓无 hyperframes 项目 → E 段按无对象通过")
+            finally:
+                sp.HTML_BASE, sp.TEMP_BASE = saved_bases
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"scene patch cover head fixture error: {e}")
+    return tc
+
+
+def test_subtitle_palette_tier_by_measured_band_luma() -> RegressionTestCase:
+    """用例83：字幕色彩按**字幕带实测亮度**分档（2026-10-11 用户观感裁定代码化）
+
+    背景（两条实测，不是新偏好）：2026-10-10 把样式收为"白字 + 半透黑圆角盒"的理由是
+    "浅底深底均稳定可读"——那是**可读性**口径。本批用户反馈"浅色背景下字幕的灰色背景
+    没必要，破坏画面整体视觉风格"，抽帧量测证实代价真实：已交付浅色主题成片的字幕带底图
+    实测中位亮度 242，其上叠一条 &H73 半透黑盒后成为整幅画面里唯一的深色大块。
+    但**不能只摘盒**：现样式是白字，落在 242 的浅底上对比只剩 12/255（≈1.05:1），
+    摘盒等于把字幕擦掉。故浅底档同时换墨色（#0f172a＝画面标题同一墨色）并给字周加
+    **浅色**半透 halo——浅底上近乎不可见，字幕压到深色图卡/照片时才把字缘托出来。
+
+    本用例锁定：
+    A 样式串唯一生成点：几何档（画布宽）× 色彩档（带亮度）两轴正交，四组合字段来源各自正确
+    B 深底档生成的串**逐字等于** 2026-10-10 字面串（既有深色主题项目重烧零变化的正证据）
+    C 浅底档三件套：不画盒（BorderStyle=1 且 BackColour 全透明）、深墨字、halo 为浅色半透，
+      并当场复算深墨字在浅底上的对比度
+    D 带亮度量测本身：浅夹具→高值、深夹具→低值、"上浅下深"夹具→取带不取整帧、
+      抽帧全失败→None、SRT 读不到→None 且点名、20 条字幕等距抽到 8 帧
+    E 阈值住 video_quality_rules.json → subtitle_style.light_band_median_min：改配置即改档；
+      缺节回退默认常量；值不可解析回退且打印点名（静默换口径即缺陷）
+    F 无从裁定即退回深底档并点名归因——**不得由"测不出"推出"是浅底"**（四态纪律）；
+      另锁边界为 >=
+    G 接线：step6 真把选中的 palette 灌进 ffmpeg 的 force_style（run_ffmpeg 桩捕获命令串
+      + [SUBTITLE-STYLE] 打印行），不是函数里算完就丢
+    H 真实成片只读冒烟：取数面在真实交付 mp4 字节上跑得出数（发布仓无成片时按"无对象"通过）
+
+    与"不做项④"的关系：本条改的是**缺省样式值**，不是新增门禁——不阻断、不裁定合格与否，
+    测不出即回旧形态。三轮观感问题 81 用例 0 抓出、全部由用户肉眼抓出，故观感侧的动作
+    是改默认，不是加检查。
+
+    变异（实测逐枚归因，取证 _取证/20261011/mutation_subtitle_palette.json）：
+    M1 浅档只摘盒不换墨色 → C3 红（1.05:1 的不可读形态回来）/
+    M2 浅档 halo 退回深色 → C4 红（浅底上又糊出字周黑胶）/
+    M3 无从裁定改判浅档 → F1 红 / M4 阈值写死字面量 → E1 红 /
+    M5 带区域取整帧 → D3 红 / M6 step6 不用 pick 返回值 → G1 红（A06 同族）/
+    M7 深档字段被顺手改动 → B 红（零变化被破坏）/ M8 采样不抽稀 → D4 红 /
+    M9 边界由 >= 翻成 > → F5 红
+    """
+    tc = RegressionTestCase(
+        "subtitle_palette_tier_by_measured_band_luma",
+        "验证字幕色彩按字幕带实测亮度分档：浅底去盒并换深墨、深底逐字不变、测不出即回旧形态"
+    )
+    try:
+        import io
+        import contextlib
+        import subprocess as _sp
+        import tempfile as _tf
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+        from PIL import Image
+
+        # ── A 两轴正交 + 字段齐全 ──
+        fields = ("FontName=", "FontSize=", "PrimaryColour=", "OutlineColour=",
+                  "BackColour=", "BorderStyle=", "Outline=", "Shadow=",
+                  "MarginV=", "Alignment=")
+        combo_ok = []
+        for geo in (eva.SUBTITLE_STYLE_WIDE, eva.SUBTITLE_STYLE_NARROW):
+            for pal in (eva.SUBTITLE_PALETTE_DARK, eva.SUBTITLE_PALETTE_LIGHT):
+                s = eva.subtitle_force_style(geo, pal)
+                combo_ok.append(all(f in s for f in fields)
+                                and f"FontSize={geo['font_size']}" in s
+                                and f"MarginV={geo['margin_v']}" in s
+                                and f"PrimaryColour={pal['primary_colour']}" in s)
+        tc.assert_equal(combo_ok, [True] * 4,
+                        "A 四组合：几何字段来自几何档、色彩字段来自色彩档")
+
+        # ── B 深底档逐字等于 2026-10-10 既有串 ──
+        legacy = ("FontName=Microsoft YaHei,"
+                  f"FontSize={eva.SUBTITLE_STYLE_WIDE['font_size']},"
+                  "PrimaryColour=&H00FFFFFF,"
+                  "OutlineColour=&H96000000,"
+                  "BackColour=&H73000000,"
+                  "BorderStyle=4,"
+                  "Outline=1,"
+                  "Shadow=0,"
+                  f"MarginV={eva.SUBTITLE_STYLE_WIDE['margin_v']},"
+                  "Alignment=2")
+        tc.assert_equal(eva.subtitle_force_style(eva.SUBTITLE_STYLE_WIDE,
+                                                 eva.SUBTITLE_PALETTE_DARK),
+                        legacy, "B 深底档＝既有形态逐字不变（历史深色项目重烧零变化）")
+
+        # ── C 浅底档三件套 ──
+        light = eva.subtitle_force_style(eva.SUBTITLE_STYLE_WIDE,
+                                         eva.SUBTITLE_PALETTE_LIGHT)
+        tc.assert_true("BorderStyle=1" in light, "C1 浅底档不画底盒")
+        tc.assert_true("BackColour=&H00000000" in light, "C2 底盒色全透明")
+        tc.assert_true("PrimaryColour=&H002A170F" in light,
+                       "C3 浅底档换深墨字（ASS 为 AABBGGRR，= #0f172a）")
+        tc.assert_true("OutlineColour=&H96FFFFFF" in light,
+                       "C4 halo 是浅色半透（深 halo 会在浅底上糊回字周黑胶）")
+        _ink = 0.2126 * 0x0f + 0.7152 * 0x17 + 0.0722 * 0x2a
+        tc.assert_true((242.0 + 5) / (_ink + 5) >= 4.5,
+                       f"C5 深墨字在浅底 242 上对比≈{(242.0 + 5) / (_ink + 5):.1f}:1"
+                       f"（白字同底只有≈{(255.0) / (242 + 5):.1f}:1）")
+
+        # ── D 带亮度量测 ──
+        def make_srt(n):
+            lines = []
+            for i in range(1, n + 1):
+                st, en = i * 4, i * 4 + 2
+                lines.append(f"{i}\n00:{st // 60:02d}:{st % 60:02d},000 --> "
+                             f"00:{en // 60:02d}:{en % 60:02d},000\n第{i}句\n")
+            return "\n".join(lines)
+
+        def fake_runner(color_top, color_band, box):
+            """抽帧桩：写出上 78% 与下 22% 不同灰度的图（模拟字幕带与画面其他区）。"""
+            def _run(cmd, *a, **k):
+                out = Path(cmd[-1])
+                img = Image.new("RGB", (200, 100), color_top)
+                px = img.load()
+                for y in range(78, 100):
+                    for x in range(200):
+                        px[x, y] = color_band
+                img.save(out)
+                box.append(cmd)
+                return _sp.CompletedProcess(cmd, 0, "", "")
+            return _run
+
+        with _tf.TemporaryDirectory() as td:
+            td = Path(td)
+            srt = td / "t.srt"
+            srt.write_text(make_srt(3), encoding="utf-8")
+            _saved_run = eva.subprocess.run
+            try:
+                calls = []
+                eva.subprocess.run = fake_runner((242, 242, 242), (242, 242, 242), calls)
+                m_light, _ = eva.subtitle_band_luma_median(td / "v.mp4", srt)
+                tc.assert_true(m_light is not None and m_light >= 200,
+                               f"D1 浅底夹具量出高亮度（实测 {m_light}）")
+                calls.clear()
+                eva.subprocess.run = fake_runner((15, 15, 15), (15, 15, 15), calls)
+                m_dark, _ = eva.subtitle_band_luma_median(td / "v.mp4", srt)
+                tc.assert_true(m_dark is not None and m_dark <= 40,
+                               f"D2 深底夹具量出低亮度（实测 {m_dark}）")
+                calls.clear()
+                eva.subprocess.run = fake_runner((242, 242, 242), (15, 15, 15), calls)
+                m_split, _ = eva.subtitle_band_luma_median(td / "v.mp4", srt)
+                tc.assert_true(m_split is not None and m_split <= 40,
+                               f"D3 上浅下深夹具取字幕带而非整帧（实测 {m_split}）")
+
+                srt20 = td / "t20.srt"
+                srt20.write_text(make_srt(20), encoding="utf-8")
+                calls.clear()
+                eva.subprocess.run = fake_runner((242, 242, 242), (242, 242, 242), calls)
+                eva.subtitle_band_luma_median(td / "v.mp4", srt20)
+                tc.assert_equal(len(calls), 8,
+                                f"D4 20 条字幕等距抽到 8 帧（实抽 {len(calls)}）")
+
+                def _boom(cmd, *a, **k):
+                    raise _sp.CalledProcessError(1, cmd)
+                eva.subprocess.run = _boom
+                m_fail, why = eva.subtitle_band_luma_median(td / "v.mp4", srt)
+                tc.assert_true(m_fail is None and bool(why),
+                               f"D5 抽帧全失败→None 且给归因（{why}）")
+                m_none, why2 = eva.subtitle_band_luma_median(td / "v.mp4", td / "missing.srt")
+                tc.assert_true(m_none is None and "SRT" in why2,
+                               f"D6 SRT 读不到→None 且点名（{why2}）")
+            finally:
+                eva.subprocess.run = _saved_run
+
+        # ── E 阈值住配置文件 ──
+        _saved_loader = eva._load_video_quality_rules
+        try:
+            eva._load_video_quality_rules = lambda *a, **k: {
+                "subtitle_style": {"light_band_median_min": 40}}
+            tc.assert_equal(eva._subtitle_light_band_min(), 40.0,
+                            "E1 阈值真由配置驱动（改值即改档判据）")
+            eva._load_video_quality_rules = lambda *a, **k: {}
+            tc.assert_equal(eva._subtitle_light_band_min(),
+                            eva.SUBTITLE_LIGHT_BAND_MEDIAN_MIN_DEFAULT,
+                            "E2 缺节即回退默认常量")
+            eva._load_video_quality_rules = lambda *a, **k: {
+                "subtitle_style": {"light_band_median_min": "很高"}}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _fb = eva._subtitle_light_band_min()
+            tc.assert_equal(_fb, eva.SUBTITLE_LIGHT_BAND_MEDIAN_MIN_DEFAULT,
+                            "E3 值不可解析仍回默认")
+            tc.assert_true("WARN" in buf.getvalue(),
+                           "E3b 回退必须点名，不得静默换口径")
+        finally:
+            eva._load_video_quality_rules = _saved_loader
+
+        # ── F 无从裁定退回深档 + 边界 ──
+        _saved_band = eva.subtitle_band_luma_median
+        _saved_min = eva._subtitle_light_band_min
+        try:
+            eva._subtitle_light_band_min = lambda: 160.0
+            eva.subtitle_band_luma_median = lambda *a, **k: (None, "抽帧全失败")
+            pal, tier, reason = eva.pick_subtitle_palette(Path("v.mp4"), Path("t.srt"))
+            tc.assert_equal(pal, eva.SUBTITLE_PALETTE_DARK,
+                            "F1 测不出即退回既有深底档（不得由'测不出'猜'浅底'）")
+            tc.assert_true("退回" in tier and "抽帧全失败" in reason,
+                           f"F2 归因可见（tier={tier}, reason={reason}）")
+            eva.subtitle_band_luma_median = lambda *a, **k: (242.0, "夹具")
+            pal, tier, _ = eva.pick_subtitle_palette(Path("v.mp4"), Path("t.srt"))
+            tc.assert_equal((pal is eva.SUBTITLE_PALETTE_LIGHT, tier), (True, "light"),
+                            "F3 浅底实测值 → 浅档")
+            eva.subtitle_band_luma_median = lambda *a, **k: (15.0, "夹具")
+            pal, tier, _ = eva.pick_subtitle_palette(Path("v.mp4"), Path("t.srt"))
+            tc.assert_equal((pal is eva.SUBTITLE_PALETTE_DARK, tier), (True, "dark"),
+                            "F4 深底实测值 → 深档")
+            eva.subtitle_band_luma_median = lambda *a, **k: (160.0, "夹具")
+            _pal, _tier, _ = eva.pick_subtitle_palette(Path("v.mp4"), Path("t.srt"))
+            tc.assert_equal(_tier, "light", "F5 边界取 >=（等于阈值即浅档）")
+            # 阈值断链哨兵：pick 若不调用 _subtitle_light_band_min（把 160 写死在函数里），
+            # 上面 F3/F4/F5 全都不会红——它们喂的亮度值本来就按 160 设计。故必须单独
+            # 把阈值抬到亮度之上再判一次（A06"登记面＝真实读取路径"同族）。
+            eva._subtitle_light_band_min = lambda: 300.0
+            eva.subtitle_band_luma_median = lambda *a, **k: (242.0, "夹具")
+            _pal, _tier, _ = eva.pick_subtitle_palette(Path("v.mp4"), Path("t.srt"))
+            tc.assert_equal(_tier, "dark",
+                            "F6 pick 真向 _subtitle_light_band_min 取阈值（阈值改 300 即翻档）")
+        finally:
+            eva.subtitle_band_luma_median = _saved_band
+            eva._subtitle_light_band_min = _saved_min
+
+        # ── G 接线：step6 真把选中的 palette 灌进 ffmpeg 命令 ──
+        with _tf.TemporaryDirectory() as td2:
+            td2 = Path(td2)
+            srt2 = td2 / "burn.srt"
+            srt2.write_text(make_srt(2), encoding="utf-8")
+            captured = {}
+            _saved_ffmpeg = eva.run_ffmpeg
+            _saved_pick = eva.pick_subtitle_palette
+            try:
+                def _fake_ffmpeg(cmd, desc=""):
+                    captured["cmd"] = [str(x) for x in cmd]
+                    return False          # 让 step6 在烧录失败处即返回，不碰真实视频
+                eva.run_ffmpeg = _fake_ffmpeg
+                eva.pick_subtitle_palette = lambda v, s: (
+                    dict(eva.SUBTITLE_PALETTE_LIGHT, primary_colour="&H00112233"),
+                    "light", "夹具归因")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = eva.step6_burn_subtitles(td2 / "in.mp4", srt2, td2)
+                tc.assert_equal(rc, False, "G0 桩下烧录按失败返回（不产生交付物）")
+                vf = [a for a in captured.get("cmd", []) if "force_style" in a]
+                tc.assert_true(bool(vf) and "PrimaryColour=&H00112233" in vf[0],
+                               "G1 选中的 palette 真进了 ffmpeg 的 force_style（取数未断链）")
+                out_txt = buf.getvalue()
+                tc.assert_true("[SUBTITLE-STYLE] 色彩档=light" in out_txt
+                               and "夹具归因" in out_txt,
+                               "G2 裁定与归因打印在案（不得静默换样式）")
+            finally:
+                eva.run_ffmpeg = _saved_ffmpeg
+                eva.pick_subtitle_palette = _saved_pick
+
+        # ── H 真实成片只读冒烟（无对象即通过）──
+        repo_root = Path(__file__).resolve().parents[2]
+        vdir = repo_root / "成果文件" / "视频"
+        vids = sorted(vdir.glob("*.mp4"), key=lambda p: p.stat().st_mtime,
+                      reverse=True) if vdir.exists() else []
+        if not vids:
+            tc.assert_true(True, "H 本仓无交付成片 → 按无对象通过，不得读成真实取数已验证")
+        else:
+            v = vids[0]
+            s = v.parent.parent / "字幕" / f"{v.stem}.srt"
+            if not s.exists():
+                tc.assert_true(True, "H 最新成片无同名 SRT → 按无对象通过")
+            else:
+                m, why = eva.subtitle_band_luma_median(v, s, samples=3)
+                tc.assert_true(m is not None,
+                               f"H 取数面在真实成片字节上跑得出数（{why}）")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"subtitle palette tier fixture error: {e}")
+    return tc
+
+
 class RegressionTestRunner:
 
     """回归测试运行器"""
@@ -12045,6 +12885,9 @@ class RegressionTestRunner:
             test_render_env_upgrade_sentinel,
             test_light_theme_content_pixel_caliber,
             test_skill_version_identity_and_ledger_off_public_face,
+            test_bgm_default_off_and_declared_pointer_not_dropped,
+            test_scene_patch_cover_head_excluded_from_time_source,
+            test_subtitle_palette_tier_by_measured_band_luma,
         ]
         self.results = []
     

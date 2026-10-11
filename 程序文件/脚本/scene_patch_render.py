@@ -137,10 +137,75 @@ def extract_fingerprints(html, config, narration_path):
     }
 
 
+def _scene_index(scene_id):
+    """'s13' → 13；非 sN 形态返回 None（T-block 的键形态由 _gsap_time_utils 决定）。"""
+    m = re.fullmatch(r"s(\d+)", str(scene_id))
+    return int(m.group(1)) if m else None
+
+
+def _scene_entry_attr(block_text):
+    m = re.search(r'\bdata-scene-entry="([^"]*)"', block_text)
+    return m.group(1).strip() if m else ""
+
+
+def split_cover_head(blocks, t_map):
+    """把"在 T-block 里有时间条目的场景"与"封面 head"分开裁定。
+
+    返回 (mapped, head_id, err)；mapped = [(scene_id, t_key), ...] 按 DOM 顺序，
+    head_id 为可排除的封面 div 的 id（无封面 head 时为 None）。
+
+    存在理由（2026-10-11，用例82）：封面 div 按模板契约存在
+    （preflight_check 的 data-scene-entry="cover|gsap|static"，且只有 scene0
+    可为 cover），其时间位由 root data-cover-duration 承载、**不进 T-block**。
+    旧实现按"div 数 == T 键数"裁定信任，于是"一切手写 HTML 项目恒有
+    T 数 = div 数 − 1"→ scene-count-mismatch → sidecar scene_times=None
+    → classify 永久 FULL → 场景级增量渲染对手写项目整体失效（实证：某 313s
+    科普片改一场后 --resume 落盘
+    baseline-time-source-untrusted(scene-count-mismatch(T=13, div=14))，
+    按全量渲染计费）。
+
+    排除判据取"**该 div 在 T-block 里没有条目**"，不取"该 div 标了 cover"：
+    编译型/哨兵型项目的 T 块含 s0: 0.0，那份封面自带时间条目、照常参与分段
+    渲染；按 entry 一律排除会把已经可用的路径改坏（过度修正）。
+
+    可排除的 head 须同时满足：全场唯一、位于 DOM 首位、entry 声明为 cover、
+    且时长与首个 T 起点吻合（吻合判据在调用处，需要 root 属性）。任一不满足
+    即返回 err → 分类器退回全量渲染，**下限＝修复前的行为**。
+    """
+    mapped, unmapped = [], []
+    for sid, text, _, _ in blocks:
+        n = _scene_index(sid)
+        if n is not None and n in t_map:
+            mapped.append((sid, n))
+        else:
+            unmapped.append((sid, _scene_entry_attr(text)))
+
+    if len(unmapped) > 1:
+        return [], None, ("scenes-without-T-entry("
+                          + ",".join(sid for sid, _ in unmapped) + ")")
+    if unmapped:
+        sid, entry = unmapped[0]
+        if blocks[0][0] != sid:
+            return [], None, f"cover-head-not-first({sid})"
+        if entry != "cover":
+            return [], None, f"scene-without-T-entry({sid}: entry={entry or '-'})"
+
+    # T 键须逐个落到某个 div 上。旧实现按**位置**配对（sorted(t_map) 对 DOM 顺序），
+    # 数量恰好相等而编号错位时窗口会静默配到别的场景上，段渲染 seek 错时间；
+    # 按 id 绑定后该形态点名退回全量。
+    extra = sorted(set(t_map) - {n for _, n in mapped})
+    if extra:
+        return [], None, "T-keys-without-scene-div(" + ",".join(str(x) for x in extra) + ")"
+
+    return mapped, (unmapped[0][0] if unmapped else None), None
+
+
 def extract_scene_times(html, config):
     """T-block + root data-duration → 各场景 [start,end)。
 
     返回 (times, err)：times = [{"id","start","end"}, ...]；数据矛盾时 err 说明原因。
+    times 只含"有 T 条目"的场景；封面 head 不进 times（其帧段由 _plan_segments
+    作为 keep 段原样保留基线），故调用方需另算 head 的 id 集合。
     """
     script_all = "\n".join(re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html))
     t_map = parse_t_block(script_all)
@@ -156,12 +221,32 @@ def extract_scene_times(html, config):
         return None, "no-data-duration"
 
     blocks = extract_scene_blocks(html)
-    if len(blocks) != len(t_map):
-        return None, f"scene-count-mismatch(T={len(t_map)}, div={len(blocks)})"
+    mapped, head_id, err = split_cover_head(blocks, t_map)
+    if err:
+        return None, err
 
-    starts = [t_map[k] for k in sorted(t_map)]
-    if starts != sorted(starts) or starts[0] != 0.0:
+    starts = [t_map[n] for _, n in mapped]
+    if starts != sorted(starts):
         return None, "T-block-not-monotonic"
+    if head_id is None:
+        # 无封面 head：时间轴必须从 0 起（既有判据逐字不变——已可用的项目形态
+        # 不因本批放宽）。
+        if starts[0] != 0.0:
+            return None, "T-block-not-monotonic"
+    else:
+        # head 段的唯一见证：root data-cover-duration 声明的封面长度必须等于首个
+        # T 起点，否则 [0, starts[0]) 这段里"是封面"这一前提未被证实，keep 段
+        # 保留的就是来路不明的帧。容差沿用本函数既有的 0.05s（S-block end 与
+        # config video_duration 两处交叉校验同口径），非新增阈值。
+        declared = root.get("cover-duration")
+        try:
+            declared_seconds = float(declared)
+        except (TypeError, ValueError):
+            return None, (f"cover-head-duration-undeclared({head_id}: "
+                          f'data-cover-duration="{declared}")')
+        if abs(starts[0] - declared_seconds) > 0.05:
+            return None, (f"cover-head({head_id}) first-T-start({starts[0]}) "
+                          f"!= data-cover-duration({declared_seconds})")
 
     # 时长见证（2026-09-03 R8 重构）：S-block 数值 end 只是见证之一，不是唯一见证。
     # 旧实现把"脚本里没有 end: 字面量"一律判不可信 → 现行手写风格（T-block +
@@ -186,7 +271,7 @@ def extract_scene_times(html, config):
         fps = 25.0
 
     times = []
-    for i, (sid, _, _, _) in enumerate(blocks):
+    for i, (sid, _) in enumerate(mapped):
         end = starts[i + 1] if i + 1 < len(starts) else duration
         if round(end * fps) - round(starts[i] * fps) < 1:
             return None, f"scene-window-sub-frame({sid}: {starts[i]}-{end} @ {fps}fps)"
@@ -397,20 +482,36 @@ class PatchRenderer:
                    if cur["scene_hashes"][sid] != base["scene_hashes"].get(sid)]
         if not changed:
             return full("no-scene-content-change")
+        # 封面 head 不参与段渲染：它没有 T 条目，wrapper 又必须剥掉 root 的
+        # data-cover-duration（否则段长与封面长度叠加），seek 不出这一段。
+        # 因此"改的是封面"只能全量——不否决的话，拼接产物会静默保留旧封面，
+        # 而 sidecar 刷新后把它记成"这次修订已生效"，属假交付形态。
+        head_ids = [sid for sid in cur["scene_order"]
+                    if sid not in {t["id"] for t in times}]
+        changed_head = [sid for sid in head_ids if sid in changed]
+        if changed_head:
+            return full("cover-head-changed(" + ",".join(changed_head) + ")")
         if len(changed) * 2 > len(cur["scene_order"]):
             return full(f"too-many-scenes-changed({len(changed)}/{len(cur['scene_order'])})")
 
-        ctx = {"base": base, "times": times, "html": html,
+        ctx = {"base": base, "times": times, "html": html, "head_ids": head_ids,
                "witness": base.get("scene_times_witness") or "s-block-end"}
         return "PATCH", changed, "", ctx
 
     # ── patch（段渲染 + 拼接 + 自校验） ──
 
-    def _plan_segments(self, times, changed):
-        """帧号对齐的分段计划。返回 [(kind, start_f, end_f, scene_ids)]，kind∈{keep,render}"""
+    def _plan_segments(self, times, changed, head_ids=()):
+        """帧号对齐的分段计划。返回 [(kind, start_f, end_f, scene_ids)]，kind∈{keep,render}
+
+        封面 head（times[0].start > 0 的那段）必须显式成为首个 keep 段：否则计划
+        只覆盖 [首 T 起点, 末窗] ，拼接产物少了封面帧数，frame-count 判据必然不等
+        → 每次 PATCH 都白渲一遍段再降级。head 帧来自基线 trim，不做二次渲染。
+        """
         bounds = [round(t["start"] * self.fps) for t in times] + \
                  [round(times[-1]["end"] * self.fps)]
         segs = []
+        if bounds[0] > 0:
+            segs.append(("keep", 0, bounds[0], list(head_ids) or ["cover-head"]))
         for i, t in enumerate(times):
             kind = "render" if t["id"] in changed else "keep"
             if segs and segs[-1][0] == kind:
@@ -582,7 +683,7 @@ class PatchRenderer:
             except OSError:
                 pass
 
-        segs = self._plan_segments(times, changed)
+        segs = self._plan_segments(times, changed, ctx.get("head_ids", ()))
         for kind, sf, ef, ids in segs:
             print(f"    [{kind}] frames {sf}-{ef} ({(ef - sf) / self.fps:.1f}s) {'+'.join(ids)}")
 
