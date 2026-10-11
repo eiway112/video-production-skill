@@ -65,10 +65,20 @@ VENV_PYTHON = ROOT / "程序文件" / "运行环境" / "venv" / "Scripts" / "pyt
 if not VENV_PYTHON.exists():
     VENV_PYTHON = Path(sys.executable)
 
-# Chrome 预览专用 ASCII 临时目录（Chrome 不支持中文 user-data-dir）：
-# 默认放在工作区根目录的上级（D:\ 盘，避免污染工作区根目录），可用环境变量覆盖
+# Chrome 预览临时目录（每轮 mkdtemp 一个 profile，收尾整目录删除），可用环境变量覆盖。
+# 2026-10-11 修正两处，各独立：
+#  ① 位置耦合 bug：旧写法 `ROOT.parent.parent / "temp_chrome_preview"` 隐含假设"项目根
+#     恰住盘符下"；项目层级多一层时，同一表达式落到工作区根，与该常量原注释
+#     "避免污染工作区根"的意图正好相反。现引 TEMP_BASE（项目内受管临时区），
+#     不依赖磁盘层级，且落在散文件清理与保留期规则的扫描面内——判据：落点若不被任何
+#     扫描面覆盖，违规就永不显形。旧落点也不在 `_工具/盘根基线.json` 内，
+#     预览中断所留残留会被盘根越界哨兵报成基线外新增。
+#  ② 原注释"Chrome 不支持中文 user-data-dir"属成文断言而非实测记录，本仓对照实测已证伪：
+#     chrome-headless-shell 152.0.7977.30，ASCII 组与中文组（profile／中文截图文件名／
+#     file:// URL 含中文与空格）同为 rc=0、截图 17331 字节逐位相同。
+#     读数与复现命令见 `操作日志.md` [2026-10-11] 预览落点 条（取证件有保留期，不作长期指针）。
 PREVIEW_TEMP = Path(os.environ.get(
-    "HYPERFRAMES_PREVIEW_TEMP", str(ROOT.parent.parent / "temp_chrome_preview")))
+    "HYPERFRAMES_PREVIEW_TEMP", str(TEMP_BASE / "chrome_preview")))
 
 
 def resolve_narration_scenes(cfg: dict, config_path, cover_duration=None):

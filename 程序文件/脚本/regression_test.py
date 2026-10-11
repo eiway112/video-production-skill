@@ -12799,6 +12799,182 @@ def test_subtitle_palette_tier_by_measured_band_luma() -> RegressionTestCase:
     return tc
 
 
+def test_preview_temp_lands_inside_project_not_drive_root() -> RegressionTestCase:
+    """用例84：预览/预判临时区落【项目内受管临时区】，不落盘根（2026-10-11 用户否掉盘根落点）
+
+    背景（用户原话："这个目录放置在D盘根目录下我认为不妥，它是必须的文档吗？"）：
+    `D:\\temp_chrome_preview` 不是文档，是 Chrome 的 user-data-dir 运行时临时目录，
+    每轮 mkdtemp、收尾整目录删除。它落盘根的唯一依据是 `_script_env` 旧注释里那句
+    "Chrome 不支持中文 user-data-dir"——**该断言此前从未实测**。本批 A/B 对照实测证伪：
+    chrome-headless-shell 152.0.7977.30，ASCII 组与中文组（profile 路径含中文、截图文件名
+    含中文、file:// URL 含中文与空格）同为 rc=0，截图 17331 字节逐位相同
+    （复现件 `过程产物/临时产物/_取证/20261011/probe_chinese_path_vs_ascii.py`，
+    取证件有保留期、不作长期指针，读数住 `操作日志.md` 同名条）。
+
+    另有一条独立成因（与 ASCII 断言无关，即使断言为真也成立）：旧写法
+    `ROOT.parent.parent / "temp_chrome_preview"` 是**位置耦合**——它隐含假设"工作区根
+    恰住盘符下一层"。层级多一层时同一表达式落到工作区根，恰与该常量原注释
+    "避免污染工作区根"的意图相反。落点纪律的判据是"落点若不被任何扫描面覆盖，违规就
+    永不显形"：盘根两个目录（`temp_chrome_preview`、`vw_vacuum_precheck`）既不在
+    `project_cleanup` 的散文件扫描根（=临时产物根）内，也不在 `_工具/盘根基线.json`
+    的 24 条基线内，即预览中断所留残留会被盘根越界哨兵报成基线外新增——生产者与判据互不知情。
+
+    本用例锁定（两个生产者一并锁，只改一个等于半生效）：
+    A `_script_env.PREVIEW_TEMP` 落 ROOT 之内、且落 TEMP_BASE（临时产物根）之内，
+      并与"旧表达式"的取值对照不同（证明判据能区分两种落点，不是恒真）
+    B `HYPERFRAMES_PREVIEW_TEMP` 覆盖仍生效（子进程真跑，不污染本进程常量）
+    C 落点真的被清理侧扫描面覆盖：与 `config_manager` 的 process_temp 同一棵树
+      （取数面 = 清理工具实际用的那个路径，不是注释里写的）
+    D 第二生产者 `content_vacuum_precheck` 的 BASE_DIR 同样在项目内 TEMP_BASE 之下
+    E 源码锚定用 AST 只取**赋值/return 表达式本身**——本模块注释大量引用旧字面量
+      （`ROOT.parent.parent`、`temp_chrome_preview`、`vw_vacuum_precheck`），
+      对全文做短语否定会自撞假红，故按节点取源码段再判
+    F 接线：`instant_preview` 从 `_script_env` 导入 PREVIEW_TEMP 且自身不再另算落点
+      （两处生产者各自拼路径＝第二真相源）
+    G 盘根旧落点当前不在位（残留核查；在位即点名待清理，不得读成机制失效）
+
+    变异（逐枚归因）：
+    M1 默认表达式改回 `ROOT.parent.parent / "temp_chrome_preview"` → A+E 红 /
+    M2 去掉 `os.environ.get` 包装（环境变量覆盖失效）→ B 红 /
+    M3 落点改到 ROOT 之外但仍在盘（如 `ROOT.parent / "chrome_preview"`）→ A 两条红 + C 红 /
+    M4 vacuum 生产者单独改回盘根（只修一个生产者的形态）→ D 红 /
+    M5 instant_preview 自行拼落点而不导入 → F 红。
+    """
+    tc = RegressionTestCase(
+        "preview_temp_lands_inside_project_not_drive_root",
+        "验证预览/留白预判临时区落项目内受管临时区、受清理面覆盖、环境变量覆盖仍生效"
+    )
+    try:
+        import ast
+        import subprocess
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _script_env
+        # content_vacuum_precheck 在模块期 import visual_boundary_check，而后者顶层
+        # PIL/numpy 缺失即 sys.exit(1)（本仓已登记的依赖地雷）。SystemExit 不属
+        # Exception，会把整个套件带走，故临时 stub 掉该依赖再导入、取数完即复位。
+        import types as _types
+        _saved_vbc = sys.modules.get("visual_boundary_check")
+        sys.modules["visual_boundary_check"] = _types.ModuleType("visual_boundary_check")
+        try:
+            import content_vacuum_precheck as cvp
+        finally:
+            if _saved_vbc is None:
+                sys.modules.pop("visual_boundary_check", None)
+            else:
+                sys.modules["visual_boundary_check"] = _saved_vbc
+
+        ROOT = _script_env.ROOT.resolve()
+        TEMP_BASE = _script_env.TEMP_BASE.resolve()
+
+        # ── A 落点在项目内、且在受管临时区之下 ──
+        pv = _script_env.PREVIEW_TEMP.resolve()
+        tc.assert_true(ROOT in pv.parents or pv == ROOT,
+                       f"A1 PREVIEW_TEMP 在 ROOT 之内（实测 {pv}，ROOT {ROOT}）")
+        tc.assert_true(TEMP_BASE in pv.parents or pv == TEMP_BASE,
+                       f"A2 PREVIEW_TEMP 落临时产物根之下（受龄期巡检覆盖）：{pv}")
+        old_expr_value = (ROOT.parent.parent / "temp_chrome_preview").resolve()
+        tc.assert_true(pv != old_expr_value,
+                       "A3 与旧表达式取值不同（判据能区分两种落点，非恒真）")
+
+        # ── B 环境变量覆盖生效（子进程，避免污染本进程常量） ──
+        with tempfile.TemporaryDirectory() as td:
+            override = (Path(td) / "自定义预览区").resolve()
+            env = dict(os.environ, HYPERFRAMES_PREVIEW_TEMP=str(override),
+                       VIDEO_WORKFLOW_ROOT=str(ROOT))
+            code = ("import _script_env,sys;"
+                    "sys.stdout.write(str(_script_env.PREVIEW_TEMP))")
+            r = subprocess.run([sys.executable, "-c", code], cwd=str(script_dir),
+                               env=env, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=60)
+            got = (r.stdout or "").strip()
+            tc.assert_equal(got, str(override),
+                            f"B1 HYPERFRAMES_PREVIEW_TEMP 覆盖生效（rc={r.returncode} "
+                            f"stderr={r.stderr[:120]}）")
+            # 覆盖件落在项目外属合法用法，故此处只锁"覆盖被读到"，不锁"在项目内"
+
+        # ── C 清理侧真取数面覆盖该落点 ──
+        from config_manager import ConfigManager
+        scan_root = ConfigManager().paths.process_temp.resolve()
+        tc.assert_true(scan_root in pv.parents or pv == scan_root,
+                       f"C PREVIEW_TEMP 落在清理扫描根（process_temp={scan_root}）之内"
+                       "——落点须被扫描面覆盖，否则违规永不显形")
+
+        # ── D 第二生产者同样在项目内 ──
+        cv = cvp.BASE_DIR.resolve()
+        tc.assert_true(TEMP_BASE in cv.parents or cv == TEMP_BASE,
+                       f"D content_vacuum_precheck.BASE_DIR 亦落项目内临时区：{cv}")
+        tc.assert_equal(cv, cvp._preview_scratch_dir().resolve(),
+                        "D2 BASE_DIR 由该函数给出（不是模块期算完又被改写）")
+
+        # ── E 源码锚定：只取表达式本身，注释不参与 ──
+        def _assign_src(path: Path, name: str) -> str:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name) and t.id == name:
+                            return ast.get_source_segment(
+                                path.read_text(encoding="utf-8"), node) or ""
+            return ""
+
+        se_path = script_dir / "_script_env.py"
+        pv_src = _assign_src(se_path, "PREVIEW_TEMP")
+        tc.assert_true(bool(pv_src), "E0 取到 PREVIEW_TEMP 赋值语句源码段")
+        tc.assert_true("temp_chrome_preview" not in pv_src
+                       and "parent" not in pv_src,
+                       f"E1 默认表达式不再含盘根写法（实取 {pv_src.strip()}）")
+
+        cv_src = _assign_src(script_dir / "content_vacuum_precheck.py", "BASE_DIR")
+        tc.assert_true(bool(cv_src), "E2 取到 BASE_DIR 赋值语句源码段")
+        # D 段已证函数返回值在项目内，此处只锁"没有第二处拼路径"。
+        # 取锚只锁函数体内的 return 表达式——其 docstring 逐字记录了旧盘根写法作为成因，
+        # 对整个函数体做短语否定会自撞假红（本仓已登记纪律：注释含锚字面即假红）。
+        cvp_path = script_dir / "content_vacuum_precheck.py"
+        cvp_text = cvp_path.read_text(encoding="utf-8")
+        _tree = ast.parse(cvp_text)
+        ret_src = ""
+        for _n in _tree.body:
+            if isinstance(_n, ast.FunctionDef) and _n.name == "_preview_scratch_dir":
+                for _st in _n.body:
+                    if isinstance(_st, ast.Return):
+                        ret_src = ast.get_source_segment(cvp_text, _st) or ""
+        tc.assert_true(bool(ret_src), "E3 取到 _preview_scratch_dir 的 return 表达式")
+        tc.assert_true("drive" not in ret_src.lower()
+                       and "vw_vacuum_precheck" not in ret_src,
+                       f"E3b return 不再按盘符拼路径（实取 {ret_src.strip()}）")
+
+        # ── F 接线：消费者导入常量，不自算第二处 ──
+        ip_path = script_dir / "instant_preview.py"
+        ip_src = ip_path.read_text(encoding="utf-8")
+        ip_tree = ast.parse(ip_src)
+        imported = []
+        for _n in ast.walk(ip_tree):
+            if isinstance(_n, ast.ImportFrom) and _n.module == "_script_env":
+                imported += [a.name for a in _n.names]
+        tc.assert_true("PREVIEW_TEMP" in imported,
+                       f"F1 instant_preview 的 _script_env 导入项含 PREVIEW_TEMP"
+                       f"（实取 {imported}）")
+        tc.assert_true("ROOT.parent.parent" not in ip_src
+                       and "temp_chrome_preview" not in ip_src,
+                       "F2 instant_preview 源码面不再出现自算的盘根落点（单一权威源）")
+
+        # ── G 盘根旧落点不在位 ──
+        drive_root = Path(_script_env.PREVIEW_TEMP.resolve().drive + "\\")
+        legacy = [ROOT.parent.parent / "temp_chrome_preview",
+                  drive_root / "vw_vacuum_precheck"]
+        still_there = [str(p) for p in legacy if p.exists()]
+        tc.assert_true(not still_there,
+                       f"G 盘根旧落点应已消失（在位即历史残留待清理，且说明仍有进程在写旧路径）："
+                       f"{still_there}")
+
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"preview temp landing fixture error: {e}")
+    return tc
+
+
 class RegressionTestRunner:
 
     """回归测试运行器"""
@@ -12888,6 +13064,7 @@ class RegressionTestRunner:
             test_bgm_default_off_and_declared_pointer_not_dropped,
             test_scene_patch_cover_head_excluded_from_time_source,
             test_subtitle_palette_tier_by_measured_band_luma,
+            test_preview_temp_lands_inside_project_not_drive_root,
         ]
         self.results = []
     

@@ -99,12 +99,16 @@ class CDPClient:
 def launch_chrome(chrome_path, port=9222):
     """Launch Chrome headless with remote debugging port.
 
-    Uses ASCII-only temp dir on D: drive to avoid Chinese path issues on Windows.
-    Chrome cannot handle Chinese characters in user-data-dir or screenshot paths.
+    Profiles live under _script_env.PREVIEW_TEMP (project-managed temp area), one
+    mkdtemp per launch, whole directory removed on cleanup.
+    NOTE (2026-10-11): the previous wording here claimed "Chrome cannot handle
+    Chinese characters in user-data-dir or screenshot paths". That was an
+    unverified assertion, and the repo's own A/B probe disproved it (ASCII group and
+    Chinese group both rc=0 with byte-identical PNG). Do not re-add it.
     """
-    ascii_temp = str(PREVIEW_TEMP)
-    os.makedirs(ascii_temp, exist_ok=True)
-    user_data_dir = tempfile.mkdtemp(prefix="chrome_pv_", dir=ascii_temp)
+    preview_temp_dir = str(PREVIEW_TEMP)
+    os.makedirs(preview_temp_dir, exist_ok=True)
+    user_data_dir = tempfile.mkdtemp(prefix="chrome_pv_", dir=preview_temp_dir)
     args = [
         chrome_path,
         "--headless=new",
@@ -582,10 +586,10 @@ def main():
             shutil.copy2(str(patched_html), str(html_path))
             html_needs_restore = True
 
-        # Capture output directory (ASCII path outside workspace to avoid pollution)
-        ascii_temp = str(PREVIEW_TEMP)
-        os.makedirs(ascii_temp, exist_ok=True)
-        capture_dir = Path(ascii_temp) / "preview_captures"
+        # Capture output directory (project-managed temp area, inside the scan surface)
+        preview_temp_dir = str(PREVIEW_TEMP)
+        os.makedirs(preview_temp_dir, exist_ok=True)
+        capture_dir = Path(preview_temp_dir) / "preview_captures"
         capture_dir.mkdir(parents=True, exist_ok=True)
 
         # Node.js script path
@@ -604,8 +608,9 @@ def main():
             existing = node_env.get('NODE_PATH', '')
             node_env['NODE_PATH'] = f"{hf_node_modules};{existing}" if existing else hf_node_modules
 
-        # Provide a Chrome user-data-dir on D: drive (ASCII-only, avoids C: drive)
-        chrome_user_data = Path(ascii_temp) / "chrome_profile"
+        # Fixed Chrome profile dir inside PREVIEW_TEMP (project temp area; the ASCII
+        # requirement behind the old D:-root placement was measured and does not hold)
+        chrome_user_data = Path(preview_temp_dir) / "chrome_profile"
         chrome_user_data.mkdir(parents=True, exist_ok=True)
         node_env['CHROME_USER_DATA_DIR'] = str(chrome_user_data)
 
@@ -714,13 +719,13 @@ def main():
                     print("  Original HTML restored")
 
             # Clean up Chrome temp data (avoid workspace pollution)
-            ascii_cleanup = PREVIEW_TEMP
-            if ascii_cleanup.exists():
+            preview_cleanup_dir = PREVIEW_TEMP
+            if preview_cleanup_dir.exists():
                 try:
-                    shutil.rmtree(str(ascii_cleanup), ignore_errors=True)
-                    print(f"  Cleaned up: {ascii_cleanup}")
+                    shutil.rmtree(str(preview_cleanup_dir), ignore_errors=True)
+                    print(f"  Cleaned up: {preview_cleanup_dir}")
                 except Exception as cleanup_err:
-                    print(f"  Warning: could not clean {ascii_cleanup}: {cleanup_err}")
+                    print(f"  Warning: could not clean {preview_cleanup_dir}: {cleanup_err}")
 
     # --- Phase 3: Generate Report ---
     print("\n--- Phase 3: Preview Report ---")
