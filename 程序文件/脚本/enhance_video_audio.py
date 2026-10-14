@@ -179,6 +179,22 @@ TTS_ENABLED = True      # config "tts_enabled"：false = 纯BGM无旁白路径�
 BGM_SOURCE = None       # config "bgm_source" 解析后的外部 BGM 文件 Path（纯BGM路径必填）
 AUDIO_BITRATE = "256k"  # config "audio_bitrate"：成片 AAC 码率（现状默认 256k 不变）
 
+# === 停顿声明（2026-10-13 停顿可控性接入批；裁定真身住 pause_marks.py）===
+# PAUSE_DECLARATIONS：{str(scene_id): [{"after": 锚词, "ms": 毫秒}, ...]}，由
+# load_config 从旁白源场景字段 `pause_marks` 采集。声明住结构化字段而非旁白文本内
+# 标记串——旁白文本的消费者有六处（字幕分段/ASR 对齐/词级 cue/数字 lint/交付说明/
+# 预检），文本内标记要求六处各自记得剥离，漏一处即"字幕印出标记串"或"cue 字符流
+# 错位"（A06 高危形态；判据住 pause_marks docstring）。
+# PAUSE_AUTO_ENABLED：config 显式声明才开。缺省关——开启＝机器替作者改朗读文本并
+# 加长片长（每处约 +0.8s，场景窗口由 TTS 时长驱动，级联时长预算与渲染成本），
+# 与 BGM_ENABLED_DEFAULT / shrink.basis 同判据：代码落地、缺省不翻。
+# _PAUSE_PLAN_MEMO：plan_scene 结果记忆化。_tts_cache_key 有五个调用位点（step1×2 /
+# timeline manifest / hq_path / hash_from_manifest），逐位点重跑锚点定位既浪费，
+# 也会让"同一场同一文本"在一轮里因中途改规则而裂成两个读数。
+PAUSE_DECLARATIONS: dict = {}
+PAUSE_AUTO_ENABLED = False
+_PAUSE_PLAN_MEMO: dict = {}
+
 
 def _coerce_bool(value, default=True):
     """配置布尔的安全解析：JSON 布尔直接用；字符串 "false"/"0"/"no" 视为 False。
@@ -194,7 +210,71 @@ def _coerce_bool(value, default=True):
     return bool(value)
 
 
-def _tts_cache_key(text):
+def _scene_pause_plan(scene_id, text):
+    """取一场的停顿计划（记忆化）。无声明且自动缺省关时**短路返回恒等计划**，
+    不触碰规则文件——这是存量 35 个未声明项目零冲击的前提：规则文件断了
+    也不得影响没有停顿声明的项目（断链只惩罚声明了它的人）。
+
+    真身裁定住 `pause_marks.plan_scene`：本函数只做取数装配（声明采集、
+    自动候选、引擎名），不写第二套判据。engine_text 只进 generate_tts，
+    旁白原文继续供字幕/ASR/cue 消费——`<break>` 不发音，对齐基准不受影响。
+    """
+    decls = PAUSE_DECLARATIONS.get(str(scene_id)) or []
+    if not decls and not PAUSE_AUTO_ENABLED:
+        return {"items": [], "engine_text": text, "notes": [],
+                "applied": 0, "skipped_reasons": [], "cache_tag": ""}
+    key = (str(scene_id), text, tuple(
+        (d.get("after"), d.get("ms")) for d in decls), bool(PAUSE_AUTO_ENABLED))
+    memo = _PAUSE_PLAN_MEMO.get(key)
+    if memo is not None:
+        return memo
+    import pause_marks as _pm            # 延迟导入：无声明项目不引入本模块依赖
+    rules = _pm.load_rules()
+    auto_decls = _pm.auto_candidates(text, rules) if PAUSE_AUTO_ENABLED else None
+    plan = _pm.plan_scene(text, decls, rules, engine=TTS_ENGINE,
+                          enabled=bool(PAUSE_AUTO_ENABLED), auto_decls=auto_decls)
+    _PAUSE_PLAN_MEMO[key] = plan
+    return plan
+
+
+def _pause_engine_text(scene_id, text):
+    """generate_tts 入口唯一的文本改写点：返回引擎文本并打印 [PAUSE] 读数。
+
+    只在这一处把 plan 的 engine_text 交给合成——旁白原文（SCENES 里的 text）
+    继续供字幕分段、ASR 对齐、词级 cue、数字 lint 消费。`<break>` 不发音，
+    对齐基准不受影响；反之若把 engine_text 写回 SCENES，标记串会印进字幕。
+    """
+    plan = _scene_pause_plan(scene_id, text)
+    if plan.get("applied"):
+        det = "，".join(f"{it['ms']}ms/{it['origin']}" for it in plan["items"])
+        print(f"  [PAUSE] 场 {scene_id}: 插入 {plan['applied']} 处强制停顿（{det}）")
+    for n in plan.get("notes") or []:
+        print(f"  [PAUSE] 场 {scene_id}: {n}")
+    return plan["engine_text"]
+
+
+def _collect_pause_state(cfg, scenes_list):
+    """load_config 尾部统一采集停顿声明与开关——**先重置再采集**。
+
+    重置是必需项而非加分：这三个全局曾被上一项目的值填充过（用例76 C 段
+    "不惰性赋值"同族），跨项目 in-process 调用时后一个项目会静默继承前一个
+    项目的停顿声明——那等于把 A 项目的朗读节奏装进 B 项目的音频。
+    """
+    global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED
+    PAUSE_DECLARATIONS = {}
+    PAUSE_AUTO_ENABLED = False
+    _PAUSE_PLAN_MEMO.clear()
+    raw = cfg.get("pause_auto_enabled")
+    if raw is None and isinstance(cfg.get("audio"), dict):
+        raw = cfg["audio"].get("pause_auto_enabled")
+    PAUSE_AUTO_ENABLED = _coerce_bool(raw, default=False)
+    for s in scenes_list or []:
+        marks = s.get("pause_marks")
+        if marks:
+            PAUSE_DECLARATIONS[str(s.get("scene_id"))] = marks
+
+
+def _tts_cache_key(text, scene_id=None):
     """Compute short hash from narration text for cache keying.
     
     Includes engine/model/voice/rate/pitch in hash. Any change to these
@@ -202,16 +282,25 @@ def _tts_cache_key(text):
     yields a fresh cache entry — old audio is never silently reused with
     a different engine, which would produce voice inconsistency across
     scenes if a project were partially re-rendered after switching.
+
+    停顿计划指纹（2026-10-13 接入批）：**仅当该场有非空 cache_tag 时**才追加
+    `|tag`。无声明项目的键值逐字不变＝存量缓存不因本批整体击穿（改声明而
+    键不变＝命中旧缓存、静默交出没有停顿的音频，pause_marks.plan_fingerprint
+    docstring 登记的同族缺陷，此处为其消费端收口）。
     """
     normalized = re.sub(r'\s+', '', text.strip())
     model_tag = QWEN_MODEL if TTS_ENGINE == "qwen" else "edge"
     cache_input = f"{normalized}|{TTS_ENGINE}|{model_tag}|{VOICE}|{RATE}|{PITCH}|{TTS_INSTRUCTION or ''}"
+    if scene_id is not None:
+        tag = _scene_pause_plan(scene_id, text).get("cache_tag") or ""
+        if tag:
+            cache_input += f"|{tag}"
     return hashlib.sha256(cache_input.encode('utf-8')).hexdigest()[:10]
 
 
 def _get_tts_hq_path(scene_id, text, tts_dir):
     """Get the hq WAV path for a scene based on text hash."""
-    h = _tts_cache_key(text)
+    h = _tts_cache_key(text, scene_id=scene_id)
     return tts_dir / f"tts_{h}_hq.wav"
 
 
@@ -226,8 +315,12 @@ def _get_tts_hash_from_manifest(manifest, scene_id, text):
     现在恒返回当前文本的 hash：文本一改 → hash 变 → 旧文件不再匹配 →
     调用方的存在性检查(step3/step5/step7)硬失败，强制先重跑 TTS。
     manifest 降级为记录（用于对照告警），不再是查找依据。
+
+    停顿声明同理（2026-10-13 接入批）：scene_id 传入后键含停顿指纹，
+    "改了声明而 hash 不变→复用没有停顿的旧音频且全部校验通过"这一形态
+    在本函数上同样被堵（与 _tts_cache_key 的注释同判据）。
     """
-    h = _tts_cache_key(text)
+    h = _tts_cache_key(text, scene_id=scene_id)
     entry = manifest.get(str(scene_id))
     if isinstance(entry, dict) and entry.get('hash') and entry['hash'] != h:
         print(f"  [WARN] Scene {scene_id}: narration text changed since last TTS run "
@@ -387,7 +480,31 @@ def _parse_bitrate_value(raw):
     return value if value > 0 else None
 
 
-def _enforce_sentence_pauses(hq_file, sentences, min_pause):
+def _shift_chars_for_inserted_silence(chars, cut_t, inserted):
+    """在 cut_t 处插入 inserted 秒静音后，字符级时刻的同步平移（词级 cue 批，2026-10-12）。
+
+    存在理由：句级时间戳由 `_enforce_sentence_pauses` 平移后**作为新值返回**，字符级流
+    若不同步平移，同一份记录里就会出现"句子说 12.0s、字符说 11.2s"的两个真相——而
+    cue 动画取的正是字符级时刻，落在插入点之后的词会**早于实际发声点亮**（与本仓
+    "声明面≠实测面"同族）。规则与句级同形而非另起一套：起点在插入点之前的字符不动，
+    其尾时刻不得越过插入点；起点在之后的字符整体平移 inserted。
+
+    纯函数：不改入参、不碰波形，故可由用例直接喂合成数据检验（不需要真 wav 与 ASR）。
+    与句级一样返回**新列表**而不是原地改入参——原地热绑定会让调用方"忘了回写也恰好
+    生效"，而句级走的是返回值，两条路径一旦分叉就只有一条能被用例证伪（2026-10-12 定）。
+    """
+    out = []
+    for item in chars:
+        s, e, m = float(item[0]), float(item[1]), item[2]
+        if s > cut_t:
+            s, e = s + inserted, e + inserted
+        elif e > cut_t:
+            e = cut_t
+        out.append([round(s, 3), round(e, 3), m])
+    return out
+
+
+def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
     """段间停顿强制——波形层根治（2026-07-28，skill-promo 句间零停顿事故）。
 
     根因：TTS 引擎整段合成时句间停顿由内部韵律决定，同一段音频里
@@ -401,16 +518,19 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause):
     幂等：补齐后间隔 ≥ min_pause，重跑即 no-op（缓存命中路径也每轮
     复检，无需重跑 ASR）。插入后仍不达标 → RuntimeError，禁止静默放行。
 
-    Returns (modified, sentences, total_inserted_seconds)
+    Returns (modified, sentences, total_inserted_seconds, chars)
+        `chars` 是入参 `chars` 经同一批插入点平移后的新列表；入参为 None（旧调用方
+        或未做字符级对齐的场景）则原样回 None。调用方**必须**回写它——句级与字符级
+        共用同一次平移，只回写句子即等于让 cue 时刻停在插入点之前。
     """
     if min_pause <= 0 or len(sentences) < 2:
-        return False, sentences, 0.0
+        return False, sentences, 0.0, chars
     deficits = [
         i for i in range(len(sentences) - 1)
         if sentences[i + 1]['rel_start'] - sentences[i]['rel_end'] < min_pause - 0.02
     ]
     if not deficits:
-        return False, sentences, 0.0
+        return False, sentences, 0.0, chars
 
     import wave
     import numpy as np
@@ -453,6 +573,11 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause):
             [audio[:cut], np.zeros((n_ins, n_ch), dtype=np.int16), audio[cut:]])
         inserted = n_ins / sr
         cut_t = cut / sr
+        # 字符级流与句级同批平移（词级 cue 的数据一致性所系）：与句子走同一条
+        # "返回新值"的路径，不在入参列表上动手——原地热绑定会让调用方漏回写
+        # 也恰好生效，从而永远测不出"回写"这条腿是不是死代码。
+        if chars is not None:
+            chars = _shift_chars_for_inserted_silence(chars, cut_t, inserted)
         # 分侧收拢式平移：前段尾时刻不得越过插入点，后段起时刻先拉到插入点
         # 再加平移量——无论 cut 落在边界哪一侧，新间隔数学上恒 ≥ min_pause
         # （旧规则按位置同向平移，cut 早于段尾时两侧同移，间隔仍为 0）
@@ -479,7 +604,7 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause):
         wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(np.ascontiguousarray(audio).tobytes())
-    return True, sentences, total_inserted
+    return True, sentences, total_inserted, chars
 
 
 def _wave_sha256(wav_path):
@@ -543,7 +668,7 @@ def _build_timeline_manifest(temp_dir):
     pause_min = float((_load_audio_sync_rules().get('sentence_pause') or {}).get('min_seconds', 0.4))
     algo_ver = f"{ALIGN_ALGO_VERSION}|{_fa.MODEL_SIZE}|pause={pause_min:g}"
     for scene_id, start, end, text in SCENES:
-        h = _tts_cache_key(text)
+        h = _tts_cache_key(text, scene_id=scene_id)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
         if not hq_file.exists():
             print(f"  [WARN] timeline manifest: TTS missing for scene {scene_id}, skipped")
@@ -575,6 +700,11 @@ def _build_timeline_manifest(temp_dir):
             entry['method'] = 'asr_forced'
             entry['match_ratio'] = prev.get('match_ratio')
             entry['sentences'] = prev['sentences']
+            # 字符级流一并结转。旧记录没有该节属**设计内状态**（v3 时代产物），
+            # 不是损坏：cue 解析侧按"无字符级数据"走句级降级并点名，不得静默当成零 cue。
+            if prev.get('chars'):
+                entry['chars'] = prev['chars']
+                entry['norm'] = prev.get('norm', '')
             aligned += 1
         else:
             segments = _split_text_to_segments(text) if text and text.strip() else []
@@ -593,6 +723,12 @@ def _build_timeline_manifest(temp_dir):
                 entry['method'] = result['method']
                 entry['match_ratio'] = result['match_ratio']
                 entry['sentences'] = result['sentences']
+                # 词级 cue 的数据源：逐发音字符的 (rel_start, rel_end, matched)。
+                # matched=0 的字符时间是插值造的，消费方（cue_resolve）必须按旗标裁定，
+                # 不得当实测值驱动画面。旧记录无该节 → 不写，消费侧走句级降级。
+                if result.get('chars'):
+                    entry['chars'] = result['chars']
+                    entry['norm'] = result.get('norm', '')
                 aligned += 1
             else:
                 entry['method'] = 'unaligned'
@@ -602,10 +738,20 @@ def _build_timeline_manifest(temp_dir):
         # 修改波形+平移时间戳后重测时长，下游（字幕/adjust_timeline/merge）
         # 自动消费新值。unaligned 场景无可靠边界，不强制（对齐失败已有告警）。
         if entry.get('method') == 'asr_forced' and entry.get('sentences'):
-            modified, new_sents, ins = _enforce_sentence_pauses(
-                hq_file, entry['sentences'], pause_min)
+            _chars = entry.get('chars')
+            modified, new_sents, ins, new_chars = _enforce_sentence_pauses(
+                hq_file, entry['sentences'], pause_min, chars=_chars)
             if modified:
                 entry['sentences'] = new_sents
+                # 插静音把插入点之后的语音整体后移，字符级流必须由同一个函数
+                # 同步平移后回写；不回写即出现"句子 12.0s、字符 11.2s"的两份
+                # 真相，而 cue 取的就是字符级时刻。平移量取自返回值而非入参别名，
+                # 故本行是真实生效路径、不是恒真的热绑定。
+                # 未做字符级对齐的场景（旧记录、降级链）new_chars 为 None——此时
+                # **不得写 entry['chars']=None**：那会把"无字符级数据"从缺键变成
+                # 显式 null，消费侧两种归因会分叉。缺键即缺键，由消费侧点名降级。
+                if new_chars is not None:
+                    entry['chars'] = new_chars
                 entry['tts_duration'] = round(get_duration(str(hq_file)), 3)
                 entry['pause_inserted'] = round(ins, 3)
                 # 停顿强制改写了波形字节：记录面重绑到改写后的实测哈希，
@@ -714,6 +860,9 @@ def load_config(config_path):
     会自动加上 cover_duration，避免下游脚本再次叠加 COVER_DURATION。
     """
     global SCENES, VIDEO_DURATION, VOICE, RATE, PITCH, TTS_ENGINE, QWEN_MODEL, BGM_ENABLED
+    # 停顿声明全局态由 _collect_pause_state 在各 return 前接管（先重置再采集，
+    # 禁止跨项目 in-process 继承上一轮的声明——用例76 C 段同族缺陷）。
+    global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED
     global SUBTITLE_DISPLAY_REPLACEMENTS, TTS_INSTRUCTION
     global VIDEO_TYPE, TTS_ENABLED, BGM_SOURCE, AUDIO_BITRATE
     global SUBTITLE_STYLE
@@ -883,6 +1032,7 @@ def load_config(config_path):
             s.get('narration', '')
         ) for i, s in enumerate(scenes_list)]
         print(f"[INFO] Loaded {len(SCENES)} scenes from narration_source: {narration_source_path}")
+        _collect_pause_state(cfg, scenes_list)
         return cfg
     
     # 第2层：检查 _compiled_scenes.json（规范化编译场景）
@@ -905,6 +1055,7 @@ def load_config(config_path):
                     s.get('narration', '')
                 ) for i, s in enumerate(scenes_list)]
                 print(f"[INFO] Loaded {len(SCENES)} scenes from _compiled_scenes.json")
+                _collect_pause_state(cfg, scenes_list)
                 return cfg
         except Exception as e:
             print(f"[WARN] Failed to load _compiled_scenes.json: {e}")
@@ -915,6 +1066,7 @@ def load_config(config_path):
         SCENES = [(s['scene_id'], float(s['start']), float(s['end']), s['narration'])
                   for s in scenes_list]
         print(f"[INFO] Loaded {len(SCENES)} scenes from config 'scenes' field")
+        _collect_pause_state(cfg, scenes_list)
         return cfg
     
     # 三层都没有找到有效场景
@@ -1402,7 +1554,7 @@ async def step1_generate_tts(temp_dir):
     if concurrency > 1:
         pending = []
         for scene_id, start, end, text in SCENES:
-            h = _tts_cache_key(text)
+            h = _tts_cache_key(text, scene_id=scene_id)
             hq_file = tts_dir / f"tts_{h}_hq.wav"
             raw_file = temp_dir / f"scene_{scene_id}_{h}.mp3"
             if not hq_file.exists() and not raw_file.exists():
@@ -1414,7 +1566,7 @@ async def step1_generate_tts(temp_dir):
             async def _pool_worker(scene_id, text, raw_file):
                 async with sem:
                     print(f"  Generating scene {scene_id} TTS...")
-                    await generate_tts(text, raw_file)
+                    await generate_tts(_pause_engine_text(scene_id, text), raw_file)
                     print(f"  Scene {scene_id}: raw TTS generated")
 
             results = await asyncio.gather(
@@ -1428,7 +1580,7 @@ async def step1_generate_tts(temp_dir):
             for scene_id, text, raw_file in failed:
                 print(f"  Scene {scene_id}: concurrent TTS failed, serial retry...")
                 try:
-                    await generate_tts(text, raw_file)
+                    await generate_tts(_pause_engine_text(scene_id, text), raw_file)
                     print(f"  Scene {scene_id}: raw TTS generated (serial retry)")
                 except Exception as e:
                     still_failed.append((scene_id, e))
@@ -1447,7 +1599,7 @@ async def step1_generate_tts(temp_dir):
     overflow_scenes = []
     new_entries = 0
     for scene_id, start, end, text in SCENES:
-        h = _tts_cache_key(text)
+        h = _tts_cache_key(text, scene_id=scene_id)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
 
         if hq_file.exists():
@@ -1464,7 +1616,7 @@ async def step1_generate_tts(temp_dir):
             raw_file = temp_dir / f"scene_{scene_id}_{h}.mp3"
             if not raw_file.exists():
                 print(f"  Generating scene {scene_id} TTS...")
-                await generate_tts(text, raw_file)
+                await generate_tts(_pause_engine_text(scene_id, text), raw_file)
 
             print(f"  Upsampling scene {scene_id} to 44.1kHz stereo...")
             ok = run_ffmpeg([

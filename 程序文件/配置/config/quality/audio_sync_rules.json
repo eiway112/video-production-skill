@@ -9,6 +9,8 @@
   "shrink": {
     "enabled_by_default": true,
     "shrink_margin_seconds": 1.5,
+    "basis": "tts_wav",
+    "$basis": "收缩侧的留白基准，两值：tts_wav＝窗口对 wav 全时长留 margin（既有行为，缺省）；speech_end＝窗口对 ASR 末句实测收尾留 margin，把 wav 尾部静音（本仓浅色片实测 0.31~0.46s/场）从'必须保留'改为'可裁'，使名义 margin 等于听感 margin。取数与词级 cue 同源（temp/_timeline_manifest.json 的 sentences[].rel_end），不新起第二套对齐。扩展侧永不使用本参数（扩展要保证音频放得下，只能按 wav）。2026-10-13 实测：本仓浅色片 13 场尾部静音合计 4.66s＝片长 1.84 个百分点，而留白 11.2% 的大头是 margin 1.5s×13 场＝19.5s 的设计值——本参数只回收尾部静音这一项，不解决信息密度。翻转前置：随一次本来就要全量重渲的修订批改本值（或项目 config 声明 shrink_basis），存量不主动重跑。",
     "description": "pipeline_runner 与 adjust_timeline.py 共同消费的 --shrink-margin 唯一权威值：TTS 播完后为镜头预留的呼吸时间。需覆盖 GSAP 场景 pre-fade(0.5s) + 感官缓冲(1.0s)，避免音频尾音撞进画面淡出。禁止任何脚本另设分叉默认值（prefab 复盘：CLI 默认 1.0s 与本值 1.5s 分叉，造成 618.9→621.7→623.8s 三次时间轴漂移）。"
   },
   "duration_consistency": {
@@ -42,7 +44,20 @@
   },
   "sentence_pause": {
     "min_seconds": 0.4,
-    "description": "段间停顿强制（enhance_video_audio._enforce_sentence_pauses）：TTS 引擎整段合成时句间停顿由内部韵律决定（skill-promo 实测同段音频句号停顿 0~0.38s 浮动，甚至为 0），标点不构成可靠控制面。以 ASR 强制对齐段级时间戳度量相邻字幕段声学间隔，不足 min_seconds 时在边界最低能量点插入差额静音并平移后续时间戳。设 0 可关闭。"
+    "description": "段间停顿强制（enhance_video_audio._enforce_sentence_pauses）：TTS 引擎整段合成时句间停顿由内部韵律决定（skill-promo 实测同段音频句号停顿 0~0.38s 浮动，甚至为 0），标点不构成可靠控制面（2026-10-13 限定：该句只描述**不改文本**时的引擎行为——引擎侧另有 `<break>` 声明面，见 pause_declaration；实测仅改标点确实不产生停顿增益，把三处顿号/分号升级为句号后同位点读数 0.36/0.40/0.30 → 0.38/0.34/0.34）。以 ASR 强制对齐段级时间戳度量相邻字幕段声学间隔，不足 min_seconds 时在边界最低能量点插入差额静音并平移后续时间戳。设 0 可关闭。"
+  },
+  "pause_declaration": {
+    "enabled_by_default": false,
+    "engines": ["qwen"],
+    "min_ms": 400,
+    "max_ms": 1000,
+    "auto_ms": 500,
+    "max_count_per_scene": 2,
+    "max_total_ms_per_scene": 1600,
+    "auto_shape_source": "narration_prosody_rules.json → segment_overload",
+    "mark_chars": "、",
+    "description": "段内停顿的引擎侧声明面（2026-10-13 停顿可控性接入批，判据与读数住 pause_marks.py 的 docstring）。存在理由：本仓既有机制只在字幕段边界补静音，段内标点由引擎内部韵律决定（同一片实测句号 0.26s 短于顿号 0.44s、同一逗号既 0.30s 又 0.86s），而 CosyVoice 的 HTTP 非实时路径默认解析 SSML、`<break time>` 单调生效。区间 [400,1000] 由四段真实旁白 × 四档声明值标定得：500ms 档 Δ ∈ [0.70,0.90]（极差 0.20s、四段复现）、800ms 档 Δ ∈ [1.08,1.30]，而 200ms 档 Δ ∈ [-0.16,+0.64]（与噪声不可分）、1200ms 档实测间隔达 1.5~2.0s。auto_ms 取 500 即因此，不是凑整。缺省 enabled_by_default=false 的理由：开启＝机器替作者改朗读文本并加长片长（每处约 +0.8s，场景窗口由 TTS 时长驱动，级联到时长预算与全量渲染），属全仓节奏基准变更——与 shrink.basis 那条同判据：代码落地、缺省不翻、挂在本来就要重跑的那批上。max_total_ms_per_scene 存在理由：SSML 模式下未声明位置的节奏也会移动（同一次调用内一枚未插 break 的逗号 0.84→0.26s），停顿预算是全场资源而非逐点独立量。mark_chars 与形状阈值（min_chars/min_enumeration_marks）分处两文件属刻意：形状判据的唯一持有者是 narration_prosody_rules.json → segment_overload，本节的 auto_shape_source 只是指针，回归用例按功能对照锁两者一致（取同一批段），不得把阈值抄成第二份。",
+    "evidence": "过程产物/临时产物/_取证/20261013/pause_batch/calibration.json（四段真实旁白、双音色、7 次调用；该目录不入 git，读数已抄进本 description）"
   },
   "alignment": {
     "p95_max_seconds": 0.6,

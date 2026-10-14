@@ -833,8 +833,9 @@ class PipelineRunner:
     accept_media_untested = False
     take_over_lock = False
     accept_render_env = False
+    accept_text_fit_untested = False
 
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -891,6 +892,9 @@ class PipelineRunner:
         self.take_over_lock = take_over_lock
         # 渲染副本判坏时的显式放行开关（2026-10-09，见 _render_env_gate_ok）
         self.accept_render_env = accept_render_env
+        # 预览期"文字塌成竖排"判据 UNTESTED 的显式放行开关（2026-10-12，见 step_preview
+        # 与 instant_preview.adjudicate_text_fit）——只覆盖"没测成"，测出塌陷（FAIL）永不可放行
+        self.accept_text_fit_untested = accept_text_fit_untested
         self.lock = None
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
@@ -1196,19 +1200,69 @@ class PipelineRunner:
                              "asset_signoff_sheet": self.source_dir / "素材确认单.json",
                              "narration_digits_rules": quality_dir / "narration_digits_rules.json",
                              "gate_mode": "mode:" + str(self.gate_mode),
+                             # 词级 cue 声明校验的扫描与归一化真身（check_cue_declarations
+                             # 只调它、不自写正则）——同 timeline 步那条 cue_resolver，
+                             # 一个真身、两个消费者，登记面按各消费者的真实读取路径各记一次。
+                             "cue_resolver": SCRIPTS / "cue_resolve.py",
+                             # 2026-10-13 停顿声明批（A06：登记面＝真实读取路径）。
+                             # check_pause_declarations 只调 pause_marks.plan_scene/load_rules，
+                             # 其读取链为 audio_sync_rules.pause_declaration（档位权威源）与
+                             # narration_prosody_rules.segment_overload（形状阈值引用），
+                             # pause_marks 顶部另硬依赖 cue_resolve（归一化同源，取不回即抛）。
+                             # 不登记即"改了停顿档位而预检缓存照常命中"——与 preview 批
+                             # capture_script 同族。audio_sync_rules 在本步是新增登记项：
+                             # 一次性冲击＝存量项目下轮 preflight/tts 判 inputs-changed
+                             # （preflight 秒级；tts 按已登记成本判据——temp 缓存在位即全命中、
+                             # 零扣费，只做本地校验；不主动重跑，已交付面不受影响）。
+                             "pause_rules": audio_rules,
+                             "pause_prosody_shape_rules": quality_dir / "narration_prosody_rules.json",
+                             "pause_marks_script": SCRIPTS / "pause_marks.py",
                              "script": SCRIPTS / "preflight_check.py"},
             "tts":          {"config": self.config_path, "narration": narration,
                              "compiled_scenes": compiled,
+                             # 停顿声明的同一条真实读取链（生效面）：enhance 的
+                             # _scene_pause_plan 在"有声明或自动开"时读 pause_marks
+                             # （其裁定经 _forced_align._normalize_chars 定位锚词、
+                             # 经 cue_resolve 保归一化同源），档位住 audio_sync_rules，
+                             # 形状阈值引用 narration_prosody_rules。无声明项目走短路
+                             # 不触碰这些文件——但登记面按"该步可能读取的路径"记，
+                             # 不按项目形态条件化（条件登记＝两套口径）。
+                             "pause_marks_script": SCRIPTS / "pause_marks.py",
+                             "align_normalizer": SCRIPTS / "_forced_align.py",
+                             "cue_resolver": SCRIPTS / "cue_resolve.py",
+                             "pause_rules": audio_rules,
+                             "pause_prosody_shape_rules": quality_dir / "narration_prosody_rules.json",
                              "script": enhance_script},
             "timeline":     {"config": self.config_path, "html": self.html_path,
                              "tts_manifest": tts_manifest,
+                             # 2026-10-12 词级 cue 批补第三枚：本步现读 `_timeline_manifest.json`
+                             # （adjust_timeline.load_cue_time_source，路径按 tts_dir.parent 推导＝
+                             # 与 _build_timeline_manifest 的写入处同源）。不登记即"改了 cue 取数
+                             # 而该步缓存照常命中"——A06"登记面＝真实读取路径"同族。
+                             # 冲击实测（_取证/20261012 隔离副本连跑四轮）：稳态下本步重跑后
+                             # html/config/narration 三件字节逐位相同，故不级联 render 的全量渲染。
+                             "timeline_manifest": self.temp_dir / "_timeline_manifest.json",
+                             # 第四枚，同一判据的另一个方向：真身不止取数、还有裁定。
+                             # adjust_timeline 只是驱动者，cue 的定位/归一化/整块改写全住在
+                             # cue_resolve.py。不登记即"改了裁定逻辑而该步缓存照常命中"——
+                             # 与 preview 批那条 capture_script 同族（取数真身不在登记面＝
+                             # 新接入的判据对全部存量项目静默不生效）。
+                             "cue_resolver": SCRIPTS / "cue_resolve.py",
                              "audio_sync_rules": audio_rules,
                              "script": SCRIPTS / "adjust_timeline.py"},
             # preview 实测消费 HTML/config 之外还有 tts_manifest（instant_preview.py:736
             # 按旁白时长决定各场采样时刻）与脚本自身；旧指纹只登记 config+html，
             # 换 TTS 音频后预览缓存照常命中，安全区预检跑的是旧时长（A06-②）。
+            # 2026-10-12 补两枚，同一判据（登记面＝真实读取路径）：
+            # ① capture_script —— 截图与"每行字数"行盒取数的真身是 preview_capture.js，
+            #    instant_preview 只是驱动者。此前它不在登记面：改它字节后预览缓存照常命中，
+            #    即新接入的塌陷判据对全部存量项目静默不生效（本批判据若不入登记面＝条文
+            #    在生效路径上没有载体，与词级 cue 批那条"须同步补登记"同族）。
+            # ② video_quality_rules —— text_fit 阈值就住在这份文件里，改阈值即须重测。
             "preview":      {"config": self.config_path, "html": self.html_path,
                              "tts_manifest": tts_manifest,
+                             "capture_script": SCRIPTS / "preview_capture.js",
+                             "video_quality_rules": quality_dir / "video_quality_rules.json",
                              "script": SCRIPTS / "instant_preview.py"},
             "render":       {"config": self.config_path, "html": self.html_path,
                              "render_rules": quality_dir / "render_rules.json"},
@@ -1227,6 +1281,10 @@ class PipelineRunner:
                              # 阈值表（audio/video 规则已在上方登记）；quick-fix 与
                              # full 的裁定面不同（视觉检查项 NA vs PASS），入指纹。
                              "media_qa_script": SCRIPTS / "media_qa_gate.py",
+                             # 停顿声明批：postprocess 内 step3/5/7 经 _get_tts_hq_path /
+                             # _get_tts_hash_from_manifest 走带 scene_id 的缓存键，声明项目
+                             # 会实际读取 pause_marks 裁定面（audio_rules 已在上方登记）。
+                             "pause_marks_script": SCRIPTS / "pause_marks.py",
                              "mode": "mode:" + ("quick-fix" if self.quick_fix else "full"),
                              "script": enhance_script},
             "delivery":     {"config": self.config_path, "video": self._delivery_paths()[0],
@@ -1237,6 +1295,12 @@ class PipelineRunner:
             "completion_report": {"config": self.config_path,
                              "video": self._delivery_paths()[0],
                              "srt": self._delivery_paths()[1],
+                             # 登记面补齐（2026-10-13，A06 同族）：本步登记面此前不含
+                             # 报告脚本自身，故"改了报告逻辑而该步缓存照常命中"——新增的
+                             # data_sources 节对全部存量项目静默不出现。frame_occupancy 是
+                             # 该节的判据真身与文案单源，同样必须登记。
+                             "script": SCRIPTS / "generate_completion_report.py",
+                             "occupancy_module": SCRIPTS / "frame_occupancy.py",
                              "state_digest": "digest:" + self._stable_state_digest()},
         }
         return {k: str(v) for k, v in inputs_map.get(step, {}).items()}
@@ -2118,7 +2182,8 @@ class PipelineRunner:
         rc = self._run_with_retry(
             [str(VENV_PYTHON), "instant_preview.py",
              "--html", str(self.html_path),
-             "--config", str(self.config_path)],
+             "--config", str(self.config_path)]
+            + (["--accept-text-fit-untested"] if self.accept_text_fit_untested else []),
             cwd=str(SCRIPTS),
             env=node_env,
             desc="instant preview"
@@ -3262,6 +3327,15 @@ Examples:
                              "this flag postprocess fails; with it the decision is recorded in "
                              "pipeline_state.media_qa_untested_decision for audit. Media QA "
                              "FAIL (a measured violation) is never accepted by this flag.")
+    parser.add_argument("--accept-text-fit-untested", dest="accept_text_fit_untested",
+                        action="store_true",
+                        help="Explicitly proceed when the preview-stage text-fit gate "
+                             "(每行字数塌陷) could not complete its measurement "
+                             "(UNTESTED — thresholds unreadable or capture step did not run). "
+                             "UNTESTED is never read as passed: without this flag the preview "
+                             "step fails; the decision is recorded in "
+                             "temp/_text_fit_check.json. A measured collapse (FAIL) is never "
+                             "accepted by this flag.")
 
     args = parser.parse_args()
 
@@ -3336,6 +3410,7 @@ Examples:
         accept_media_untested=args.accept_media_untested,
         take_over_lock=args.take_over_lock,
         accept_render_env=args.accept_render_env,
+        accept_text_fit_untested=args.accept_text_fit_untested,
     )
 
     if args.status:

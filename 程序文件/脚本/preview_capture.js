@@ -38,16 +38,159 @@ function readCompositionSize(htmlPath) {
     return { width, height };
 }
 
+/**
+ * 版面塌陷（每行字数）取数面（2026-10-12 接入；判据住在 instant_preview.py，本函数只取数）。
+ *
+ * 为什么在预览里加这一条：既有三条判据（字幕安全区、视觉边界、画面内容终检）管"越界"
+ * 与"空场"，没有一条管"字框过窄"。消费者副本一份已交付竖屏片的正文塌成每行 3 字的
+ * 竖排列，全程绿到交付（读数见 操作日志.md [2026-10-12] 同名条）。
+ *
+ * 取数口径（两条必修，均为该轮实测踩到后写入）：
+ *  ① 行盒用 Range.getClientRects() 数浏览器**实际渲染出的行**，不用"容器宽／字号"几何
+ *    推算——中文实际字宽、letter-spacing、flex 挤压都不在几何式里；
+ *  ② 时刻取各场**稳态**（S-block 优先，无则 T-block，再无则调用方传入的场景窗口），
+ *    每场 start+2.5 与 end-1.5 两点，经页面全局 tl.seek() 落位（与本项目既有预览
+ *    同一 seek 通道，不另造第二套时间语义）。在 t=0 量会把宽度动画中的元素误判成
+ *    塌陷（假阳，实测 .fr-bar）、并漏掉晚揭示的长句（假阴）。
+ *  ③ 聚合＝**逐元素跨采样取最优（最大）读数**：一个文本框在它最舒展那一刻仍不达标才算
+ *    真塌陷；取最坏读数等于把入场过程当结论。
+ *
+ * 本函数只返回原始读数（候选节点列表 + 取数面元数据），不做四态裁定，也不写阈值——
+ * 阈值由调用方（instant_preview 读 video_quality_rules.json → text_fit）传入。
+ */
+async function measureTextFit(page, thresholds, fallbackWindows) {
+    const minLines = thresholds.minLines;
+    const minChars = thresholds.minChars;
+
+    const sampling = await page.evaluate((fb) => {
+        const out = [];
+        const T = (typeof window.T !== 'undefined' && window.T) ? window.T : null;
+        const S = (typeof window.S !== 'undefined' && window.S) ? window.S : null;
+        let timeSrc = 'none';
+        if (S && S.length) {
+            timeSrc = 'S-block';
+            for (const s of S) {
+                if (s.cover) continue;
+                out.push(s.start + 2.5, Math.max(s.start + 2.5, s.end - 1.5));
+            }
+        } else if (T) {
+            timeSrc = 'T-block';
+            const vs = Object.values(T).sort((a, b) => a - b);
+            vs.forEach((v, i) => {
+                out.push(v + 2.5);
+                if (i + 1 < vs.length) out.push(vs[i + 1] - 1.5);
+            });
+        } else if (fb && fb.length) {
+            timeSrc = 'config-scenes';
+            for (const s of fb) {
+                out.push(s.start + 2.5, Math.max(s.start + 2.5, s.end - 1.5));
+            }
+        }
+        const tl = (typeof window.tl !== 'undefined') ? window.tl : null;
+        const dur = tl ? tl.duration() : (out.length ? Math.max(...out) + 3 : 10);
+        const times = [...new Set(out.map(x => +x.toFixed(2)))]
+            .filter(x => x >= 0 && x <= dur).sort((a, b) => a - b);
+        return { times, timeSrc, hasTimeline: !!tl, timelineDuration: +dur.toFixed(1) };
+    }, fallbackWindows);
+
+    if (sampling.timeSrc === 'none') {
+        // 三个时刻源都没有＝稳态采样无从落位，属取数断链，不得由"没发现问题"短路成通过
+        return { status_hint: 'no_time_source', samples: 0, measured_nodes: 0, nodes: [] };
+    }
+
+    const best = {};
+    for (const t of sampling.times) {
+        const rows = await page.evaluate(({ time, minLines, minChars }) => {
+            if (typeof tl !== 'undefined' && tl && tl.seek) {
+                tl.seek(time, false);
+                if (typeof gsap !== 'undefined') gsap.ticker.tick();
+            }
+            const out = [];
+            const chainOpacity = (el) => {
+                let o = 1, n = el;
+                while (n && n !== document.body) {
+                    const cs = getComputedStyle(n);
+                    o *= parseFloat(cs.opacity || '1');
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return 0;
+                    n = n.parentElement;
+                }
+                return o;
+            };
+            for (const el of document.querySelectorAll('body *')) {
+                // 只认节点"自己持有"的文本，嵌套子节点的文本由那个子节点自己作答（否则同一段
+                // 文字被父/子各报一次，且父级行盒数是整块布局的行数、不是这句话的行数）
+                const own = Array.from(el.childNodes)
+                    .filter(n => n.nodeType === 3 && n.textContent.trim());
+                if (!own.length) continue;
+                const text = own.map(n => n.textContent.trim()).join('').replace(/\s+/g, '');
+                if (text.length < minChars) continue;
+                if (chainOpacity(el) < 0.5) continue;          // 未在场即不裁定
+                const cs = getComputedStyle(el);
+                const fsz = parseFloat(cs.fontSize) || 0;
+                if (!fsz) continue;
+                const range = document.createRange();
+                own.forEach(n => { try { range.selectNodeContents(n); } catch (e) {} });
+                const rects = Array.from(range.getClientRects()).filter(x => x.height > 2);
+                if (rects.length < minLines) continue;          // 未折行即无"每行字数"可言
+                const box = el.getBoundingClientRect();
+                out.push({
+                    key: (el.id ? '#' + el.id
+                          : (String(el.className).split(' ')[0] || el.tagName)) + ':' + text.slice(0, 12),
+                    cpl: +(text.length / rects.length).toFixed(2),
+                    lines: rects.length, chars: text.length,
+                    font_px: +fsz.toFixed(1), box_w: Math.round(box.width),
+                    capacity: +(box.width / fsz).toFixed(2), at: time,
+                });
+            }
+            return out;
+        }, { time: t, minLines, minChars });
+        for (const row of rows) {
+            if (!best[row.key] || row.cpl > best[row.key].cpl) best[row.key] = row;
+        }
+    }
+
+    const nodes = Object.values(best).sort((a, b) => a.cpl - b.cpl);
+    return {
+        time_src: sampling.timeSrc,
+        has_timeline: sampling.hasTimeline,
+        timeline_duration: sampling.timelineDuration,
+        samples: sampling.times.length,
+        sample_times: sampling.times.slice(0, 40),
+        min_lines: minLines,
+        min_chars: minChars,
+        measured_nodes: nodes.length,
+        nodes: nodes.slice(0, 200),
+    };
+}
+
 async function main() {
     const args = process.argv.slice(2);
     if (args.length < 3) {
-        console.error('Usage: node preview_capture.js <html_path> <config_path> <output_dir>');
+        console.error('Usage: node preview_capture.js <html_path> <config_path> <output_dir> '
+            + '[--fit-min-cpl=N] [--fit-min-lines=N] [--fit-min-chars=N]');
         process.exit(1);
     }
 
     const htmlPath = path.resolve(args[0]);
     const configPath = path.resolve(args[1]);
     const outputDir = path.resolve(args[2]);
+
+    // 版面塌陷取数的门槛值由调用方传入（权威源 instant_preview 读 video_quality_rules.json）。
+    // 刻意不给 JS 侧默认值：缺省即"调用方忘了接线"，那种形态必须显式暴露而非静默按某个数字跑。
+    const flagNumber = (prefix) => {
+        for (const a of args.slice(3)) {
+            if (a.startsWith(prefix)) {
+                const v = parseFloat(a.slice(prefix.length));
+                return Number.isFinite(v) && v > 0 ? v : null;
+            }
+        }
+        return null;
+    };
+    const fitThresholds = {
+        minCpl: flagNumber('--fit-min-cpl='),
+        minLines: flagNumber('--fit-min-lines='),
+        minChars: flagNumber('--fit-min-chars='),
+    };
 
     if (!fs.existsSync(htmlPath)) {
         console.error(`HTML not found: ${htmlPath}`);
@@ -209,6 +352,40 @@ async function main() {
             } catch (err) {
                 console.error(`  Scene ${sceneId} error: ${err.message}`);
                 manifest.errors.push({ sceneId, error: err.message });
+            }
+        }
+
+        // ── 版面塌陷（每行字数）取数：只取数，裁定归 instant_preview.py ──
+        // 放在截图循环之后：塌陷判据要的是"各场稳态"，与截图共用同一个已加载页面，
+        // 不另开第二次 goto（新开一次即多一次 30s 网络等待，且两份页面状态会分叉）。
+        const fitWindows = scenes.map(s => ({
+            start: parseFloat(s.start) + coverDuration,
+            end: parseFloat(s.end) + coverDuration,
+        }));
+        const fitMissing = [['minCpl', '--fit-min-cpl'], ['minLines', '--fit-min-lines'],
+                            ['minChars', '--fit-min-chars']]
+            .filter(([k]) => fitThresholds[k] === null).map(([k, f]) => `${k}(${f})`);
+        if (fitMissing.length) {
+            manifest.text_fit = { status_hint: 'thresholds_not_passed', missing: fitMissing,
+                                  samples: 0, measured_nodes: 0, nodes: [] };
+            console.log(`  [TEXT-FIT] 取数未跑：调用方未传阈值 ${fitMissing.join(', ')}`);
+        } else {
+            const fitStarted = Date.now();
+            try {
+                const fit = await measureTextFit(
+                    page,
+                    { minLines: fitThresholds.minLines, minChars: fitThresholds.minChars },
+                    fitWindows);
+                fit.min_chars_per_line = fitThresholds.minCpl;
+                manifest.text_fit = fit;
+                console.log(`  [TEXT-FIT] 时刻源=${fit.time_src || 'none'} `
+                    + `采样 ${fit.samples} 次，候选节点 ${fit.measured_nodes} 个`
+                    + `（${((Date.now() - fitStarted) / 1000).toFixed(1)}s）`);
+            } catch (e) {
+                manifest.text_fit = { status_hint: 'measure_failed',
+                                      error: String((e && e.message) || e),
+                                      samples: 0, measured_nodes: 0, nodes: [] };
+                console.error(`  [TEXT-FIT] 取数异常: ${(e && e.message) || e}`);
             }
         }
 

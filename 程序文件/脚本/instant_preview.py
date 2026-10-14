@@ -45,7 +45,8 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 # Import shared GSAP time resolution utilities (T-block aware)
 sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_script_times
-from _script_env import ROOT, PREVIEW_TEMP, resolve_narration_scenes
+from _script_env import ROOT, PREVIEW_TEMP, QUALITY_DIR, resolve_narration_scenes
+import _gate_status as gs
 
 # Default Chrome path (same as HyperFrames uses)
 DEFAULT_CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -325,6 +326,188 @@ def compute_capture_gap(node_scenes, manifest_entries, capture_dir):
     return sorted(expected_ids - covered), len(covered), len(expected_ids)
 
 
+# ── 版面塌陷（每行字数）门禁：取数在 preview_capture.js，裁定在此 ──────────
+#
+# 存在理由：既有三条判据（字幕安全区预检、视觉边界、画面内容终检）管"越界"与"空场"，
+# 没有一条管"字框过窄"。消费者副本一份**已交付**的竖屏片正文塌成每行 3 字的竖排列，
+# 从预览到终检全程绿灯（读数见 操作日志.md [2026-10-12] 同名条与用例85 docstring）。
+#
+# 职责切分：JS 侧只报原始行盒读数（含逐元素跨采样最优值），本模块持有全部阈值与裁定——
+# 一条判据不在两层各写一份，且"取数没跑成"由本层显式判 UNTESTED，不得由"没发现问题"短路。
+TEXT_FIT_REQUIRED_KEYS = ("min_chars_per_line", "min_lines", "min_chars")
+TEXT_FIT_RECORD_NAME = "_text_fit_check.json"
+
+
+def load_text_fit_rules(rules_path=None):
+    """读 config/quality/video_quality_rules.json → text_fit 节，返回 (rules, 归因)。
+
+    fail-closed：缺文件／不可解析／缺节／缺键／值非正数一律返回 (None, 点名断在哪条腿)。
+    本门禁**刻意不设默认阈值**：给一个回退常量即把"配置断链"读成"按某个数字查过且干净"。
+    （与 `enhance_video_audio.pick_subtitle_palette` 的"读不到即回退深档"不同级——那条只
+    换配色、不裁定合格与否；本条是门禁。）
+    """
+    path = Path(rules_path) if rules_path else QUALITY_DIR / "video_quality_rules.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, f"配置文件缺失：{path}"
+    except (OSError, ValueError) as e:
+        return None, f"配置文件不可解析：{path.name}（{type(e).__name__}: {e}）"
+    section = data.get("text_fit") if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        return None, f"{path.name} 缺 text_fit 节（阈值断链，不得按猜测值裁定）"
+    missing = [k for k in TEXT_FIT_REQUIRED_KEYS if k not in section]
+    if missing:
+        return None, f"{path.name} → text_fit 缺必需键 {missing}"
+    rules = {}
+    for key in TEXT_FIT_REQUIRED_KEYS:
+        raw = section[key]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None, f"{path.name} → text_fit.{key} 不可解析为数值：{raw!r}"
+        if not value > 0:
+            return None, f"{path.name} → text_fit.{key} 非正数：{raw!r}"
+        rules[key] = value
+    return rules, None
+
+
+def adjudicate_text_fit(fit, rules):
+    """四态裁定 → (status, 报告行列表, findings)。
+
+    判塌陷需三条**同时**成立（缺一即不判，2026-10-12 三件实测标定）：
+      ① 行盒数 ≥ min_lines（收到 2，覆盖"2 行 × 极低字数"形态；旧探针取 3 会漏）
+      ② 实测每行字数 < min_chars_per_line
+      ③ 盒容量（getBoundingClientRect 宽／font-size，CJK 字宽≈1em）亦 < min_chars_per_line
+    第③条是必需的区分项而非加严：短文本落在宽盒里自然折行不是塌陷。实测竖屏卡片标题
+    "❸没发现≠没问题"（8 字／2 行＝每行 4 字、盒容 7.4 字）只按②会被判成缺陷，而它排版正常；
+    真病灶那两枚的盒容只有 2.0 字（44px 框／22px 字）。
+
+    测量面对象为 0 → NOT_APPLICABLE，不判 PASS：已交付的 13 场横屏件
+    已交付的 13 场横屏知识口播件与竖屏骨架在 1920/1080 画布下正文极少折行，实测候选 0 个，
+    此时判 PASS 即把"无对象"读成"查过且干净"（A04 同族）。
+    """
+    label = f"阈值：每行 ≥ {rules['min_chars_per_line']:g} 字" \
+            f"／折行 ≥ {rules['min_lines']:g} 行／盒容 < {rules['min_chars_per_line']:g} 字才判塌陷"
+    if fit is None:
+        return gs.UNTESTED, [f"  [TEXT-FIT] UNTESTED — 捕获脚本未产出 text_fit 段"
+                             f"（脚本版本不符或该步未跑），本项无从裁定；{label}"], [], {}
+    if not isinstance(fit, dict):
+        return (gs.UNTESTED,
+                [f"  [TEXT-FIT] UNTESTED — text_fit 段不是对象（实取 "
+                 f"{type(fit).__name__}），本项无从裁定；{label}"], [],
+                {"reason": "text_fit_not_mapping"})
+    hint = fit.get("status_hint")
+    if hint:
+        why = {"thresholds_not_passed": "调用方未传阈值 " + str(fit.get("missing")),
+               "measure_failed": "取数异常 " + str(fit.get("error")),
+               "no_time_source": "页面无 S-block／T-block 且 config 无场景窗口，"
+                                 "稳态采样时刻无从落位"}.get(hint, str(hint))
+        return gs.UNTESTED, [f"  [TEXT-FIT] UNTESTED — {why}；{label}"], [], dict(fit)
+
+    raw_nodes = fit.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        # 取数面结构不符（版本不符或被改坏）→ 无从裁定，不得靠异常炸掉整轮预览
+        return (gs.UNTESTED,
+                [f"  [TEXT-FIT] UNTESTED — text_fit.nodes 不是列表"
+                 f"（实取 {type(raw_nodes).__name__}），本项无从裁定；{label}"],
+                [], {"reason": "nodes_not_list"})
+
+    def _num(v):
+        """读数必须是有限正数；None/字符串/NaN/Inf（JS 侧 Infinity 经 JSON 即 null）一律不算取到。"""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+    nodes, unreadable = [], []
+    for n in raw_nodes:
+        if not isinstance(n, dict):
+            unreadable.append((str(n)[:24], "节点不是对象"))
+            continue
+        lines_ = _num(n.get("lines"))
+        chars_ = _num(n.get("chars"))
+        if lines_ is None or chars_ is None:
+            # 连"是否够上候选门槛"都无从判定＝同样是取数断链，不得静默把该节点当不存在
+            # （若 JS 把 lines 改名，全量节点静默消失会伪装成"测量面无对象"的合法 N/A）
+            missing = [k for k in ("lines", "chars") if _num(n.get(k)) is None]
+            unreadable.append((str(n.get("key", "?"))[:36], "缺 " + "/".join(missing)))
+            continue
+        if lines_ >= rules["min_lines"] and chars_ >= rules["min_chars"]:
+            cpl_, cap_ = _num(n.get("cpl")), _num(n.get("capacity"))
+            if cpl_ is None or cap_ is None:
+                # 已过候选门槛却缺核心读数＝取数断链，判未测并点名——
+                # 绝不退回"缺即视为达标"的默认值（那会把改名/漏发读成查过且干净）
+                missing = [k for k, v in (("cpl", n.get("cpl")),
+                                          ("capacity", n.get("capacity"))) if _num(v) is None]
+                unreadable.append((str(n.get("key", "?"))[:36], "缺 " + "/".join(missing)))
+                continue
+            # 数值单独存一对已验证的副本用于比较；原读数按 JS 发来的形态留给报告面
+            # （`2` 与 `2.0` 的字面差异属显示面，不得因解析而改动既有报告文案）
+            nodes.append(dict(n, _cpl=cpl_, _capacity=cap_))
+
+    findings = [n for n in nodes
+                if n["_cpl"] < rules["min_chars_per_line"]
+                and n["_capacity"] < rules["min_chars_per_line"]]
+    meta = {"time_src": fit.get("time_src"), "samples": fit.get("samples"),
+            "measured_nodes": fit.get("measured_nodes"), "candidates": len(nodes),
+            "unreadable": len(unreadable)}
+    head = (f"  [TEXT-FIT] 时刻源={fit.get('time_src')} 采样 {fit.get('samples')} 次 "
+            f"候选节点 {fit.get('measured_nodes')} 个（{label}）")
+    if findings:
+        lines = [f"  [TEXT-FIT] FAIL — {len(findings)} 个文本节点塌成竖排"] + [head]
+        for n in sorted(findings, key=lambda x: x.get("cpl", 0))[:10]:
+            lines.append(f"    ✗ {n.get('key')}: 每行 {n.get('cpl')} 字"
+                         f"（{n.get('chars')} 字／{n.get('lines')} 行，"
+                         f"盒宽 {n.get('box_w')}px／字号 {n.get('font_px')}px＝盒容 "
+                         f"{n.get('capacity')} 字）@{n.get('at')}s")
+        lines.append("    -> 该框放不下设计下限要求的字数；修向＝加宽容器或缩短文本"
+                     "（版面骨架的 min-width:calc(var(--min-cpl)*var(--fs-body)) 即此规则的设计侧实现）")
+        return gs.FAIL, lines, findings, meta
+    if unreadable:
+        # 有节点够上了候选门槛、却没有可用读数＝取数断链。判未测并逐节点点名，
+        # 既不得读成 PASS（缺键即视为达标），也不得读成 NOT_APPLICABLE（那是"测量面无对象"）。
+        # 位置在 findings 之后、PASS 之前：即便其余节点全部达标，断链面也不被"其余节点"洗白。
+        detail = "；".join(f"{k}（{why}）" for k, why in unreadable[:10])
+        return (gs.UNTESTED,
+                [f"  [TEXT-FIT] UNTESTED — {len(unreadable)} 个候选节点缺核心读数：{detail}"
+                 f"（取数面与裁定面字段名不一致，或该值在 JS 侧为 Infinity/NaN）；{label}"],
+                [], meta)
+    if not nodes:
+        return (gs.NOT_APPLICABLE,
+                [f"  [TEXT-FIT] NOT_APPLICABLE — 测量面无候选节点"
+                 f"（折行 ≥ {rules['min_lines']:g} 行且字符 ≥ {rules['min_chars']:g} 的自持文本节点 0 个），"
+                 f"本项不裁定也不计通过"] + [head], [], meta)
+    return (gs.PASS,
+            [f"  [TEXT-FIT] PASS — {len(nodes)} 个候选节点每行字数均达下限"] + [head], [], meta)
+
+
+def write_text_fit_record(temp_dir, status, findings, meta, report_lines=None, decision=None):
+    """裁定的文件级留痕：落项目 temp 的 _text_fit_check.json。
+
+    "检查点跑过"需要正证据而不是由"没有异常记录"反推（与 duration_budget 通过路径
+    留痕同判据），故 PASS 亦写盘；每次预览全量覆写本轮结论，读取侧只信当轮文件。
+    """
+    record = {
+        "status": status,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "findings": findings,
+        "thresholds": meta.get("thresholds") or None,
+        "time_src": meta.get("time_src"),
+        "samples": meta.get("samples"),
+        "measured_nodes": meta.get("measured_nodes"),
+        "candidates": meta.get("candidates"),
+    }
+    if report_lines:
+        record["report_lines"] = [str(x).strip() for x in report_lines]
+    if decision:
+        record["decision"] = decision
+    path = Path(temp_dir) / TEXT_FIT_RECORD_NAME
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def _thumb_size(png_bytes):
     """按截图实测宽高比选缩略图尺寸（竖版 1080×1920 压成 480×270 会失真到不可用）。"""
     from PIL import Image
@@ -506,6 +689,11 @@ def main():
                         help="Chrome debugging port (default: 9222)")
     parser.add_argument("--serve-port", type=int, default=8765,
                         help="Local HTTP server port for serving HTML (default: 8765)")
+    parser.add_argument("--accept-text-fit-untested", action="store_true",
+                        help="版面塌陷判据无从裁定时知情放行（默认阻断；放行必须留痕）")
+    parser.add_argument("--text-fit-rules", default=None,
+                        help="覆盖 text_fit 阈值文件路径（回归取证用；默认读 "
+                             "config/quality/video_quality_rules.json 单一权威源）")
     args = parser.parse_args()
 
     html_path = Path(args.html)
@@ -568,6 +756,25 @@ def main():
     safety_violations = []
     capture_count = 0
     capture_gap = []
+    # Phase 2 整体包在 try/except 里（node 崩/截图复制失败都不得把脚本炸掉）。但"吞掉异常"
+    # 不等于"检查跑过了"：旧形态下异常发生后 safety_violations 仍是空表，报告面照样印
+    # "[PASS] All scenes stay above subtitle safety line"——把"没跑成"印成"查过且干净"，
+    # 与本仓四态纪律相悖。phase2_error 让这一态可见、可阻断。
+    phase2_error = None
+    safety_untested = None
+    # 版面塌陷门禁：阈值先读，读不回即整项无从裁定（不得带着猜测值跑取数）
+    text_fit_rules, text_fit_rules_reason = load_text_fit_rules(args.text_fit_rules)
+    fit_status = None
+    fit_lines = []
+    fit_findings = []
+    fit_meta = {"thresholds": text_fit_rules}
+    if text_fit_rules is None:
+        fit_status = gs.UNTESTED
+        fit_lines = [f"  [TEXT-FIT] UNTESTED — 阈值断链：{text_fit_rules_reason}"]
+    elif args.density_only:
+        fit_status = gs.NOT_APPLICABLE
+        fit_lines = ["  [TEXT-FIT] NOT_APPLICABLE — 本次只跑密度分析"
+                     "（--density-only 不启动截图，行盒取数无对象）"]
     if not args.density_only:
         print("\n--- Phase 2: Chrome Screenshots (puppeteer-core) ---")
 
@@ -637,6 +844,12 @@ def main():
                 'node', str(capture_script),
                 str(html_path), str(node_config_path), str(capture_dir)
             ]
+            # 阈值由 Python 侧（权威源读者）下传给取数侧当门槛；取数侧刻意不设缺省值，
+            # 缺传即显式回吐 thresholds_not_passed，不静默按某个数字跑一趟。
+            if text_fit_rules is not None:
+                cmd += [f"--fit-min-cpl={text_fit_rules['min_chars_per_line']:g}",
+                        f"--fit-min-lines={text_fit_rules['min_lines']:g}",
+                        f"--fit-min-chars={text_fit_rules['min_chars']:g}"]
             print(f"  Running: {' '.join(cmd[:3])} ...")
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
@@ -671,6 +884,18 @@ def main():
                           f"/{expected_scenes} 场"
                           + (f"，缺: {capture_gap}" if capture_gap else "（完整）"))
 
+                    # 版面塌陷裁定：取数面在 node、判据面在此，两轴各证一件事。
+                    # manifest 里没有 text_fit 段属"取数没跑成"，由 adjudicate 判 UNTESTED
+                    # （版本不符/该步未跑都会显形在这里，不得读成"查过且干净"）。
+                    # 阈值断链时不进入 adjudicate：它自身要读阈值出文案，带 None 进去即
+                    # TypeError 把整轮预览炸掉——"已经判完的项"不得再走一遍取数。
+                    if text_fit_rules is not None:
+                        fit_status, fit_lines, fit_findings, _fit_meta = adjudicate_text_fit(
+                            manifest.get("text_fit"), text_fit_rules)
+                        fit_meta.update(_fit_meta)
+                    for line in fit_lines:
+                        print(line)
+
                     screenshots = []
                     for entry in manifest.get("scenes", []):
                         png_path = capture_dir / entry["file"]
@@ -697,15 +922,24 @@ def main():
                             safety_violations = check_preview_safety(
                                 manifest.get("scenes", []), temp_dir)
                         except ImportError as e:
-                            print(f"  [Safety Zone Pre-check] skipped ({e})")
+                            # 判据模块装不上（PIL/numpy 缺失）＝这一项没跑成。旧形态只 print
+                            # 一行 skipped，随后 Overall 照旧印 "[PASS] All scenes stay above
+                            # subtitle safety line"——把"没跑成"印成"查过且干净"。现点名 UNTESTED。
+                            # 刻意不阻断（与 phase2_error 不同档）：消费者环境装不上 PIL 时，
+                            # 拦下即等于把"本机缺依赖"报成"成片有缺陷"；此处只撤掉伪 PASS 文案。
+                            safety_untested = f"字幕安全区判据模块不可用：{e}"
+                            print(f"  [Safety Zone Pre-check] UNTESTED — {safety_untested}"
+                                  "（不判 PASS）")
                     else:
                         print("  No screenshots to generate grid from")
                 else:
                     print("  Capture manifest not found")
 
         except subprocess.TimeoutExpired:
-            print("  ERROR: Capture script timed out after 120s")
+            phase2_error = "Capture script timed out after 120s"
+            print(f"  ERROR: {phase2_error}")
         except Exception as e:
+            phase2_error = f"{type(e).__name__}: {e}"
             print(f"  ERROR during preview capture: {e}")
             import traceback
             traceback.print_exc()
@@ -726,6 +960,22 @@ def main():
                     print(f"  Cleaned up: {preview_cleanup_dir}")
                 except Exception as cleanup_err:
                     print(f"  Warning: could not clean {preview_cleanup_dir}: {cleanup_err}")
+
+    # 取数面未跑成的兜底：捕获脚本超时/非零返回/整体异常时 manifest 从未被读到，
+    # 此时该项不得留成"没有结论也没有点名"——补一条 UNTESTED 并点名成因。
+    if fit_status is None:
+        fit_status = gs.UNTESTED
+        fit_lines = ["  [TEXT-FIT] UNTESTED — 捕获脚本未成功返回，text_fit 取数无落盘证据"]
+        print(fit_lines[0])
+    fit_decision = ("accepted_untested" if fit_status == gs.UNTESTED
+                    and args.accept_text_fit_untested else None)
+    try:
+        fit_record_path = write_text_fit_record(
+            temp_dir, fit_status, fit_findings, fit_meta,
+            report_lines=fit_lines, decision=fit_decision)
+    except OSError as e:
+        fit_record_path = None
+        print(f"  [TEXT-FIT] 留痕写入失败（不影响裁定，影响追溯）: {e}")
 
     # --- Phase 3: Generate Report ---
     print("\n--- Phase 3: Preview Report ---")
@@ -788,6 +1038,16 @@ def main():
         for start, end in sparse_windows:
             report_lines.append(f"   {start:.0f}s-{end:.0f}s: < 3 events in 30s")
 
+    # Text fit（每行字数）——版面塌陷门禁，四态各有一行可读卡点
+    report_lines.append("")
+    report_lines.append("== Text Fit (每行字数) ==")
+    report_lines.extend(fit_lines)
+    report_lines.append(f"  状态: {fit_status}"
+                        + (f"（已按 --accept-text-fit-untested 放行，留痕 decision="
+                           f"{fit_decision}）" if fit_decision else ""))
+    if fit_record_path is not None:
+        report_lines.append(f"  留痕: {fit_record_path}")
+
     # Overall assessment
     report_lines.append("")
     report_lines.append("== Overall Assessment ==")
@@ -800,7 +1060,13 @@ def main():
                 f"overflow {v['overflow_px']}px @{v['time']:.0f}s")
         report_lines.append("         -> reduce content height / tighten padding-bottom, then re-preview")
     elif not args.density_only:
-        if capture_gap:
+        if phase2_error:
+            report_lines.append(
+                f"  [UNTESTED] 字幕安全区本次未跑完（预览阶段异常：{phase2_error}）"
+                " —— 不得判 PASS，异常被打印不等于检查通过")
+        elif safety_untested:
+            report_lines.append(f"  [UNTESTED] 字幕安全区 {safety_untested} —— 不得判 PASS")
+        elif capture_gap:
             report_lines.append(
                 f"  [FAIL] {len(capture_gap)} 场无预览像素（缺: {capture_gap}），"
                 f"安全区预检对这些场无证据 —— 不得判 PASS")
@@ -809,6 +1075,17 @@ def main():
         else:
             report_lines.append(
                 "  [FAIL] 未截到任何场景截图，安全区预检无像素证据 —— 不得判 PASS")
+
+    # 版面塌陷四态照常进结论面：N/A 与 UNTESTED 都不得写成通过（四态纪律）
+    if fit_status == gs.FAIL:
+        report_lines.append(f"  [FAIL] {len(fit_findings)} 个文本节点塌成竖排"
+                            "（每行字数低于设计下限，详见 == Text Fit == 节）")
+    elif fit_status == gs.UNTESTED:
+        report_lines.append("  [UNTESTED] 版面塌陷判据无从裁定"
+                            + (f"（decision={fit_decision}，已知情放行）" if fit_decision
+                               else "—— 不得读成该项干净"))
+    elif fit_status == gs.NOT_APPLICABLE:
+        report_lines.append("  [N/A] 版面塌陷判据无测量对象（对象为 0 ≠ 查过且干净）")
     total_deserts = len(desert_windows)
     total_sparse = len(sparse_windows)
     if total_deserts == 0 and total_sparse <= 1:
@@ -833,8 +1110,20 @@ def main():
         print(f"\nPREVIEW FAILED: {len(safety_violations)} scene(s) overflow the subtitle "
               f"safety zone — fix layout before rendering.")
         return 2
+    # 版面塌陷与"越界"同档：都是改完画面才能继续的结构缺陷，放进渲染就是白跑一次全量。
+    if fit_status == gs.FAIL:
+        print(f"\nPREVIEW FAILED: {len(fit_findings)} 个文本节点塌成竖排"
+              "（每行字数低于 video_quality_rules.json → text_fit 的设计下限）—— "
+              "加宽容器或缩短文本后重跑预览，禁止带此形态进入全量渲染。")
+        return 2
+
     # 退出码 2 = 真实溢出；3 = 预检存在盲区（零截图或部分场景未截到）。
     # 两者都不得当作 PASS 放行——盲区里溢出多少张图都不会被看见。
+    if not args.density_only and phase2_error:
+        print(f"\nPREVIEW FAILED: 预览阶段异常（{phase2_error}）—— 字幕安全区与版面塌陷"
+              "两项本次没有跑完，异常被打印不等于检查通过。修好取数链后重跑预览，"
+              "禁止带着这一盲区进入全量渲染。")
+        return 3
     if not args.density_only and capture_count == 0:
         print("\nPREVIEW FAILED: 零截图，字幕安全区未被实测 —— "
               "检查场景发现/Chrome/捕获链路后重跑，禁止带此盲区进入全量渲染。")
@@ -843,6 +1132,13 @@ def main():
         print(f"\nPREVIEW FAILED: {len(capture_gap)} 场未截到预览图（缺: {capture_gap}），"
               "字幕安全区对这些场无证据 —— 常见成因是 Chrome 渲染进程中途崩溃，"
               "重跑预览至覆盖完整后再进入全量渲染。")
+        return 3
+    # 塌陷判据无从裁定：默认与盲区同档阻断（"没测成"不得读成"没查出问题"）；
+    # 知情放行必须走显式开关，且已在 _text_fit_check.json 留 decision=accepted_untested。
+    if fit_status == gs.UNTESTED and not args.accept_text_fit_untested:
+        print("\nPREVIEW FAILED: 版面塌陷判据无从裁定（阈值断链/取数未跑成）—— "
+              "按点名成因修复后重跑；确需带此盲区进入渲染，用 --accept-text-fit-untested "
+              "显式放行（会留痕）。")
         return 3
     return 0
 

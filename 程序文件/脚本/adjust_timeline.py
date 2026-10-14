@@ -33,12 +33,60 @@ import time
 from pathlib import Path
 from script_interface import Config, Result, Logger, EXIT_CODE, atomic_write_json
 
+# 换包装时必须持住旧流对象（与 pipeline_runner.py:55-60 同一修法）：旧 TextIOWrapper
+# 一旦被 GC，其析构会关掉共享的底层 buffer，import 本模块的宿主（回归套件、探针）
+# 之后任何打印都报 "I/O operation on closed file"。本批的用例89 是第一个
+# in-process 驱动 `main()` 的用例，撞上后即修法，不是绕开。
+_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Import shared GSAP time resolution utilities
 sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_scene_map
+import cue_resolve
+
+
+def load_cue_time_source(tts_dir):
+    """词级 cue 的时间记录源：`_timeline_manifest.json`（tts 步末尾落盘）。
+
+    路径按真实读取处推导——`tts_dir.parent` 就是项目 temp 根，与
+    `_build_timeline_manifest` 的写入处同源；登记面（`pipeline_runner._step_inputs("timeline")`）
+    也必须登记同一个路径，否则就是 A06"登记面≠真实读取路径"的同族缺陷。
+    文件缺失返回 {}：让调用侧把"声明在位但无记录"显式报出来，而不是静默当"没有 cue"。
+    """
+    p = Path(tts_dir).parent / "_timeline_manifest.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return {str(s.get('scene_id')): s for s in data.get('scenes', [])}
+
+
+def resolve_cue_block(html_content, tts_dir):
+    """词级 cue 声明 → 解析 → 整块写入的唯一入口（两个写盘分支共用）。
+
+    三条设计约束，逐条对应一种失败形态：
+      1) 无声明 → 原样返回、零字节动作。写成"总是输出空块"会让每个存量项目的
+         index.html 变字节 → render 步判 inputs-changed → 一次全量渲染
+         （前置实测：稳态重跑三件字节逐位相同，见 `_取证/20261012/交接_词级cue驱动动画批.md` §5）。
+      2) 解析有 FAIL/UNTESTED → 由 problems 带回，调用侧必须在**写盘之前**拦下，
+         不产出"块里半截 cue、元素永不亮"的成片。
+      3) 绝不在此处重新对齐：句级与字符级时刻必须取自同一次对齐输出，而实测对齐读数随
+         计算线程环境移动（±0.02~0.42s），自跑即让 cue 脱离已交付字幕的时间基准。
+    """
+    return cue_resolve.resolve_and_apply(html_content, load_cue_time_source(tts_dir))
+
+
+def report_cue_problems(problems):
+    """失败文案的唯一生成点（两个写盘分支共用，各拼一份即两套口径）。"""
+    for _p in problems:
+        print(f"  [CUE] {_p}")
+    print("  ERROR: cue 声明未能全部解析——拒绝写出半截 cue 块（禁止静默回退）")
+    return EXIT_CODE.GATE_FAILURE
 
 
 def get_duration(filepath):
@@ -109,7 +157,8 @@ def measure_tts_durations(tts_dir, num_scenes, config_scenes=None):
     return durations
 
 
-def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrink_margin=1.5):
+def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrink_margin=1.5,
+                      trim_durations=None):
     """Calculate extension/shrink and cumulative offset for each scene.
 
     Bidirectional adjustment: the target margin between TTS end and scene end
@@ -124,6 +173,9 @@ def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrin
         shrink: enable bidirectional convergence to `shrink_margin`
         shrink_margin: target margin beyond TTS (default 1.5s = audio_sync_rules.json
             authoritative value; active when --shrink)
+        trim_durations: [dur1, dur2, ...] 可裁基准（仅收缩侧使用）。缺省＝tts_durations，
+            即与既有行为逐字等价。传入时**调用侧须保证已逐项 min(wav)**——扩展侧永不使用
+            本参数，因为扩展要保证音频放得下，只能按 wav 全时长。
 
     Returns:
         extensions: [ext1, ext2, ...] how much each scene grows (negative = shrink)
@@ -131,19 +183,20 @@ def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrin
         total_ext: total extension/shrink applied to video
     """
     extensions = []
+    if trim_durations is None:
+        trim_durations = tts_durations
     # 目标边距：--shrink 打开时用 shrink_margin，否则用 buffer
     target_margin = shrink_margin if shrink else buffer
     for i, (start, end) in enumerate(boundaries):
         window = end - start
         tts = tts_durations[i]
-        target_window = tts + target_margin
-
-        if window < target_window:
-            # 窗口不足以覆盖 TTS + target margin → 扩展
-            ext = target_window - window
-        elif shrink and window > target_window:
+        trim = trim_durations[i]
+        if window < tts + target_margin:
+            # 窗口不足以覆盖 TTS + target margin → 扩展（**恒按 wav，不按可裁基准**）
+            ext = (tts + target_margin) - window
+        elif shrink and window > trim + target_margin:
             # 窗口盈余 → 收敛到 target（仅在 --shrink 时才反向收缩）
-            ext = target_window - window  # negative value
+            ext = (trim + target_margin) - window  # negative value
         else:
             # 窗口刚好或未开启收缩 → 不动
             ext = 0.0
@@ -438,6 +491,94 @@ def _write_narration_scenes(narration_path, scenes, cover_duration):
     print(f"  Updated narration_source: {narration_path}")
 
 
+VALID_SHRINK_BASES = ("tts_wav", "speech_end")
+
+
+def resolve_shrink_basis(cli_value, config_value, rules_value):
+    """收缩基准的三级优先：CLI > 项目 config 的 shrink_basis > 配置权威源。
+
+    非法值**不静默穿过**：点名后回退 `tts_wav`（＝既有行为）。
+    这是 fail-closed 到旧行为，不是 fail-open 到新行为——配置写坏不该让时间轴悄悄换基准。
+    """
+    for tag, v in (("--shrink-basis", cli_value), ("config.shrink_basis", config_value)):
+        if v is None:
+            continue
+        if v in VALID_SHRINK_BASES:
+            return v
+        print(f"  WARNING: {tag} = {v!r} 非合法值（{VALID_SHRINK_BASES}）— 回退 tts_wav")
+        return "tts_wav"
+    return rules_value if rules_value in VALID_SHRINK_BASES else "tts_wav"
+
+
+def _default_shrink_basis():
+    """--shrink-basis 单一权威源：`audio_sync_rules.json → shrink.basis`。
+
+    两个取值（2026-10-13 用户裁定"换余量基准，挂在本来就要重渲的那一批顺带生效"）：
+      `tts_wav`（缺省）＝窗口对 wav 全时长留 `shrink_margin`。既有行为，逐字不变。
+      `speech_end`     ＝窗口对 **ASR 末句实测收尾**留 `shrink_margin`，把 wav 尾部静音
+        （本仓浅色片实测 0.31–0.46s／场）从"必须保留"改为"可裁"。收益是名义余量＝听感余量，
+        代价是全仓时间轴基准变更 → 缺省不动，由项目 config `shrink_basis` 或 CLI 显式声明。
+
+    读不回（缺文件／缺节／缺键／值非法）一律回 `tts_wav` 并打印归因——fail-closed 到既有行为，
+    不得由"配置断链"读出"新行为"（A06 同族：断链必须点名，不能伪装成裁定）。
+    """
+    valid = ("tts_wav", "speech_end")
+    try:
+        from _script_env import ROOT
+        rules_path = ROOT / "程序文件" / "配置" / "config" / "quality" / "audio_sync_rules.json"
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            basis = json.load(f)["shrink"].get("basis", "tts_wav")
+        if basis not in valid:
+            print(f"  WARNING: shrink.basis = {basis!r} 非合法值（{valid}）— 回退 tts_wav")
+            return "tts_wav"
+        return basis
+    except Exception as exc:
+        print(f"  WARNING: audio_sync_rules.json 的 shrink.basis 取不回"
+              f"（{type(exc).__name__}: {exc}）— 回退 tts_wav")
+        return "tts_wav"
+
+
+def measure_speech_ends(tts_dir, num_scenes):
+    """逐场 ASR 末句收尾时刻（场内相对秒），取自生产落盘的 `_timeline_manifest.json`。
+
+    与词级 cue 同一个时间源（`load_cue_time_source`），不新起第二套取数：
+    句级 `sentences[].rel_end` 与 `chars` 出自同一次对齐，两处各跑一遍对齐就会因
+    线程环境漂移（实测 ±0.02~0.42s）而使"留白基准"与"字幕基准"分叉。
+
+    返回 `{scene_id(str): rel_end}`，缺项即不返回该键——调用侧按"无实测"回退 wav，
+    禁止用 0.0 或整场时长兜底（前者会把窗口裁到音频开头，后者等于没改）。
+    """
+    by_id = load_cue_time_source(tts_dir)
+    out = {}
+    for sid in range(1, num_scenes + 1):
+        sc = by_id.get(str(sid))
+        if not sc:
+            continue
+        sents = sc.get("sentences") or []
+        vals = []
+        for s in sents:
+            try:
+                vals.append(float(s["rel_end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not vals:
+            continue
+        rel_end = max(vals)
+        tts_dur = sc.get("tts_duration")
+        try:
+            tts_dur = float(tts_dur) if tts_dur is not None else None
+        except (TypeError, ValueError):
+            tts_dur = None
+        # 一致性哨兵：末句收尾不得晚于 wav 时长（超出即记录与音频不同代），
+        # 也不得逼近 0（降级/塌缩记录会让整场被裁光）。两种形态一律不采信。
+        if tts_dur is not None and (rel_end <= 0 or rel_end > tts_dur + 0.05):
+            print(f"  [SHRINK-BASIS] 场 {sid} 末句 rel_end={rel_end:.2f}s 与 "
+                  f"wav={tts_dur:.2f}s 不符 — 该场回退 wav 基准")
+            continue
+        out[str(sid)] = rel_end
+    return out
+
+
 def _default_shrink_margin():
     """--shrink-margin 单一权威源：config/quality/audio_sync_rules.json。
 
@@ -467,6 +608,11 @@ def main():
                         help="Target margin beyond TTS when shrinking. Default: read from "
                              "config/quality/audio_sync_rules.json (single source of truth, "
                              "currently 1.5s). Pass explicitly only for one-off experiments.")
+    parser.add_argument("--shrink-basis", choices=("tts_wav", "speech_end"), default=None,
+                        help="收缩侧的留白基准：tts_wav（缺省，既有行为）按 wav 全时长；"
+                             "speech_end 按 ASR 末句实测收尾，把 wav 尾部静音从'必须保留'改为"
+                             "'可裁'。未显式传参时读项目 config 的 shrink_basis，再回 "
+                             "audio_sync_rules.json → shrink.basis。扩展侧永不使用本参数。")
     args = parser.parse_args()
 
     # margin 单一权威源：未显式传参 → 从 audio_sync_rules.json 读取
@@ -594,8 +740,32 @@ def main():
     # Measure TTS durations
     tts_durations = measure_tts_durations(tts_dir, num_scenes, cfg.get('scenes'))
 
+    # 收缩侧基准：CLI > 项目 config 的 shrink_basis > audio_sync_rules.json → shrink.basis
+    # 三级里任何一级没声明就落到下一级，缺省 tts_wav ＝ 既有行为逐字不变。
+    basis = resolve_shrink_basis(args.shrink_basis, cfg.get('shrink_basis'),
+                                 _default_shrink_basis())
+    trim_durations = None
+    if basis == "speech_end" and args.shrink:
+        speech_ends = measure_speech_ends(tts_dir, num_scenes)
+        missing = [i + 1 for i in range(num_scenes) if str(i + 1) not in speech_ends]
+        if missing:
+            print(f"  [SHRINK-BASIS] {len(missing)}/{num_scenes} 场无末句实测"
+                  f"（场 {missing}）— 这些场按 wav 基准")
+        if not speech_ends:
+            print("  [SHRINK-BASIS] 全场取不到末句实测 — 整体回退 tts_wav 基准"
+                  "（多为 _timeline_manifest.json 缺失或早于句级记录落盘）")
+        else:
+            # 可裁基准永不得高于 wav：末句若晚于 wav（异常记录）由 measure_speech_ends 拦掉，
+            # 这里再兜一层 min 使"换基准"在结构上不可能把音频裁掉哪怕 0.01s。
+            trim_durations = [min(tts_durations[i], speech_ends.get(str(i + 1), tts_durations[i]))
+                              for i in range(num_scenes)]
+            reclaim = sum(t - m for t, m in zip(tts_durations, trim_durations))
+            print(f"  [SHRINK-BASIS] speech_end 生效：可裁尾部静音合计 {reclaim:.2f}s"
+                  f"（{len(speech_ends)}/{num_scenes} 场有末句实测）")
+
     print(f"\nTTS Duration Analysis (shrink={'ON' if args.shrink else 'OFF'}" +
-          (f", margin={args.shrink_margin}s" if args.shrink else "") + "):")
+          (f", margin={args.shrink_margin}s" if args.shrink else "") +
+          (f", basis={basis}" if args.shrink else "") + "):")
     for i, (start, end) in enumerate(boundaries):
         window = end - start
         tts = tts_durations[i]
@@ -611,7 +781,8 @@ def main():
     # Calculate extensions and offsets (bidirectional)
     extensions, offsets, total_ext = calculate_offsets(
         boundaries, tts_durations,
-        shrink=args.shrink, shrink_margin=args.shrink_margin
+        shrink=args.shrink, shrink_margin=args.shrink_margin,
+        trim_durations=trim_durations
     )
 
     ext_label = f"{total_ext:+.1f}s" if total_ext < 0 else f"+{total_ext:.1f}s"
@@ -643,6 +814,17 @@ def main():
                       f"  Recover: delete {html_bak.name} + {html_hash_path.name} "
                       f"in the project dir, then re-run this step.")
                 return EXIT_CODE.GATE_FAILURE
+        # 零调整分支也必须走 cue 写入面（2026-10-12 词级 cue 批）。这不是"顺手补一处"：
+        # 窗口已收敛的项目走的就是这个提前返回，只在下方的调整分支写块＝
+        # 收敛后新加的 cue 声明永远不落盘，而预检那条校验已判它合法——
+        # 条文在生效路径上没有载体（A06 同族）。写在 _write_hash 之前，
+        # 使哈希基准＝真正落盘的那份字节，否则下一轮把自家写的块读成"手工编辑"。
+        html_content, cue_changed, cue_problems = resolve_cue_block(html_content, tts_dir)
+        if cue_problems:
+            return report_cue_problems(cue_problems)
+        if cue_changed:
+            html_path.write_text(html_content, encoding='utf-8')
+            print(f"  Updated HTML (cue 块，零调整分支): {html_path}")
         _write_hash(html_hash_path, html_content)
         # Zero adjustment does NOT imply config is in sync: when the HTML was
         # manually edited (fresh baseline, already-converged S-block) while the
@@ -702,6 +884,13 @@ def main():
     html_content = update_data_duration(html_content, new_video_duration)
 
     # Write modified HTML
+    # 词级 cue 定界块：与零调整分支共用 resolve_cue_block（约束见该函数 docstring，
+    # 两处各写一份即两套口径）。
+    html_content, cue_changed, cue_problems = resolve_cue_block(html_content, tts_dir)
+    if cue_problems:
+        return report_cue_problems(cue_problems)
+    if cue_changed:
+        print(f"  CUE-MAP: 整块再生成（{len(cue_resolve.scan_cue_declarations(html_content))} 条声明）")
     html_path.write_text(html_content, encoding='utf-8')
     _write_hash(html_hash_path, html_content)
     print(f"\n  Updated HTML: {html_path}")

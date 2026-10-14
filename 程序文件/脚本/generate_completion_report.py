@@ -422,6 +422,32 @@ def run_delivery_audit(report: Dict[str, Any],
             "basis": "agent-wiki 角色分离：6 维度全部由真实数据推导，治具裁定，禁止自证"}
 
 
+def _frame_occupancy_face(video_path):
+    """完工报告侧的**取数接线**：判据真身与文案都不在本文件里（单源住 frame_occupancy）。
+
+    三种"取不到"各自点名，且一律不影响 verdict/status——本面是描述面：
+      · 模块取不回（未随导出/路径变了）→ untested 点名模块名
+      · 依赖缺失（numpy/ffmpeg）→ 由 measure 自己返回 untested 归因
+      · 成片不在位 → 不进入本函数（外层 else 分支已拦）
+    """
+    try:
+        import frame_occupancy as _fo
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"frame_occupancy 模块取不回（{type(e).__name__}）"}
+    return _fo.measure(str(video_path))
+
+
+def _fo_format(m):
+    try:
+        import frame_occupancy as _fo
+    except Exception:                                   # noqa: BLE001
+        # 独立标记，不复用 format_line 的前缀字面量：语义本来就不同——
+        # "接线断了（模块取不回）"不等于"跑过了但取不到数（untested）"。
+        # 复用同一前缀即把第二个文案源写进报告（用例93 D2 抓到的正是这个）。
+        return "[FRAME-OCCUPANCY-DISCONNECTED] 文案生成点取不回（frame_occupancy 不可导入）"
+    return _fo.format_line(m)
+
+
 def ffprobe_get_metadata(video_path: str) -> Dict[str, Any]:
     """使用 ffprobe 获取视频元数据"""
     try:
@@ -569,6 +595,16 @@ def generate_report(
         if not report["validation"]["has_audio_stream"]:
             report["issues"].append("No audio stream found in output")
             all_valid = False
+
+        # 画面占用（描述面，2026-10-13 复盘评估批）：只出数、不裁定、不进任何退出码。
+        # 存在理由不是"补一条门禁"，而是把只能靠肉眼发现的形态写成纸上的数——同日实测
+        # 6 块内容永久不可见而终检/审计/回归全绿，三轮观感问题也全部由用户肉眼抓出。
+        # 为何不定阈值：跨 9 支已交付成片实测，同一绝对口径横竖屏差 3.8 倍且方向与
+        # "健康/病灶"相反，纵向几何下限会错杀 6/9 既有交付（含用户点名验收通过件）。
+        # 完整论证与翻转前置住 frame_occupancy 模块 docstring，本处不复制第二份判据。
+        # 取数断链按点名处理（不得由"没有这一节"反推"没跑成"还是"跑过且干净"）。
+        report["data_sources"]["frame_occupancy"] = _frame_occupancy_face(video_path)
+        print("  " + _fo_format(report["data_sources"]["frame_occupancy"]))
     
     # 数据源2：字幕文件
     if subtitle_file:

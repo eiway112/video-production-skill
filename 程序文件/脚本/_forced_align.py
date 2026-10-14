@@ -106,6 +106,21 @@ def _normalize_chars(text):
     return ''.join(chars), index_map
 
 
+def segment_char_offsets(segments):
+    """每个字幕分段在**归一化字符流**里的索引区间 [(start, end_exclusive), ...]。
+
+    单一权威源：`align_scene` 用它切句，`cue_resolve` 用它把一枚字符时刻归到某句。
+    两处各写一遍累加规则即两套索引——偏移一位就会让 cue 落在别的句上，
+    且这种错在画面上表现为"亮早/亮晚一点"，没有任何门禁会响（A06 同族）。
+    """
+    offs, cur = [], 0
+    for seg in segments or []:
+        n = len(_normalize_chars(seg)[0])
+        offs.append((cur, cur + n))
+        cur += n
+    return offs
+
+
 def _transcribe_words(wav_path, model, initial_prompt=None):
     """识别音频，返回 [(word_text, start, end), ...]（保持时间升序）。"""
     segments, _info = model.transcribe(
@@ -206,9 +221,20 @@ def align_scene(wav_path, text, segments, model=None):
 
     Returns:
         {"sentences": [{"text", "rel_start", "rel_end"}, ...],
-         "match_ratio": float, "method": "asr_forced"}
+         "match_ratio": float, "method": "asr_forced",
+         "norm": <对齐基准的归一化字符流>,
+         "chars": [[rel_start, rel_end, matched01], ...]}   # 与 norm 逐字符同长
         或 None（模型不可用 / 匹配率过低 / 首句零匹配 / 存在塌缩零长句
         → 调用方降级）
+
+    `chars` 是词级 cue 动画的数据源（2026-10-12 词级 cue 批）。三点不得误读：
+      - **它一直在被计算**：`_align_char_times` 本就返回逐字符 starts/ends/matched_flags，
+        旧实现切完句即丢弃，故本批是"把已有数据接出去"，不是新算法、不改任何既有裁定。
+      - `matched=0` 的字符时间是**插值造出来的**（未匹配区间在左右锚点间线性均分，
+        `_align_char_times` 的 166-186 行），只能当"大致时候"用；驱动画面须由消费方
+        按旗标裁定（见 cue_resolve），不得把插值时刻当实测。
+      - `sentences[]` 的字面输出与顺序逐字未动（用例锁定），句级消费方（step5 字幕、
+        media_qa 对齐检查）零变化。
     """
     if model is None:
         model = load_align_model()
@@ -257,19 +283,19 @@ def align_scene(wav_path, text, segments, model=None):
 
     sentences = []
     seg_matched_counts = []
-    norm_cursor = 0
-    for seg, seg_norm in zip(segments, seg_norms):
-        n = len(seg_norm)
+    # 索引区间取自单一权威源 `segment_char_offsets`（与 cue_resolve 同一函数），
+    # 不再在本函数内维护第二个 norm_cursor 累加器。
+    for seg, (a, b) in zip(segments, segment_char_offsets(segments)):
+        n = b - a
         if n == 0:
             # 纯标点/空白分段（理论不出现）：沿用上一段结束时刻
             prev_end = sentences[-1]["rel_end"] if sentences else 0.0
             sentences.append({"text": seg, "rel_start": prev_end, "rel_end": prev_end})
             seg_matched_counts.append(0)
             continue
-        rel_start = starts[norm_cursor]
-        rel_end = ends[norm_cursor + n - 1]
-        seg_matched_counts.append(sum(matched_flags[norm_cursor:norm_cursor + n]))
-        norm_cursor += n
+        rel_start = starts[a]
+        rel_end = ends[b - 1]
+        seg_matched_counts.append(sum(matched_flags[a:b]))
         sentences.append({
             "text": seg,
             "rel_start": round(rel_start, 3),
@@ -303,7 +329,12 @@ def align_scene(wav_path, text, segments, model=None):
                   f"unreliable, fallback")
             return None
 
-    return {"sentences": sentences, "match_ratio": round(ratio, 3), "method": "asr_forced"}
+    # 字符级流随结果一并出（词级 cue 的数据源；与 ref_norm 逐字符同长）。
+    # matched_flags 为 None 只发生在"无任何匹配"分支，那已在上面 return None 处拦下。
+    chars = [[round(float(starts[i]), 3), round(float(ends[i]), 3),
+              1 if matched_flags[i] else 0] for i in range(len(ref_norm))]
+    return {"sentences": sentences, "match_ratio": round(ratio, 3),
+            "method": "asr_forced", "norm": ref_norm, "chars": chars}
 
 
 def main():

@@ -62,9 +62,19 @@ RENDER_CRITICAL_CHECKS = {
     "subtitle_safe",      # check 11: missing subtitle-safe div
     "image_integrity",    # check 3:  image NOT FOUND / empty src
     "scene_visibility",   # check 7:  black frame (opacity:0 w/o GSAP)
+    # check 7b: 元素级同款。scene_visibility 只量 #sceneN，且**契约型 HTML 下整体
+    # return 跳过**（本仓项目全部带 data-scene-*，故那条对现网项目是空转的）。
+    # 2026-10-13 复盘：6 处容器带 .rv 而入场的 tween 只打其子元素 → 父层 opacity
+    # 恒 0、整块子树从未出现在成片里，终检 20 项与审计 6 维全绿未拦。
+    "element_reveal",
     "scene_contract",     # check 0:  contract declaration mismatch
+    "cue_declaration",    # check 0b: data-cue-at 词在该场旁白里定位不到（接线断，永不亮）
     "design_rules",       # check 8:  independent timeline, missing opacity:0
     "narration_digits",   # check 13: Chinese numerals for quantitative values in narration
+    # check 13b: 停顿声明（pause_marks）在 TTS 之前复核——越界档位/锚词落不到/
+    # 引擎不支持这些形态若留到 TTS 步炸，已是白扣一轮账号余额（缓存被清后）。
+    # 判据本体住 pause_marks.plan_scene，预检与生效路径同一裁定源。
+    "pause_declaration",
     "asset_signoff",      # check 14: 屏显/旁白与位点1 素材确认单分叉
 }
 
@@ -80,6 +90,9 @@ class PreflightResult:
         self.errors = []
         self.warnings = []
         self._log_entries = []  # structured log for JSON output
+        # 判据自报计数：使"跑过且判了几处"成为正证据，而非由测试侧另算一遍
+        # （第二个取数面会与判据漂移，本仓 A06 同族）。由各 check_* 自行登记。
+        self.counts = {}
         # 内容画像（wp 批次复盘：退出纪律首次执行）：text_only 纯文字视频
         # 本就无图片素材/设计产物，相关 4 条 WARN 属预期而非异常，降为 INFO，
         # 消除常驻警告噪音（信号疲劳会淹没真问题）。config 声明 content_profile。
@@ -577,6 +590,90 @@ def _scene_hidden_state(content: str, attrs: str, scene_id) -> tuple:
     return inline_opacity_zero, css_opacity_zero, css_visibility_hidden
 
 
+def check_cue_declarations(html_path: Path, cfg: dict, r: PreflightResult):
+    """[Cue] 词级 cue 声明的结构校验（2026-10-12 词级 cue 批）。
+
+    这条**不是观感门禁**，是接线正确性判据：声明的词若不在该场旁白的发音字符流里，
+    对应元素永远不会亮——"少一个动画"在成片上只能靠人眼事后发现，属渲染前必须拦下的
+    形态（与 `bgm_source`／`narration_source` 的"指针找不到即报错、禁止静默回退"同判据）。
+
+    本函数只裁预检面能裁的那一半：声明有无归属、词是否出现在**该场旁白**里。
+    绝对时刻要等 ASR 字符流存在才能算，归 timeline 步的
+    `cue_resolve.resolve_and_apply` 裁定（同一链、同一扫描函数）。两处各写一份正则
+    即两套语法，改了一处另一处照常"读不到"而不报错（A06 同族），故扫描与归一化
+    的唯一持有者在 `cue_resolve`，这里只调它。
+
+    fail-closed 三向：旁白面整体读不回 / 该场无旁白文本 / 词不在旁白里，一律 ERROR。
+    方向按 brief §2.3 记为偏离原案（原案写 UNTESTED）：预检是渲染前的阻断位点，
+    "无从核对"若降为 WARN，即等于把"接线断了"读成"接线没问题"，与本仓
+    A04 四态在阻断位点的用法（`visual_boundary_check` 未测即退出码 2）一致。
+    """
+    print("\n[0b] Word-level cue declarations (data-cue-at)")
+
+    try:
+        import cue_resolve as _cr
+    except ImportError as _e:            # 取数身拿不到即点名，不得静默跳过本校验
+        r.error(f"cue 声明校验未执行：cue_resolve 模块取不回（{_e}）",
+                check_id="cue_declaration")
+        return
+
+    if not html_path.exists():
+        r.warn(f"HTML 缺失（{html_path}），cue 声明面无从扫描——本项未执行",
+               check_id="cue_declaration")
+        return
+
+    decls = _cr.scan_cue_declarations(html_path.read_text(encoding='utf-8'))
+    if not decls:
+        # 无声明是合法常态（本项目不走词级动画），记 OK 留正证据而非"无记录"
+        r.ok("无词级 cue 声明（0 条）", check_id="cue_declaration")
+        return
+
+    # 旁白面：narration_source 已由 check_json_config 解析进 cfg['scenes']（单一权威源），
+    # 此处只读该已解析面，不再自行解析指针——两处解析即两套口径。
+    nar_by_scene = {}
+    for s in (cfg or {}).get("scenes") or []:
+        if not isinstance(s, dict):
+            continue
+        key = _cr.normalize_scene_id(s.get("scene_id"))
+        if not key:
+            continue
+        text = s.get("narration") or ""
+        nar_by_scene[key] = "".join(text) if isinstance(text, list) else str(text)
+
+    if not nar_by_scene:
+        r.error(f"{len(decls)} 条 cue 声明在位，但旁白面（config／narration_source 的 scenes）"
+                "读不回，词能否定位无从核对——属取数断链，不得按『没有缺陷』放行",
+                check_id="cue_declaration")
+        return
+
+    problems = 0
+    for d in decls:
+        if d["scene_id"] is None:
+            r.error(_cr.format_declaration_error(d), check_id="cue_declaration")
+            problems += 1
+            continue
+        cue_norm = _cr.normalize(d["cue"])
+        if not cue_norm:
+            r.error(f"场景 {d['scene_id']} 的 cue 声明「{d['cue']}」归一化后没有发音字符，"
+                    "无从在任何字符流里定位", check_id="cue_declaration")
+            problems += 1
+            continue
+        nar_norm = _cr.normalize(nar_by_scene.get(_cr.normalize_scene_id(d["scene_id"]), ""))
+        if not nar_norm:
+            r.error(f"场景 {d['scene_id']} 声明了 cue「{d['cue']}」，但该场在旁白源里没有文本"
+                    "（cover 场本就无旁白），词无从定位", check_id="cue_declaration")
+            problems += 1
+            continue
+        if cue_norm not in nar_norm:
+            r.error(f"场景 {d['scene_id']} 的 cue 声明「{d['cue']}」不在该场旁白里——这条 cue "
+                    "永远不会亮（改成旁白中的实际词，或删除该声明；注意旁白按规范用阿拉伯数字，"
+                    "「三大支柱」对不上「3 大支柱」）", check_id="cue_declaration")
+            problems += 1
+
+    if problems == 0:
+        r.ok(f"cue 声明全部可定位：{len(decls)} 条", check_id="cue_declaration")
+
+
 def check_scene_contracts(html_path: Path, r: PreflightResult):
     """[Contract] Validate structural declarations on scene divs.
 
@@ -845,7 +942,12 @@ def check_scene_visibility(html_path: Path, r: PreflightResult):
     if contracted_ids:
         legacy_ids = [s for s in scene_ids if s not in contracted_ids]
         if not legacy_ids:
-            r.ok(f"All {len(scene_ids)} scenes validated via contracts — regex check skipped")
+            # 措辞纪律（2026-10-13）：本条对契约型场景**没有做任何裁定**，不得写成
+            # "validated via contracts"——契约检查只核属性在位，不核揭示路径。
+            # 真实裁定位点是 check_element_reveal（元素级，含场景根）。
+            r.ok(f"All {len(scene_ids)} scenes are contract-type — this regex check "
+                 f"does not adjudicate them; element-level reveal coverage is decided "
+                 f"by check_element_reveal")
             return
         # Some contracted, some legacy — only check legacy scenes below
         scene_ids = legacy_ids
@@ -926,6 +1028,245 @@ def check_scene_visibility(html_path: Path, r: PreflightResult):
 
     if visible_scenes and not invisible_scenes:
         r.ok(f"Scene visibility: {len(visible_scenes)} scenes have visible initial state or GSAP entrance")
+
+
+def check_element_reveal(html_path: Path, r: PreflightResult):
+    """CRITICAL (元素级): 初始隐藏的元素必须有入场语句**命中它自己**。
+
+    与 check_scene_visibility 的分工：那条量整场 `#sceneN`，且在场景带
+    `data-scene-*` 契约时整体跳过 —— 本仓现网项目全部是契约型 HTML，故它对
+    现网是空转的。本条量**元素级**，专抓 2026-10-13 复盘的形态：
+
+      CSS `.rv{opacity:0}` 挂在**容器**上，入场 tween 写成 `#容器 .chip`
+      → 父层 opacity 恒 0，子元素再亮也不显示，整块内容在成片里永久不可见。
+
+    判据（零阈值，不依赖像素/采样，故不存在"标定"问题）。**只阻断形态①**：
+
+      ① 元素 N 初始隐藏、无 tween 命中 N、但 N 的**后代**被 tween 命中 → ERROR
+      ② 元素 N 初始隐藏、N 与其后代都没有 tween 命中 → WARN（不阻断）
+
+    为何只阻断①：它问的是**结构关系**（容器出现在选择器的祖先段、却从未作为末段被命中），
+    与"认得哪个 GSAP API"无关；取数面按第 2 步说明取宽，宽取数只会让判据漏判、不会错杀。
+    ②由"什么都没找到"这一否定证据支撑，而本仓揭示路径是开放集合（`forEach(el => …)`、
+    自定义转场封装、动态拼接选择器），把"我没找到"读成"不存在"即 A06 同族误杀 ——
+    全仓 64 份 index.html 首次普查因该形态误报 10 份，故它只报不拦。
+
+    两条限定（不是排除）：
+      · **场景根（带 data-scene-id）一并参与**。曾把它排除、理由是"整场可见性归
+        check_scene_visibility"，而该条在场景带契约属性时整体 return 跳过 —— 两条判据
+        互相指认，现网契约 HTML 的场景根实际无人裁定（判据自报计数：64 份 index.html 合计 380 处）。2026-10-13 普查实测
+        该洞当前 0 个犯事对象（380 处全部被 GSAP 直接命中），故本条接上它**不误杀任何存量项目**，
+        只将"两处分工各让一步"的真空洞关闭；
+      · 元素 id 另有 CSS 规则把它设回可见（`.sc{opacity:0}` + `#scene0{opacity:1}`）时
+        不算隐藏 —— 按特异度，id 规则压过类规则。
+
+    取数断链按 ERROR 处理（预检是阻断位点，"无从核对"降为 WARN 即把接线断了读成
+    接线没问题）：声明了隐藏类却一个 GSAP 目标都提不出来 → 点名并判错。
+
+    边界：选择器按**后代**语义匹配（`A B` 允许 B 的任意层级祖先为 A），不支持
+    `>` 直接子代 —— 出现即按后代近似，本仓 HTML 无该形态。
+    """
+    print("\n[7b/12] Element Reveal (hidden container vs child-only entrance)")
+
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id="element_reveal")
+        return
+
+    content = html_path.read_text(encoding='utf-8')
+
+    # ── 1. 初始隐藏的选择器：从 <style> 里取声明了 opacity:0 / visibility:hidden 的规则 ──
+    styles = "".join(re.findall(r'<style[^>]*>(.*?)</style>', content, re.DOTALL))
+    styles = re.sub(r'/\*.*?\*/', '', styles, flags=re.DOTALL)   # 注释里的 { } 会让规则切分错位
+    hidden_classes, hidden_ids, restored_ids = set(), set(), set()
+    for sel_list, body in re.findall(r'([^{}]+)\{([^{}]*)\}', styles):
+        hidden = (re.search(r'opacity\s*:\s*0(?![.\d])', body)
+                  or re.search(r'visibility\s*:\s*hidden', body))
+        shown = (re.search(r'opacity\s*:\s*(?:[1-9]|0\.\d)', body)
+                 or re.search(r'visibility\s*:\s*visible', body))
+        for one in (s.strip() for s in sel_list.split(',')):
+            m = re.fullmatch(r'\.([A-Za-z_][\w-]*)', one)
+            if m:
+                if hidden:
+                    hidden_classes.add(m.group(1))
+                continue
+            m = re.fullmatch(r'#([A-Za-z_][\w-]*)', one)
+            if not m:
+                continue
+            if hidden:
+                hidden_ids.add(m.group(1))
+            elif shown:
+                restored_ids.add(m.group(1))
+
+    if not hidden_classes and not hidden_ids:
+        r.counts["element_reveal"] = {"hidden": 0, "scene_root_hidden": 0,
+                                      "blocked_container": 0, "no_entrance": 0}
+        r.ok("无初始隐藏元素（CSS 未声明 opacity:0 / visibility:hidden 的类或 id 规则）",
+             check_id="element_reveal")
+        return
+
+    # ── 2. "被引用过的选择器"集合 ──
+    # 取数面刻意取**宽**：凡脚本里长得像 CSS 选择器的字符串字面量全部纳入，而不是只认
+    # 我认识的 GSAP API。收窄会把"我没认出来"读成"没有揭示"（普查实测两类：
+    # `gsap.utils.toArray("X").forEach(el => …)` 与自定义转场封装 `pushH("#scene0","#scene1",t)`）。
+    # 宽取数只让判据**漏判**，不让它错杀 —— 而本判据的区分力不来自"认得哪个 API"，
+    # 来自结构：容器只在 `#容器 子元素` 这类选择器的**祖先段**出现、从未作为**末段**被命中，
+    # 即"入场只打子元素"。这一区分与取数面宽窄无关。
+    scripts = "".join(re.findall(r'<script[^>]*>(.*?)</script>', content, re.DOTALL))
+    selectors = re.findall(
+        r'[\'"]([#.][A-Za-z_][\w-]*(?:\s+[#.>]?[A-Za-z_][\w-]*)*)[\'"]', scripts)
+    selectors = [s for s in selectors
+                 if not re.fullmatch(r'#[0-9a-fA-F]{3,8}', s)]          # 排除 #rrggbb
+    if not selectors:
+        r.counts["element_reveal"] = {"acquisition_broken": True,
+                                      "hidden": -1, "scene_root_hidden": -1,
+                                      "blocked_container": -1, "no_entrance": -1}
+        r.error(f"CSS 声明了 {len(hidden_classes | hidden_ids)} 个初始隐藏选择器，"
+                f"但脚本里一个 GSAP 目标都取不到 —— 本判据无从核对，按缺陷处理",
+                check_id="element_reveal")
+        return
+    seg_lists = [s.split() for s in selectors]
+
+    # ── 3. 轻量 DOM（html.parser：注释与 <script>/<style> 内容不进元素树） ──
+    from html.parser import HTMLParser
+
+    class _N:
+        __slots__ = ("tag", "id", "classes", "parent", "children", "text", "scene_root")
+
+        def __init__(self, tag, attrs, parent):
+            self.tag, self.parent, self.children = tag, parent, []
+            d = dict(attrs or [])
+            self.id = d.get("id")
+            self.classes = set((d.get("class") or "").split())
+            # 场景根标记：本判据**也裁场景根**（2026-10-13 起；此前排除的理由是
+            # "整场归 check_scene_visibility"，而那条对契约型 HTML 整体跳过 → 两处互指空转）。
+            # 该标记现仅用于计数透出（r.counts["element_reveal"]["scene_root_hidden"]）。
+            self.scene_root = "data-scene-id" in d
+            self.text = ""
+
+    class _P(HTMLParser):
+        VOID = {"img", "br", "hr", "input", "meta", "link", "source", "area",
+                "base", "col", "embed", "param", "track", "wbr"}
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root = _N("#root", [], None)
+            self.cur = self.root
+            self.nodes = []
+            self._skip = 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self._skip += 1
+            n = _N(tag, attrs, self.cur)
+            self.cur.children.append(n)
+            self.nodes.append(n)
+            if tag not in self.VOID:
+                self.cur = n
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style") and self._skip:
+                self._skip -= 1
+            node = self.cur
+            while node is not None and node.tag != tag:
+                node = node.parent
+            if node is not None and node.parent is not None:
+                self.cur = node.parent
+
+        def handle_data(self, data):
+            if data.strip():
+                self.cur.text += data.strip()
+
+    p = _P()
+    p.feed(content)
+    nodes = p.nodes
+
+    def _seg_match(seg, node):
+        for tok in re.findall(r'[#.]?[A-Za-z_][\w-]*', seg):
+            if tok[0] == '#':
+                if node.id != tok[1:]:
+                    return False
+            elif tok[0] == '.':
+                if tok[1:] not in node.classes:
+                    return False
+            elif node.tag != tok:
+                return False
+        return True
+
+    def _matches(segs, node):
+        if not _seg_match(segs[-1], node):
+            return False
+        i = len(segs) - 2
+        anc = node.parent
+        while i >= 0:
+            if anc is None:
+                return False
+            if _seg_match(segs[i], anc):
+                i -= 1
+            anc = anc.parent
+        return True
+
+    def _hidden(node):
+        if node.id in restored_ids:
+            return False                                   # id 规则按特异度设回可见
+        return bool(node.classes & hidden_classes) or node.id in hidden_ids
+
+    hidden_nodes = [n for n in nodes if _hidden(n)]
+    if not hidden_nodes:
+        r.counts["element_reveal"] = {"hidden": 0, "scene_root_hidden": 0,
+                                      "blocked_container": 0, "no_entrance": 0}
+        r.ok(f"CSS 声明了隐藏选择器，但无元素受它约束（{len(nodes)} 个元素）",
+             check_id="element_reveal")
+        return
+
+    hit = [any(_matches(sl, n) for sl in seg_lists) for n in hidden_nodes]
+    blocked_container, no_entrance = [], []
+    for idx, n in enumerate(hidden_nodes):
+        if hit[idx]:
+            continue
+        if any(_matches(sl, d) for sl in seg_lists for d in _descendants(n)):
+            blocked_container.append(n)
+        else:
+            no_entrance.append(n)
+
+    def _label(n):
+        cls = "." + ".".join(sorted(n.classes)) if n.classes else ""
+        return f"#{n.id}{cls}" if n.id else f"<{n.tag}{cls}>"
+
+    for n in blocked_container:
+        r.error(
+            f"{_label(n)} 初始隐藏（opacity:0/visibility:hidden）却无任何入场语句命中它自己，"
+            f"而 GSAP 打的是它的**子元素** —— 父层恒不可见，整块子树在成片里永不出现。"
+            f"修法：把隐藏类从容器移到叶子上，或给容器补一条父级 tween",
+            check_id="element_reveal")
+    for n in no_entrance[:12]:
+        r.warn(
+            f"{_label(n)} 初始隐藏、未找到命中它自身或其后代的 GSAP 目标"
+            f"（不阻断：入场写法是开放集合，本判据只否证不确证）",
+            check_id="element_reveal")
+    if len(no_entrance) > 12:
+        r.warn(f"另有 {len(no_entrance) - 12} 处同形态未逐条点名（同类计数见上）",
+               check_id="element_reveal")
+
+    r.counts["element_reveal"] = {
+        "hidden": len(hidden_nodes),
+        "scene_root_hidden": sum(1 for n in hidden_nodes if n.scene_root),
+        "blocked_container": len(blocked_container),
+        "no_entrance": len(no_entrance),
+    }
+    if not blocked_container:
+        r.ok(f"{len(hidden_nodes)} 处初始隐藏元素无「容器隐藏·入场只打子元素」形态"
+             f"（{len(no_entrance)} 处未找到 GSAP 目标，仅告警不阻断）",
+             check_id="element_reveal")
+
+
+def _descendants(node):
+    out = []
+    stack = list(node.children)
+    while stack:
+        cur = stack.pop()
+        out.append(cur)
+        stack.extend(cur.children)
+    return out
 
 
 def check_design_rules(html_path: Path, r: PreflightResult):
@@ -1220,6 +1561,131 @@ def check_narration_digits(cfg: dict, r: PreflightResult):
             f"{f.scope}: 命中 “{f.matched}” — 上下文 “…{f.context}…” — {f.suggestion}",
             check_id="narration_digits",
         )
+
+
+def check_pause_declarations(cfg: dict, r: PreflightResult):
+    """[13b] 停顿声明复核（2026-10-13 停顿可控性接入批）。
+
+    位点价值＝在花钱之前判：本检查跑在 TTS 步之前，而声明越界 / 锚词定位不到 /
+    引擎不支持 这些形态在 TTS 步炸即是白扣一轮账号余额（缓存被清后）。
+    判据本体不住这里——**与生效路径同一个裁定源** `pause_marks.plan_scene`，
+    预检只是把它对每场的抛错形态翻译成 check_id="pause_declaration" 的
+    ERROR/WARN 面（两处各写一套阈值即 A06 同族的第二判据面，禁止）。
+
+    旁白面读 cfg['scenes']（narration_source 已由 check_json_config 解析进该面，
+    与 cue_declaration 同一处置——两处解析即两套口径）。
+
+    引擎名与开关的读取在本函数内镜像 enhance 的口径（顶层 + audio 对象覆盖）：
+    in-process 导入 enhance_video_audio 会把脚本级模块初始化拉进预检，代价大于
+    这十几行镜像；等价性由用例95 的双向夹具锁定（同一组值两路读结果必须相同），
+    与 check_json_config 镜像 narration_source 解析顺序、以用例18 锁定同判据。
+    """
+    print("\n[13b/15] Pause declarations (pause_marks → CosyVoice <break>)")
+    if not cfg:
+        r.warn("Skipped — no config loaded", check_id="pause_declaration")
+        return
+
+    try:
+        import pause_marks as _pm
+    except (ImportError, RuntimeError) as e:   # pause_marks 顶部取不回 cue_resolve 即 RuntimeError
+        r.error(f"停顿声明复核未执行：pause_marks 模块取不回（{e}）——"
+                "锚词定位与归一化不得另起一套口径，本项无从核对即 ERROR",
+                check_id="pause_declaration")
+        return
+
+    scenes = [s for s in (cfg.get("scenes") or []) if isinstance(s, dict)]
+    decl_map = {str(s.get("scene_id")): s.get("pause_marks")
+                for s in scenes if s.get("pause_marks")}
+
+    # —— 开关与引擎（镜像 enhance 口径，见 docstring 限定）——
+    def _as_bool(v, default):
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() not in ("false", "0", "no", "off", "")
+        return bool(v)
+
+    auto_raw = cfg.get("pause_auto_enabled")
+    if auto_raw is None and isinstance(cfg.get("audio"), dict):
+        auto_raw = cfg["audio"].get("pause_auto_enabled")
+    auto_on = _as_bool(auto_raw, False)
+
+    engine = str(cfg.get("tts_engine", "qwen") or "qwen").lower()
+    if isinstance(cfg.get("audio"), dict) and 'engine' in cfg["audio"]:
+        engine = str(cfg["audio"]["engine"]).lower()
+
+    tts_on = _as_bool(cfg.get("tts_enabled"), True)
+    if isinstance(cfg.get("audio"), dict):
+        tts_on = _as_bool(cfg["audio"].get("tts_enabled", cfg.get("tts_enabled")), True)
+
+    n_decl = sum(len(v) for v in decl_map.values())
+    if not decl_map and not auto_on:
+        # 无声明是合法常态（本机制缺省关闭），记 OK 留正证据而非"无记录"
+        r.ok(f"无停顿声明，自动插缺省关闭（扫过 {len(scenes)} 场）",
+             check_id="pause_declaration")
+        return
+
+    # 规则文件只在有人点名停顿时才读——存量项目不因规则断链被本项误伤
+    # （enhance 侧 _scene_pause_plan 的短路条件与此逐字对齐）。
+    try:
+        rules = _pm.load_rules()
+    except _pm.PausePlanError as e:
+        r.error(str(e), check_id="pause_declaration")
+        return
+
+    problems = 0
+    supported = engine in rules["engines"]
+    if auto_on and not supported and not decl_map:
+        # 自动开着但引擎不支持：plan_scene 对"无声明+不支持引擎"返回恒等计划，
+        # 机器一声不响——作者以为开了自动补停顿，实际零动作。WARN 不 ERROR：
+        # 该组合无破坏性（与声明在场即 ERROR 相对）。
+        r.warn(f"pause_auto_enabled=true 但引擎 {engine!r} 不在支持清单 "
+               f"{rules['engines']!r}——本机制对本项目零动作，不构成缺陷但作者应知情",
+               check_id="pause_declaration")
+
+    for s in scenes:
+        sid = str(s.get("scene_id"))
+        text = s.get("narration") or ""
+        if isinstance(text, list):
+            text = "".join(text)
+        decls = decl_map.get(sid) or []
+        if not decls and not auto_on:
+            continue
+        if not tts_on and decls:
+            r.error(f"场 {sid}: tts_enabled=false 但声明了 {len(decls)} 处停顿——"
+                    "无 TTS 则停顿永不发生，声明在此项目形态下是假的控制面。"
+                    "请删除声明或恢复旁白。", check_id="pause_declaration")
+            problems += 1
+            continue
+        # 尖括号两形态判据（有包裹→整调用 400；无包裹→被当文字念出且门禁读不出）。
+        # will_wrap 取"将被包裹"的保守归因：声明在场或自动开启即可能进 SSML 分支。
+        try:
+            _pm.check_angle_brackets(text, will_wrap=bool(decls) or (auto_on and supported))
+        except _pm.PausePlanError as e:
+            r.error(f"场 {sid}: {e}", check_id="pause_declaration")
+            problems += 1
+            continue
+        try:
+            plan = _pm.plan_scene(
+                text, decls, rules, engine=engine,
+                enabled=bool(auto_on and supported),
+                auto_decls=_pm.auto_candidates(text, rules) if auto_on else None)
+        except _pm.PausePlanError as e:
+            r.error(f"场 {sid}: {e}", check_id="pause_declaration")
+            problems += 1
+            continue
+        for note in plan.get("notes") or []:
+            r.warn(f"场 {sid}: {note}", check_id="pause_declaration")
+
+    if problems == 0 and n_decl:
+        r.ok(f"停顿声明全部可执行：{n_decl} 条（{len(decl_map)} 场），"
+             f"引擎 {engine!r} 在支持清单内；自动插{'开' if auto_on else '关'}",
+             check_id="pause_declaration")
+    elif problems == 0:
+        r.ok(f"无作者声明；自动插开（引擎 {engine!r}），形状候选按规则可执行",
+             check_id="pause_declaration")
 
 
 def _div_block(content: str, open_tag: str) -> str:
@@ -1686,13 +2152,16 @@ def main():
     check_config_html_sync(cfg, html_path, r)
     check_bak_consistency(html_path, r)
     check_scene_contracts(html_path, r)
+    check_cue_declarations(html_path, cfg or pre_cfg, r)
     check_scene_visibility(html_path, r)
+    check_element_reveal(html_path, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)
     check_placeholder_images(html_path, r)
     check_image_clarity(html_path, r)  # NEW: Check critical images for clarity
     check_subtitle_safe_zone(html_path, r)
     check_narration_digits(cfg or pre_cfg, r)
+    check_pause_declarations(cfg or pre_cfg, r)
     check_alignment_model_cache(cfg or pre_cfg, r)
     check_asset_signoff(project_dir, cfg or pre_cfg, html_path, r)
     check_output_dir_cleanliness(output_dir, r)
