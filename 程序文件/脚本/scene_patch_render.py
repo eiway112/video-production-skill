@@ -40,7 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block
-from _script_env import ROOT
+from _script_env import ROOT, validate_managed_name
 
 # 换包装保活对：持旧防旧包装析构关底层 buffer，持新防本轮新代被下个重绑点顶掉
 # 后引用归零（无需 gc.collect 即 finalize）。理由详见 script_interface 内同名表。
@@ -395,10 +395,16 @@ class PatchRenderer:
             self.config = json.load(f)
 
         paths = self.config.get("paths", {})
-        self.html_project = paths.get("html_project", "")
+        # 受管目录名单段性校验，口径同 pipeline_runner（2026-10-16 回灌批）
+        self.html_project = validate_managed_name(
+            paths.get("html_project", ""), "html_project",
+            source=f"{self.config_path.name} paths.html_project") or ""
+        _temp_sub = validate_managed_name(
+            paths.get("temp_subdir"), "temp_subdir",
+            source=f"{self.config_path.name} paths.temp_subdir")
         self.source_dir = HTML_BASE / self.html_project
         self.html_path = self.source_dir / "index.html"
-        self.temp_dir = TEMP_BASE / paths.get("temp_subdir", f"{self.html_project}_audio")
+        self.temp_dir = TEMP_BASE / (_temp_sub or f"{self.html_project}_audio")
         self.render_raw = self.temp_dir / "render_raw.mp4"
         self.sidecar_path = self.temp_dir / SIDECAR_NAME
         self.verdict_path = self.temp_dir / VERDICT_NAME

@@ -2575,6 +2575,10 @@ def main():
         if config_path is None:
             config_path = CONFIG_BASE / args.config  # For error message
 
+    # 受管目录名校验（2026-10-15 消费者侧根因修复，2026-10-16 回灌）：--html 带路径
+    # 会穿透 HTML_BASE 拼接读到嵌套/错误位置，口径同 pipeline_runner
+    args.html = _script_env.validate_managed_name(
+        args.html, "--html", source="preflight_check") or args.html
     html_path = HTML_BASE / args.html / "index.html"
 
     print("=" * 60)

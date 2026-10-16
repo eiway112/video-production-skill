@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_line_time, resolve_script_times, parse_scene_map
 from _narration_lint import scan_srt_file as _lint_scan_srt, format_findings as _lint_format
-from _script_env import ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE
+from _script_env import ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE, validate_managed_name
 from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _forced_align as _fa  # 叶子模块（faster_whisper 仅在 load 时导入）；版本面消费 MODEL_SIZE
@@ -1093,7 +1093,9 @@ def get_paths(config_cfg=None):
         video_name = p.get('video_name', '')
         # 兼容两种配置写法：paths.subtitle_name 或 subtitle.file
         subtitle_name = p.get('subtitle_name', '') or config_cfg.get('subtitle', {}).get('file', '')
-        temp_subdir = p.get('temp_subdir', 'crm_audio')
+        temp_subdir = validate_managed_name(
+            p.get('temp_subdir'), "temp_subdir",
+            source="config paths.temp_subdir") or 'crm_audio'
         subtitle_file = root / "成果文件" / "字幕" / subtitle_name
     else:
         video_name = "销售CRM系统工具开发_赋能个性化销售场景.mp4"

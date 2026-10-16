@@ -172,3 +172,51 @@ def load_forensic_rules() -> dict:
             f"取证规则配置缺必需键 {missing}：{FORENSIC_RULES_PATH}")
     return data
 
+
+def validate_managed_name(value, field: str, source: str = ""):
+    """校验"受管目录名"字段（paths.temp_subdir / paths.html_project / --html 等）。
+
+    语义契约：这些字段的值是**单段目录名**，各消费点以 `BASE / value` 直接拼接
+    （TEMP_BASE=过程产物/临时产物、HTML_BASE=程序文件/源码/hyperframes）。
+    本函数是唯一校验点，fail-closed——拒绝路径分隔符、`.`/`..` 段、绝对路径与
+    盘符前缀；不静默截断、不回退默认值（静默回退会把配错的落点洗成"看起来对"）。
+
+    背景（2026-10-15 消费者侧根因修复，2026-10-16 回灌本仓）：使用者克隆里
+    config paths.temp_subdir 被带入路径值 '过程产物/临时产物/<项目>'，穿透 6 个
+    消费点的 TEMP_BASE/temp_subdir 拼接，落成 过程产物/临时产物/过程产物/临时产物/
+    <项目>/ 自我嵌套副本（508MB/2777 文件）。两次巡检只清副本未清源头，7 日内
+    同形态再现——正解是堵拼接入口，不是每日清垃圾。
+
+    与 preflight check 2b（check_config_path_fields，用例99）的分工：那一条裁的是
+    5 枚**点号路径字段**的扩展名，且住在预检位点；本函数裁的是**目录名字段**的
+    单段性，且住在拼接入口，故覆盖不走预检的 CLI 直调路径。两者不互相替代。
+
+    刻意不纳入的同类输入（登记为待办，见 AGENTS.md 同名条）：narration_source 类
+    候选路径（其值合法含 `/`，与目录名不是同一契约）、asset_scanner /
+    generate_photo_registry / narration_pause_precheck / pipeline_runner 的 SDL
+    编译入口（`video.name`）——后四者是同一形态但无既有回归夹具承接，
+    翻转前置＝任一处真实触发过一次错值，届时一并接入并补夹具。
+
+    None/空串返回 None——由调用方走各自的"缺省默认值"分支，不在本层代决。
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    where = f"{source} 的 {field}" if source else field
+    problems = []
+    if '/' in s or '\\' in s:
+        problems.append("含路径分隔符")
+    segments = s.replace('\\', '/').split('/')
+    if any(seg in ('.', '..') for seg in segments):
+        problems.append("含 . 或 .. 段")
+    if Path(s).is_absolute() or (len(s) >= 2 and s[1] == ':'):
+        problems.append("是绝对路径或带盘符")
+    if problems:
+        raise RuntimeError(
+            f"{where} 必须是单段目录名，收到 {s!r}（{'；'.join(problems)}）"
+            "——禁止带路径的值：它会穿透 BASE/字段名 拼接，在受管临时区/源码区内"
+            "造出自我嵌套目录。请改为纯目录名（如 'demo-project'）")
+    return s
+

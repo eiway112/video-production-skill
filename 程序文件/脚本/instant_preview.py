@@ -50,7 +50,7 @@ _streams_kept = (sys.stdout, sys.stderr)
 # Import shared GSAP time resolution utilities (T-block aware)
 sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_script_times
-from _script_env import ROOT, PREVIEW_TEMP, QUALITY_DIR, resolve_narration_scenes
+from _script_env import ROOT, PREVIEW_TEMP, QUALITY_DIR, resolve_narration_scenes, validate_managed_name
 import _gate_status as gs
 
 # Default Chrome path (same as HyperFrames uses)
@@ -919,7 +919,11 @@ def main():
     video_duration = float(config.get("video_duration", 0))
 
     # Determine output paths
-    temp_subdir = config.get("paths", {}).get("temp_subdir", "preview_temp")
+    # 受管目录名单段性校验，口径同 pipeline_runner（2026-10-16 回灌批）：
+    # 带路径的 temp_subdir 会穿透拼接造出 过程产物/临时产物/过程产物/临时产物/...
+    temp_subdir = validate_managed_name(
+        config.get("paths", {}).get("temp_subdir"), "temp_subdir",
+        source=f"{config_path.name} paths.temp_subdir") or "preview_temp"
     temp_dir = ROOT / "过程产物" / "临时产物" / temp_subdir
     temp_dir.mkdir(parents=True, exist_ok=True)
     output_path = Path(args.output) if args.output else temp_dir / "preview_grid.png"

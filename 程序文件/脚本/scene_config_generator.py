@@ -49,7 +49,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 _streams_kept = (sys.stdout, sys.stderr)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _script_env import ROOT
+from _script_env import ROOT, validate_managed_name
 SCRIPTS = ROOT / "程序文件" / "脚本"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
 SAMPLE_RATE = 44100
@@ -281,8 +281,14 @@ Narration file format (scenes separated by ---):
     # Derive default names from video name
     base_name = Path(args.video_name).stem
     subtitle_name = args.subtitle_name or f"{base_name}.srt"
-    temp_subdir = args.temp_subdir or f"{base_name}_audio"
-    html_project = args.html_project or base_name.lower().replace(' ', '-')
+    # 受管目录名单段性校验（生成端双保险，2026-10-16 回灌批）：本脚本是 config 的
+    # 生产者，坏值一旦写进 paths 就会穿透下游全部消费点，故在写盘前即拒
+    temp_subdir = validate_managed_name(
+        args.temp_subdir, "--temp-subdir", source="scene_config_generator") \
+        or f"{base_name}_audio"
+    html_project = validate_managed_name(
+        args.html_project, "--html-project", source="scene_config_generator") \
+        or base_name.lower().replace(' ', '-')
 
     # Setup temp directory
     temp_dir = TEMP_BASE / temp_subdir

@@ -45,7 +45,7 @@ _streams_kept = (sys.stdout, sys.stderr)
 # Path setup — allow importing OpenMontage modules
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _script_env import ROOT, VENV_PYTHON
+from _script_env import ROOT, VENV_PYTHON, validate_managed_name
 SCRIPTS = ROOT / "程序文件" / "脚本"
 CONFIG_DIR = ROOT / "程序文件" / "配置"
 OPENMONTAGE_SRC = ROOT / "程序文件" / "源码" / "openmontage"
@@ -255,7 +255,9 @@ class OpenMontageRunner:
         self.paths_config = self.config.get("paths", {})
 
         # Resolve paths
-        temp_subdir = self.paths_config.get("temp_subdir", f"openmontage_{self.pipeline_name}")
+        temp_subdir = validate_managed_name(
+            self.paths_config.get("temp_subdir"), "temp_subdir",
+            source="config paths.temp_subdir") or f"openmontage_{self.pipeline_name}"
         self.temp_dir = TEMP_BASE / temp_subdir
         self.artifacts_dir = self.temp_dir / "artifacts"
 

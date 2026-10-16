@@ -118,6 +118,41 @@ def export_repo_face(tc: RegressionTestCase) -> str:
     return "dev" if present else "published"
 
 
+def _tracked_index_html(base: Path):
+    """返回 base 目录下**被 git 跟踪**的 index.html 列表；取数断链返回 None（不得回退磁盘普查）。
+
+    存在理由：公开面类断言裁的是"随导出发布了什么"，而磁盘目录在使用者克隆里还含
+    gitignored 的实网项目——两者不等价时，按磁盘普查裁"公开面"会把"这台机器上有什么"
+    读成"公开面有什么"。tracked 集才是公开面的取数真值。
+    口径沿用例67/72 那条：`-c core.quotepath=off` 且走 `-z`（两者配套，见 AGENTS.md
+    对两种形态口径相反的登记）。
+    """
+    import subprocess
+    root = SUITE_SCRIPT_DIR.parent.parent
+    try:
+        rel = base.resolve().relative_to(root).as_posix()
+    except Exception:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-c", "core.quotepath=off", "ls-files", "-z", "--",
+             rel + "/*/index.html"],
+            capture_output=True, text=True, encoding="utf-8",
+            cwd=str(root), timeout=30)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    for raw in (r.stdout or "").split("\0"):
+        if not raw.strip():
+            continue
+        p = (root / raw.replace("/", os.sep)).resolve()
+        if p.is_file():
+            out.append(p)
+    return out
+
+
 # ============================================================================
 # 用例集合
 # ============================================================================
@@ -17396,27 +17431,66 @@ def test_vacuum_probe_carries_referenced_assets() -> RegressionTestCase:
             tc.assert_true(probe.is_file(), "G2 探针仍须正常生成")
 
         # H. 现网只读普查：引用取数面覆盖到 assets（不写死项目名）
+        #    取数面按**仓库角色**分两档（2026-10-16 消费者副本回灌批收口）：
+        #    开发仓裁"磁盘上真实存在引用素材的项目"，公开面裁"随导出携带的 tracked 夹具"。
+        #    两档的取数口径必须各自等于其裁定对象——使用者克隆的 hyperframes/ 下按设计
+        #    可有 gitignored 实网项目，若公开面仍按磁盘普查，量的是"这台机器上有什么"
+        #    而不是"公开面发布了什么"，同一判据在两种安装面上给出相反读数。
         import preflight_check as pfc
         base = pfc.HTML_BASE
         projects = sorted(base.glob("*/index.html")) if base.is_dir() else []
-        with_assets = 0
-        for h in projects:
-            if any(r.startswith("assets/") for r in
-                   cv.relative_asset_refs(h.read_text(encoding="utf-8", errors="replace"))):
-                with_assets += 1
+
+        def _refs_assets(h):
+            return any(r.startswith("assets/") for r in
+                       cv.relative_asset_refs(h.read_text(encoding="utf-8", errors="replace")))
+
+        with_assets = sum(1 for h in projects if _refs_assets(h))
         tc.assert_true(len(projects) >= 1, "H1 普查须真取到对象（取 0 份即本段空跑）")
         if export_repo_face(tc) == "published":
             # 公开面只带清单 §5 的中性化夹具，它们按设计不引用业务素材，故"取数面覆盖到 assets/"
             # 这一读数在本面无对象。刻意按 `with_assets == 0` 取证而非"断言它必须缺席"：
             # 缺席与否归脱敏门禁裁定，本条只声明**本段取数面的覆盖面**，且夹具一旦带上素材即转红，
             # 逼下批改这条读数（沿用例85 的"不得把不导出读成回归坏了"，也不得反过来把它洗成通过）。
-            tc.assert_equal(with_assets, 0,
-                            f"H2-发布仓面：公开面 {len(projects)} 份夹具中引用 assets/ 者实取 "
-                            f"{with_assets} 份——该覆盖读数只在开发仓成立，不得读成公开面已验证")
+            tracked = _tracked_index_html(base)
+            if tracked is None:
+                # git 取数断链时不得由"磁盘普查为 0"顶替 tracked 面读数（A06 同族）
+                tc.assert_true(False,
+                               "H2-发布仓面 tracked 取数断链（非 git 安装面或 git 不可用）："
+                               "本段无从裁定，不得读成公开面已验证")
+            else:
+                tc.assert_true(len(tracked) >= 1,
+                               "H2b tracked 面为空即本段空跑（取数口径断了而非内容干净）")
+                pub_with = sum(1 for h in tracked if _refs_assets(h))
+                tc.assert_equal(pub_with, 0,
+                                f"H2-发布仓面：公开面 tracked {len(tracked)} 份夹具中引用 "
+                                f"assets/ 者实取 {pub_with} 份（磁盘面另有 {with_assets} 份，"
+                                "其中含 gitignored 实网项目者不属公开面）——该覆盖读数只在"
+                                "开发仓成立，不得读成公开面已验证")
         else:
             tc.assert_true(with_assets >= 1,
                            f"H2 现网 {len(projects)} 份中应至少有一份引用 assets/，"
                            "否则本段无从证覆盖")
+            # 本面把 tracked 取数腿也跑一遍：公开面分支在本仓无对象，若不在这里取证，
+            # 该 helper 断了要等下一次 §8.2 才显形。首版即恒返回空表，靠这两条当场转红。
+            # 归因（实测，不靠猜）：git 的 pathspec 随 cwd 解析——"绝对 pathspec +
+            # cwd=脚本目录"这一组合恒 0 命中，而两个因素各自单独都不致命（仓根 cwd 下
+            # 绝对 pathspec 可用）。98-M7 摘的正是 cwd 这条腿。
+            # 开发仓按设计业务项目全量入 git，故 tracked 面应等于磁盘面；
+            # 出现差额即有项目未跟踪，照常放行但点名。
+            dev_tracked = _tracked_index_html(base)
+            tc.assert_true(dev_tracked is not None,
+                           "H2c 开发仓 tracked 取数腿断了（helper 返回 None）——"
+                           "公开面分支将永无对象，不得留成静默")
+            if dev_tracked is not None:
+                tc.assert_true(len(dev_tracked) >= 1,
+                               f"H2d 开发仓 tracked 面为空（磁盘 {len(projects)} 份）＝pathspec 失配")
+                tracked_keys = {str(x.resolve()) for x in dev_tracked}
+                untracked = [h.parent.name for h in projects
+                             if str((base / h.parent.name / "index.html").resolve())
+                             not in tracked_keys]
+                tc.assert_equal(untracked, [],
+                                f"H2e 磁盘有而 tracked 无的项目（不影响本段裁定，但须可见）："
+                                f"{untracked[:5]}")
         tc.mark_passed()
     except Exception as e:
         import traceback
@@ -20162,6 +20236,7 @@ class RegressionTestRunner:
             test_fingerprint_registry_matches_reading_face,
             test_single_source_and_repo_hygiene,
             test_mutation_matrix_engine_adjudicates_its_own_criteria,
+            test_managed_names_reject_path_values_at_concat_face,
         ]
         self.results = []
     
@@ -20202,6 +20277,297 @@ class RegressionTestRunner:
             "success_rate": passed / len(self.results) if self.results else 0,
             "results": self.results
         }
+
+def test_managed_names_reject_path_values_at_concat_face() -> RegressionTestCase:
+    """用例109：受管目录名（temp_subdir/html_project）带路径即 fail-closed（2026-10-16 回灌批）。
+
+    来源与定级：缺陷由使用者克隆（WorkBuddy）2026-10-15 取证并本地修复，本批按
+    「发布仓代码只接受从本仓导出」的方向**回灌开发仓**。事故形态在其工作区实测：
+    config paths.temp_subdir 被带入路径值 '过程产物/临时产物/<项目>'，穿透 6 个消费点
+    的 `TEMP_BASE / temp_subdir` 拼接，落成 过程产物/临时产物/过程产物/临时产物/<项目>/
+    自我嵌套副本（508MB/2777 文件）；两轮巡检只清副本未清源头，7 日内同形态再现。
+
+    本仓侧证据分级（不得与对方读数混算）：
+    - 缺陷**入口**在本仓同构存在（`pipeline_runner.py` 等 `BASE / 值` 拼接，接入前零校验）；
+    - 本仓**无**该形态的触发记录：全仓自我嵌套目录实测 0 个（`过程产物/临时产物/过程产物` 不在位），
+      140 份含 paths 节的 config、两键 275 处声明逐条复算 0 判错——即本件对本仓属
+      **防未来**，不得写成"本仓已拦下一次"。
+
+    与用例99（preflight check 2b）的分工：那一条裁 5 枚**点号路径字段**的扩展名且住在
+    预检位点；本件裁**目录名字段**的单段性且住在拼接入口，故覆盖不走预检的 CLI 直调。
+    两者不互相替代，谁也不得被对方洗成"已覆盖"。
+
+    本用例锁定：
+    A 负向：事故原值 + 路径类形态（正/反斜杠、'..'、'.'、绝对路径、盘符、混合）
+      一律 RuntimeError——不是警告、不是静默截断、不回退默认值
+    B 合法样本零误报：**本仓全部 config 实值**（真实数据而非手写样本）+ 中文名/点号/空格名
+    C 空值分支：None/空串/纯空白返回 None（缺省分支交调用方，本层不代决）
+    D 集成级：坏 temp_subdir 的 config 实例化 PipelineRunner 即 RuntimeError；
+      好 config 实例化后 temp_dir == TEMP_BASE/<纯名>
+    E 接线实证（AST，非源码文本锚）：11 个受管消费点各自的配置承载变量，其赋值右元
+      **必须真是一次 validate_managed_name 调用**，且该文件内确有对应 BASE 拼接
+      ——对方版此段缺失并自认"覆盖不到 scene_patch_render"，本段补上（A06：条文要住在生效路径）
+
+    变异（逐枚归因）：
+    M1 某消费点删掉校验调用直拼 → E 该条红（对方版只能靠 D 段兜 pipeline_runner）
+    M2 校验函数只警告不 raise → A 红
+    M3 校验放行分隔符（仅拒 '..'）→ A 红
+    M4 合法样本被误拒（把名字里的点号当路径）→ B 红
+    M5 空值分支改成 raise → C 红
+    """
+    tc = RegressionTestCase(
+        "managed_names_reject_path_values_at_concat_face",
+        "验证受管目录名带路径即 fail-closed、合法纯名零误报、11 个消费点接线由 AST 实证"
+    )
+    try:
+        import ast
+        import json as _json
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _script_env as se
+
+        # ── A 负向：路径类值必须 RuntimeError ──
+        bs = chr(92)
+        bad_values = [
+            "过程产物" + "/" + "临时产物" + "/" + "demo-proj",   # 事故原值形态
+            "过程产物" + bs + "临时产物" + bs + "demo-proj",
+            "a/b", "a" + bs + "b", "../evil", "..", ".", "/abs/x",
+            "D:" + bs + "x", "C:/x", "过程产物/../../etc",
+        ]
+        for v in bad_values:
+            try:
+                se.validate_managed_name(v, "temp_subdir", source="用例109")
+                tc.assert_true(False, f"A 坏值未被拒（判据失效）：{v!r}")
+            except RuntimeError:
+                tc.assert_true(True, f"A 坏值被拒：{v!r}")
+            except Exception as e:
+                tc.assert_true(
+                    False, f"A 坏值 {v!r} 抛了非 RuntimeError（{type(e).__name__}），"
+                    "调用方无法按类型分流")
+
+        # 归因面：拒绝文案须点名"单段目录名"与收到的原值，否则读者无从整改。
+        # 断言条数在"抛/不抛"两态下须相等——否则变异体让该处不抛时这三条被静默跳过，
+        # 引擎按判据二读成"整案截断"（109-M2 首版即因此 CRASH，实为用例自己的计数缺陷）。
+        msg = None
+        try:
+            se.validate_managed_name("过程产物/x", "temp_subdir",
+                                     source="cfg.json paths.temp_subdir")
+        except RuntimeError as e:
+            msg = str(e)
+        if msg is None:
+            tc.assert_true(False, "A2 该形态未被拒，归因文案三条同时失据（判据失效）")
+            tc.assert_true(False, "A3 同上（原值回显无从核对）")
+            tc.assert_true(False, "A4 同上（来源字段点名无从核对）")
+        else:
+            tc.assert_true("单段目录名" in msg, f"A2 拒绝文案须给出契约：{msg[:160]}")
+            tc.assert_true("过程产物/x" in msg, f"A3 拒绝文案须回显收到的原值：{msg[:160]}")
+            tc.assert_true("cfg.json" in msg, f"A4 拒绝文案须点名来源字段：{msg[:160]}")
+
+        # ── B 合法样本零误报：先扫本仓真实 config 实值 ──
+        real_pairs = []
+        cfg_roots = [se.CONFIG_BASE, script_dir.parent / "源码" / "hyperframes"]
+        seen = set()
+        for base in cfg_roots:
+            if not base.is_dir():
+                continue
+            for cf in sorted(base.rglob("*.json")):
+                if cf in seen:
+                    continue
+                seen.add(cf)
+                try:
+                    data = _json.loads(cf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                p = data.get("paths")
+                if not isinstance(p, dict):
+                    continue
+                for k in ("html_project", "temp_subdir"):
+                    v = p.get(k)
+                    if v:
+                        real_pairs.append((k, str(v), cf.name))
+        # 取样面须**等于**声明全集，而不是"不少于某个按开发仓规模抄来的数"：
+        # 发布仓只有 2 份夹具（实测两键声明 8 处），钉固定值即把"不导出"读成"回归坏了"
+        # （沿用 105 A6a 那条判据）。改判结构关系：real_pairs 须闭合到 declared_total，
+        # 任一侧漏扫即红；下界取 1 而非 50——取 0 处才是空跑。
+        declared_total = 0
+        for base in cfg_roots:
+            if not base.is_dir():
+                continue
+            for cf in sorted(base.rglob("*.json")):
+                try:
+                    data = _json.loads(cf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                p = data.get("paths") if isinstance(data, dict) else None
+                if isinstance(p, dict):
+                    declared_total += sum(1 for k in ("html_project", "temp_subdir") if p.get(k))
+        tc.assert_equal(len(real_pairs), declared_total,
+                        f"B0 取样面未闭合到声明全集（取 {len(real_pairs)} / 声明 {declared_total}）"
+                        "＝扫描根漏了一处")
+        tc.assert_true(len(real_pairs) >= 1,
+                       "B0 取样面为空（0 处声明）＝本段空跑，两仓都无对象时不得印绿")
+        offenders = []
+        for k, v, cfname in real_pairs:
+            try:
+                r = se.validate_managed_name(v, k, source=f"{cfname} paths.{k}")
+                if r != v:
+                    offenders.append(f"{cfname} {k}={v!r} -> {r!r}")
+            except Exception as e:
+                offenders.append(f"{cfname} {k}={v!r} 被误拒：{e}")
+        tc.assert_equal(offenders, [],
+                        f"B 存量 config 零误报（实取 {len(real_pairs)} 处声明）："
+                        f"{offenders[:3]}")
+        for v in ["中文目录名", "a.b", "a b", "_取证", "crm_audio",
+                  "bgm-showcase-test_audio", "demo-proj"]:
+            # 逐条捕获：变异体让合法名被误拒时，须记成一条**可对位的断言失败**而非把整案
+            # 炸掉（109-M4 首版即因未捕获而 CRASH，引擎按判据二拒绝归因）
+            try:
+                r = se.validate_managed_name(v, "temp_subdir", source="用例109")
+                tc.assert_equal(r, v, f"B2 手写合法名零误报：{v!r}")
+            except Exception as e:
+                tc.assert_true(False, f"B2 手写合法名被误拒：{v!r} -> {e}")
+
+        # ── C 空值分支 ──
+        for v in (None, "", "   "):
+            try:
+                ok = se.validate_managed_name(v, "temp_subdir") is None
+            except Exception as e:
+                ok = False
+                v = f"{v!r}（抛 {type(e).__name__}）"
+            tc.assert_true(ok, f"C {v!r} 须返回 None（缺省分支交调用方，本层不代决）")
+
+        # ── D 集成级：PipelineRunner 接线实证 ──
+        tmp = Path(tempfile.mkdtemp(prefix="regr109_"))
+        # 事故形态的落点：TEMP_BASE/过程产物/临时产物/regr109_proj。本轮前若在，
+        # 那是真实残留（须留给现场诊断），夹具只清自己造的那一份
+        nested_bad = se.TEMP_BASE / "过程产物" / "临时产物" / "regr109_proj"
+        nested_pre_existed = nested_bad.exists()
+        try:
+            import pipeline_runner as _pr
+            bad_cfg = {"paths": {"html_project": "regr109_proj",
+                                 "temp_subdir": "过程产物/临时产物/regr109_proj"},
+                       "video_duration": 10.0, "fps": 25, "resolution": "1920x1080"}
+            bad_path = tmp / "bad.json"
+            bad_path.write_text(_json.dumps(bad_cfg, ensure_ascii=False), encoding="utf-8")
+            raised = None
+            try:
+                _pr.PipelineRunner(bad_path, html_project="regr109_proj")
+            except RuntimeError:
+                raised = "RuntimeError"
+            except SystemExit as e:
+                raised = f"SystemExit(code={e.code})"
+            except Exception as e:
+                raised = f"{type(e).__name__}: {e}"
+            tc.assert_equal(raised, "RuntimeError",
+                            "D1 坏 temp_subdir 的 config 实例化 PipelineRunner 必须 "
+                            "RuntimeError（fail-closed，不得静默落盘嵌套目录）")
+
+            good_cfg = {"paths": {"html_project": "regr109_proj",
+                                  "temp_subdir": "regr109_proj"},
+                        "video_duration": 10.0, "fps": 25, "resolution": "1920x1080"}
+            good_path = tmp / "good.json"
+            good_path.write_text(_json.dumps(good_cfg, ensure_ascii=False), encoding="utf-8")
+            pr = _pr.PipelineRunner(good_path, html_project="regr109_proj")
+            tc.assert_equal(str(pr.temp_dir), str(_pr.TEMP_BASE / "regr109_proj"),
+                            "D2 好 config 的 temp_dir = TEMP_BASE/<纯名>（接线实证）")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            # 落点卫生（沿用例86 D1b/D1c）：PipelineRunner 实例化会往 TEMP_BASE/<名>
+            # 写 pipeline_state.json，夹具不得在受管临时区留下常驻残留
+            shutil.rmtree(se.TEMP_BASE / "regr109_proj", ignore_errors=True)
+            # 变异体摘掉校验腿时，坏值会真拼出嵌套副本。只清**本轮新造出来的**那一份：
+            # 若该路径本轮前即在，那是真实事故残留，须留给现场诊断，夹具不得代为抹证
+            if not nested_pre_existed and nested_bad.exists():
+                shutil.rmtree(nested_bad, ignore_errors=True)
+                for up in (nested_bad.parent, nested_bad.parent.parent):
+                    try:
+                        up.rmdir()          # 只收空壳，非空即抛并被 except 吞掉
+                    except Exception:
+                        pass
+            tc.assert_true(not nested_bad.exists() or nested_pre_existed,
+                           "D3 夹具不得在受管临时区留下嵌套副本（也不得抹掉本轮之前的真实残留）")
+            tc.assert_true(not (se.TEMP_BASE / "regr109_proj").exists(),
+                           "D4 夹具残留须随本轮清干净（受管临时区不留测试项目）")
+
+        # ── E 接线实证（AST）：配置承载变量的赋值右元须真是 validate_managed_name 调用 ──
+        # 判据：只断"文件里出现过该函数名"会被注释与 import 行洗白（A12 同族）；
+        # 只断"该变量被赋值过"会被"赋值但没校验"洗白。故锚**赋值语句的右元调用**。
+        sites = [
+            ("pipeline_runner.py", "self.html_project"),
+            ("pipeline_runner.py", "_temp_sub"),
+            ("scene_patch_render.py", "self.html_project"),
+            ("scene_patch_render.py", "_temp_sub"),
+            ("enhance_video_audio.py", "temp_subdir"),
+            ("instant_preview.py", "temp_subdir"),
+            ("openmontage_runner.py", "temp_subdir"),
+            ("scene_config_generator.py", "temp_subdir"),
+            ("scene_config_generator.py", "html_project"),
+            ("adjust_timeline.py", "args.html"),
+            ("preflight_check.py", "args.html"),
+            ("preprocess_photos.py", "args.project"),
+        ]
+
+        def _call_targets(tree):
+            """收集"赋值右元里出现 validate_managed_name 调用"的赋值目标名集合。"""
+            out = set()
+
+            def has_call(node):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        f = sub.func
+                        nm = f.id if isinstance(f, ast.Name) else (
+                            f.attr if isinstance(f, ast.Attribute) else "")
+                        if nm == "validate_managed_name":
+                            return True
+                return False
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    targets = ([t.id for t in node.targets if isinstance(t, ast.Name)]
+                               + [f"{t.value.id}.{t.attr}" for t in node.targets
+                                  if isinstance(t, ast.Attribute)
+                                  and isinstance(t.value, ast.Name)])
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    targets = [node.target.id]
+                else:
+                    continue
+                if node.value is not None and has_call(node.value):
+                    out.update(targets)
+            return out
+
+        parsed_cache = {}
+        for fname, var in sites:
+            if fname not in parsed_cache:
+                src = (script_dir / fname).read_text(encoding="utf-8", errors="replace")
+                try:
+                    parsed_cache[fname] = ast.parse(src)
+                except SyntaxError as e:
+                    tc.assert_true(False, f"E0 {fname} AST 解析失败（取数断链）：{e}")
+                    continue
+            bound = _call_targets(parsed_cache[fname])
+            tc.assert_true(var in bound,
+                           f"E {fname} 的 {var} 未由 validate_managed_name 的返回值绑定"
+                           "——该消费点接线断了，坏值会穿透 BASE 拼接（M1 形态）")
+        # 空跑哨兵：名单非空，且被点名的文件确实存在 BASE 拼接（否则上面断言只是"变量恰好被赋过值"）
+        tc.assert_true(len(sites) >= 11, f"E-哨兵 受管消费点名单不得为空跑：{len(sites)}")
+        concat_hits = 0
+        for fname in {f for f, _ in sites}:
+            src = (script_dir / fname).read_text(encoding="utf-8", errors="replace")
+            if "TEMP_BASE /" in src or "HTML_BASE /" in src or '"临时产物" /' in src:
+                concat_hits += 1
+        tc.assert_equal(concat_hits, len({f for f, _ in sites}),
+                        "E-哨兵 名单内每个文件都须真有 BASE 拼接点（缺位即本段失去意义）")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("managed_names_reject_path_values error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
 
 def main():
     import argparse

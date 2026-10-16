@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 # Fix GBK encoding in PowerShell（import 即生效）+ 公共路径
-from _script_env import ROOT, HTML_BASE  # noqa: E402, F401
+from _script_env import ROOT, HTML_BASE, validate_managed_name  # noqa: E402, F401
 
 try:
     from PIL import Image
@@ -339,6 +339,9 @@ def main():
                         help="Re-crop even if cached versions exist")
     args = parser.parse_args()
 
+    # 受管目录名单段性校验，口径同 pipeline_runner（2026-10-16 回灌批）
+    args.project = validate_managed_name(
+        args.project, "--project", source="preprocess_photos") or args.project
     project_dir = HTML_BASE / args.project
     spec_path = project_dir / "photo-crop-spec.json"
 

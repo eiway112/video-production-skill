@@ -47,7 +47,7 @@ from typing import Any, Dict
 from pathlib import Path
 from _gsap_time_utils import parse_scene_map
 from pipeline_state_fingerprint import compute_inputs_fingerprint
-from _script_env import ROOT, VENV_PYTHON
+from _script_env import ROOT, VENV_PYTHON, validate_managed_name
 from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _gate_status as gs
@@ -882,10 +882,20 @@ class PipelineRunner:
         if not self.html_project:
             print("ERROR: html_project not specified (via --html or config paths.html_project)")
             sys.exit(1)
+        # 受管目录名校验（2026-10-15 消费者侧根因修复，2026-10-16 回灌）：
+        # html_project/temp_subdir 必须是单段目录名——带路径的值会穿透
+        # TEMP_BASE/temp_subdir 拼出 过程产物/临时产物/过程产物/临时产物/<项目>/
+        # 自我嵌套副本。校验单点住 _script_env.validate_managed_name。
+        self.html_project = validate_managed_name(
+            self.html_project, "html_project",
+            source=f"{self.config_path.name} paths.html_project")
+        _temp_sub = validate_managed_name(
+            paths.get("temp_subdir"), "temp_subdir",
+            source=f"{self.config_path.name} paths.temp_subdir")
 
         self.source_dir = HTML_BASE / self.html_project
         self.html_path = self.source_dir / "index.html"
-        self.temp_dir = TEMP_BASE / paths.get("temp_subdir", f"{self.html_project}_audio")
+        self.temp_dir = TEMP_BASE / (_temp_sub or f"{self.html_project}_audio")
         self.tts_dir = self.temp_dir / "tts_44k"
         self.render_raw = self.temp_dir / "render_raw.mp4"
         self.sidecar_path = self.temp_dir / SCENE_PATCH_SIDECAR

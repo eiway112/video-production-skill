@@ -633,7 +633,7 @@ def main():
         args.shrink_margin = _default_shrink_margin()
 
     # Determine HTML project name (from arg or config)
-    from _script_env import HTML_BASE, resolve_narration_scenes
+    from _script_env import HTML_BASE, resolve_narration_scenes, validate_managed_name
     
     if args.html is None:
         # Read from config
@@ -644,6 +644,10 @@ def main():
         except (json.JSONDecodeError, FileNotFoundError, ValueError):
             args.html = 'hotel-partition-wall'
     
+    # 受管目录名校验（2026-10-15 消费者侧根因修复，2026-10-16 回灌）：--html 带路径
+    # 会穿透 HTML_BASE 拼接读到嵌套/错误位置，口径同 pipeline_runner
+    args.html = validate_managed_name(
+        args.html, "--html", source="adjust_timeline") or args.html
     html_path = HTML_BASE / args.html / "index.html"
     config_path = Path(args.config)
     tts_dir = Path(args.tts_dir)
