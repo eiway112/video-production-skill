@@ -724,6 +724,34 @@ def delivery_notes_path(video_path) -> Path:
     return p.parents[1] / f"交付说明_{p.stem}.md"
 
 
+def find_mismatched_delivery_notes(notes: Path):
+    """推导落点不存在时，同层已有的其它 `交付说明_*.md`（命名不符候选）。
+
+    存在理由：说明文件名与 config `paths.video_name` 不一致时，自动写入分支只报
+    "尚未创建"、审计第 6 维据此判"缺该节"——归因把**建错了名字**说成**没建**，人据
+    此会去补建甚至重跑全链，而真实修法只是改名 + 单步补写（零重渲）。
+
+    返回文件名列表（可为空＝同层确无其它说明）。目录不可读时按空处理：本函数只影响
+    **归因文案**，不影响裁定方向——审计第 6 维在两种形态下都照样判红，不会因扫不动
+    而把缺节洗白成通过。
+    """
+    parent = Path(notes).parent
+    try:
+        if not parent.is_dir():
+            return []
+        return sorted(p.name for p in parent.glob("交付说明_*.md")
+                      if p.name != Path(notes).name and p.is_file())
+    except OSError:
+        return []
+
+
+def format_notes_name_mismatch(notes: Path, candidates) -> str:
+    """命名不符归因文案的唯一生成点（流水线打印面与审计第 6 维共用）。"""
+    return (f"同层已存在 {'、'.join(candidates)} —— 交付说明的文件名须由 config "
+            f"paths.video_name 逐字推导为 {Path(notes).name}；改名对齐后单跑 "
+            f"pipeline_runner.py --step completion_report 即可补写该节（零重渲）")
+
+
 def format_subtitle_source_section(line: str) -> str:
     """实测行 → 交付说明整节（标题 + 行 + 数据源页脚）。行本身来自唯一生成点。"""
     return (f"## {DELIVERY_NOTES_SECTION_TITLE}\n\n"

@@ -3,8 +3,9 @@
 """
 统一验证框架
 
-从 preflight_check.py / verify_tts_product(_v2).py / regression_test.py /
-architecture_self_check.py 中提取的公共验证规则的统一实现：
+从 preflight_check.py / verify_tts_product(_v2).py / regression_test.py 中提取的
+公共验证规则的统一实现（原第四项来源 architecture_self_check.py 已于 2026-10-16
+作为零引用死件删除，其规则早已并入本件）：
   1. 规则加载 —— 配置/validation_rules.yaml（PyYAML 缺失时支持同名 .json）
   2. 标准化检查执行 —— 检查原语（primitives）+ 规则引擎
   3. 统一结果输出 —— script_interface.Result（Result Object Pattern）

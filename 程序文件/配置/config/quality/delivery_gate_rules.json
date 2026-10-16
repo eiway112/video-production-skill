@@ -31,5 +31,13 @@
   "skill_version": {
     "description": "技能版本身份读数（2026-10-10 根因批）。消费者侧此前没有任何版本判据，\"我用的是哪一版\"从未被定义，落后因此不可见、同步只能靠记性；实测形态是本地 origin/main 缓存陈旧时 rev-list 报 0 落后、看着像已同步而真实落后 2 提交。故读数须同时给出该缓存年龄，年龄超本阈值即判 UNTESTED，不得由 0 推出\"最新\"。信息面，永不阻断（离线/无网/zip 安装都是合法终态），不得接进任何交付判据。",
     "upstream_stale_after_hours": 24
+  },
+  "path_field_extensions": {
+    "description": "config 路径字段的扩展名权威映射（2026-10-15 面板建议批，判据住 preflight check_config_path_fields，check_id=path_ext）。存在理由：另一条会话更新 config 的脚本把 paths.video_name 写成了 .srt，两支成片遂以 .srt 名落进 成果文件/视频/ 并在后处理步失败——该键此前无任何校验。全仓 103 份 pipeline config 普查：paths.video_name 103/103、paths.subtitle_name 102/102、delivery.output_video 69/69、delivery.output_subtitle 60/60、subtitle.file 60/60 全部与声明扩展名一致、违规 0 处；各字段声明份数本就不同，故判据必须容忍缺位，校验落地零误杀。键不存在或值为空一律不判（这些字段按 config 形态是可选的，缺字段属项目形态而非违规）；只在字段在场且非空时比对其结尾扩展名。",
+    "paths.video_name": ".mp4",
+    "paths.subtitle_name": ".srt",
+    "delivery.output_video": ".mp4",
+    "delivery.output_subtitle": ".srt",
+    "subtitle.file": ".srt"
   }
 }

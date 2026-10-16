@@ -52,12 +52,15 @@ from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _gate_status as gs
 
-# 换包装时必须持住旧流对象：旧 TextIOWrapper 一旦被 GC，其析构会关掉共享的底层
-# buffer，宿主进程（import 本模块的测试/工具）之后任何打印都报 "I/O operation on
-# closed file"。CLI 独立运行时这两个引用无副作用。
+# 换包装时必须持住旧流对象，换完后还须持住本次造出的新代：旧 TextIOWrapper 一旦
+# 引用归零即 finalize（无需 gc.collect），其析构会关掉共享的底层 buffer，宿主进程
+# （import 本模块的测试/工具）之后任何打印都报 "I/O operation on closed file"。
+# 只持旧不足以防住自造新代——它没有别的持有者，下个重绑点一顶掉它即引用归零。
+# CLI 独立运行时这两个引用无副作用。用例105 锁定。
 _std_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+_std_streams_kept = (sys.stdout, sys.stderr)
 
 
 SCRIPTS = ROOT / "程序文件" / "脚本"
@@ -122,7 +125,13 @@ STEP_NAMES = [s[0] for s in STEPS]
 
 # 指纹登记项中由流水线自己写盘的运行时产物：路径写错即永久空转（见 _fingerprint）。
 # 与源文件（narration.json 等）区分——后者按项目形态可缺，缺失属正常。
-_RUNTIME_ARTIFACT_INPUTS = frozenset({"tts_manifest", "render_raw"})
+# timeline_manifest 于 2026-10-16 审计批加入：它由 timeline 步的 enhance 真身写盘
+# （_build_timeline_manifest），postprocess 步 step5 又按名读取；实测全仓 49 个 temp
+# 中 12 个缺该文件，缺时指纹退化为常量 notfound: 而静默——点名面原先只认两枚名字，
+# 新增登记项不会被看见，正与"登记面与生效路径须互相可见"的既有判据相反。
+# _compiled_scenes.json 刻意不入本集合：它由编译器按项目形态产出，手写 HTML 项目
+# 结构上没有该文件，纳入点名面即给 68 个项目制造长期噪声。
+_RUNTIME_ARTIFACT_INPUTS = frozenset({"tts_manifest", "render_raw", "timeline_manifest"})
 
 # 结构化错误码：mark_failed 的 error_code 取值集合。
 # 语义分类固定，供完工报告/排障工具按码路由，避免解析自由文本 error。
@@ -132,6 +141,18 @@ OUTPUT_MISSING = "OUTPUT_MISSING"        # 产物文件缺失/为空
 VERIFY_FAILED = "VERIFY_FAILED"          # 验证/质检类失败
 QUICKFIX_BLOCKED = "QUICKFIX_BLOCKED"    # quick-fix 产物交付拦截
 UNKNOWN = "UNKNOWN"                      # 未分类失败
+
+
+def _next_revision_name(stem):
+    """已交付成片被拦截时的推荐修订名（后缀感知递增）。
+
+    旧实现无条件追加 _修订01：对已叫 X_修订01 的成片建议出 X_修订01_修订01。
+    新名 = 末尾 _修订NN 的 NN+1（两位数补零）；无该后缀则 _修订01。
+    """
+    m = re.search(r"_修订(\d+)$", stem)
+    if m:
+        return f"{stem[: -len(m.group(0))]}_修订{int(m.group(1)) + 1:02d}"
+    return f"{stem}_修订01"
 
 
 def _coerce_bool(value, default=True):
@@ -834,8 +855,9 @@ class PipelineRunner:
     take_over_lock = False
     accept_render_env = False
     accept_text_fit_untested = False
+    accept_bar_overflow_untested = False
 
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False, accept_bar_overflow_untested=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -895,6 +917,10 @@ class PipelineRunner:
         # 预览期"文字塌成竖排"判据 UNTESTED 的显式放行开关（2026-10-12，见 step_preview
         # 与 instant_preview.adjudicate_text_fit）——只覆盖"没测成"，测出塌陷（FAIL）永不可放行
         self.accept_text_fit_untested = accept_text_fit_untested
+        # 预览期"底部对齐容器纵向溢出"判据 UNTESTED 的显式放行开关（2026-10-15，见
+        # step_preview 与 instant_preview.adjudicate_bar_overflow）——与 text_fit 的开关
+        # 各管各的面，不互相越界；测出溢出（FAIL）永不可放行
+        self.accept_bar_overflow_untested = accept_bar_overflow_untested
         self.lock = None
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
@@ -1177,7 +1203,24 @@ class PipelineRunner:
         自动失效重跑。克制原则：只登记每步真实消费的配置与脚本，不做全量覆盖。
         """
         narration = self.source_dir / "narration.json"
-        compiled = self.source_dir / "_compiled_scenes.json"
+        # 登记面＝真实读取路径（A06-①，2026-10-16 审计批）：读取方
+        # enhance_video_audio.load_config 第2层按 `dirname(config_path)/_compiled_scenes.json`
+        # 取数（enhance_video_audio.py:1046-1047），旧登记写的是 source_dir 下的同名文件。
+        # 全仓实测：source_dir 形态 1 份（仅 wall-crack-remedy，且其 config 走第3层 inline
+        # scenes，该分支根本不执行），读取方形态 0 份——即这项登记在任何真实配置下都退化为
+        # 常量 "notfound:<路径>"＝永久零贡献，而真实读取路径无登记。与当年 tts_manifest
+        # 指向不存在的 temp/tts_44k/ 是同族，那条已修，本条补齐。
+        compiled = Path(self.config_path).parent / "_compiled_scenes.json"
+        # 跨步共享的裁定基座（只登记"决定结论"的那两件，不登记写盘/路径类基础设施）：
+        # _gate_status 是四态裁定优先级（FAIL>UNTESTED>PASS）的唯一真身，被 preflight/
+        # instant_preview/media_qa_gate/visual_boundary_check 等 10 个活件导入；
+        # _gsap_time_utils 是 T-block/S-block 的解析真身（AGENTS.md 核心原则#1 点名的
+        # 单一权威源读取器），被 adjust_timeline/enhance/instant_preview/preflight 及本
+        # 文件的 verify 腿导入。改任一件即令对应步的历史结论失去依据，故按消费者各记一次。
+        # 刻意不登记 script_interface（原子写＝落盘机制，不产出裁定）与 _script_env
+        # （路径推导，每次运行现算）：登记面按"影响该步结论"取，不做全量覆盖。
+        gate_status = SCRIPTS / "_gate_status.py"
+        gsap_utils = SCRIPTS / "_gsap_time_utils.py"
         # tts_manifest 落盘位置是 temp 根，不是 temp/tts_44k/：写入方
         # enhance_video_audio._save_tts_manifest、消费方 instant_preview:736 同源。
         # 旧指纹登记指向 tts_44k 下的同名文件——全仓实测该路径 0 个存在
@@ -1217,6 +1260,19 @@ class PipelineRunner:
                              "pause_rules": audio_rules,
                              "pause_prosody_shape_rules": quality_dir / "narration_prosody_rules.json",
                              "pause_marks_script": SCRIPTS / "pause_marks.py",
+                             # check 2b 的扩展名权威源（2026-10-15）：不登记即"改了扩展名
+                             # 映射而预检缓存照常命中"＝A06 同族。该文件此前不在任何步
+                             # 登记面，本批新增登记 → 存量项目下轮 preflight 判
+                             # inputs-changed（秒级静态检查，不级联 TTS/渲染）。
+                             "path_ext_rules": quality_dir / "delivery_gate_rules.json",
+                             # 2026-10-16 审计批补登（A06：登记面＝真实读取路径）：
+                             # 数字红线判据真身 _narration_lint（preflight_check.py:39-40
+                             # 用它扫 config 旁白），其阈值文件 narration_digits_rules 早已
+                             # 登记而判据本体未登记；T-block 解析真身 _gsap_time_utils
+                             # （preflight_check 经它读场景窗口）。不登记即"改了 lint 口径
+                             # 而预检缓存照常命中"，与 preview 批那条 capture_script 同族。
+                             "narration_lint": SCRIPTS / "_narration_lint.py",
+                             "gsap_time_utils": gsap_utils,
                              "script": SCRIPTS / "preflight_check.py"},
             "tts":          {"config": self.config_path, "narration": narration,
                              "compiled_scenes": compiled,
@@ -1232,6 +1288,12 @@ class PipelineRunner:
                              "cue_resolver": SCRIPTS / "cue_resolve.py",
                              "pause_rules": audio_rules,
                              "pause_prosody_shape_rules": quality_dir / "narration_prosody_rules.json",
+                             # 2026-10-16 审计批补登：TTS 产物七层验证的判据真身
+                             # （enhance_video_audio.py:1657/1674 按名导入并写 verify 结果）。
+                             # 不登记即"改了七层判据而 tts 步缓存照常命中、旧结论继续供数"，
+                             # 与 2026-10-12 批 preview_capture.js 那条同族。
+                             "tts_verify": SCRIPTS / "verify_tts_product.py",
+                             "gsap_time_utils": gsap_utils,
                              "script": enhance_script},
             "timeline":     {"config": self.config_path, "html": self.html_path,
                              "tts_manifest": tts_manifest,
@@ -1249,6 +1311,7 @@ class PipelineRunner:
                              # 新接入的判据对全部存量项目静默不生效）。
                              "cue_resolver": SCRIPTS / "cue_resolve.py",
                              "audio_sync_rules": audio_rules,
+                             "gsap_time_utils": gsap_utils,
                              "script": SCRIPTS / "adjust_timeline.py"},
             # preview 实测消费 HTML/config 之外还有 tts_manifest（instant_preview.py:736
             # 按旁白时长决定各场采样时刻）与脚本自身；旧指纹只登记 config+html，
@@ -1261,14 +1324,31 @@ class PipelineRunner:
             # ② video_quality_rules —— text_fit 阈值就住在这份文件里，改阈值即须重测。
             "preview":      {"config": self.config_path, "html": self.html_path,
                              "tts_manifest": tts_manifest,
+                             # 2026-10-16 审计批补登三条（同一判据：登记面＝真实读取路径）：
+                             # ① boundary_module —— instant_preview.py:301 按名导入
+                             #    visual_boundary_check 的 measure_content_bottom /
+                             #    frame_height / subtitle_safety_line 作安全线取数；2026-09-02
+                             #    那次"安全线按实测画布高等比推导"改的正是本件，而预览缓存
+                             #    当时不会失效。② narration —— :911 经 resolve_narration_scenes
+                             #    读场景窗口（只登记 config 时，改窗口不改旁白的修订对预览免检）。
+                             #    ③ gate_status/capture 之外的四态裁定优先级住 _gate_status，
+                             #    text_fit/bar_overflow 的 UNTESTED 判定即由它给出。
+                             "narration": narration,
+                             "boundary_module": SCRIPTS / "visual_boundary_check.py",
+                             "gate_status": gate_status,
+                             "gsap_time_utils": gsap_utils,
                              "capture_script": SCRIPTS / "preview_capture.js",
                              "video_quality_rules": quality_dir / "video_quality_rules.json",
                              "script": SCRIPTS / "instant_preview.py"},
             "render":       {"config": self.config_path, "html": self.html_path,
                              "render_rules": quality_dir / "render_rules.json"},
             "verify":       {"config": self.config_path, "html": self.html_path,
+                             # 2026-10-16 审计批补登：本步的时长一致性取数经
+                             # pipeline_runner.py:48 的 parse_scene_map（T-block 解析真身）。
+                             "gsap_time_utils": gsap_utils,
                              "render_raw": self.render_raw},
             "visual_check": {"config": self.config_path, "render_raw": self.render_raw,
+                             "gate_status": gate_status,
                              "script": SCRIPTS / "visual_boundary_check.py"},
             "postprocess":  {"config": self.config_path, "html": self.html_path,
                              "render_raw": self.render_raw, "narration": narration,
@@ -1285,6 +1365,20 @@ class PipelineRunner:
                              # _get_tts_hash_from_manifest 走带 scene_id 的缓存键，声明项目
                              # 会实际读取 pause_marks 裁定面（audio_rules 已在上方登记）。
                              "pause_marks_script": SCRIPTS / "pause_marks.py",
+                             # 2026-10-16 审计批补登四条（同一判据）：
+                             # ① timeline_manifest —— step5 字幕时间戳主路径真读
+                             #    _timeline_manifest.json（enhance_video_audio.py:2385 经
+                             #    _load_timeline_manifest），此前只登记在 timeline 步。它不是
+                             #    本步自产产物，故 A13 那条"自产不登记"的豁免在此不适用。
+                             # ② narration_lint —— step5/7 的数字红线取数真身
+                             #    （enhance_video_audio.py:42 import scan_srt_file），其阈值
+                             #    文件 narration_digits_rules 已登记而本体未登记。
+                             # ③ gate_status —— 终检四态裁定优先级；④ gsap_time_utils ——
+                             #    停顿/句末时刻取数经它解析 S/T-block。
+                             "timeline_manifest": self.temp_dir / "_timeline_manifest.json",
+                             "narration_lint": SCRIPTS / "_narration_lint.py",
+                             "gate_status": gate_status,
+                             "gsap_time_utils": gsap_utils,
                              "mode": "mode:" + ("quick-fix" if self.quick_fix else "full"),
                              "script": enhance_script},
             "delivery":     {"config": self.config_path, "video": self._delivery_paths()[0],
@@ -1301,6 +1395,13 @@ class PipelineRunner:
                              # 该节的判据真身与文案单源，同样必须登记。
                              "script": SCRIPTS / "generate_completion_report.py",
                              "occupancy_module": SCRIPTS / "frame_occupancy.py",
+                             # 2026-10-16 审计批补登两条：本步的"产物-状态一致性"自适应容差
+                             # 权威源是 delivery_gate_rules.json（generate_completion_report.py:48
+                             # 直读），第 6 维"交付说明同源性"的取数与文案真身是 media_qa_gate.py
+                             # （:402 按名导入）。改容差/改审计判据而该步缓存照命中＝交付说明节
+                             # 与审计结论按旧口径继续供数。
+                             "gate_rules": quality_dir / "delivery_gate_rules.json",
+                             "media_qa_script": SCRIPTS / "media_qa_gate.py",
                              "state_digest": "digest:" + self._stable_state_digest()},
         }
         return {k: str(v) for k, v in inputs_map.get(step, {}).items()}
@@ -2183,7 +2284,8 @@ class PipelineRunner:
             [str(VENV_PYTHON), "instant_preview.py",
              "--html", str(self.html_path),
              "--config", str(self.config_path)]
-            + (["--accept-text-fit-untested"] if self.accept_text_fit_untested else []),
+            + (["--accept-text-fit-untested"] if self.accept_text_fit_untested else [])
+            + (["--accept-bar-overflow-untested"] if self.accept_bar_overflow_untested else []),
             cwd=str(SCRIPTS),
             env=node_env,
             desc="instant preview"
@@ -2703,7 +2805,7 @@ class PipelineRunner:
             self.state.mark_started(step_name)
         print(f"  BLOCKED: 交付目标已是上一轮成功交付的成片：{self.output_file}")
         print("  AGENTS.md 交付纪律：已交付文件不得覆盖，需修订时加后缀。")
-        print(f"  处理：config paths.video_name 改为 '{self.output_file.stem}_修订01.mp4' 后重跑；")
+        print(f"  处理：config paths.video_name 改为 '{_next_revision_name(self.output_file.stem)}.mp4' 后重跑；")
         print("        或将旧成片移出成果目录；紧急情况用 --force 越过（不推荐）。")
         self.state.mark_failed(
             step_name,
@@ -2831,6 +2933,13 @@ class PipelineRunner:
         if not line:
             return f"跳过（终检未记录来源分布）: {notes.name}"
         if not notes.exists():
+            # 归因分岔：同层若有其它 交付说明_*.md，那是**名字不对**而非**没建**——
+            # 旧文案一律报"尚未创建"，人据此会去补建或重跑全链，真实修法只是改名。
+            from media_qa_gate import (find_mismatched_delivery_notes,
+                                       format_notes_name_mismatch)
+            cands = find_mismatched_delivery_notes(notes)
+            if cands:
+                return f"跳过（交付说明名称不符）: {format_notes_name_mismatch(notes, cands)}"
             return f"跳过（交付说明尚未创建）: {notes.name}"
         new_text, changed = splice_subtitle_source_section(
             notes.read_text(encoding='utf-8'), format_subtitle_source_section(line))
@@ -3336,6 +3445,17 @@ Examples:
                              "step fails; the decision is recorded in "
                              "temp/_text_fit_check.json. A measured collapse (FAIL) is never "
                              "accepted by this flag.")
+    parser.add_argument("--accept-bar-overflow-untested", dest="accept_bar_overflow_untested",
+                        action="store_true",
+                        help="Explicitly proceed when the preview-stage bottom-aligned bar "
+                             "overflow gate (柱压字) could not complete its measurement "
+                             "(UNTESTED — threshold unreadable or capture step did not run). "
+                             "UNTESTED is never read as passed: without this flag the preview "
+                             "step fails; the decision is recorded in "
+                             "temp/_bar_overflow_check.json. A measured overflow (FAIL) is "
+                             "never accepted by this flag. This flag does NOT cover the "
+                             "text-fit gate — that gate has its own "
+                             "--accept-text-fit-untested.")
 
     args = parser.parse_args()
 
@@ -3411,6 +3531,7 @@ Examples:
         take_over_lock=args.take_over_lock,
         accept_render_env=args.accept_render_env,
         accept_text_fit_untested=args.accept_text_fit_untested,
+        accept_bar_overflow_untested=args.accept_bar_overflow_untested,
     )
 
     if args.status:

@@ -29,7 +29,7 @@
   },
   "black_frame": {
     "min_black_seconds": 1.0,
-    "pixel_threshold": 0.10,
+    "pixel_threshold": 0.1,
     "max_overlap_with_narration_seconds": 1.0,
     "fail_on_violation": true,
     "description": "黑场-音频重叠门禁（media_qa_gate no_black_frame_with_subtitle）：blackdetect 扫描成片，任一黑场区间与字幕展示窗口重叠超过 max_overlap_with_narration_seconds → 拒收（画面空档但音频持续播放）。测量对象是物理帧，不依赖任何声明值。"
@@ -48,15 +48,16 @@
   },
   "pause_declaration": {
     "enabled_by_default": false,
-    "engines": ["qwen"],
+    "engines": [
+      "qwen"
+    ],
     "min_ms": 400,
     "max_ms": 1000,
     "auto_ms": 500,
     "max_count_per_scene": 2,
     "max_total_ms_per_scene": 1600,
-    "auto_shape_source": "narration_prosody_rules.json → segment_overload",
     "mark_chars": "、",
-    "description": "段内停顿的引擎侧声明面（2026-10-13 停顿可控性接入批，判据与读数住 pause_marks.py 的 docstring）。存在理由：本仓既有机制只在字幕段边界补静音，段内标点由引擎内部韵律决定（同一片实测句号 0.26s 短于顿号 0.44s、同一逗号既 0.30s 又 0.86s），而 CosyVoice 的 HTTP 非实时路径默认解析 SSML、`<break time>` 单调生效。区间 [400,1000] 由四段真实旁白 × 四档声明值标定得：500ms 档 Δ ∈ [0.70,0.90]（极差 0.20s、四段复现）、800ms 档 Δ ∈ [1.08,1.30]，而 200ms 档 Δ ∈ [-0.16,+0.64]（与噪声不可分）、1200ms 档实测间隔达 1.5~2.0s。auto_ms 取 500 即因此，不是凑整。缺省 enabled_by_default=false 的理由：开启＝机器替作者改朗读文本并加长片长（每处约 +0.8s，场景窗口由 TTS 时长驱动，级联到时长预算与全量渲染），属全仓节奏基准变更——与 shrink.basis 那条同判据：代码落地、缺省不翻、挂在本来就要重跑的那批上。max_total_ms_per_scene 存在理由：SSML 模式下未声明位置的节奏也会移动（同一次调用内一枚未插 break 的逗号 0.84→0.26s），停顿预算是全场资源而非逐点独立量。mark_chars 与形状阈值（min_chars/min_enumeration_marks）分处两文件属刻意：形状判据的唯一持有者是 narration_prosody_rules.json → segment_overload，本节的 auto_shape_source 只是指针，回归用例按功能对照锁两者一致（取同一批段），不得把阈值抄成第二份。",
+    "description": "段内停顿的引擎侧声明面（2026-10-13 停顿可控性接入批，判据与读数住 pause_marks.py 的 docstring）。存在理由：本仓既有机制只在字幕段边界补静音，段内标点由引擎内部韵律决定（同一片实测句号 0.26s 短于顿号 0.44s、同一逗号既 0.30s 又 0.86s），而 CosyVoice 的 HTTP 非实时路径默认解析 SSML、`<break time>` 单调生效。区间 [400,1000] 由四段真实旁白 × 四档声明值标定得：500ms 档 Δ ∈ [0.70,0.90]（极差 0.20s、四段复现）、800ms 档 Δ ∈ [1.08,1.30]，而 200ms 档 Δ ∈ [-0.16,+0.64]（与噪声不可分）、1200ms 档实测间隔达 1.5~2.0s。auto_ms 取 500 即因此，不是凑整。缺省 enabled_by_default=false 的理由：开启＝机器替作者改朗读文本并加长片长（每处约 +0.8s，场景窗口由 TTS 时长驱动，级联到时长预算与全量渲染），属全仓节奏基准变更——与 shrink.basis 那条同判据：代码落地、缺省不翻、挂在本来就要重跑的那批上。max_total_ms_per_scene 存在理由：SSML 模式下未声明位置的节奏也会移动（同一次调用内一枚未插 break 的逗号 0.84→0.26s），停顿预算是全场资源而非逐点独立量。mark_chars 与形状阈值（min_chars/min_enumeration_marks）分处两文件属刻意：形状判据的唯一持有者是 narration_prosody_rules.json → segment_overload，pause_marks.py:180-181 在运行期**引用**那两个键（键名映射 min_chars→min_segment_chars、min_enumeration_marks→min_marks），不在本节复制数值。2026-10-16 单源收敛：本节原有一枚 `auto_shape_source` 指针字符串，全仓 .py 命中 0 个消费者，且其 description 曾承诺\"回归用例按功能对照锁两者一致\"——该用例不存在（实测 regression_test.py grep 该键名 0 命中）。指针不承载取数、承诺又没有载体，两件都是条文在生效路径上没有落脚点，故删除键并改正叙述。",
     "evidence": "过程产物/临时产物/_取证/20261013/pause_batch/calibration.json（四段真实旁白、双音色、7 次调用；该目录不入 git，读数已抄进本 description）"
   },
   "alignment": {

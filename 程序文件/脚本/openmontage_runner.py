@@ -33,8 +33,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+# 换包装保活对：持旧防旧包装析构关底层 buffer，持新防本轮新代被下个重绑点顶掉
+# 后引用归零（无需 gc.collect 即 finalize）。理由详见 script_interface 内同名表。
+# 用例105 锁定。
+_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+_streams_kept = (sys.stdout, sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Path setup — allow importing OpenMontage modules
@@ -1843,7 +1848,12 @@ class OpenMontageRunner:
         return True
 
     def run_summary(self) -> str:
-        """Return a summary string for workflow_router integration."""
+        """Return a summary string for external orchestration.
+
+        原指向的 workflow_router.py 已于 2026-10-16 作为零引用死件删除（全仓 import 与
+        subprocess 字符串两面均 0 消费者）；本方法保留为 OpenMontage 自身的输出面，
+        不再声称有路由件消费它。
+        """
         pipeline = self.pipeline_name
         steps = len(self.steps_def)
         input_path = self.input_config.get("path", "(none)")

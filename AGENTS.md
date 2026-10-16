@@ -211,7 +211,7 @@ preflight → tts → timeline → render
 **命名**：
 - ✅ 中文业务名：`{业务描述性名称}.mp4`
 - ✅ 修订后缀：`{项目名}_修订01.mp4`
-- ❌ 技术词：不允许 `final`, `v01`, `render`, `raw`, `tmp`
+- ❌ 技术词：清单不在此处手抄——交付裁定面唯一权威源 `config/quality/delivery_gate_rules.json → audit.prohibited_terms`（由 `generate_completion_report` 消费）；本仓不承载工作区卫生扫描面，其超集判据住开发仓侧，故此处只留指针
 
 **约定**：
 - 已交付文件不得覆盖（需修订时加后缀）

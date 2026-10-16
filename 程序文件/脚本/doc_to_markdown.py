@@ -22,8 +22,13 @@ import io
 import argparse
 from pathlib import Path
 
+# 换包装保活对：持旧防旧包装析构关底层 buffer，持新防本轮新代被下个重绑点顶掉
+# 后引用归零（无需 gc.collect 即 finalize）。理由详见 script_interface 内同名表。
+# 用例105 锁定。
+_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+_streams_kept = (sys.stdout, sys.stderr)
 
 # PPT 原生图片格式：原字节直接落盘（免二次编码损失）；其余（webp 等）转 PNG。
 _NATIVE_IMAGE_EXTS = {"PNG": "png", "JPEG": "jpg", "GIF": "gif",

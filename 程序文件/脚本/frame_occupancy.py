@@ -32,7 +32,26 @@ TILE = 8
 STD_MIN = 6.0
 SCALE_H = 384
 BODY_TOP = 0.10
-SUBTITLE_LINE_RATIO = 860 / 1080.0      # 字幕安全线（横竖同比例，本仓按实测画布高推导）
+SUBTITLE_LINE_RATIO = 860 / 1080.0      # 兜底比例（仅在权威推导取不回时使用，见下）
+
+
+def authority_body_ratio(frame_h):
+    """主体区下界＝字幕安全线，按权威推导取比例，不抄常量。
+
+    存在理由（2026-10-16 单源收敛）：本件曾把 `860/1080` 写成模块常量，而 AGENTS.md
+    明文"`visual_boundary_check.subtitle_safety_line` 为同源判据、安全线按实测画布高
+    等比推导（非常量）"。留着一个抄来的比例＝第二个真相源：权威侧改了预留带参数，
+    本描述面的口径不会跟着变，而且不报错。
+    延迟导入并按 BaseException 兜住：`visual_boundary_check` 顶层缺 PIL/numpy 即
+    `sys.exit(1)`（该地雷已登记），本件被完工报告 in-process 导入，绝不能把报告带崩。
+    取不回即退回字面比例，但**退回必须可见**——口径来源随读数一起进 caliber，
+    不得让"抄来的常量"冒充"权威推导值"。
+    """
+    try:
+        from visual_boundary_check import subtitle_safety_line
+        return subtitle_safety_line(frame_h) / float(frame_h), "subtitle_safety_line"
+    except BaseException as e:                          # noqa: BLE001
+        return SUBTITLE_LINE_RATIO, f"兜底字面量 860/1080（权威推导取不回：{type(e).__name__}）"
 LOW_SHARE_OF_BLANK = 0.05               # "低占用秒"的门槛，仅用于描述，不作裁定
 
 CALIBER = {"tile": TILE, "std_min": STD_MIN, "scale_h": SCALE_H,
@@ -65,7 +84,8 @@ def measure(video_path, scene_windows=None):
         arr = np.frombuffer(raw[:n * W * SCALE_H * 3], dtype=np.uint8)
         arr = arr.reshape(n, SCALE_H, W, 3).astype(int)
         g = arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114
-        occ = _occupancy(np, g)
+        body_ratio, ratio_src = authority_body_ratio(h0)
+        occ = _occupancy(np, g, body_ratio)
         out = {"caliber": dict(CALIBER), "frames": int(n),
                "canvas": [w0, h0], "duration_s": round(float(dur), 2),
                "median": round(float(np.median(occ)), 3),
@@ -73,6 +93,11 @@ def measure(video_path, scene_windows=None):
                "min": round(float(occ.min()), 3),
                "low_blank_seconds": int((occ < LOW_SHARE_OF_BLANK).sum()),
                "max_low_blank_run_seconds": int(_longest_run(occ < LOW_SHARE_OF_BLANK))}
+        # 口径来源随读数一起落盘：描述面若把抄来的比例冒充权威推导值，读的人无从分辨。
+        # 刻意放在 caliber **之外**——caliber 是本件声明的静态口径，用例93 G3 锁"读数自带
+        # 口径且等于声明口径"，把随项目画布高而变的推导值塞进去会让那条断言失去意义。
+        out["body_ratio"] = [BODY_TOP, round(body_ratio, 4)]
+        out["body_ratio_source"] = ratio_src
         if scene_windows:
             per = []
             for sid, a, b in scene_windows:
@@ -94,9 +119,9 @@ def measure(video_path, scene_windows=None):
         return {"untested": f"度量异常（{type(e).__name__}: {str(e)[:80]}）"}
 
 
-def _occupancy(np, gray):
+def _occupancy(np, gray, body_ratio=None):
     n, H = gray.shape[0], gray.shape[1]
-    y0, y1 = int(BODY_TOP * H), int(SUBTITLE_LINE_RATIO * H)
+    y0, y1 = int(BODY_TOP * H), int((body_ratio or SUBTITLE_LINE_RATIO) * H)
     y1 = max(y1, y0 + TILE)
     body = gray[:, y0:y1, :]
     hh = (body.shape[1] // TILE) * TILE

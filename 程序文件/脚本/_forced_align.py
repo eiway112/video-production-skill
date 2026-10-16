@@ -46,6 +46,11 @@ _MODEL = None                 # 进程级模型缓存
 # WhisperModel(“small”) 实际解析到的 HF 仓库；缓存目录名由它派生，不另写一份
 MODEL_REPO_ID = f"Systran/faster-whisper-{MODEL_SIZE}"
 
+# main() 内换包装的保活表（模块级非 CLI 路径不触及）：持旧防旧包装析构关底层
+# buffer，持新防本轮新代被下个重绑点顶掉后引用归零（无需 gc.collect 即 finalize）。
+# 理由详见 script_interface 内同名表。用例105 锁定。
+_stdout_keepalive = []
+
 
 def load_align_model():
     """加载 faster-whisper 模型（进程级单例）。失败返回 None（调用方降级）。"""
@@ -340,7 +345,9 @@ def align_scene(wav_path, text, segments, model=None):
 def main():
     """独立 CLI：对单个 wav + 文本做对齐并打印 JSON（自测/离线复核用）。"""
     import argparse
+    _stdout_keepalive.append(sys.stdout)   # 持旧：被本次顶掉的那一代
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    _stdout_keepalive.append(sys.stdout)   # 持新：本次造出的这一代
     parser = argparse.ArgumentParser(description="Forced alignment: TTS wav + known text -> sentence times")
     parser.add_argument("--wav", required=True)
     parser.add_argument("--text", help="narration text inline")

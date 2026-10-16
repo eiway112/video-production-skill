@@ -12,8 +12,8 @@
     { "pattern": "点\\s*[Cc]sv", "replace": ".csv" },
     { "pattern": "点\\s*[Pp]df", "replace": ".pdf" },
     { "pattern": "杰森文件", "replace": "JSON 文件" },
-    { "pattern": "毫米", "replace": "mm" },
-    { "pattern": "厘米", "replace": "cm" },
+    { "pattern": "(?<!立方)(?<!平方)(?<!公)毫米", "replace": "mm" },
+    { "pattern": "(?<!立方)(?<!平方)(?<!公)厘米", "replace": "cm" },
     { "pattern": "千瓦时", "replace": "kWh" }
   ],
   "lint_patterns": [
@@ -22,6 +22,6 @@
       "message": "疑似朗读层扩展名直通显示层（如『点Json』应为『.json』）"
     }
   ],
-  "$note_replacements": "replacements 按声明顺序应用于 SRT 显示文本，均为正则。仅影响字幕显示，不改 TTS 朗读文本。单位类替换（毫米→mm）如与语境冲突（如『毫米波』），用项目级 subtitle_display_replacements 先行替换保护。",
+  "$note_replacements": "replacements 按声明顺序应用于 SRT 显示文本，均为正则。仅影响字幕显示，不改 TTS 朗读文本。单位类替换（毫米→mm）如与语境冲突（如『毫米波』），用项目级 subtitle_display_replacements 先行替换保护。复合量纲词（立方厘米／平方毫米／平方公里）必须整体保留中文，否则会被拆成『每立方cm』这类中英混排；该保护住在毫米／厘米两条规则的负向后顾里，删掉即复现（2026-10-15 用户验收在成片字幕上抓到）。",
   "$note_lint": "lint_patterns 用于 step7/media_qa_gate 终检：正常流程下 replacements 已消除这些形态，仍命中说明有外部 SRT 导入或词典缺口 → 报错拒收。"
 }

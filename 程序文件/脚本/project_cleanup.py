@@ -40,8 +40,13 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import List
 
+# 换包装保活对：持旧防旧包装析构关底层 buffer，持新防本轮新代被下个重绑点顶掉
+# 后引用归零（无需 gc.collect 即 finalize）。理由详见 script_interface 内同名表。
+# 用例105 锁定。
+_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+_streams_kept = (sys.stdout, sys.stderr)
 
 from config_manager import ConfigManager
 from _fs_walk import dir_size as _dir_size, rglob as _rglob_no_reparse, walk as _walk

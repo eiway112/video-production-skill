@@ -21,8 +21,15 @@ import os
 import io
 import json
 
+# 换包装时必须持住旧流对象，换完后还须持住本次造出的新代（与 pipeline_runner /
+# adjust_timeline 同名保活对同一修法）：旧 TextIOWrapper 一旦引用归零即 finalize
+# （无需 gc.collect），其析构会关掉共享的底层 buffer，import 本模块的宿主（回归
+# 套件、探针）之后任何打印都报 "I/O operation on closed file"。只持旧不足以防住
+# 自造新代——它没有别的持有者，下个重绑点一顶掉它即引用归零。用例105 锁定。
+_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+_streams_kept = (sys.stdout, sys.stderr)
 
 import re
 import hashlib

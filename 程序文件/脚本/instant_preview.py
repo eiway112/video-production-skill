@@ -39,8 +39,13 @@ import tempfile
 import shutil
 from pathlib import Path
 
+# 换包装保活对：持旧防旧包装析构关底层 buffer，持新防本轮新代被下个重绑点顶掉
+# 后引用归零（无需 gc.collect 即 finalize）。理由详见 script_interface 内同名表。
+# 用例105 锁定。
+_streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+_streams_kept = (sys.stdout, sys.stderr)
 
 # Import shared GSAP time resolution utilities (T-block aware)
 sys.path.insert(0, str(Path(__file__).parent))
@@ -95,6 +100,42 @@ class CDPClient:
             self.ws.close()
         except Exception:
             pass
+
+
+def make_run_scratch(base=None):
+    """本轮预览的工作目录＝`<预览临时区>/run_<pid>_<随机>`，父目录按需创建。
+
+    唯一化做在**父目录**一层：Chrome profile 与 preview_captures 都落在它下面，故两支
+    并发天然隔离（旧形态两处都是固定名，实测并发时两支全部零截图、其中一支直接报
+    "browser is already running"，读数见 操作日志 [2026-10-15] 机制 条）。
+    父目录 mkdir 不可省：预览区被上一轮收尾删空后，`mkdtemp(dir=...)` 会直接
+    FileNotFoundError——本批首版即因此炸过一次（旧代码靠 os.makedirs 兜着）。
+    """
+    base = Path(base) if base else PREVIEW_TEMP
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"run_{os.getpid()}_", dir=str(base)))
+
+
+def cleanup_run_scratch(preview_temp_dir):
+    """收尾只删**本轮**那个工作目录，返回被删路径（无对象时返回 None）。
+
+    刻意不顺手回收其它轮次的 `run_*` 遗留：首版加了这条，并发实测当场把另一支正在用的
+    目录删掉（那支日志先印 `Captured: 24 screenshots` 再印 `Capture manifest not found`
+    ——截图与 manifest 一起被邻居的收尾清掉）。崩溃遗留因此保留，由 `过程产物/临时产物/`
+    的龄期巡检点名（只报不删，属既有覆盖）；要真回收须走 project_cleanup 新增类别。
+    同样刻意不再 rmtree 整个预览临时区：`HYPERFRAMES_PREVIEW_TEMP` 被指到某个已有内容的
+    目录时，那会连它原有内容一并删掉（AGENTS.md 登记的翻转前置，本批兑现）。
+    """
+    if not preview_temp_dir:
+        print("  Cleaned up: 本轮未创建预览工作目录（无对象可清理，非清理失败）")
+        return None
+    d = Path(preview_temp_dir)
+    try:
+        shutil.rmtree(str(d), ignore_errors=True)
+        print(f"  Cleaned up: {d}")
+    except Exception as cleanup_err:
+        print(f"  Warning: could not clean {d}: {cleanup_err}")
+    return d
 
 
 def launch_chrome(chrome_path, port=9222):
@@ -483,8 +524,9 @@ def adjudicate_text_fit(fit, rules):
             [f"  [TEXT-FIT] PASS — {len(nodes)} 个候选节点每行字数均达下限"] + [head], [], meta)
 
 
-def write_text_fit_record(temp_dir, status, findings, meta, report_lines=None, decision=None):
-    """裁定的文件级留痕：落项目 temp 的 _text_fit_check.json。
+def _write_check_record(record_name, temp_dir, status, findings, meta,
+                        report_lines=None, decision=None):
+    """裁定文件级留痕的共享实现：落项目 temp 的 `record_name`。
 
     "检查点跑过"需要正证据而不是由"没有异常记录"反推（与 duration_budget 通过路径
     留痕同判据），故 PASS 亦写盘；每次预览全量覆写本轮结论，读取侧只信当轮文件。
@@ -503,9 +545,160 @@ def write_text_fit_record(temp_dir, status, findings, meta, report_lines=None, d
         record["report_lines"] = [str(x).strip() for x in report_lines]
     if decision:
         record["decision"] = decision
-    path = Path(temp_dir) / TEXT_FIT_RECORD_NAME
+    path = Path(temp_dir) / record_name
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def write_text_fit_record(temp_dir, status, findings, meta, report_lines=None, decision=None):
+    """text_fit 裁定留痕（_text_fit_check.json）——语义见 _write_check_record。"""
+    return _write_check_record(TEXT_FIT_RECORD_NAME, temp_dir, status, findings, meta,
+                               report_lines=report_lines, decision=decision)
+
+
+# ── 底部对齐容器纵向溢出（柱状图压字）判据：取数在 preview_capture.js，裁定在此 ──────
+#
+# 存在理由：柱状图画在"底部对齐容器"里（flex 容器，子项贴容器底），柱子写高后
+# 整体越过容器顶边、压在前文标题上——2026-10-15 用户在一支交付件上肉眼报"数值柱压住
+# 了标题"，而当时六维审计与全部既有预览判据（字幕安全区、视觉边界、text_fit）全绿：
+# 它们量"是否越出画布"与"字框是否过窄"，没有一条量"容器内元素是否探出容器顶"。
+#
+# 与 text_fit 的三处刻意不同（各有存在理由，不得对称化）：
+#   ① JS 侧逐容器**跨采样取最坏（max）**——溢出是几何事实，"晚场动画才溢出"用取最优
+#      会被稳态前的读数洗白；text_fit 取最优（t=0 会把宽度动画中的元素误判成塌陷）。
+#   ② 阈值**不下传取数面**：结构识别（flex + flex-end 容器）无阈值参数，候选表全量
+#      回报含未溢出者；text_fit 的阈值决定"哪些节点进入测量面"，故必须下传。
+#   ③ tolerance 合法域含 0（零容忍＝最严方向）：text_fit 的"非正数即断链"是因为那边
+#      0 会把门禁放宽到永不触发；这边 0 只是"不许任何溢出"，放宽方向是**负值**。
+BAR_OVERFLOW_REQUIRED_KEYS = ("tolerance_px",)
+BAR_OVERFLOW_RECORD_NAME = "_bar_overflow_check.json"
+
+
+def load_bar_overflow_rules(rules_path=None):
+    """读 config/quality/video_quality_rules.json → bar_overflow 节，返回 (rules, 归因)。
+
+    fail-closed：缺文件／不可解析／缺节／缺键／值不可解析（含 NaN/Inf）／负值一律返回
+    (None, 点名断在哪条腿)。**不设默认阈值**：给回退常量即把"配置断链"读成"按某数字查过且干净"。
+    """
+    path = Path(rules_path) if rules_path else QUALITY_DIR / "video_quality_rules.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, f"配置文件缺失：{path}"
+    except (OSError, ValueError) as e:
+        return None, f"配置文件不可解析：{path.name}（{type(e).__name__}: {e}）"
+    section = data.get("bar_overflow") if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        return None, f"{path.name} 缺 bar_overflow 节（阈值断链，不得按猜测值裁定）"
+    missing = [k for k in BAR_OVERFLOW_REQUIRED_KEYS if k not in section]
+    if missing:
+        return None, f"{path.name} → bar_overflow 缺必需键 {missing}"
+    rules = {}
+    for key in BAR_OVERFLOW_REQUIRED_KEYS:
+        raw = section[key]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None, f"{path.name} → bar_overflow.{key} 不可解析为数值：{raw!r}"
+        if not (value >= 0 and value < float("inf")):
+            return None, (f"{path.name} → bar_overflow.{key} 非法（须有限非负数，"
+                          f"0=零容忍）：{raw!r}")
+        rules[key] = value
+    return rules, None
+
+
+def adjudicate_bar_overflow(bar, rules):
+    """四态裁定 → (status, 报告行列表, findings, meta)。
+
+    判据：`overflow_px = 内容盒顶边（rect.top + borderTop + paddingTop）− 后代可见元素
+    union 顶边`（取数实现见 preview_capture.js measureBarOverflow），findings 边界
+    `> tolerance_px`——亚像素舍入属噪声，真病灶实测 14~66px 量级。
+
+    `overflow_px` 为负是**正常态**（内容在容器内），故读数校验"有限数"而非"正数"；
+    对象为 0 → NOT_APPLICABLE 不判 PASS（同 text_fit，A04 同族）。
+    """
+    tol = rules["tolerance_px"]
+    label = f"阈值：内容盒顶边 − 后代 union 顶边 > {tol:g}px 判溢出"
+    if bar is None:
+        return gs.UNTESTED, [f"  [BAR-OVERFLOW] UNTESTED — 捕获脚本未产出 bar_overflow 段"
+                             f"（脚本版本不符或该步未跑），本项无从裁定；{label}"], [], {}
+    if not isinstance(bar, dict):
+        return (gs.UNTESTED,
+                [f"  [BAR-OVERFLOW] UNTESTED — bar_overflow 段不是对象（实取 "
+                 f"{type(bar).__name__}），本项无从裁定；{label}"], [],
+                {"reason": "bar_overflow_not_mapping"})
+    hint = bar.get("status_hint")
+    if hint:
+        why = {"measure_failed": "取数异常 " + str(bar.get("error")),
+               "no_time_source": "页面无 S-block／T-block 且 config 无场景窗口，"
+                                 "稳态采样时刻无从落位"}.get(hint, str(hint))
+        return gs.UNTESTED, [f"  [BAR-OVERFLOW] UNTESTED — {why}；{label}"], [], dict(bar)
+
+    raw_nodes = bar.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        return (gs.UNTESTED,
+                [f"  [BAR-OVERFLOW] UNTESTED — bar_overflow.nodes 不是列表"
+                 f"（实取 {type(raw_nodes).__name__}），本项无从裁定；{label}"],
+                [], {"reason": "nodes_not_list"})
+
+    def _num(v):
+        """读数必须是有限数；None/字符串/NaN/±Inf（JS 侧经 JSON 即 null）一律不算取到。
+        与 text_fit 的 _num 刻意不同：此处**负值合法**（内容在容器内即负溢出）。"""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+    nodes, unreadable = [], []
+    for n in raw_nodes:
+        if not isinstance(n, dict):
+            unreadable.append((str(n)[:24], "节点不是对象"))
+            continue
+        ov_ = _num(n.get("overflow_px"))
+        if ov_ is None:
+            unreadable.append((str(n.get("key", "?"))[:36], "缺 overflow_px"))
+            continue
+        nodes.append(dict(n, _overflow=ov_))
+
+    findings = [n for n in nodes if n["_overflow"] > tol]
+    meta = {"time_src": bar.get("time_src"), "samples": bar.get("samples"),
+            "measured_nodes": bar.get("measured_nodes"), "candidates": len(nodes),
+            "unreadable": len(unreadable)}
+    head = (f"  [BAR-OVERFLOW] 时刻源={bar.get('time_src')} 采样 {bar.get('samples')} 次 "
+            f"候选容器 {bar.get('measured_nodes')} 个（{label}）")
+    if findings:
+        lines = [f"  [BAR-OVERFLOW] FAIL — {len(findings)} 个底部对齐容器内元素探出容器顶"] + [head]
+        for n in sorted(findings, key=lambda x: -x["_overflow"])[:10]:
+            lines.append(f"    ✗ {n.get('key')}: 溢出 {n.get('overflow_px')}px"
+                         f"（内容顶边 y{n.get('content_top')} / 后代顶边 y{n.get('union_top')}，"
+                         f"盒高 {n.get('box_h')}px）@{n.get('at')}s")
+        lines.append("    -> 容器里的内容整体高过容器＝上沿压到前文；修向＝加高容器／减柱高／"
+                     "调纵向分配，勿压在标题上")
+        return gs.FAIL, lines, findings, meta
+    if unreadable:
+        # 有容器进了候选面却没有可用读数＝取数断链。判未测并逐节点点名，
+        # 既不得读成 PASS（缺键即视为达标），也不得读成 N/A（那是"测量面无对象"）。
+        # 位置在 findings 之后、PASS 之前：其余容器全部达标不得把断链面洗白。
+        detail = "；".join(f"{k}（{why}）" for k, why in unreadable[:10])
+        return (gs.UNTESTED,
+                [f"  [BAR-OVERFLOW] UNTESTED — {len(unreadable)} 个候选容器缺核心读数：{detail}"
+                 f"（取数面与裁定面字段名不一致，或该值在 JS 侧为 Infinity/NaN）；{label}"],
+                [], meta)
+    if not nodes:
+        return (gs.NOT_APPLICABLE,
+                [f"  [BAR-OVERFLOW] NOT_APPLICABLE — 测量面无候选容器"
+                 f"（computed display:flex/inline-flex 且子项底部对齐的容器 0 个），"
+                 f"本项不裁定也不计通过"] + [head], [], meta)
+    return (gs.PASS,
+            [f"  [BAR-OVERFLOW] PASS — {len(nodes)} 个候选容器内容均未探出容器顶"] + [head],
+            [], meta)
+
+
+def write_bar_overflow_record(temp_dir, status, findings, meta, report_lines=None, decision=None):
+    """bar_overflow 裁定留痕（_bar_overflow_check.json）——语义见 _write_check_record。"""
+    return _write_check_record(BAR_OVERFLOW_RECORD_NAME, temp_dir, status, findings, meta,
+                               report_lines=report_lines, decision=decision)
 
 
 def _thumb_size(png_bytes):
@@ -694,6 +887,11 @@ def main():
     parser.add_argument("--text-fit-rules", default=None,
                         help="覆盖 text_fit 阈值文件路径（回归取证用；默认读 "
                              "config/quality/video_quality_rules.json 单一权威源）")
+    parser.add_argument("--accept-bar-overflow-untested", action="store_true",
+                        help="底部对齐容器溢出判据无从裁定时知情放行（默认阻断；放行必须留痕）")
+    parser.add_argument("--bar-overflow-rules", default=None,
+                        help="覆盖 bar_overflow 阈值文件路径（回归取证用；默认读 "
+                             "config/quality/video_quality_rules.json 单一权威源）")
     args = parser.parse_args()
 
     html_path = Path(args.html)
@@ -775,6 +973,19 @@ def main():
         fit_status = gs.NOT_APPLICABLE
         fit_lines = ["  [TEXT-FIT] NOT_APPLICABLE — 本次只跑密度分析"
                      "（--density-only 不启动截图，行盒取数无对象）"]
+    # 底部对齐容器溢出门禁：同判据先读阈值，读不回即整项无从裁定
+    bar_rules, bar_rules_reason = load_bar_overflow_rules(args.bar_overflow_rules)
+    bar_status = None
+    bar_lines = []
+    bar_findings = []
+    bar_meta = {"thresholds": bar_rules}
+    if bar_rules is None:
+        bar_status = gs.UNTESTED
+        bar_lines = [f"  [BAR-OVERFLOW] UNTESTED — 阈值断链：{bar_rules_reason}"]
+    elif args.density_only:
+        bar_status = gs.NOT_APPLICABLE
+        bar_lines = ["  [BAR-OVERFLOW] NOT_APPLICABLE — 本次只跑密度分析"
+                     "（--density-only 不启动截图，容器几何取数无对象）"]
     if not args.density_only:
         print("\n--- Phase 2: Chrome Screenshots (puppeteer-core) ---")
 
@@ -782,6 +993,10 @@ def main():
             print(f"ERROR: Chrome not found: {args.chrome}")
             print("  Use --chrome to specify Chrome path, or --density-only to skip screenshots")
             return 1
+
+        # 收尾清理的作用域哨兵：本轮 run 目录尚未创建即失败时，finally 不得炸
+        # NameError（那会把"预览没跑成"变成"清理阶段崩了"这一条误导性归因）。
+        preview_temp_dir = None
 
         # Patch HTML with local GSAP to avoid CDN dependency
         patched_html = patch_html_with_local_gsap(html_path, temp_dir)
@@ -793,9 +1008,12 @@ def main():
             shutil.copy2(str(patched_html), str(html_path))
             html_needs_restore = True
 
-        # Capture output directory (project-managed temp area, inside the scan surface)
-        preview_temp_dir = str(PREVIEW_TEMP)
-        os.makedirs(preview_temp_dir, exist_ok=True)
+        # Capture output directory —— **按运行唯一化**（2026-10-15 面板建议批）。
+        # 旧实现直接用 PREVIEW_TEMP 固定名，其下的 chrome_profile 与 preview_captures
+        # 也是固定名：两支项目并行跑预览即抢同一个 user-data-dir，Chrome 报
+        # "browser is already running"；该失败发生在截图取数之前，容易被读成
+        # "画面/契约有问题"（另一条会话实证曾据此去查 CSS 契约，方向整个错掉）。
+        preview_temp_dir = str(make_run_scratch())
         capture_dir = Path(preview_temp_dir) / "preview_captures"
         capture_dir.mkdir(parents=True, exist_ok=True)
 
@@ -896,6 +1114,15 @@ def main():
                     for line in fit_lines:
                         print(line)
 
+                    # 底部对齐容器溢出裁定：同 text_fit 的分工（取数在 node、判据在此），
+                    # 阈值断链时不进 adjudicate（同上，判完的项不得再走一遍取数）。
+                    if bar_rules is not None:
+                        bar_status, bar_lines, bar_findings, _bar_meta = adjudicate_bar_overflow(
+                            manifest.get("bar_overflow"), bar_rules)
+                        bar_meta.update(_bar_meta)
+                    for line in bar_lines:
+                        print(line)
+
                     screenshots = []
                     for entry in manifest.get("scenes", []):
                         png_path = capture_dir / entry["file"]
@@ -952,14 +1179,8 @@ def main():
                     backup_html.unlink()
                     print("  Original HTML restored")
 
-            # Clean up Chrome temp data (avoid workspace pollution)
-            preview_cleanup_dir = PREVIEW_TEMP
-            if preview_cleanup_dir.exists():
-                try:
-                    shutil.rmtree(str(preview_cleanup_dir), ignore_errors=True)
-                    print(f"  Cleaned up: {preview_cleanup_dir}")
-                except Exception as cleanup_err:
-                    print(f"  Warning: could not clean {preview_cleanup_dir}: {cleanup_err}")
+            # 收尾：只删本轮工作目录（职责与归因见 cleanup_run_scratch）
+            cleanup_run_scratch(preview_temp_dir)
 
     # 取数面未跑成的兜底：捕获脚本超时/非零返回/整体异常时 manifest 从未被读到，
     # 此时该项不得留成"没有结论也没有点名"——补一条 UNTESTED 并点名成因。
@@ -976,6 +1197,22 @@ def main():
     except OSError as e:
         fit_record_path = None
         print(f"  [TEXT-FIT] 留痕写入失败（不影响裁定，影响追溯）: {e}")
+
+    # 同族兜底：bar_overflow 取数随同一次 node 调用，未跑成时同样补 UNTESTED 并点名。
+    if bar_status is None:
+        bar_status = gs.UNTESTED
+        bar_lines = ["  [BAR-OVERFLOW] UNTESTED — 捕获脚本未成功返回，"
+                     "bar_overflow 取数无落盘证据"]
+        print(bar_lines[0])
+    bar_decision = ("accepted_untested" if bar_status == gs.UNTESTED
+                    and args.accept_bar_overflow_untested else None)
+    try:
+        bar_record_path = write_bar_overflow_record(
+            temp_dir, bar_status, bar_findings, bar_meta,
+            report_lines=bar_lines, decision=bar_decision)
+    except OSError as e:
+        bar_record_path = None
+        print(f"  [BAR-OVERFLOW] 留痕写入失败（不影响裁定，影响追溯）: {e}")
 
     # --- Phase 3: Generate Report ---
     print("\n--- Phase 3: Preview Report ---")
@@ -1048,6 +1285,16 @@ def main():
     if fit_record_path is not None:
         report_lines.append(f"  留痕: {fit_record_path}")
 
+    # Bar overflow（底部对齐容器上探）——柱压字门禁，四态各有一行可读卡点
+    report_lines.append("")
+    report_lines.append("== Bar Overflow (底部对齐容器上探) ==")
+    report_lines.extend(bar_lines)
+    report_lines.append(f"  状态: {bar_status}"
+                        + (f"（已按 --accept-bar-overflow-untested 放行，留痕 decision="
+                           f"{bar_decision}）" if bar_decision else ""))
+    if bar_record_path is not None:
+        report_lines.append(f"  留痕: {bar_record_path}")
+
     # Overall assessment
     report_lines.append("")
     report_lines.append("== Overall Assessment ==")
@@ -1086,6 +1333,16 @@ def main():
                                else "—— 不得读成该项干净"))
     elif fit_status == gs.NOT_APPLICABLE:
         report_lines.append("  [N/A] 版面塌陷判据无测量对象（对象为 0 ≠ 查过且干净）")
+    # 容器溢出四态同族处理：N/A 与 UNTESTED 都不得写成通过
+    if bar_status == gs.FAIL:
+        report_lines.append(f"  [FAIL] {len(bar_findings)} 个底部对齐容器内元素探出容器顶"
+                            "（详见 == Bar Overflow == 节）")
+    elif bar_status == gs.UNTESTED:
+        report_lines.append("  [UNTESTED] 容器溢出判据无从裁定"
+                            + (f"（decision={bar_decision}，已知情放行）" if bar_decision
+                               else "—— 不得读成该项干净"))
+    elif bar_status == gs.NOT_APPLICABLE:
+        report_lines.append("  [N/A] 容器溢出判据无测量对象（对象为 0 ≠ 查过且干净）")
     total_deserts = len(desert_windows)
     total_sparse = len(sparse_windows)
     if total_deserts == 0 and total_sparse <= 1:
@@ -1116,12 +1373,18 @@ def main():
               "（每行字数低于 video_quality_rules.json → text_fit 的设计下限）—— "
               "加宽容器或缩短文本后重跑预览，禁止带此形态进入全量渲染。")
         return 2
+    # 容器溢出同档：柱压字是几何事实，改完再渲，不放行。
+    if bar_status == gs.FAIL:
+        print(f"\nPREVIEW FAILED: {len(bar_findings)} 个底部对齐容器内元素探出容器顶"
+              "（阈值见 video_quality_rules.json → bar_overflow）—— "
+              "加高容器／调整内容高度后重跑预览，禁止带此形态进入全量渲染。")
+        return 2
 
     # 退出码 2 = 真实溢出；3 = 预检存在盲区（零截图或部分场景未截到）。
     # 两者都不得当作 PASS 放行——盲区里溢出多少张图都不会被看见。
     if not args.density_only and phase2_error:
-        print(f"\nPREVIEW FAILED: 预览阶段异常（{phase2_error}）—— 字幕安全区与版面塌陷"
-              "两项本次没有跑完，异常被打印不等于检查通过。修好取数链后重跑预览，"
+        print(f"\nPREVIEW FAILED: 预览阶段异常（{phase2_error}）—— 字幕安全区、版面塌陷与"
+              "容器溢出三项本次没有跑完，异常被打印不等于检查通过。修好取数链后重跑预览，"
               "禁止带着这一盲区进入全量渲染。")
         return 3
     if not args.density_only and capture_count == 0:
@@ -1138,6 +1401,12 @@ def main():
     if fit_status == gs.UNTESTED and not args.accept_text_fit_untested:
         print("\nPREVIEW FAILED: 版面塌陷判据无从裁定（阈值断链/取数未跑成）—— "
               "按点名成因修复后重跑；确需带此盲区进入渲染，用 --accept-text-fit-untested "
+              "显式放行（会留痕）。")
+        return 3
+    # 容器溢出同族：放行开关独立（一个开关只覆盖一项，不得互相越界覆盖）。
+    if bar_status == gs.UNTESTED and not args.accept_bar_overflow_untested:
+        print("\nPREVIEW FAILED: 容器溢出判据无从裁定（阈值断链/取数未跑成）—— "
+              "按点名成因修复后重跑；确需带此盲区进入渲染，用 --accept-bar-overflow-untested "
               "显式放行（会留痕）。")
         return 3
     return 0

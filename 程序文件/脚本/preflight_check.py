@@ -67,6 +67,18 @@ RENDER_CRITICAL_CHECKS = {
     # 2026-10-13 复盘：6 处容器带 .rv 而入场的 tween 只打其子元素 → 父层 opacity
     # 恒 0、整块子树从未出现在成片里，终检 20 项与审计 6 维全绿未拦。
     "element_reveal",
+    # check 7c: 章级常驻条结构闭环（cl/cf 配对 · tag 自报归属 · 点亮锚）。手写
+    # HTML 三个环节各自独立书写，任一处漏改即成片观感与结构不符——实证
+    # building-perf-craft 曾缺第 6 章刻度（tag 有 06 无 cf6）。
+    "chapter_bar",
+    # check 7d: 画面文本中文语境夹半角标点（半角引号为主要形态）。字幕侧有 SRT
+    # 口径而画面文本无；手写 HTML 正文是唯一载体（实证七域系列 _修订01 三处，
+    # 字幕侧扫描 0 命中）。
+    "text_punct",
+    # check 4b: GSAP 主时间轴未注册进 window.__timelines。渲染器只驱动注册表
+    # （全局 tl 变量它不认），缺注册即每帧取 t=0；预览与空窗预判的 seek 腿读的恰是
+    # 全局 tl，故两条都看不见——只有全量渲完 + 码率门禁才暴露（一次 13 分钟级白渲）。
+    "timeline_registry",
     "scene_contract",     # check 0:  contract declaration mismatch
     "cue_declaration",    # check 0b: data-cue-at 词在该场旁白里定位不到（接线断，永不亮）
     "design_rules",       # check 8:  independent timeline, missing opacity:0
@@ -330,7 +342,8 @@ def check_json_config(config_path: Path, r: PreflightResult):
 
     # 单一权威源（AGENTS.md §1）：config 不得内嵌场景/时间轴数据。
     # 该节无任何语义消费者：主链的场景/时间轴一律来自 narration.json + HTML T-block；
-    # 唯一按数据读取它的 preflight_simple.py 不在流水线内，scene_patch_render.py:123
+    # 唯一按数据读取它的 preflight_simple.py（不在流水线内）已于 2026-10-16 作为零引用
+    # 死件删除；scene_patch_render.py:123
     # 只是把它并入 config 哈希（"渲染相关配置变更"的代理，不解读其内容）。
     # 2026-08-22 曾因它与 narration/HTML 分叉而误导 verify 报错定位。
     # 空节不判（历史脚手架脚本 fix_project_structures.py 会写空壳）。
@@ -353,6 +366,80 @@ def check_json_config(config_path: Path, r: PreflightResult):
         r.warn(f"No backup config found: {bak_path.name}")
 
     return cfg
+
+
+def _load_path_field_extensions():
+    """扩展名权威映射（唯一源 delivery_gate_rules.json → path_field_extensions）。
+
+    返回 (mapping, error)：任何"读不到/读不懂/节残缺"形态都把 error 填上，由调用方
+    判 ERROR 并点名断在哪条腿——不得由取数断链短路成一个干净的通过。
+    """
+    path = CONFIG_BASE / "quality" / "delivery_gate_rules.json"
+    if not path.exists():
+        return None, f"权威源缺失: {path}"
+    try:
+        rules = json.loads(path.read_text(encoding='utf-8')).get("path_field_extensions")
+    except (json.JSONDecodeError, OSError) as e:
+        return None, f"权威源不可读（{type(e).__name__}）: {path}"
+    if not isinstance(rules, dict):
+        return None, "权威源缺 path_field_extensions 节"
+    mapping = {k: v for k, v in rules.items()
+               if not k.startswith("$") and k != "description"}
+    bad = sorted(k for k, v in mapping.items()
+                 if not isinstance(v, str) or not v.startswith("."))
+    if not mapping:
+        return None, "path_field_extensions 节内无字段声明"
+    if bad:
+        return None, f"节内值形态非法（须为以 . 开头的扩展名）: {bad}"
+    return mapping, None
+
+
+def _dig_field(cfg, dotted):
+    """按点号路径取值；返回 (值, 该路径是否存在)。"""
+    cur = cfg
+    for part in dotted.split('.'):
+        if not isinstance(cur, dict) or part not in cur:
+            return None, False
+        cur = cur[part]
+    return cur, True
+
+
+def check_config_path_fields(cfg, r: PreflightResult):
+    """CRITICAL: config 路径字段的扩展名须等于权威源声明值（check 2b）。
+
+    存在理由（另一条会话实证）：更新 config 的脚本把 paths.video_name 写成 .srt，
+    两支成片遂以 .srt 名落进 成果文件/视频/ 并在后处理步失败——该键此前无任何校验。
+    字段缺位或值为空一律不判（它们按 config 形态是可选的，缺字段属项目形态而非违规）；
+    只在字段在场且非空时比对结尾扩展名。
+    """
+    print("\n[2b/12] Config Path Field Extensions")
+    check_id = "path_ext"
+    mapping, err = _load_path_field_extensions()
+    if err:
+        r.error(f"扩展名权威源无从读取，本项未核对（{err}）", check_id)
+        return
+    if not cfg:
+        r.error("config 未加载，路径字段扩展名无从核对（取数断链不得读成通过）", check_id)
+        return
+
+    checked = 0
+    bad_fields = []
+    for dotted, want in sorted(mapping.items()):
+        value, present = _dig_field(cfg, dotted)
+        if not present or value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        checked += 1
+        if not str(value).lower().endswith(want.lower()):
+            bad_fields.append(dotted)
+            r.error(f"{dotted} 扩展名应为 {want}，实为 {value!r}"
+                    " — 错名产物会以该扩展名落进成果目录并在后处理步失败", check_id)
+    r.counts[check_id] = {"checked": checked, "declared": len(mapping),
+                          "violations": len(bad_fields)}
+    if not checked:
+        r.info("本 config 未声明任何受校验的路径字段（NOT_APPLICABLE，非通过）", check_id)
+    elif not bad_fields:
+        # 有违规时不再印通过行：判红与"全部一致"同屏出现即把违规洗白成也通过
+        r.ok(f"{checked}/{len(mapping)} 个路径字段扩展名与权威源一致", check_id)
 
 
 def check_html_images(html_path: Path, r: PreflightResult):
@@ -468,6 +555,103 @@ def check_gsap_timing(html_path: Path, r: PreflightResult):
                     f"Transition {from_s}->{to_s}: comment says T={expected}s, "
                     f"actual tl.to at {actual}s (delta={actual-expected:.1f}s)"
                 )
+
+
+# 渲染器只驱动 window.__timelines 注册表里的时间轴，**全局 tl 变量它不认**
+# （hyperframes runtime：注册表为空/根 id 无匹配键时打印
+#  "Root timeline not bound — render will freeze at t=0"）。缺注册时渲染器不报错、
+#  每帧取 t=0，于是要等一次全量渲染跑完再由后处理码率门禁暴露。预览与空窗预判
+#  都看不见这一形态：它们的 seek 腿读的是全局 tl（本仓 69/69 项目都有该变量）。
+#
+# 两种注册写法在现网并存（2026-10-15 普查：方括号 56 份、点号 12 份），取数面
+#  必须同时覆盖——只 grep 方括号字面即把 12 份合法项目判红（取数口径窄于事实）。
+_TIMELINE_REGISTRY_PATTERNS = (
+    re.compile(r'''window\.__timelines\[\s*["']([^"']+)["']\s*\]\s*='''),
+    re.compile(r'window\.__timelines\.([A-Za-z_$][\w$]*)\s*='),
+)
+
+
+def _inline_scripts(content: str):
+    """内联 <script> 段（外链 script 标签无正文，不参与注册语句扫描）。"""
+    return re.findall(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', content, re.DOTALL)
+
+
+def timeline_registry_keys(body: str):
+    """注册表键名（按出现顺序去重）——本判据与探针回退腿共用的唯一取数处。"""
+    keys = []
+    for pat in _TIMELINE_REGISTRY_PATTERNS:
+        for m in pat.finditer(body):
+            if m.group(1) not in keys:
+                keys.append(m.group(1))
+    return keys
+
+
+def check_timeline_registration(html_path: Path, r: PreflightResult):
+    """CRITICAL: GSAP 主时间轴必须注册进 window.__timelines（渲染器的唯一驱动源）。"""
+    print("\n[4b/12] Timeline Registry Binding Check")
+    check_id = "timeline_registry"
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id)
+        return
+
+    content = html_path.read_text(encoding='utf-8', errors='replace')
+    scripts = _inline_scripts(content)
+    if not scripts:
+        # 取数断链：没有内联脚本＝无从判断有没有注册，不得读成"没有注册问题"
+        r.error("找不到内联 <script> 段，时间轴注册无从核对（取数断链不得读成通过）",
+                check_id)
+        return
+    body = "\n".join(scripts)
+
+    keys = timeline_registry_keys(body)
+    has_ctor = re.search(r'\bgsap\.timeline\s*\(', body) is not None
+    mentions_registry = 'window.__timelines' in body
+    r.counts[check_id] = {
+        "registered_keys": len(keys),
+        "has_timeline_ctor": has_ctor,
+        "mentions_registry": mentions_registry,
+    }
+
+    if not keys:
+        if has_ctor or mentions_registry:
+            # 含 mentions_registry：识别到注册表字样却取不到键名＝形态超出静态识别能力。
+            # 按 check_cue_declarations 的既有取舍判 ERROR——预检是阻断位点，"无从核对"
+            # 降为 WARN 即把"接线断了"读成"接线没问题"，后果是白付一次全量渲染。
+            r.error(
+                "GSAP 时间轴未注册进 window.__timelines"
+                + ("（识别到该字样的赋值但取不到键名，静态无法核对注册形态）"
+                   if mentions_registry else "（有 gsap.timeline 构造、无注册语句）")
+                + " — 渲染器只驱动注册表，缺注册将全程冻结在 t=0",
+                check_id)
+        else:
+            r.info("未发现 GSAP 时间轴构造，本项不适用（NOT_APPLICABLE，非通过）",
+                   check_id)
+        return
+
+    root_ids = re.findall(r'data-root="true"[^>]*?data-composition-id="([^"]+)"'
+                          r'|data-composition-id="([^"]+)"[^>]*?data-root="true"',
+                          content)
+    root_id = next((a or b for a, b in root_ids), None)
+
+    # 根声明了合成 id 却不在注册表里＝渲染器找不到主时间轴（与"整表为空"同一后果）。
+    # 键数多少不改变这条，故判在单键回退之前。现网 69/69 根元素无该属性，零误杀。
+    if root_id and root_id not in keys:
+        r.error(f"根 data-composition-id=\"{root_id}\" 不在注册键 {keys} 中"
+                " — 渲染器找不到主时间轴，将冻结在 t=0", check_id)
+        return
+
+    if len(keys) == 1:
+        r.ok(f"主时间轴已注册：window.__timelines[\"{keys[0]}\"]", check_id)
+        return
+
+    # 多键：渲染器按"根 data-composition-id 匹配键，无该属性时取注册表第一个"回退。
+    # 插入序是运行时事实，静态扫描无法确证哪个键落在第一位，故只否证不确证。
+    if root_id:
+        r.ok(f"{len(keys)} 个注册键，根 data-composition-id=\"{root_id}\" 在表中", check_id)
+    else:
+        r.warn(f"{len(keys)} 个注册键且根元素无 data-composition-id：渲染器按插入序"
+               f"取第一个（键名 {keys}），静态无从裁定驱动哪条 —— 请人工确认主时间轴在首",
+               check_id)
 
 
 def check_config_html_sync(cfg: dict, html_path: Path, r: PreflightResult):
@@ -1267,6 +1451,285 @@ def _descendants(node):
         out.append(cur)
         stack.extend(cur.children)
     return out
+
+
+def check_chapter_bar(html_path: Path, r: PreflightResult):
+    """CRITICAL (结构级): 章级常驻条（#clN 章名格 / #cfN 刻度格）与场景自报归属闭环。
+
+    2026-10-15 面板建议接入。存在理由：章级常驻条由手写 HTML 承载、编译器不产出
+    （它是常设观感默认而非必填项，无条的项目属正常），条上格子、场景自报归属、
+    GSAP 切换语句三个环节各自独立书写，任一处漏改即成片观感与结构不符——
+    实证 building-perf-craft 曾缺第 6 章刻度（tag 有 06 无 cf6）。
+    与最接近的 check_element_reveal 的分工：那条管"整体不可见"，本条管"结构性错位"。
+
+    三腿判据（零渲染、零像素）：
+      L1 配对：id="clN" 集合 == id="cfN" 集合（两向差集各点名）
+      L2 闭环：sN-tag 文本行首 `NN ·` → 存在 clNN；且 clNN 的全部点亮语句锚
+               == 该章**首个**带 NN 场景的 T 键（craft 修复形态证明锚点是章首场，
+               同章多场取最小场景号；锚收束场会把切章点推后一整段）
+      L3 点亮：每个 clN/cfN 必须有含 opacity:1（或 autoAlpha:1）的语句，锚 `T.sX`
+               须为 T 块已有键、第三参缺锚判错 —— "有 DOM 无语句" = 条上死格子，
+               该章永不点亮
+
+    取数纪律：
+      · DOM 面 html.parser（注释与 script/style 内容不进元素树），tag 文本取子树拼接；
+      · 脚本面**先剥 /* */ 与 // 注释再按 `;` 切语句**——注释里的 "#clN" 字面不得
+        凭空造出一条点亮语句（cue 声明接入时实测踩过该形态），一行多语句（craft
+        :686 形态）靠 `;` 切分区分，单语句多引用（数组形态）按 findall 全取；
+      · 点亮锚强制 `T.sX`：数值锚（第三参直接写秒数）在 adjust_timeline 改时间后
+        不随动、切章点必漂移，属违规而非另一种合法写法。
+
+    适用域与四态：
+      · 无 #clN/#cfN → 不适用（印 ok 并计数 0），不判红；
+      · sN-tag 行首无 `NN ·` 前缀（英文标签、"GATE 0 · 立项"等）→ 腿 2 无对象，
+        不判红（tag 是作者侧自报，非必填）；clN 无对应 tag 不判（无缺陷证据，
+        不为假设造分支）；
+      · 有 cl/cf 条但 T 块取不到（`var T = {...}` 形态未命中）→ ERROR 一次点名：
+        预检是阻断位点，"锚无从核对"不得静默跳过（A06 同族）。
+
+    check_id: chapter_bar（render 模式阻断；audit 模式降 warning）。
+    """
+    print("\n[7c/12] Chapter Bar (cl/cf pairing, tag closure, lit anchors)")
+
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id="chapter_bar")
+        return
+
+    content = html_path.read_text(encoding='utf-8')
+
+    # ── 1. DOM 面：id 集合 + 每元素直接文本（tag 文本取子树拼接） ──
+    from html.parser import HTMLParser
+
+    class _N:
+        __slots__ = ("tag", "id", "parent", "children", "text")
+
+        def __init__(self, tag, attrs, parent):
+            self.tag, self.parent, self.children = tag, parent, []
+            self.id = dict(attrs or []).get("id")
+            self.text = ""
+
+    class _P(HTMLParser):
+        VOID = {"img", "br", "hr", "input", "meta", "link", "source", "area",
+                "base", "col", "embed", "param", "track", "wbr"}
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root = _N("#root", [], None)
+            self.cur = self.root
+            self.nodes = []
+
+        def handle_starttag(self, tag, attrs):
+            n = _N(tag, attrs, self.cur)
+            self.cur.children.append(n)
+            self.nodes.append(n)
+            if tag not in self.VOID:
+                self.cur = n
+
+        def handle_endtag(self, tag):
+            node = self.cur
+            while node is not None and node.tag != tag:
+                node = node.parent
+            if node is not None and node.parent is not None:
+                self.cur = node.parent
+
+        def handle_data(self, data):
+            if data.strip():
+                self.cur.text += data.strip()
+
+    p = _P()
+    p.feed(content)
+
+    all_ids = {n.id for n in p.nodes if n.id}
+    cl_ids = sorted(int(i[2:]) for i in all_ids if re.fullmatch(r"cl\d+", i))
+    cf_ids = sorted(int(i[2:]) for i in all_ids if re.fullmatch(r"cf\d+", i))
+    if not cl_ids and not cf_ids:
+        r.counts["chapter_bar"] = {"cl": 0, "cf": 0, "tagged_chapters": 0,
+                                   "lit_ids": 0, "violations": 0}
+        r.ok("无章级常驻条（#clN/#cfN 均未声明，本检查不适用）", check_id="chapter_bar")
+        return
+
+    tag_chapter = {}   # 章号 → 该章最小场景号（章首场）
+    for n in p.nodes:
+        m = re.fullmatch(r"s(\d+)-tag", n.id or "")
+        if not m:
+            continue
+        t = n.text + "".join(d.text for d in _descendants(n))
+        cm = re.match(r'^\s*(\d{1,2})\s*·', t)
+        if cm:
+            scene_no, chap = int(m.group(1)), int(cm.group(1))
+            tag_chapter[chap] = min(tag_chapter.get(chap, scene_no), scene_no)
+
+    # ── 2. 脚本面：剥注释 → 按 ; 切语句 → 引用 + opacity:1 + T.sX 锚 ──
+    scripts = "".join(re.findall(r'<script[^>]*>(.*?)</script>', content, re.DOTALL))
+    scripts = re.sub(r'/\*.*?\*/', '', scripts, flags=re.DOTALL)
+    scripts = re.sub(r'//[^\n]*', '', scripts)
+
+    tm = re.search(r'var\s+T\s*=\s*\{([^}]*)\}', scripts, re.DOTALL)
+    t_keys = {int(k) for k in re.findall(r'\bs(\d+)\s*:', tm.group(1))} if tm else None
+
+    lit = {}   # ("cl"|"cf", N) → [锚场号或 None, ...]
+    for stmt in scripts.split(";"):
+        refs = re.findall(r'["\']#(cl|cf)(\d+)["\']', stmt)
+        if not refs:
+            continue
+        if not re.search(r'(?:opacity|autoAlpha)\s*:\s*1(?:\.0+)?(?![.\d])', stmt):
+            continue
+        am = re.search(r'\bT\.s(\d+)\b', stmt)
+        anchor = int(am.group(1)) if am else None
+        for kind, num in refs:
+            lit.setdefault((kind, int(num)), []).append(anchor)
+
+    # ── 3. 三腿裁定 ──
+    viol = []
+    for n in sorted(set(cl_ids) - set(cf_ids)):
+        viol.append(f"L1 cl{n} 无配对 cf{n}（章名格有、刻度格缺）")
+    for n in sorted(set(cf_ids) - set(cl_ids)):
+        viol.append(f"L1 cf{n} 无配对 cl{n}（刻度格有、章名格缺）")
+
+    for chap in sorted(tag_chapter):
+        if chap not in cl_ids:
+            viol.append(f"L2 第 {chap} 章自报（首场 s{tag_chapter[chap]}）但无 cl{chap} 章名格")
+            continue
+        for a in lit.get(("cl", chap), []):
+            if a is not None and a != tag_chapter[chap]:
+                viol.append(f"L2 cl{chap} 点亮锚 T.s{a} != 章首场 "
+                            f"T.s{tag_chapter[chap]}（切章点须落在章首场）")
+
+    for kind, nums in (("cl", cl_ids), ("cf", cf_ids)):
+        for n in nums:
+            anchors = lit.get((kind, n), [])
+            if not anchors:
+                viol.append(f"L3 {kind}{n} 有 DOM 无点亮语句（opacity:1）"
+                            f"——条上死格子，该章永不点亮")
+                continue
+            for a in anchors:
+                if a is None:
+                    viol.append(f"L3 {kind}{n} 点亮语句缺 T 锚点（第三参不是 T.sX）")
+                elif t_keys is not None and a not in t_keys:
+                    viol.append(f"L3 {kind}{n} 锚 T.s{a} 不在 T 块（键：{sorted(t_keys)}）")
+
+    if t_keys is None:
+        viol.append("T 块取不到（var T = {...} 形态未命中）"
+                    "——章级条锚无从核对，按缺陷处理")
+
+    r.counts["chapter_bar"] = {
+        "cl": len(cl_ids), "cf": len(cf_ids),
+        "tagged_chapters": len(tag_chapter), "lit_ids": len(lit),
+        "violations": len(viol),
+    }
+    for v in viol:
+        r.error(f"章级条结构：{v}", check_id="chapter_bar")
+    if not viol:
+        r.ok(f"章级条结构闭环：{len(cl_ids)} 章名格 / {len(cf_ids)} 刻度格配对，"
+             f"{len(tag_chapter)} 章自报归属，{len(lit)} 个格子有有效点亮锚",
+             check_id="chapter_bar")
+
+
+# 画面文本半角标点判据（check_text_punctuation）的主表与邻接语境集。
+# 主表＝八字句读标点；参考表（() % ~ - +）刻意不入判据——中文技术文本有合法
+# 用法（f(x) / 95% / 5~10 / ISO 9001-2015 / C++），全仓普查 79 处命中全为合法形态。
+TEXT_PUNCT_CHARS = ".,;:!?\"'"
+TEXT_PUNCT_FULLWIDTH = {",": "，", ".": "。", ";": "；", ":": "：", "!": "！",
+                        "?": "？", '"': "“”", "'": "‘’"}
+# 邻接语境＝中文语境的标点/全角字符区：CJK 汉字 + 中式标点（U+3000-303F）
+# + 全角区（U+FF00-FFEF）。全角区不可省：`。"` 段尾闭合形态里引号右邻是
+# 非汉字的全角字符，纯汉字集实测漏判 5 处（2026-10-15 探针扩集取证）。
+TEXT_PUNCT_CJK_CTX = re.compile(
+    r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
+
+
+def check_text_punctuation(html_path: Path, r: PreflightResult):
+    """CRITICAL (文本级): 画面文本中文语境夹半角标点（半角引号为主要形态）。
+
+    2026-10-15 面板建议接入。存在理由：字幕侧有 SRT 口径而没有"画面文本"口径，
+    手写 HTML 正文里的中文引号用半角双引号（"…"）在成片上显示为英文式直引号——
+    实证七域系列 _修订01 交付自查抓到三处，而字幕侧扫描 0 命中（病灶只存在于
+    HTML 正文）。半角逗号/句号/问号后接中文同属该形态。
+
+    判据（主表 8 字符 , . ; : ! ? " '）：
+      · 该字符**左邻或右邻**命中中文语境集（CJK 汉字 + 中式标点 U+3000-303F
+        + 全角区 U+FF00-FFEF）即判违规；
+      · `.` 例外：右邻为 ASCII 字母/数字即跳过（扩展名/域名/版本号/小数——
+        首轮普查 4 处 `.` 全部为该形态：`01_工作规矩.md` / `v1.2` / `3.5倍`，
+        无例外即 4 处误杀）；
+      · 参考表（() % ~ - +）刻意不入判据（见上方常量注释）。
+
+    取数纪律（与 _取证/20261015/text_punct_probe.py 同一口径，探针为标定件）：
+      · 文本段取 html.parser 的 data（convert_charrefs=True）——注释不进 data、
+        属性值（aria-label/alt）不进 data、script/style/title 整体跳过；
+      · data 保留原文不 strip：strip 会破坏段边缘字符的邻接关系；
+      · **跨元素边界不判**（`<b>中文</b>"…"` 里引号左邻是标签边界而非汉字）——
+        保守方向是漏判而非误杀。伪元素 content（CSS 生成文本）与属性值同属
+        已知漏判面，翻转条件＝出现真实病灶落在该类载体上再扩取数面（扩面须
+        同步探针与回归用例）。
+
+    适用域与四态：
+      · 文件缺失 → ERROR（预检是阻断位点，"无从核对"不得静默跳过，A06 同族）；
+      · 无文本段 → 不适用（印 ok 并计数 0）——空/纯脚本 HTML 无对象，不判红；
+      · 违规逐条 ERROR 并带 ±14 字上下文片段与全角替换提示；干净印 ok 行
+        （通过路径给出正证据，非由"无错误"反推）。
+
+    check_id: text_punct（render 模式阻断；audit 模式降 warning）。
+    """
+    print("\n[7d/12] Text Punctuation (ASCII punct in CJK screen text)")
+
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id="text_punct")
+        return
+
+    content = html_path.read_text(encoding='utf-8', errors='replace')
+
+    from html.parser import HTMLParser
+
+    class _TextScanner(HTMLParser):
+        SKIP = {"script", "style", "title"}
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.skip = 0
+            self.texts = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in self.SKIP:
+                self.skip += 1
+
+        def handle_endtag(self, tag):
+            if tag in self.SKIP and self.skip:
+                self.skip -= 1
+
+        def handle_data(self, data):
+            if not self.skip and data.strip():
+                self.texts.append(data)
+
+    scanner = _TextScanner()
+    scanner.feed(content)
+
+    findings = []
+    for seg_no, seg in enumerate(scanner.texts):
+        for i, ch in enumerate(seg):
+            if ch not in TEXT_PUNCT_CHARS:
+                continue
+            left = seg[i - 1] if i > 0 else ""
+            right = seg[i + 1] if i + 1 < len(seg) else ""
+            if not (TEXT_PUNCT_CJK_CTX.match(left) or TEXT_PUNCT_CJK_CTX.match(right)):
+                continue
+            if ch == "." and right and right.isascii() and right.isalnum():
+                continue
+            ctx = seg[max(0, i - 14):i] + f"【{ch}】" + seg[i + 1:i + 15]
+            ctx = re.sub(r'\s+', ' ', ctx)
+            findings.append(
+                f"第 {seg_no + 1} 文本段：…{ctx}…（{ch} → {TEXT_PUNCT_FULLWIDTH[ch]}）")
+
+    r.counts["text_punct"] = {"texts": len(scanner.texts),
+                              "violations": len(findings)}
+    for f in findings:
+        r.error(f"画面文本半角标点：{f}", check_id="text_punct")
+    if not findings:
+        if not scanner.texts:
+            r.ok("画面文本无文本段（本检查不适用）", check_id="text_punct")
+        else:
+            r.ok(f"画面文本无中文夹半角标点（扫描 {len(scanner.texts)} 文本段）",
+                 check_id="text_punct")
 
 
 def check_design_rules(html_path: Path, r: PreflightResult):
@@ -2147,14 +2610,18 @@ def main():
     # Run all checks — production readiness FIRST (upstream gate)
     check_production_readiness(project_dir, pre_cfg, r)
     cfg = check_json_config(config_path, r)
+    check_config_path_fields(cfg, r)
     check_html_images(html_path, r)
     check_gsap_timing(html_path, r)
+    check_timeline_registration(html_path, r)
     check_config_html_sync(cfg, html_path, r)
     check_bak_consistency(html_path, r)
     check_scene_contracts(html_path, r)
     check_cue_declarations(html_path, cfg or pre_cfg, r)
     check_scene_visibility(html_path, r)
     check_element_reveal(html_path, r)
+    check_chapter_bar(html_path, r)
+    check_text_punctuation(html_path, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)
     check_placeholder_images(html_path, r)

@@ -31,15 +31,18 @@ import shutil
 import argparse
 import time
 from pathlib import Path
-from script_interface import Config, Result, Logger, EXIT_CODE, atomic_write_json
+from script_interface import (Config, Result, Logger, EXIT_CODE, atomic_write_json,
+                              atomic_write_text)
 
-# 换包装时必须持住旧流对象（与 pipeline_runner.py:55-60 同一修法）：旧 TextIOWrapper
-# 一旦被 GC，其析构会关掉共享的底层 buffer，import 本模块的宿主（回归套件、探针）
-# 之后任何打印都报 "I/O operation on closed file"。本批的用例89 是第一个
-# in-process 驱动 `main()` 的用例，撞上后即修法，不是绕开。
+# 换包装时必须持住旧流对象，换完后还须持住本次造出的新代（与 pipeline_runner /
+# enhance_video_audio 同名保活对同一修法）：旧 TextIOWrapper 一旦引用归零即 finalize
+# （无需 gc.collect），其析构会关掉共享的底层 buffer，import 本模块的宿主（回归
+# 套件、探针）之后任何打印都报 "I/O operation on closed file"。只持旧不足以防住
+# 自造新代——它没有别的持有者，下个重绑点一顶掉它即引用归零。用例105 锁定。
 _streams_prev = (sys.stdout, sys.stderr)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+_streams_kept = (sys.stdout, sys.stderr)
 
 # Import shared GSAP time resolution utilities
 sys.path.insert(0, str(Path(__file__).parent))
@@ -443,17 +446,27 @@ def detect_cover_duration(html_content):
 
 
 def _read_hash(hash_path):
-    """Read stored MD5 hash from .hash file."""
+    """读 .hash。返回合法 MD5 串；任何断链形态一律返回 None。
+
+    缺失 / 空文件 / 半截（写盘被打断）/ 非十六进制 / 读不出，全部归并为 None 是有意的：
+    调用方对"没有可信哈希"只能采取同一个动作（按当前内容重设基线），区分形态只影响
+    归因文案、不影响裁定方向。**旧实现把断链返回的 None/"" 交给 `if stored_hash and ...`
+    判断，短路成"无手工编辑"，随后无条件从 .bak 恢复——等于把"哈希没读到"读成"没人改过"，
+    本轮刚补进 HTML/config 的修复会被抹掉（2026-10-15 面板建议批实证形态）。**
+    """
     try:
-        return Path(hash_path).read_text(encoding='utf-8').strip()
-    except FileNotFoundError:
+        raw = Path(hash_path).read_text(encoding='utf-8').strip()
+    except OSError:
         return None
+    if len(raw) == 32 and all(c in '0123456789abcdefABCDEF' for c in raw):
+        return raw
+    return None
 
 
 def _write_hash(hash_path, content):
-    """Write MD5 hash of content to .hash file."""
+    """Write MD5 hash of content to .hash（原子：半截写即断链，见 _read_hash）。"""
     h = hashlib.md5(content.encode('utf-8')).hexdigest()
-    Path(hash_path).write_text(h, encoding='utf-8')
+    atomic_write_text(hash_path, h)
 
 
 def _write_narration_scenes(narration_path, scenes, cover_duration):
@@ -660,7 +673,15 @@ def main():
         stored_hash = _read_hash(html_hash_path)
         current_hash = hashlib.md5(html_content.encode('utf-8')).hexdigest()
 
-        if stored_hash and current_hash != stored_hash:
+        if stored_hash is None:
+            # 断链 → 按当前 HTML 重设基线。走 else 分支会从 .bak 恢复，把本轮刚补的
+            # 修复（如场景根 opacity）一并抹掉，且日志上完全看不出发生过。
+            shutil.copy2(html_path, html_bak)
+            _write_hash(html_hash_path, html_content)
+            html_content = html_path.read_text(encoding='utf-8')
+            print("  [HASH-BROKEN] HTML .hash 缺失或不可解析 → 按当前 HTML 重设基线"
+                  "（不恢复 .bak）")
+        elif current_hash != stored_hash:
             # HTML was manually edited since last adjust_timeline run
             # Discard stale backup, use current HTML as new baseline
             shutil.copy2(html_path, html_bak)
@@ -688,7 +709,14 @@ def main():
         stored_cfg_hash = _read_hash(config_hash_path)
         current_cfg_text = config_path.read_text(encoding='utf-8')
         current_cfg_hash = hashlib.md5(current_cfg_text.encode('utf-8')).hexdigest()
-        if stored_cfg_hash and current_cfg_hash != stored_cfg_hash:
+        if stored_cfg_hash is None:
+            # 同 HTML 侧：断链不得走"从 .bak 恢复"。config 是单一权威源，被旧备份
+            # 覆盖等于把本轮刚改的字段（时长预算/停顿声明/路径字段…）静默回退。
+            shutil.copy2(config_path, config_bak)
+            _write_hash(config_hash_path, current_cfg_text)
+            print("  [HASH-BROKEN] config .hash 缺失或不可解析 → 按当前 config 重设基线"
+                  "（不恢复 .bak）")
+        elif current_cfg_hash != stored_cfg_hash:
             # Config was manually edited since last adjust_timeline run
             shutil.copy2(config_path, config_bak)
             _write_hash(config_hash_path, current_cfg_text)

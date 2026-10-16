@@ -64,7 +64,6 @@
   },
   "pause_measurement": {
     "audible_floor_seconds": 0.2,
-    "min_sample_seconds": 0.15,
     "_判据": "音频面读数（可选，需该项目已有 _timeline_manifest.json 且该场 method=asr_forced 且带 chars）：把逐发音字符的实测时间戳映射回旁白原文，量每个标点后的静音间隔；间隔 < audible_floor_seconds 即点名『标了标点但几乎没停』。取不到 manifest／该场未对齐／chars 与 norm 长度不等 → 该场逐场点名跳过，不得按 0 计。",
     "_下限依据": "本仓实测停顿分布（标点类中位）：句号 0.40、分号 0.44、冒号 0.40、逗号 0.34、顿号 0.30、字间无标点 0.00；0.2s 取在『短停顿』与『连读』之间，用于点名异常而非裁定合格。"
   }

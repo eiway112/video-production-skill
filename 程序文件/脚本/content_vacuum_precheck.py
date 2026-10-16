@@ -125,7 +125,50 @@ def parse_scenes(html: str):
     return measured, not_applicable, untested
 
 
-def make_probe(html_src: Path, work: Path) -> Path:
+# HTML 里的相对资源引用（图片/脚本/样式）。协议头、data URI 与绝对路径（含 //host）
+# 不取——它们不依赖工作目录，复制到探针工作区反而无意义。
+_RELATIVE_REF_RE = re.compile(
+    r'(?:src|href)\s*=\s*["\'](?!https?:|data:|file:|blob:|/)([^"\'#\?]+)', re.I)
+
+
+def relative_asset_refs(src: str):
+    """被测 HTML 引用的相对路径资源，去重保序（探针工作目录需要它们才能在位）。"""
+    from urllib.parse import unquote
+    out = []
+    for ref in _RELATIVE_REF_RE.findall(src):
+        ref = unquote(ref).strip().lstrip('./')
+        if ref and ref not in out:
+            out.append(ref)
+    return out
+
+
+def copy_referenced_assets(html_src: Path, work: Path, refs):
+    """把 HTML 引用的相对资源按原层级复制进探针工作目录。
+
+    存在理由：探针 HTML 落在别处的临时区，`./assets/x.png` 相对它解析不到 → 含图
+    场次的覆盖率被**系统性低估**（实测同一场 0.223 → 素材在位后 0.489）。旧实现只
+    硬编码复制 gsap.min.js，那是"已知资源名逐个补"，图片这类同案资源仍漏；现按
+    HTML 实际引用取数（登记面＝真实读取路径）。
+
+    返回缺失清单并点名：引用了但项目目录里没有＝被测件自身缺陷（该场仍会偏低），
+    不得由探针静默兜掉，也不得因为"复制不到"就把整场判成空窗。
+    """
+    missing = []
+    project = html_src.parent
+    for ref in refs:
+        src_path = (project / ref).resolve()
+        # 只带项目目录内的引用：指向项目外的引用在探针里同样解析不到，点名而非跟随
+        if not str(src_path).startswith(str(project.resolve())) or not src_path.is_file():
+            missing.append(ref)
+            continue
+        dst = work / ref
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dst)
+    return missing
+
+
+def make_probe(html_src: Path, work: Path):
+    """生成 seek 探针；返回 (probe 路径, 未能带入工作目录的资源引用)。"""
     src = html_src.read_text(encoding="utf-8")
     if "</body>" not in src:
         raise RuntimeError(f"{html_src} 缺少 </body>，无法注入 seek 探针")
@@ -137,9 +180,18 @@ def make_probe(html_src: Path, work: Path) -> Path:
   window.__ready = false;
   requestAnimationFrame(function () {
     requestAnimationFrame(function () {
-      if (typeof tl !== 'undefined' && tl && tl.pause) {
-        tl.pause();
-        tl.seek(t, false);
+      // 驱动源两腿：全局 tl（本仓 69/69 项目都有），取不到则回退渲染器真正驱动的
+      // window.__timelines 注册表（唯一条目）。旧实现只认 tl，注册表写法不同名时
+      // 探针静默不 seek——两帧同为 t=0 会让比值恒 1、把空窗判成 OK（漏判而非误杀）。
+      var driver = (typeof tl !== 'undefined' && tl && tl.pause) ? tl : null;
+      if (!driver) {
+        var reg = window.__timelines || {};
+        var ks = Object.keys(reg).filter(function (k) { return reg[k] && reg[k].pause; });
+        if (ks.length === 1) driver = reg[ks[0]];
+      }
+      if (driver) {
+        driver.pause();
+        driver.seek(t, false);
         if (typeof gsap !== 'undefined') gsap.ticker.tick();
       }
       window.__ready = true;
@@ -150,10 +202,8 @@ def make_probe(html_src: Path, work: Path) -> Path:
 </body>"""
     probe = work / "probe.html"
     probe.write_text(injected, encoding="utf-8")
-    gsap = html_src.parent / "gsap.min.js"
-    if gsap.exists():
-        shutil.copy2(gsap, work / "gsap.min.js")
-    return probe
+    missing = copy_referenced_assets(html_src, work, relative_asset_refs(src))
+    return probe, missing
 
 
 def shoot(chrome: Path, probe: Path, t: float, out: Path):
@@ -298,8 +348,13 @@ def main():
     work.mkdir(parents=True)
     try:
         chrome = find_chrome()
-        probe = make_probe(html_src, work)
+        probe, missing = make_probe(html_src, work)
         print(f"content_vacuum 预判（零渲染，判据与 visual_boundary_check 同源）: {html_src.parent.name}")
+        if missing:
+            print(f"  ⚠ HTML 引用了但未能带入工作目录的资源 {len(missing)} 项 -> "
+                  + ", ".join(missing[:8])
+                  + ("…" if len(missing) > 8 else "")
+                  + "（该场覆盖率仍会偏低，属被测件引用问题，不因此判空窗）")
         for sid, reason in untested:
             print(f"  {sid:6s} 无从推导窗口 -> UNTESTED（{reason}）")
         results = [probe_scene(chrome, probe, sid, s, d, work, not args.quiet)

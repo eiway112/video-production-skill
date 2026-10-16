@@ -402,7 +402,30 @@ def resolve_and_apply(html_text, scenes_by_id):
 # 实测（2026-10-12 agent-decision-map 首轮）：按"句子"直觉选词时 27 条里有 3 条段内偏移为 0
 # （词级时刻＝句级时刻，挂 cue 等于没挂）、6 条预估差值 <1.6s，而按句子校验全部判"可定位"。
 # 判据：**词级/句级差值的边界是字幕分段，不是句子**——故本函数用生产同一个分段函数取段。
-MIN_OBSERVABLE_OFFSET_CHARS = 6   # 段内偏移低于此值＝差值不可观测（按 §八·补 成片折算率 4.0 字符/秒 ≈ 1.5s）
+def _cue_offset_threshold():
+    """段内偏移可观测档的取数：权威源 video_quality_rules.json → cue_placement，取不回才兜底。
+
+    2026-10-16 单源收敛：该阈值此前只住本模块常量，而换算率在三处各写一份
+    （本行注释 4.0 字/秒、AGENTS.md 记实测回归 4.76 字/秒、踩坑清单 3.87–3.95）。
+    阈值入配置后，常量降为"配置断链时的兜底"，且**兜底必须可见**（来源随读数一起
+    暴露给 CUE_OFFSET_SOURCE，用例107 锁"值真来自配置文件而非调用点字面量"）。
+    本预检面是 WARN 档（不裁定交付），故取不回按"回退＋点名"处理，不比照 text_fit
+    那类承载门禁的节点走 fail-closed——两处失效面不同，混为一档会把提示性工具变成阻断。
+    """
+    fallback = 6
+    try:
+        import json
+        from pathlib import Path
+        p = Path(__file__).resolve().parent.parent / "配置" / "config" / "quality" / "video_quality_rules.json"
+        val = int(json.loads(p.read_text(encoding="utf-8"))["cue_placement"]["min_observable_offset_chars"])
+        if val <= 0:
+            raise ValueError("非正数")
+        return val, "video_quality_rules.json → cue_placement.min_observable_offset_chars"
+    except Exception as e:                                  # noqa: BLE001
+        return fallback, f"兜底字面量 6（配置取不回：{type(e).__name__}: {str(e)[:60]}）"
+
+
+MIN_OBSERVABLE_OFFSET_CHARS, CUE_OFFSET_SOURCE = _cue_offset_threshold()
 
 
 def _production_segmenter():

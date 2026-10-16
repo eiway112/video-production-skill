@@ -90,6 +90,11 @@ class RegressionTestCase:
 # 套件级共用判据
 # ============================================================================
 
+# 套件脚本目录单点。需要定位"与本套件同仓的取证件"的用例一律用它，不得各写一份
+# `Path(__file__)...` 推导；它与引擎侧 `_script_env.SCRIPT_DIR` 的同源性由用例108 D1 断言。
+SUITE_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
 def export_repo_face(tc: RegressionTestCase) -> str:
     """返回 'dev'（本仓面）或 'published'（发布仓面）；半导出即判红并返回 'dev'。
 
@@ -100,7 +105,7 @@ def export_repo_face(tc: RegressionTestCase) -> str:
     "不导出"读成"回归坏了"）。故按脱敏三件套是否在位切分支，与用例67/77/78 的
     "缺席即锁"同一手法，只是抽成单点以免第四处各写一份判据。
     """
-    script_dir = Path(__file__).parent
+    script_dir = SUITE_SCRIPT_DIR
     trio = [script_dir / "publish_export_gate.py",
             script_dir.parent / "配置" / "config_dev" / "publish_redact_terms.json",
             script_dir.parent.parent / "AI视频制作工作流模板" / "发布仓导出清单_方案B.md"]
@@ -363,24 +368,103 @@ Second subtitle
     return tc
 
 def test_subtitle_overflow_detection() -> RegressionTestCase:
-    """用例6：字幕溢出检测"""
+    """用例6：字幕溢出检测（2026-10-16 重写为执行级）。
+
+    旧形态是**自算恒真**：局部变量 `duration_s = 30.0` / `srt_end_s = 35.0` 相减后
+    断言差值 > 0.5，全程没有调用过 `media_qa_gate`。它占用例名册里"字幕溢出已覆盖"
+    那一格，而把生产侧的 `subtitle_not_overflow` 整段摘掉，本用例照样绿——
+    即 AGENTS.md 记过的"断言恒真＝空跑"在本仓的又一例（且是全仓唯一对该检查项的覆盖，
+    实测 `grep subtitle_not_overflow regression_test.py` 除本例外命中 0）。
+    现改为直调终检真身，正反两档：越过 0.5s 容差判 FAIL、落在容差内判 PASS，
+    并锁"时长取不到时不得判通过"（四态纪律）。
+    """
     tc = RegressionTestCase(
         "subtitle_overflow_detection",
-        "验证字幕不能超过视频结尾"
+        "验证字幕不能超过视频结尾（由 media_qa_gate 真身裁定）"
     )
-    
     try:
-        # 模拟检查逻辑
-        duration_s = 30.0
-        srt_end_s = 35.0
-        overflow = srt_end_s - duration_s
-        
-        tc.assert_true(overflow > 0.5, "Overflow detected correctly")
+        import json
+        import tempfile
+        import types
+        from pathlib import Path
+        import media_qa_gate as mq
+        import _gate_status as gs
+
+        saved = {}
+
+        def _patch(name, value):
+            if name not in saved:
+                saved[name] = getattr(mq, name)
+            setattr(mq, name, value)
+
+        def _restore():
+            for k, v in saved.items():
+                setattr(mq, k, v)
+
+        def run_case(tmp, duration, last_end_s):
+            """造一份只有"时长 vs 末条字幕结束点"这一个变量的夹具，其余腿一律桩成干净。"""
+            video = tmp / "案例成片.mp4"
+            video.write_bytes(b"fake")
+            srt = tmp / "案例成片.srt"
+            srt.write_text(
+                f"1\n00:00:01,000 --> 00:00:{int(last_end_s):02d},000\n第一段旁白\n",
+                encoding="utf-8")
+            cfg = tmp / "cfg.json"
+            cfg.write_text(json.dumps({"fps": 25, "resolution": "1920x1080"}),
+                           encoding="utf-8")
+            src = tmp / "_subtitle_timestamp_source.json"
+            src.write_text(json.dumps({
+                "subtitle_file": srt.name,
+                "srt_entries": len(mq.parse_srt(str(srt))),
+                "scenes": [{"scene_id": "s1", "source": "asr_forced", "segments": 1}],
+            }, ensure_ascii=False), encoding="utf-8")
+            _patch("ffprobe_get_streams", lambda p: [
+                {"codec_type": "video", "codec_name": "h264", "bit_rate": "1500000",
+                 "r_frame_rate": "25/1", "width": 1920, "height": 1080},
+                {"codec_type": "audio", "codec_name": "aac", "bit_rate": "128000"}])
+            _patch("ffprobe_get_duration", lambda p, d=None: duration)
+            _patch("ffmpeg_detect_silence", lambda p, d=None: 1.0)
+            _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: [1.0, 1.2, 1.4, 1.6, 1.8])
+            _patch("ffmpeg_detect_black_intervals", lambda *a, **k: [])
+            _patch("ffmpeg_detect_long_silences", lambda *a, **k: [])
+            _patch("subprocess", types.SimpleNamespace(
+                run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")))
+            qa = mq.MediaQAGate()
+            _passed, res = qa.validate(str(video), str(srt), visual_check_passed=True,
+                                       config_path=str(cfg), subtitle_source_path=str(src))
+            return res
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            try:
+                # A. 越过 0.5s 容差 → 该项 FAIL，且整体不得判 PASS
+                res_a = run_case(tmp, duration=10.0, last_end_s=13)
+                tc.assert_equal(res_a["check_statuses"].get("subtitle_not_overflow"), gs.FAIL,
+                                f"A1 末条字幕 13s 对 10s 成片须判 FAIL，实得 "
+                                f"{res_a['check_statuses'].get('subtitle_not_overflow')}")
+                tc.assert_equal(res_a["verdict"], gs.FAIL,
+                                "A2 单项 FAIL 即整体 FAIL（不得被其余项的绿洗白）")
+                tc.assert_true(any("Subtitle overflow" in str(e) and "13.0s" in str(e)
+                                   for e in res_a.get("errors", [])),
+                               f"A3 违规文案须点名实测两端点（取自数据面，非手抄结论），实得 {res_a.get('errors')}")
+
+                # B. 落在容差内（10.4s 对 10.0s，<0.5s）→ 该项 PASS
+                res_b = run_case(tmp, duration=10.0, last_end_s=10)
+                tc.assert_equal(res_b["check_statuses"].get("subtitle_not_overflow"), gs.PASS,
+                                "B1 容差内的收尾不得判违规（阈值一格未动，只是夹具换档）")
+
+                # C. 时长取不到（ffprobe 失败）→ 该项不得静默 PASS
+                res_c = run_case(tmp, duration=0.0, last_end_s=99)
+                status_c = res_c["check_statuses"].get("subtitle_not_overflow")
+                tc.assert_true(status_c != gs.PASS,
+                               f"C1 时长无从裁定时不得把溢出项记成通过，实得 {status_c}")
+            finally:
+                _restore()
+
         tc.mark_passed()
-        
     except Exception as e:
-        tc.mark_failed(str(e))
-    
+        import traceback
+        tc.mark_failed("subtitle overflow error: " + str(e) + "\n" + traceback.format_exc())
     return tc
 
 def test_pipeline_state_fingerprint() -> RegressionTestCase:
@@ -549,7 +633,14 @@ def test_completion_report_cli_entry() -> RegressionTestCase:
     return tc
 
 def test_media_qa_gate_checks() -> RegressionTestCase:
-    """用例10：媒体QA门禁检查项"""
+    """用例10：媒体QA门禁检查项。
+
+    2026-10-15 加固：术语词典（subtitle_term_rules.json）正反例——直调显示层替换真身
+    （enhance_video_audio._normalize_subtitle_terms）锁"该换的换"（点Json→.json、
+    毫米→mm、杰森文件→JSON 文件、千瓦时→kWh 四类）与"该留的留"（立方/平方前缀保护，
+    即用户验收抓到的『每立方cm』事故形态，删掉负向后顾即复现）；lint 侧补三向
+    （已替换文本无残留 / 正常中文『点击』不误伤 / 多形态扩展名仍命中）。
+    """
     tc = RegressionTestCase(
         "media_qa_gate_checks",
         "验证媒体QA门禁检查项齐备（黑场重叠/单字行/术语规范新门禁，项名见 media_qa_gate docstring）"
@@ -594,6 +685,53 @@ def test_media_qa_gate_checks() -> RegressionTestCase:
         _hit = any(_re.compile(p['pattern']).search('配置写在点Json文件里')
                    for p in term_patterns)
         tc.assert_true(_hit, "check16: lint pattern catches '点Json' leakage")
+
+        # 术语词典正反例（2026-10-15 用户验收"每立方cm"事故的回归锁）——
+        # 直调显示层替换真身（enhance_video_audio._normalize_subtitle_terms，单一权威源），
+        # 正例证"该换的换"、反例证负向后顾保护在位（删掉即复现中英混排）
+        from enhance_video_audio import (
+            _load_subtitle_term_rules,
+            _normalize_subtitle_terms,
+        )
+        _term_rules = _load_subtitle_term_rules()
+        tc.assert_true(len(_term_rules.get("replacements", [])) > 0,
+                      "term_rules: replacements from authoritative dictionary loadable "
+                      "and non-empty (空规则＝显示层替换整体静默失效)")
+        for _src, _want, _why in (
+            ("配置写在点Json文件里", "配置写在.json文件里",
+             "点Json → .json（串中文中形态，非仅串首）"),
+            ("隔声层 15 毫米", "隔声层 15 mm", "单位类：毫米 → mm"),
+            ("杰森文件损坏", "JSON 文件损坏", "中文音译形态：杰森文件 → JSON 文件"),
+            ("耗电 2 千瓦时", "耗电 2 kWh", "单位类：千瓦时 → kWh"),
+        ):
+            _got = _normalize_subtitle_terms(_src)
+            tc.assert_true(_got == _want,
+                          f"term_rules 正例：{_why}（实得 {_got!r}）")
+        for _phrase, _why in (
+            ("每立方厘米", "2026-10-15 用户验收抓到的『每立方cm』事故形态"),
+            ("平方毫米", "『平方』前缀保护"),
+            ("立方毫米", "『立方』前缀保护"),
+            ("平方厘米", "『平方』前缀保护"),
+        ):
+            _kept = _normalize_subtitle_terms(_phrase)
+            tc.assert_true(_kept == _phrase,
+                          f"term_rules 反例：{_phrase} 须整体保留中文（{_why}；"
+                          f"负向后顾删掉即复现）：实得 {_kept!r}")
+        _cleaned = _normalize_subtitle_terms("配置写在点Json文件里")
+        _leak = [p["pattern"] for p in term_patterns
+                 if _re.compile(p["pattern"]).search(_cleaned)]
+        tc.assert_true(not _leak,
+                      f"check16b: 已替换文本不得再命中 lint"
+                      f"（replacements 消除 lint 形态；残留 {_leak}＝词典缺口）")
+        _fp_hit = [p["pattern"] for p in term_patterns
+                   if _re.compile(p["pattern"]).search("点击开始按钮")]
+        tc.assert_true(not _fp_hit,
+                      f"check16c: lint 不得误伤正常中文（点击 等形态；"
+                      f"命中 {_fp_hit}＝pattern 被改宽）")
+        _multi_ok = all(any(_re.compile(p["pattern"]).search(t) for p in term_patterns)
+                        for t in ("视频是点mp4", "字幕是点 Srt 文件", "脚本是点py"))
+        tc.assert_true(_multi_ok,
+                      "check16d: lint 覆盖多形态扩展名直通（点mp4 / 点 Srt / 点py）")
         
         tc.mark_passed()
         
@@ -884,14 +1022,34 @@ def test_pipeline_cache_fingerprint_wiring() -> RegressionTestCase:
         tc.assert_true('"--fresh"' in runner_content and "fresh=args.fresh" in runner_content,
                       "--fresh flag exists and is wired into PipelineRunner")
         
-        # 6. 完成时必须记录指纹——计数基准取运行时 STEPS，不抄字面 8
-        #    （2026-09-19 审核 A12：手抄阈值与权威清单脱钩即静默失去覆盖）
-        fp_records = runner_content.count("self._fingerprint(")
-        tc.assert_equal(len(_pr.STEPS), 10,
-                        "STEPS is the step-count authority (change this only with intent)")
-        tc.assert_true(fp_records >= len(_pr.STEPS),
-                       f"Every step records a fingerprint on completion "
-                       f"(found {fp_records}, need >=len(STEPS)={len(_pr.STEPS)})")
+        # 6. 完成时必须记录指纹——2026-10-16 由"数源码出现次数"改为逐步配对。
+        #    旧形态 `runner_content.count("self._fingerprint(") >= len(_pr.STEPS)` 属本仓
+        #    A12 点名的"数源码字符串常量"型弱断言：任意另一步多调一次即可补足计数，
+        #    而某一步整体不再记指纹时照样绿。现按 AST 逐枚配对——每个步骤名都要存在
+        #    一处 mark_completed("<step>", self._fingerprint("<step>"))，且两处字面量同名，
+        #    缺失与跨步错配各自显形。
+        import ast as _ast16
+        _tree16 = _ast16.parse(runner_content)
+        _pairs = set()
+        for _n in _ast16.walk(_tree16):
+            if not isinstance(_n, _ast16.Call):
+                continue
+            _f = _n.func
+            if not (isinstance(_f, _ast16.Attribute) and _f.attr == "mark_completed"):
+                continue
+            if len(_n.args) < 2:
+                continue
+            a0, a1 = _n.args[0], _n.args[1]
+            if not (isinstance(a0, _ast16.Constant) and isinstance(a0.value, str)):
+                continue
+            _inner = a1.func if isinstance(a1, _ast16.Call) else None
+            if (isinstance(_inner, _ast16.Attribute) and _inner.attr == "_fingerprint"
+                    and a1.args and isinstance(a1.args[0], _ast16.Constant)
+                    and a1.args[0].value == a0.value):
+                _pairs.add(a0.value)
+        _missing16 = sorted(set(s[0] for s in _pr.STEPS) - _pairs)
+        tc.assert_equal(_missing16, [],
+                        f"6 每个步骤都须有 mark_completed(step, _fingerprint(step)) 配对，缺：{_missing16}")
         
         tc.mark_passed()
         
@@ -3124,7 +3282,8 @@ def test_config_single_source_timeline_rejected() -> RegressionTestCase:
     """用例40：config 内嵌 timeline 节 → preflight 报错（单一权威源，2026-08-31）
 
     背景：11 个存量项目 config 内嵌 t_block/scene_metadata，无任何语义消费者
-    （唯一按数据读取它的 preflight_simple.py 不在流水线内；scene_patch_render.py:123
+    （历史上唯一按数据读取它的 preflight_simple.py 不在流水线内，2026-10-16 作为零引用
+    死件删除；scene_patch_render.py:123
     仅把它并入 config 哈希，不解读内容），清除前普查 21 份含该节者中 14 份已与自身
     video_duration 分叉（统计取自 git 清除前版本）；8-22 的 verify 报错定位正是被
     这份死数据误导。本次清除死数据并把红线代码化。
@@ -3656,8 +3815,12 @@ def test_scene_patch_default_route_and_time_witness() -> RegressionTestCase:
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace", timeout=180)
                 help_text = " ".join((cli.stdout or "").split())
-                tc.assert_true("--no-scene-patch" in help_text,
-                               "E2 CLI exposes the opt-out flag")
+                # 整词匹配（同文件 :6763 那条已立此判据）：子串匹配会放过改名形态，
+                # 例如把开关改成 `--no-scene-patch-v2` 时旧断言仍绿，而调用方已失效。
+                import re as _re43
+                tc.assert_true(bool(_re43.search(
+                    r"(?<![\w-])--no-scene-patch(?![\w-])", help_text)),
+                    "E2 CLI exposes the opt-out flag (whole-token match)")
                 tc.assert_true("always attempts it when a baseline exists" in help_text,
                                "E2 opt-out help states the baseline-present default")
                 tc.assert_true("DEPRECATED / no-op" in help_text,
@@ -3779,6 +3942,35 @@ def test_delivery_slot_written_only_by_postprocess() -> RegressionTestCase:
                 runner._delivery_slot_guard("postprocess")
                 tc.assert_equal(runner.state.data["steps"]["postprocess"]["started"], started,
                                 "B6 guard does not reset a running step's started timestamp")
+
+                # ── B7 拦截文案的推荐修订名后缀感知（2026-10-15）──
+                #    旧实现无条件追加 _修订01：对已叫 X_修订01 的成片建议出
+                #    X_修订01_修订01。基准 = 建议名能直接复制进 config 使用。
+                import io as _io
+                import contextlib as _cl
+                tc.assert_equal(_pr._next_revision_name("片名"), "片名_修订01",
+                                "B7 plain stem suggests _修订01")
+                tc.assert_equal(_pr._next_revision_name("片名_修订01"), "片名_修订02",
+                                "B7 revision stem increments instead of appending again")
+                tc.assert_equal(_pr._next_revision_name("片名_修订09"), "片名_修订10",
+                                "B7 two-digit increment stays zero-padded")
+                runner.state = PipelineState(run_dir / "state_rev.json")
+                slot2 = td / "成果文件" / "视频" / "_regress-slot_修订01.mp4"
+                slot2.write_bytes(b"\x00" * 64)
+                runner.output_file = slot2
+                (run_dir / "completion_report.json").write_text(json.dumps({
+                    "status": "VALIDATED",
+                    "data_sources": {"video_file": {"path": str(slot2)}},
+                }, ensure_ascii=False), encoding="utf-8")
+                buf_r = _io.StringIO()
+                with _cl.redirect_stdout(buf_r):
+                    blocked_r = runner._delivery_slot_guard("postprocess")
+                tc.assert_true(not blocked_r,
+                               "B7 revision-named delivered artifact is blocked")
+                tc.assert_true("_regress-slot_修订02.mp4" in buf_r.getvalue(),
+                               "B7 advice names the next revision (02)")
+                tc.assert_true("_regress-slot_修订01_修订01" not in buf_r.getvalue(),
+                               "B7 unconditional-append form must not come back")
 
                 # ── C 时长一致性门禁检查的对象 = 后处理真实输入源 ──
                 runner.state = PipelineState(run_dir / "state_dur.json")
@@ -12010,10 +12202,11 @@ def test_light_theme_content_pixel_caliber() -> RegressionTestCase:
             src_cov = _re.sub(r"\s+", " ", inspect.getsource(vbc.measure_content_coverage))
             tc.assert_true("content_pixel_mask" in src_bottom and "content_pixel_mask" in src_cov,
                            "G1 两位点必须经 content_pixel_mask 取掩码")
-            for frag, who in (("BRIGHTNESS_THRESHOLD", "measure_content_bottom"),
-                              ("BRIGHTNESS_THRESHOLD", "measure_content_coverage")):
-                tc.assert_true(frag not in src_bottom if who == "measure_content_bottom" else True,
-                               f"G2 {who} 不得内联 {frag}（已收敛到唯一生成点）")
+            # G2 逐位点各自断言。旧写法是一个两行循环配
+            # `assert_true(frag not in src_bottom if who == ... else True)`：
+            # 第二行退化成 assert_true(True)＝空跑，且第一行与 G3 重复，循环本身不提供覆盖。
+            tc.assert_true("BRIGHTNESS_THRESHOLD" not in src_bottom,
+                           "G2a measure_content_bottom 不得内联亮度阈值（已收敛到唯一生成点）")
             tc.assert_true("BRIGHTNESS_THRESHOLD" not in src_cov, "G3 覆盖率不得内联亮度公式")
             src_mask = _re.sub(r"\s+", " ", inspect.getsource(vbc.content_pixel_mask))
             # 亮度公式整条只住掩码函数内；该式对 R/G 各引用一次阈值常量（同一条语句）
@@ -13218,8 +13411,8 @@ def test_content_vacuum_last_scene_enters_measurement() -> RegressionTestCase:
                 work_root = tmp / "vacuum_work"
                 work_root.mkdir()
                 cvp.find_chrome = lambda: Path("chrome-stub")
-                cvp.make_probe = lambda html_src, work: (work / "probe.html").write_text(
-                    "x", encoding="utf-8") or work / "probe.html"
+                cvp.make_probe = lambda html_src, work: ((work / "probe.html").write_text(
+                    "x", encoding="utf-8") or work / "probe.html", [])
                 cvp.probe_scene = lambda chrome, probe, sid, s, d, work, verbose: {
                     "sid": sid, "status": gs.PASS, "early": 0.4, "late": 0.5, "ratio": 0.8}
                 cvp.BASE_DIR = work_root
@@ -13388,8 +13581,8 @@ def test_content_vacuum_summary_states_real_criterion() -> RegressionTestCase:
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
                 cvp.find_chrome = lambda: Path("chrome-stub")
-                cvp.make_probe = lambda html_src, work: (work / "probe.html").write_text(
-                    "x", encoding="utf-8") or work / "probe.html"
+                cvp.make_probe = lambda html_src, work: ((work / "probe.html").write_text(
+                    "x", encoding="utf-8") or work / "probe.html", [])
                 cvp.probe_scene = lambda chrome, probe, sid, s, d, work, verbose: {
                     "sid": sid, "status": gs.PASS, "early": 0.4, "late": 0.5, "ratio": 0.8}
                 cvp.BASE_DIR = tmp / "work"
@@ -13535,12 +13728,15 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         ip = _safe_import_rebinding_module("instant_preview")
         pr = _safe_import_rebinding_module("pipeline_runner")
 
-        def _rules_file(tmp, payload):
-            p = tmp / "rules.json"
+        def _rules_file(tmp, payload, name="rules.json"):
+            # name 参数供 bar 面使用：两条判据各读自己的文件，同名会互相覆盖
+            # （_drive 里先写 fit 后写 bar，同名即 fit 读到 bar 的 payload）。
+            p = tmp / name
             p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             return p
 
         GOOD = {"text_fit": {"min_chars_per_line": 6, "min_lines": 2, "min_chars": 6}}
+        BAR_GOOD = {"bar_overflow": {"tolerance_px": 2}}
 
         def _node(cpl, capacity, lines=4, chars=12, key="body:测试文本"):
             return {"key": key, "cpl": cpl, "capacity": capacity, "lines": lines,
@@ -13559,6 +13755,13 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         # 字符数取 6（= min_chars 门槛）——低于门槛的短标签属设计内豁免，不是本判据的对象。
         FIT_TWO_LINE = dict(FIT_OK, measured_nodes=1,
                             nodes=[_node(3.0, 3.0, lines=2, chars=6, key="fr-bar:两行塌陷")])
+
+        # bar_overflow 面的最低可读夹具：负溢出是正常态（内容在容器内），
+        # 本用例只要求它"有段可读且判 PASS"，不裁定 bar 语义（那由用例104 承载）。
+        BAR_OK = {"time_src": "S-block", "samples": 9, "measured_nodes": 1,
+                  "nodes": [{"key": "s1:#chart:bar-group", "overflow_px": -12.0,
+                             "content_top": 900.0, "union_top": 912.0,
+                             "box_h": 240, "at": 12.0}]}
 
         # ── A 阈值 fail-closed ──
         rules, reason = ip.load_text_fit_rules()
@@ -13701,13 +13904,16 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
 
         # ── D 接线：驱动真实 main()（桩 node 子进程，零 Chrome、零渲染） ──
         def _drive(manifest_obj, rules_payload=None, extra=(), run_raises=None,
-                   grid_raises=None):
+                   grid_raises=None, bar_rules_payload=BAR_GOOD):
             """跑一次真实 main()：HTML/config 为夹具，node 与截图为桩。
 
             桩的是"取数动作"（Chrome+node），不是裁定——main() 的阈值读取、下传、
             四态裁定、留痕落盘、退出码分支全部真跑。
             run_raises 非空即让子进程调用抛该异常，用来驱动 Phase 2 的外层 except 分支
             （旧形态下该分支只 print 不落状态，Overall 照旧印 [PASS]）。
+            bar_rules_payload 为 None 即不传 --bar-overflow-rules（测阈值断链轮）；
+            默认给 BAR_GOOD，使 bar 面在各轮不干扰 fit 面的既有期望（bar 断链会
+            以 UNTESTED 掺进退出码，把"fit 轮的既有断言"变成两因共果）。
             """
             with tempfile.TemporaryDirectory() as td2:
                 tmp = Path(td2)
@@ -13730,6 +13936,9 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
                     "// stub", encoding="utf-8")
                 argv = [f"--text-fit-rules={_rules_file(tmp, rules_payload)}"] \
                     if rules_payload is not None else []
+                if bar_rules_payload is not None:
+                    argv.append(f"--bar-overflow-rules="
+                                f"{_rules_file(tmp, bar_rules_payload, 'bar_rules.json')}")
                 cmds = []
 
                 def fake_run(cmd, *a, **k):
@@ -13785,9 +13994,9 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         def _line(cmds):
             """最后一次子进程的命令行；一次都没跑即返回空串，让对应断言自己转红而不是截断用例。"""
             return " ".join(cmds[-1]) if cmds else "<子进程一次都没被调用>"
-        MANIFEST_OK = dict(SCENES, text_fit=FIT_OK)
-        MANIFEST_BAD = dict(SCENES, text_fit=FIT_BAD)
-        MANIFEST_NOFIT = dict(SCENES)
+        MANIFEST_OK = dict(SCENES, text_fit=FIT_OK, bar_overflow=BAR_OK)
+        MANIFEST_BAD = dict(SCENES, text_fit=FIT_BAD, bar_overflow=BAR_OK)
+        MANIFEST_NOFIT = dict(SCENES, bar_overflow=BAR_OK)
 
         rc, out, cmds, record = _drive(MANIFEST_OK, rules_payload=GOOD)
         tc.assert_equal(rc, 0, f"D0 达标轮退出码：{rc}\n{out[-400:]}")
@@ -14489,8 +14698,18 @@ def test_word_level_cue_write_face_and_contracts() -> RegressionTestCase:
             tc.assert_true("Path(tts_dir).parent / \"_timeline_manifest.json\"" in src_at,
                            "A6 读取路径逐字写在取数函数里（与 enhance_video_audio 的写入处同一表达式）")
             src_eva = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8")
-            tc.assert_true("_timeline_manifest.json" in src_eva,
-                           "A7 写入方确实产出同名文件（读取侧不至永远空转）")
+            # A7 由"整份源码里有没有这个词"改为"写入函数体内有没有该路径"（2026-10-16）。
+            #   旧形态在注释里写一句 _timeline_manifest.json 也能满足，属"载体自述字面"型弱断言。
+            import ast as _ast89
+            _tree89 = _ast89.parse(src_eva)
+            _writer89 = next((n for n in _ast89.walk(_tree89)
+                              if isinstance(n, _ast89.FunctionDef)
+                              and n.name == "_build_timeline_manifest"), None)
+            tc.assert_true(_writer89 is not None,
+                           "A7a 写入函数 _build_timeline_manifest 须在（取数面被改名即点名）")
+            tc.assert_true("_timeline_manifest.json" in _ast89.unparse(_writer89),
+                           "A7 写入函数体内须出现该文件名（读取侧不至永远空转；"
+                           "unparse 会把引号归一为单引号，故此处只锚文件名本体）")
 
         # ═════════════════════════════════════════════════════════════════
         # B. 写入规则（单元面：不依赖真身 CLI）
@@ -16777,10 +16996,3062 @@ def test_pause_declaration_effective_face() -> RegressionTestCase:
     return tc
 
 
+def test_timeline_registry_binding_blocked() -> RegressionTestCase:
+    """用例96：GSAP 主时间轴必须注册进 window.__timelines（preflight check 4b）。
+
+    存在理由（2026-10-15 面板建议裁定，落点改为生效路径接线）：渲染器只驱动
+    `window.__timelines` 注册表，**全局 tl 变量它不认**（hyperframes runtime 原文
+    "Root timeline not bound — render will freeze at t=0"）。缺注册时渲染器不报错、
+    每帧取 t=0，要等一次全量渲染跑完再由后处理码率门禁暴露。预览与空窗预判都看不见
+    这一形态——它们的 seek 腿读的恰是全局 tl（本仓 69/69 项目都有该变量），故"预览过了"
+    与"预判不判空窗"两条都不构成反证。
+
+    取数面必须同时覆盖两种写法：2026-10-15 普查现网 69 份 index.html 中方括号 56 份、
+    点号 12 份——只 grep `__timelines["main"]` 字面即把 12 份合法项目判红（A06 同族：
+    取数口径窄于事实）。C 段就是这条的守卫。
+    """
+    tc = RegressionTestCase(
+        "timeline_registry_binding_blocked",
+        "验证主时间轴注册判据：未注册即阻断，两种写法与根 id 匹配不误杀，取数断链不读成通过"
+    )
+    try:
+        import ast
+        import inspect
+        import re
+        import tempfile
+        import sys as _sys
+        from pathlib import Path
+
+        import preflight_check as pfc
+
+        def _html(body, script):
+            return ("<!DOCTYPE html><html><head></head><body>" + body
+                    + "<script>" + script + "</script></body></html>")
+
+        def _run(html_text, mode="render"):
+            with tempfile.TemporaryDirectory() as td:
+                f = Path(td) / "index.html"
+                f.write_text(html_text, encoding="utf-8")
+                r = pfc.PreflightResult(mode=mode)
+                buf = []
+
+                class _W:
+                    encoding = "utf-8"
+
+                    def write(s, t):
+                        buf.append(t)
+
+                    def flush(s):
+                        pass
+
+                old = _sys.stdout
+                _sys.stdout = _W()
+                try:
+                    pfc.check_timeline_registration(f, r)
+                finally:
+                    _sys.stdout = old
+                return r, "".join(buf)
+
+        def _mine(r):
+            ids = [x["check_id"] for x in r._log_entries if x["level"] == "ERROR"]
+            return [e for e, c in zip(r.errors, ids) if c == "timeline_registry"]
+
+        def _warns(r):
+            ids = [x["check_id"] for x in r._log_entries if x["level"] == "WARN"]
+            return [w for w, c in zip(r.warnings, ids) if c == "timeline_registry"]
+
+        CTOR = "var tl = gsap.timeline({paused: true}); tl.to('#a', {opacity: 1}, 1);"
+        REG_BRACKET = 'window.__timelines = window.__timelines || {};\nwindow.__timelines["main"] = tl;'
+        REG_DOT = "window.__timelines = window.__timelines || {};\nwindow.__timelines.main = tl;"
+
+        # ═════════════════════════════════════════════════════════
+        # A. 病灶：有 GSAP 构造、无注册 → ERROR 且点名"冻结在 t=0"
+        # ═════════════════════════════════════════════════════════
+        r, out = _run(_html("<div>x</div>", CTOR))
+        tc.assert_equal(len(_mine(r)), 1, "A1 未注册形态应判 1 条 ERROR")
+        tc.assert_true("冻结在 t=0" in out, "A2 ERROR 文案须点名后果（冻结在 t=0）")
+        tc.assert_true("gsap.timeline 构造" in out, "A3 文案须给出归因（有构造、无注册语句）")
+
+        # ═════════════════════════════════════════════════════════
+        # B/C. 两种合法写法各自不判（C 专防取数面只认方括号）
+        # ═════════════════════════════════════════════════════════
+        for label, reg in (("B", REG_BRACKET), ("C", REG_DOT)):
+            r, out = _run(_html("<div>x</div>", CTOR + "\n" + reg))
+            tc.assert_equal(len(_mine(r)), 0, f"{label}1 该写法不得判错")
+            tc.assert_equal(len(_warns(r)), 0, f"{label}2 该写法不得告警")
+            tc.assert_true("main" in out, f"{label}3 OK 行须回显注册键名")
+
+        # 反面见证：只认方括号的旧取数面会把点号写法判成病灶（C 段不是恒真）
+        tc.assert_equal(pfc.timeline_registry_keys('window.__timelines.main = tl;'),
+                        ["main"], "C4 键提取须覆盖点号写法")
+        tc.assert_equal(pfc.timeline_registry_keys('window.__timelines["main"] = tl;'),
+                        ["main"], "C5 键提取须覆盖方括号写法")
+        tc.assert_equal(pfc.timeline_registry_keys(
+            'window.__timelines["a"] = t1; window.__timelines.b = t2;'),
+            ["a", "b"], "C6 多键去重保序")
+
+        # ═════════════════════════════════════════════════════════
+        # D. 取数断链：无内联 script → ERROR（不得读成通过）
+        # ═════════════════════════════════════════════════════════
+        r, out = _run('<html><body><script src="bundle.js"></script></body></html>')
+        tc.assert_equal(len(_mine(r)), 1, "D1 内联脚本取不到应判 ERROR")
+        tc.assert_true("无从核对" in out, "D2 文案须点名是取数断链，而非把断链说成没有注册问题")
+        tc.assert_equal(len(r.warnings), 0, "D3 断链不得降为告警")
+
+        # ═════════════════════════════════════════════════════════
+        # E. 无 GSAP 构造 → NOT_APPLICABLE（不得印 PASS）
+        # ═════════════════════════════════════════════════════════
+        r, out = _run(_html("<div>x</div>", "console.log('static page');"))
+        tc.assert_equal(len(_mine(r)), 0, "E1 无时间轴项目不得判错")
+        tc.assert_equal(len(_warns(r)), 0, "E2 无时间轴项目不得告警")
+        lv = [x["level"] for x in r._log_entries if x["check_id"] == "timeline_registry"]
+        tc.assert_equal(lv, ["INFO"], "E3 不适用须记 INFO 而非 OK（四态纪律）")
+        tc.assert_true("不适用" in out, "E4 文案须写明 NOT_APPLICABLE 语义")
+
+        # ═════════════════════════════════════════════════════════
+        # F. 根 data-composition-id 与注册表的三种配对
+        # ═════════════════════════════════════════════════════════
+        r, out = _run(_html('<div data-root="true" data-composition-id="root">x</div>',
+                            CTOR + "\n" + REG_BRACKET))
+        tc.assert_equal(len(_mine(r)), 1,
+                        "F1 根 id 不在注册表中须判 ERROR，与整表为空同一后果")
+        tc.assert_true("data-composition-id" in out, "F2 文案须点名根 id")
+
+        r, out = _run(_html('<div data-root="true" data-composition-id="main">x</div>',
+                            CTOR + "\n" + REG_BRACKET))
+        tc.assert_equal(len(_mine(r)), 0, "F3 根 id 命中注册键不得判错")
+
+        multi = CTOR + "\n" + REG_BRACKET + "\nwindow.__timelines[\"other\"] = tl2;"
+        r, out = _run(_html("<div>x</div>", multi))
+        tc.assert_equal(len(_mine(r)), 0, "F4 多键且根无 id 属渲染器插入序回退，不得判 ERROR")
+        tc.assert_equal(len(_warns(r)), 1, "F5 多键无从静态裁定须告警点名")
+        r, out = _run(_html('<div data-root="true" data-composition-id="main">x</div>', multi))
+        tc.assert_equal(len(_mine(r)), 0, "F6 多键且根 id 命中须放行")
+        tc.assert_equal(len(_warns(r)), 0, "F7 根 id 命中时不该再告警")
+
+        # ═════════════════════════════════════════════════════════
+        # G. 接线（AST 取 main 体内 Call，不用源码文本锚）+ 阻断档登记
+        # ═════════════════════════════════════════════════════════
+        tree = ast.parse(inspect.getsource(pfc.main))
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_timeline_registration" in called,
+                       "G1 main() 体内须真调用本判据（AST，非文本锚）")
+        tc.assert_true("timeline_registry" in pfc.RENDER_CRITICAL_CHECKS,
+                       "G2 须登记进 RENDER_CRITICAL_CHECKS（渲染关键项）")
+        # audit 模式下 render-critical 降为告警，这条既有取舍须继续成立
+        r, _ = _run(_html("<div>x</div>", CTOR), mode="audit")
+        tc.assert_equal(len(r.errors), 0, "G3 audit 模式下本判据降为告警不阻断")
+        tc.assert_true(any("冻结在 t=0" in w for w in r.warnings),
+                       "G4 audit 模式仍须留痕（降档不等于取消）")
+
+        # ═════════════════════════════════════════════════════════
+        # H. 现网只读普查：零误杀担保（不写死任何项目名，发布仓按无对象通过）
+        # ═════════════════════════════════════════════════════════
+        base = pfc.HTML_BASE
+        projects = sorted(base.glob("*/index.html")) if base.is_dir() else []
+        sick = []
+        for h in projects:
+            body = "\n".join(pfc._inline_scripts(h.read_text(encoding="utf-8",
+                                                              errors="replace")))
+            keys = pfc.timeline_registry_keys(body)
+            if not keys and re.search(r'\bgsap\.timeline\s*\(', body):
+                sick.append(h.parent.name)
+        tc.assert_true(bool(projects) or True, "H0 无对象时本段按无对象通过（发布仓面）")
+        tc.assert_equal(sick, [],
+                        f"H1 现网 {len(projects)} 份 HTML 中不得有构造了却没注册的项目")
+        tc.assert_true(len(projects) >= 1, "H2 普查须真取到对象（取 0 份即本段空跑）")
+
+        # ═════════════════════════════════════════════════════════
+        # I. 判据自报计数（正证据，不由测试侧另算）
+        # ═════════════════════════════════════════════════════════
+        r, _ = _run(_html("<div>x</div>", CTOR + "\n" + REG_BRACKET))
+        c = r.counts.get("timeline_registry", {})
+        tc.assert_equal(sorted(c.keys()),
+                        ["has_timeline_ctor", "mentions_registry", "registered_keys"],
+                        "I1 计数字段名须稳定（改名即断消费者）")
+        tc.assert_equal(c.get("registered_keys"), 1, "I2 计数须真反映注册数")
+        tc.assert_true(c.get("has_timeline_ctor") is True, "I3 构造见证须为真")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("timeline_registry error: " + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_delivery_notes_name_mismatch_attributed() -> RegressionTestCase:
+    """用例97：交付说明"建错名字"与"没建"须分开归因（三处消费共用单源）。
+
+    存在理由（2026-10-15 实例）：交付说明文件名由 config `paths.video_name` 单点推导，
+    若手工建的说明名字与推导名不符，流水线自动写入分支只报"尚未创建"、审计第 6 维据此
+    判"缺该节"——归因把**建错了名字**说成**没建**。人据此会去补建甚至重跑全链，而真实
+    修法只是改名 + 单步补写（零重渲）。当日一支已交付片即因此判出唯一红项。
+
+    本件同时是"记忆件不得顶替生效路径"的落地：该判据先只落进项目记忆（按需加载），
+    现接进流水线打印面与审计裁定面。
+    """
+    tc = RegressionTestCase(
+        "delivery_notes_name_mismatch_attributed",
+        "验证交付说明错名归因：错名与未建分开报，修法给出改名+单步补写，三处消费同源"
+    )
+    try:
+        import ast
+        import inspect
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        import media_qa_gate as mq
+        import pipeline_runner as pr
+        import generate_completion_report as gcr
+
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            notes = tmp / "交付说明_正确名.md"
+
+            # A. 空层＝确实没建
+            tc.assert_equal(mq.find_mismatched_delivery_notes(notes), [],
+                            "A1 同层无说明文件须返回空列表（不是 None）")
+
+            # B. 有错名 → 列出候选，文案含期望名与零重渲修法
+            (tmp / "交付说明_错名A.md").write_text("x", encoding="utf-8")
+            (tmp / "交付说明_错名B.md").write_text("x", encoding="utf-8")
+            cands = mq.find_mismatched_delivery_notes(notes)
+            tc.assert_equal(cands, ["交付说明_错名A.md", "交付说明_错名B.md"],
+                            "B1 错名候选须按名排序全部列出")
+            text = mq.format_notes_name_mismatch(notes, cands)
+            tc.assert_true("交付说明_正确名.md" in text, "B2 文案须点名期望文件名（推导名）")
+            tc.assert_true("paths.video_name" in text,
+                           "B3 文案须点名权威源，不得只说名字不对")
+            tc.assert_true("--step completion_report" in text, "B4 文案须给出单步补写动作")
+            tc.assert_true("零重渲" in text, "B5 文案须写明成本档（避免人去重跑全链）")
+
+            # C. 不列自己（推导名在场时不该把它报成错名件）
+            notes.write_text("y", encoding="utf-8")
+            tc.assert_equal(mq.find_mismatched_delivery_notes(notes),
+                            ["交付说明_错名A.md", "交付说明_错名B.md"],
+                            "C1 候选须排除推导名自身")
+            notes.unlink()
+
+            # D. 目录不存在 → 空列表（可扫描且为空），非 None
+            tc.assert_equal(mq.find_mismatched_delivery_notes(Path("Z:/no/such/交付说明_x.md")),
+                            [], "D1 父目录不可达须返回空列表")
+
+            # E. 文案单源：两处消费者都调同一函数，不得各写一份归因
+            #    （方法源码带缩进，ast.parse 前必须 dedent——否则炸 unexpected indent）
+            import textwrap
+            src_pr = textwrap.dedent(
+                inspect.getsource(pr.PipelineRunner._sync_subtitle_source_section))
+            src_gcr = textwrap.dedent(inspect.getsource(gcr.run_delivery_audit))
+            for name, src in (("pipeline_runner", src_pr), ("审计面", src_gcr)):
+                tree = ast.parse(src)
+                called = {n.func.id for n in ast.walk(tree)
+                          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+                tc.assert_true("find_mismatched_delivery_notes" in called,
+                               f"E1 {name} 须调用错名比对取数面")
+                tc.assert_true("format_notes_name_mismatch" in called,
+                               f"E2 {name} 须复用归因文案单源（不得另写一份）")
+
+            # F. 三态分岔：错名 / 没建 / 无从核对 各给不同文案
+            with tempfile.TemporaryDirectory() as td:
+                d2 = Path(td)
+                n2 = d2 / "交付说明_target.md"
+                (d2 / "交付说明_other.md").write_text("x", encoding="utf-8")
+                got = mq.find_mismatched_delivery_notes(n2)
+                tc.assert_equal(got, ["交付说明_other.md"], "F1 错名态须可辨")
+                (d2 / "交付说明_other.md").unlink()
+                tc.assert_equal(mq.find_mismatched_delivery_notes(n2), [],
+                                "F2 未建态须与错名态区分（空列表）")
+
+            # G. 非 md 与子目录不得混入候选
+            (tmp / "交付说明_目录.md").mkdir()
+            (tmp / "readme.md").write_text("x", encoding="utf-8")
+            got = mq.find_mismatched_delivery_notes(notes)
+            tc.assert_true("交付说明_目录.md" not in got, "G1 同名目录不得进候选")
+            tc.assert_true("readme.md" not in got, "G2 非交付说明文件不得进候选")
+            tc.mark_passed()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:
+        import traceback
+        tc.mark_failed("delivery_notes_name_mismatch error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_vacuum_probe_carries_referenced_assets() -> RegressionTestCase:
+    """用例98：空窗预判探针须按 HTML 实际引用带入素材（含图场次覆盖率不再被低估）。
+
+    存在理由（2026-10-15 实测）：探针 HTML 落在别处的临时区，`./assets/x.png` 相对它
+    解析不到 → 含图场次覆盖率被系统性低估。同一场、同一时刻、同一判据的前后对照：
+    素材缺失 early=0.141/late=0.241，素材在位 early=0.538/late=0.547（低估 3.8 倍）。
+    方向是**漏判**：判据要求 late ≥ 0.15 才可能判空窗，素材缺失把 late 压低即让真空窗
+    逃过判定。旧实现只硬编码复制 gsap.min.js＝"已知资源名逐个补"，图片这类同案资源仍漏；
+    现按 HTML 引用取数（登记面＝真实读取路径）。
+
+    同批补探针 seek 的第二条腿：旧注入只认全局 `tl`，注册表写法不同名时探针静默不
+    seek，两帧同为 t=0 会让比值恒 1、把空窗判成 OK——与本判据要防的形态同向（漏判）。
+    """
+    tc = RegressionTestCase(
+        "vacuum_probe_carries_referenced_assets",
+        "验证探针按引用带素材：相对引用全取、缺失点名、越界不跟随、seek 腿含注册表回退"
+    )
+    try:
+        import tempfile
+        from pathlib import Path
+
+        import content_vacuum_precheck as cv
+
+        # A. 引用取数：相对路径全取，含中文文件名与 ./ 前缀归一
+        src = ('<script src="gsap.min.js"></script>'
+               '<img src="./assets/图 一.png">'
+               '<img src="assets/sub/表 二.png">'
+               '<link href="style.css">')
+        refs = cv.relative_asset_refs(src)
+        tc.assert_equal(refs, ["gsap.min.js", "assets/图 一.png", "assets/sub/表 二.png",
+                               "style.css"],
+                        "A1 相对引用须全取（含中文/空格/子目录），./ 前缀须归一")
+
+        # B. 非相对引用不取：协议头、data URI、绝对路径、query/fragment 剥离
+        tc.assert_equal(cv.relative_asset_refs(
+            '<img src="https://cdn/x.png"><img src="data:image/png;base64,AAA">'
+            '<img src="/abs/x.png"><img src="//cdn/x.png">'), [],
+            "B1 协议头/绝对路径/data URI 不得进复制清单")
+        tc.assert_equal(cv.relative_asset_refs('<img src="a.png?v=2#f">'), ["a.png"],
+                        "B2 query 与 fragment 须剥离后再取文件名")
+        tc.assert_equal(cv.relative_asset_refs('<img src="a.png"><img src="a.png">'),
+                        ["a.png"], "B3 重复引用须去重")
+
+        # C/D/E. 复制腿：在位复制、缺失点名、越界不跟随
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proj = root / "proj"
+            (proj / "assets" / "sub").mkdir(parents=True)
+            (proj / "index.html").write_text("x", encoding="utf-8")
+            (proj / "gsap.min.js").write_text("G", encoding="utf-8")
+            (proj / "assets" / "图 一.png").write_bytes(b"PNG1")
+            (proj / "assets" / "sub" / "表 二.png").write_bytes(b"PNG2")
+            work = root / "work"
+            work.mkdir()
+
+            missing = cv.copy_referenced_assets(
+                proj / "index.html", work,
+                ["gsap.min.js", "assets/图 一.png", "assets/sub/表 二.png"])
+            tc.assert_equal(missing, [], "C1 全部在位时缺失清单须为空")
+            tc.assert_equal((work / "assets" / "图 一.png").read_bytes(), b"PNG1",
+                            "C2 素材须按原相对层级落进工作目录（丢层级即引用解析不到）")
+            tc.assert_true((work / "assets" / "sub" / "表 二.png").is_file(),
+                           "C3 子目录层级须一并建立")
+            tc.assert_true((work / "gsap.min.js").is_file(),
+                           "C4 gsap 仍须在位（由通用腿覆盖，非旧硬编码）")
+
+            missing = cv.copy_referenced_assets(
+                proj / "index.html", work, ["assets/不存在.png"])
+            tc.assert_equal(missing, ["assets/不存在.png"],
+                            "D1 引用了但项目里没有须进缺失清单并点名（不得静默）")
+
+            # E. 越界引用：项目外**真实存在**的文件才配当夹具——文件不存在时摘掉守卫
+            #    也无差别（首版即因此让 M6 存活）。work 建在 deep/w 下，使摘守卫后的
+            #    误复制落在可观察位置，而非与源文件重合抛 SameFileError。
+            outside = root / "outside.png"
+            outside.write_bytes(b"OUT")
+            (root / "p2").mkdir()
+            proj2 = root / "p2" / "proj"
+            proj2.mkdir()
+            (proj2 / "index.html").write_text("x", encoding="utf-8")
+            work2 = root / "deep" / "a" / "b"
+            work2.mkdir(parents=True)
+            missing = cv.copy_referenced_assets(
+                proj2 / "index.html", work2, ["../../outside.png"])
+            tc.assert_equal(missing, ["../../outside.png"],
+                            "E1 指向项目目录外的引用不得跟随复制（越界点名）")
+            tc.assert_true(not (root / "deep" / "outside.png").exists(),
+                           "E2 越界引用不得被复制进工作目录的解析路径")
+
+        # F. 探针注入：seek 腿须含注册表回退（旧实现只认全局 tl）
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proj = root / "p"
+            proj.mkdir()
+            (proj / "index.html").write_text(
+                '<html><body><img src="./assets/a.png"></body></html>', encoding="utf-8")
+            (proj / "assets").mkdir()
+            (proj / "assets" / "a.png").write_bytes(b"X")
+            work = root / "w"
+            work.mkdir()
+            probe, missing = cv.make_probe(proj / "index.html", work)
+            body = probe.read_text(encoding="utf-8")
+            tc.assert_equal(missing, [], "F1 make_probe 须把引用到的素材带进工作目录")
+            tc.assert_true((work / "assets" / "a.png").is_file(), "F2 素材须真落工作目录")
+            tc.assert_true("var reg = window.__timelines || {};" in body
+                           and "driver = reg[ks[0]]" in body,
+                           "F3 seek 腿须含注册表回退代码（锚语句本体；注释里的字样不算锚）")
+            tc.assert_true("driver" in body, "F4 注入脚本须先定驱动源再 seek")
+            tc.assert_true("t=([0-9.]+)" in body, "F5 seek 时刻取数腿不得丢")
+
+            # G. 无引用项目：missing 空、probe 仍生成（不得因"没素材"报错）
+            (proj / "index.html").write_text("<html><body></body></html>", encoding="utf-8")
+            probe, missing = cv.make_probe(proj / "index.html", work)
+            tc.assert_equal(missing, [], "G1 无相对引用时缺失清单须为空（非 None）")
+            tc.assert_true(probe.is_file(), "G2 探针仍须正常生成")
+
+        # H. 现网只读普查：引用取数面覆盖到 assets（不写死项目名）
+        import preflight_check as pfc
+        base = pfc.HTML_BASE
+        projects = sorted(base.glob("*/index.html")) if base.is_dir() else []
+        with_assets = 0
+        for h in projects:
+            if any(r.startswith("assets/") for r in
+                   cv.relative_asset_refs(h.read_text(encoding="utf-8", errors="replace"))):
+                with_assets += 1
+        tc.assert_true(len(projects) >= 1, "H1 普查须真取到对象（取 0 份即本段空跑）")
+        if export_repo_face(tc) == "published":
+            # 公开面只带清单 §5 的中性化夹具，它们按设计不引用业务素材，故"取数面覆盖到 assets/"
+            # 这一读数在本面无对象。刻意按 `with_assets == 0` 取证而非"断言它必须缺席"：
+            # 缺席与否归脱敏门禁裁定，本条只声明**本段取数面的覆盖面**，且夹具一旦带上素材即转红，
+            # 逼下批改这条读数（沿用例85 的"不得把不导出读成回归坏了"，也不得反过来把它洗成通过）。
+            tc.assert_equal(with_assets, 0,
+                            f"H2-发布仓面：公开面 {len(projects)} 份夹具中引用 assets/ 者实取 "
+                            f"{with_assets} 份——该覆盖读数只在开发仓成立，不得读成公开面已验证")
+        else:
+            tc.assert_true(with_assets >= 1,
+                           f"H2 现网 {len(projects)} 份中应至少有一份引用 assets/，"
+                           "否则本段无从证覆盖")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("vacuum_probe_assets error: " + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_config_path_field_extensions_checked() -> RegressionTestCase:
+    """用例99：config 路径字段的扩展名须等于权威源声明值（preflight check 2b）。
+
+    存在理由（2026-10-15 面板建议批，另一条会话实证）：更新 config 的脚本把
+    `paths.video_name` 写成 `.srt`，两支成片遂以 .srt 名落进 成果文件/视频/ 并在后处理步
+    失败。该键此前无任何校验——全仓 103 份 pipeline config 普查：video_name 103/103、
+    subtitle_name 102/102、output_video 69/69、output_subtitle 60/60、subtitle.file
+    60/60 全部与声明扩展名一致，违规 0 处（各字段声明份数不同，故校验必须容忍缺位），
+    校验落地零误杀。
+
+    两处取舍不得读成宽松：①字段**缺位或空值不判**（它们按 config 形态是可选的，把
+    "没声明" 判成违规会误杀 43 份缺 subtitle.file、34 份缺 delivery.output_video 的项目）；
+    ②有违规时**不再印通过行**——首版就是判红之后又印了一句 "5/5 一致"，
+    同屏出现即把违规洗白成"也通过"。
+    """
+    tc = RegressionTestCase(
+        "config_path_field_extensions_checked",
+        "验证路径字段扩展名判据：错配逐字段点名，可选字段缺位不误杀，权威源断链不读成通过"
+    )
+    try:
+        import ast
+        import inspect
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import preflight_check as pfc
+
+        # 权威映射从判据的权威源取，测试侧不得维护第二份（第二个取数面必与判据漂移）
+        RULES, rules_err = pfc._load_path_field_extensions()
+        if rules_err:
+            raise AssertionError("权威源在开发仓不可读，本用例无从取证: " + str(rules_err))
+
+        def _cfg(video="a.mp4", subtitle="a.srt", dv="o/a.mp4", ds="o/a.srt", sf="o/a.srt"):
+            c = {"paths": {"video_name": video, "subtitle_name": subtitle},
+                 "delivery": {"output_video": dv, "output_subtitle": ds},
+                 "subtitle": {"file": sf}}
+            return c
+
+        def _run(cfg, rules_text=None, base=None, no_file=False):
+            """在临时权威源上跑判据；rules_text=None 时写默认映射，no_file 则不落盘权威源。"""
+            root = Path(base) if base else Path(tempfile.mkdtemp())
+            q = root / "quality"
+            q.mkdir(parents=True, exist_ok=True)
+            if not no_file:
+                if rules_text is None:
+                    rules_text = json.dumps({"path_field_extensions": dict(RULES)},
+                                            ensure_ascii=False)
+                (q / "delivery_gate_rules.json").write_text(rules_text, encoding="utf-8")
+            old = pfc.CONFIG_BASE
+            pfc.CONFIG_BASE = root
+            try:
+                r = pfc.PreflightResult(mode="render")
+                buf = []
+
+                class _W:
+                    encoding = "utf-8"
+
+                    def write(s, t):
+                        buf.append(t)
+
+                    def flush(s):
+                        pass
+
+                import sys as _sys
+                so = _sys.stdout
+                _sys.stdout = _W()
+                try:
+                    pfc.check_config_path_fields(cfg, r)
+                finally:
+                    _sys.stdout = so
+                return r, "".join(buf)
+            finally:
+                pfc.CONFIG_BASE = old
+
+        def _mine(r):
+            ids = [x["check_id"] for x in r._log_entries if x["level"] == "ERROR"]
+            return [e for e, c in zip(r.errors, ids) if c == "path_ext"]
+
+        # ═════════════════════════════════════════════════════════
+        # A. 病灶：video_name 写成 .srt → 判错且点名"应为 .mp4"
+        # ═════════════════════════════════════════════════════════
+        r, out = _run(_cfg(video="建筑.a.srt"))
+        tc.assert_equal(len(_mine(r)), 1, "A1 扩展名错配应判 1 条 ERROR")
+        tc.assert_true("应为 .mp4" in out, "A2 文案须给出应有扩展名")
+        tc.assert_true("paths.video_name" in out, "A3 文案须点名具体字段，不得只说 config 有问题")
+        tc.assert_true("成果目录" in out, "A4 文案须点名后果（错名产物落进成果目录）")
+
+        # B. 修法：全部与权威源一致 → 不判，且通过行给出覆盖面读数
+        r, out = _run(_cfg())
+        tc.assert_equal(len(_mine(r)), 0, "B1 正确扩展名不得判错")
+        tc.assert_equal(len(r.warnings), 0, "B2 正确态不该留告警")
+        tc.assert_true(f"{len(RULES)}/{len(RULES)}" in out, "B3 通过行须印 checked/declared 覆盖面")
+
+        # C. 五个键逐个错配各自判红（证明判据真遍历声明表，而非只查 video_name）
+        for label, bad in (("C1", _cfg(video="a.srt")),
+                           ("C2", _cfg(subtitle="a.mp4")),
+                           ("C3", _cfg(dv="o/a.srt")),
+                           ("C4", _cfg(ds="o/a.mp4")),
+                           ("C5", _cfg(sf="o/a.mp4"))):
+            r, out = _run(bad)
+            tc.assert_equal(len(_mine(r)), 1, f"{label} 该字段错配须各自判红")
+        r, out = _run(_cfg(video="a.MP4", subtitle="a.SRT"))
+        tc.assert_equal(len(_mine(r)), 0, "C6 扩展名比对须大小写不敏感（.MP4 合法）")
+
+        # D. 可选字段缺位不判（把"没声明"判成违规会误杀现网 24 份项目）
+        r, out = _run({"paths": {"video_name": "a.mp4"}})
+        tc.assert_equal(len(_mine(r)), 0, "D1 未声明的可选字段不得判错")
+        tc.assert_true(f"1/{len(RULES)}" in out, "D2 通过行须如实反映只核对了 1 个字段")
+
+        # E. 空值与 null 按未声明处理
+        for label, cfg in (("E1", _cfg(video="")), ("E2", _cfg(video=None)),
+                           ("E3", _cfg(video="   "))):
+            r, out = _run(cfg)
+            tc.assert_equal(len(_mine(r)), 0, f"{label} 空值不得按错配判红")
+
+        # F. 权威源断链六形态各自判 ERROR 且点名断在哪条腿
+        broken = [
+            ("F1 缺文件", "MISSING"),
+            ("F2 不可解析", "{ not json"),
+            ("F3 缺节", json.dumps({"other": 1}, ensure_ascii=False)),
+            ("F4 节非对象", json.dumps({"path_field_extensions": "x"}, ensure_ascii=False)),
+            ("F5 节内空", json.dumps({"path_field_extensions": {}}, ensure_ascii=False)),
+            ("F6 值形态非法", json.dumps({"path_field_extensions": {"a": "mp4"}},
+                                        ensure_ascii=False)),
+        ]
+        for label, text in broken:
+            r, out = _run(_cfg(), rules_text=(None if text == "MISSING" else text),
+                          no_file=(text == "MISSING"))
+            errs = _mine(r)
+            tc.assert_equal(len(errs), 1, f"{label} 应判 ERROR（不得静默通过）")
+            tc.assert_true("未核对" in out or "无从读取" in out,
+                           f"{label} 文案须点名是权威源断链")
+
+        # G. config 未加载判 ERROR（取数断链不得读成通过）
+        for label, cfg in (("G1", None), ("G2", {})):
+            r, out = _run(cfg)
+            tc.assert_equal(len(_mine(r)), 1, f"{label} config 缺位须判 ERROR")
+
+        # H. 违规时不得混印通过行（本批自己踩到的形态，锁成断言）
+        r, out = _run(_cfg(video="a.srt"))
+        tc.assert_true("与权威源一致" not in out,
+                       "H1 有违规时不得再印通过行（判红与'全部一致'同屏即洗白违规）")
+
+        # I. 接线（AST）+ 登记面（A06：改了权威源而该步缓存照常命中＝判据不生效）
+        tree = ast.parse(inspect.getsource(pfc.main))
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_config_path_fields" in called,
+                       "I1 main() 须真调用本判据（AST，非文本锚）")
+        import pipeline_runner as pr
+        src = inspect.getsource(pr.PipelineRunner._step_inputs)
+        tc.assert_true("delivery_gate_rules.json" in src,
+                       "I2 扩展名权威源须登记进 preflight 步指纹输入面")
+
+        # J. 现网普查：全部 pipeline config 零违规（担保不误杀存量项目）
+        import glob as _glob
+        cfgs = sorted((pfc.CONFIG_BASE / "pipelines").glob("*.json")) \
+            if (pfc.CONFIG_BASE / "pipelines").is_dir() else []
+        bad_cfgs = []
+        for c in cfgs:
+            try:
+                data = json.loads(c.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for dotted, want in RULES.items():
+                val, present = pfc._dig_field(data, dotted)
+                if present and isinstance(val, str) and val.strip() \
+                        and not val.lower().endswith(want.lower()):
+                    bad_cfgs.append(f"{c.name}:{dotted}")
+        if export_repo_face(tc) == "published":
+            # 同 98 H2：本仓 103 份业务 config 按 never_in_target/清单未列不导出，"现网零违规"
+            # 这一误杀读数在公开面无对象。按实取份数取证，不写恒真条。
+            tc.assert_equal(len(cfgs), 0,
+                            f"J1-发布仓面：本面 config 普查对象实取 {len(cfgs)} 份——"
+                            "零误杀读数只在开发仓成立，不得读成公开面已验证")
+        else:
+            tc.assert_true(len(cfgs) >= 1, "J1 普查须真取到 config（取 0 份即本段空跑）")
+        tc.assert_equal(bad_cfgs, [],
+                        f"J2 现网 {len(cfgs)} 份 config 中不得有扩展名错配字段")
+
+        # K. 判据自报计数
+        r, out = _run(_cfg(video="a.srt"))
+        c = r.counts.get("path_ext", {})
+        tc.assert_equal(sorted(c.keys()), ["checked", "declared", "violations"],
+                        "K1 计数字段须含 violations（缺它则'判了几处'不可核）")
+        tc.assert_equal((c.get("checked"), c.get("violations")), (len(RULES), 1),
+                        "K2 计数须真反映核对数与违规数")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("path_ext error: " + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_hash_break_does_not_restore_baseline() -> RegressionTestCase:
+    """用例100：.hash 断链时不得走"从 .bak 恢复"（adjust_timeline 基线判定）。
+
+    存在理由（2026-10-15 面板建议批，代码链现查）：`_read_hash` 旧实现对缺失返回 None、
+    对空文件返回 ""，调用点写成 `if stored_hash and current != stored_hash:` —— 断链被
+    **短路成"无手工编辑"**，随后无条件 `copy2(.bak, html)` 把本轮刚补进 HTML 的修复抹掉。
+    config 侧同族且更严重（断链即覆盖本轮 config）。这正是 A06"取数断链会伪装成裁定"
+    发生在自己基线判定上的形态。
+
+    取证方式：在临时工作流根上造最小项目，用 subprocess 跑 `adjust_timeline.py` 真身
+    （备份段在 TTS 检查之前，故无波形也能走到该分支；后续 TTS 报错不参与本用例断言）。
+    """
+    tc = RegressionTestCase(
+        "hash_break_does_not_restore_baseline",
+        "验证哈希断链三形态均重设基线不恢复备份，合法哈希的两态判定不回退，写盘原子"
+    )
+    try:
+        import hashlib
+        import json
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        import adjust_timeline as adj
+
+        MARK = "<!-- ROUND-FIX-MARKER -->"
+
+        def _root():
+            """临时工作流根 + 最小项目（含 T 块/注册/指针 narration）。"""
+            tmp = Path(tempfile.mkdtemp(prefix="hashprobe_"))
+            (tmp / "AGENTS.md").write_text("# probe\n", encoding="utf-8")
+            proj = tmp / "程序文件" / "源码" / "hyperframes" / "probe-proj"
+            proj.mkdir(parents=True)
+            (proj / "index.html").write_text(
+                '<!DOCTYPE html><html><body><div id="root" data-duration="10">'
+                '<div data-scene-id="s1" data-scene-entry="gsap" '
+                'data-scene-subtitle-safe="true">x</div></div>'
+                '<script>var T = { s1: 0.0 };\n'
+                'var tl = gsap.timeline({paused: true});\n'
+                'tl.to("#s1", {opacity: 1}, T.s1 + 1);\n'
+                'window.__timelines = window.__timelines || {};\n'
+                'window.__timelines["main"] = tl;</script></body></html>',
+                encoding="utf-8")
+            (proj / "narration.json").write_text(json.dumps(
+                {"scenes": [{"scene_id": "s1", "start": 0.0, "end": 10.0, "duration": 10.0,
+                             "narration": "这是一句用于最小夹具的旁白文本。",
+                             "type": "content"}]}, ensure_ascii=False), encoding="utf-8")
+            cfg = tmp / "probe.json"
+            cfg.write_text(json.dumps({
+                "paths": {"html_project": "probe-proj", "video_name": "probe.mp4",
+                          "subtitle_name": "probe.srt", "temp_dir": str(tmp / "temp")},
+                "narration_source": "narration.json", "video_duration": 10.0},
+                ensure_ascii=False), encoding="utf-8")
+            (tmp / "tts_44k").mkdir()
+            return tmp, proj, cfg
+
+        def _adjust(tmp, proj, cfg):
+            env = dict(os.environ, VIDEO_WORKFLOW_ROOT=str(tmp),
+                       PYTHONDONTWRITEBYTECODE="1")
+            p = Path(__file__).parent
+            r = subprocess.run([sys.executable, "-X", "utf8", "adjust_timeline.py",
+                                "--html", "probe-proj", "--config", str(cfg),
+                                "--tts-dir", str(tmp / "tts_44k")],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=300, env=env, cwd=str(p))
+            return (r.stdout or "") + (r.stderr or "")
+
+        def _baseline_then_break(tmp, proj, cfg, break_how):
+            out1 = _adjust(tmp, proj, cfg)                       # 建基线
+            h = proj / "index.html"
+            h.write_text(h.read_text(encoding="utf-8").replace(
+                "</body>", MARK + "</body>", 1), encoding="utf-8")   # 本轮修复
+            hf = proj / "index.html.hash"
+            if break_how == "missing":
+                hf.unlink()
+            elif break_how == "empty":
+                hf.write_text("", encoding="utf-8")
+            elif break_how == "half":
+                hf.write_text("abc", encoding="utf-8")           # 半截写
+            elif break_how == "ok":
+                pass                                             # 保持合法（对照组）
+            out2 = _adjust(tmp, proj, cfg)
+            return out1, out2, h, hf
+
+        # ═════════════════════════════════════════════════════════
+        # A/B/C. 断链三形态：均重设基线、保住本轮修复、点名
+        # ═════════════════════════════════════════════════════════
+        for label, how in (("A", "missing"), ("B", "empty"), ("C", "half")):
+            tmp, proj, cfg = _root()
+            _, out2, h, hf = _baseline_then_break(tmp, proj, cfg, how)
+            tc.assert_true(MARK in h.read_text(encoding="utf-8"),
+                           f"{label}1 断链形态下本轮修复不得被 .bak 抹掉")
+            tc.assert_true("[HASH-BROKEN]" in out2,
+                           f"{label}2 须点名走了重设基线分支（不得静默）")
+            tc.assert_true("Restored HTML from backup" not in out2,
+                           f"{label}3 断链时不得出现恢复动作")
+            tc.assert_true(hf.exists() and len(hf.read_text(encoding="utf-8").strip()) == 32,
+                           f"{label}4 基线哈希须按当前 HTML 重建为合法 MD5")
+
+        # D. 对照组：哈希合法且与当前相等时，恢复判定照常（本批未放宽既有设计）
+        tmp, proj, cfg = _root()
+        _adjust(tmp, proj, cfg)
+        out2 = _adjust(tmp, proj, cfg)
+        tc.assert_true("[HASH-BROKEN]" not in out2,
+                       "D1 哈希合法时不该判断链（否则 A-C 是恒真）")
+
+        # E. 真手工编辑（哈希合法但与当前不等）仍走 manual edit 分支
+        tmp, proj, cfg = _root()
+        _adjust(tmp, proj, cfg)
+        h = proj / "index.html"
+        h.write_text(h.read_text(encoding="utf-8").replace("</body>", "<p>e</p></body>", 1),
+                     encoding="utf-8")
+        out2 = _adjust(tmp, proj, cfg)
+        tc.assert_true("Manual edit detected" in out2,
+                       "E1 合法哈希下的真改动仍须识别为手工编辑")
+        tc.assert_true("[HASH-BROKEN]" not in out2, "E2 手工编辑不得误判断链")
+
+        # F. config 侧同族：config 哈希断链不得覆盖本轮 config
+        tmp, proj, cfg = _root()
+        _adjust(tmp, proj, cfg)
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        data["duration_budget"] = {"seconds": 421, "enforcement": "soft"}
+        cfg.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        (tmp / "probe.hash").unlink()
+        out2 = _adjust(tmp, proj, cfg)
+        tc.assert_true("Restored config from backup" not in out2,
+                       "F1 config 哈希断链时不得从 .bak 覆盖本轮 config")
+        tc.assert_true("duration_budget" in cfg.read_text(encoding="utf-8"),
+                       "F2 本轮新增字段须保住")
+        tc.assert_true("[HASH-BROKEN] config" in out2 or "[HASH-BROKEN]" in out2,
+                       "F3 须点名 config 侧重设基线")
+
+        # G. 哈希写盘须委托原子写（不是原地截断）：断链形态由 _read_hash 兜，本段只证委托
+        tmp, proj, cfg = _root()
+        hf = proj / "index.html.hash"
+        adj._write_hash(hf, "seed")
+        before = hf.read_text(encoding="utf-8")
+        tc.assert_equal(len(before), 32, "G1 正常写入须为 32 位 MD5")
+        tc.assert_equal(before, hashlib.md5("seed".encode("utf-8")).hexdigest(),
+                        "G2 写入值须等于内容 MD5")
+        real = adj.atomic_write_text
+        seen = []
+
+        def _flaky(path, text):
+            seen.append(str(path))
+            raise OSError(28, "simulated disk full")
+        adj.atomic_write_text = _flaky
+        raised = False
+        try:
+            adj._write_hash(hf, "changed-content")
+        except OSError:
+            raised = True
+        finally:
+            adj.atomic_write_text = real
+        tc.assert_equal(seen, [str(hf)], "G3 写盘须真经原子写入口（退化回 open(w) 即空跑）")
+        tc.assert_true(raised, "G4 写盘失败须向上抛（不得静默留旧哈希当成已更新）")
+        tc.assert_equal(hf.read_text(encoding="utf-8"), before,
+                        "G5 失败后旧哈希字节不变（原子写，非原地截断）")
+
+        # H. _read_hash 形态判定（含"看着像但不是"的边界）
+        tmp, proj, cfg = _root()
+        hf = proj / "index.html.hash"
+        good = hashlib.md5(b"x").hexdigest()
+        cases = [(good, good, "H1 合法值原样返回"),
+                 ("", None, "H2 空文件判断链"),
+                 ("   ", None, "H3 仅空白判断链"),
+                 (good[:31], None, "H4 少一位（半截）判断链"),
+                 (good + "z", None, "H5 含非 hex 字符判断链"),
+                 (good.upper(), good.upper(), "H6 大写 hex 仍属合法形态")]
+        for write, expect, msg in cases:
+            hf.write_text(write, encoding="utf-8")
+            tc.assert_equal(adj._read_hash(hf), expect, msg)
+        hf.unlink()
+        tc.assert_equal(adj._read_hash(hf), None, "H7 文件缺失判断链")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("hash_break error: " + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_preview_scratch_isolated_per_run() -> RegressionTestCase:
+    """用例101：预览工作目录按运行唯一化，收尾只删本轮（instant_preview）。
+
+    存在理由（2026-10-15 面板建议批 + 本批正反对照实测）：旧形态下工作目录直接用
+    `PREVIEW_TEMP` 固定名，其下 Chrome profile 与 preview_captures 也都是固定名。两支
+    项目并行跑预览即抢同一 user-data-dir——**旧形态对照两支全部 rc=3、零截图，其中一支
+    日志直接印 "browser is already running"**；改为本轮唯一目录后两支全部 rc=0、各截
+    18/24 张。该失败发生在截图取数之前，极易被误读成"画面/CSS 契约有问题"。
+
+    本批另一条由并发实测当场抓出的自错一并锁死：首版顺手加了"回收其它轮次 run_* 遗留"，
+    结果把**另一支正在用的目录**删掉（那支先印 `Captured: 24 screenshots` 再印
+    `Capture manifest not found`）。故清理范围收在"只删本轮"，遗留交由龄期巡检点名。
+    """
+    tc = RegressionTestCase(
+        "preview_scratch_isolated_per_run",
+        "验证预览工作目录按运行唯一、profile 与截图同落其下、收尾只删本轮且不碰覆盖键目录内容"
+    )
+    try:
+        import ast
+        import inspect
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        import instant_preview as ip
+
+        # A. 每轮唯一：两次申请得到不同目录，且都在给定基目录下
+        base = Path(tempfile.mkdtemp()) / "chrome_preview"
+        d1 = ip.make_run_scratch(base)
+        d2 = ip.make_run_scratch(base)
+        tc.assert_true(d1 != d2, "A1 两轮申请必须得到不同目录")
+        tc.assert_true(d1.is_dir() and d2.is_dir(), "A2 返回目录须真实存在（供 Chrome 直接用）")
+        tc.assert_true(str(d1.parent) == str(base), "A3 run 目录须落在预览临时区之下")
+        tc.assert_true(d1.name.startswith("run_"), "A4 目录名须带 run_ 前缀（清理侧据此识别）")
+
+        # B. 父目录不存在时也能建（本批首版真实踩到：上一轮收尾删空后 mkdtemp 直接失败）
+        deep = Path(tempfile.mkdtemp()) / "not-yet-created" / "chrome_preview"
+        db = ip.make_run_scratch(deep)
+        tc.assert_true(db.is_dir(), "B1 基目录缺失须按需创建，不得 FileNotFoundError")
+
+        # C. 收尾只删本轮：另一轮目录与区外内容都不该动
+        keep = ip.make_run_scratch(base)
+        other = ip.make_run_scratch(base)
+        (other / "capture_manifest.json").write_text("{}", encoding="utf-8")
+        outside = base / "not_a_run_dir"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("keep me", encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            gone = ip.cleanup_run_scratch(keep)
+        tc.assert_equal(str(gone), str(keep), "C1 清理须返回本轮目录")
+        tc.assert_true(not keep.exists(), "C2 本轮目录须被删除")
+        tc.assert_true(other.exists()
+                       and (other / "capture_manifest.json").exists(),
+                       "C3 另一轮正在用的目录不得被本轮收尾删掉（首版真实踩到的缺陷）")
+        tc.assert_true((outside / "precious.txt").is_file(),
+                       "C4 非 run_ 内容不得连带删除（覆盖键指向已有目录时的保护）")
+
+        # C5. 把模块级 PREVIEW_TEMP 也指到本临时区后再收尾：并发邻居仍不得被删。
+        # 首版实现按 PREVIEW_TEMP 回收全部 run_*，而测试的 base 是另一个目录，
+        # 那枚缺陷在本段之前无从显形（变异体存活过一次，故补此段）。
+        real_temp = ip.PREVIEW_TEMP
+        try:
+            ip.PREVIEW_TEMP = base
+            mine = ip.make_run_scratch(base)
+            neighbour = ip.make_run_scratch(base)
+            (neighbour / "capture_manifest.json").write_text("{}", encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                ip.cleanup_run_scratch(mine)
+            tc.assert_true(not mine.exists(), "C5a 收尾须删掉本轮目录")
+            tc.assert_true(neighbour.exists()
+                           and (neighbour / "capture_manifest.json").is_file(),
+                           "C5b 同区其它轮的目录正在被用，不得连带回收")
+        finally:
+            ip.PREVIEW_TEMP = real_temp
+
+        # D. 无对象时点名而非静默、也不炸 NameError
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            res = ip.cleanup_run_scratch(None)
+        tc.assert_true(res is None, "D1 未创建工作目录时返回 None")
+        tc.assert_true("无对象可清理" in buf.getvalue(),
+                       "D2 须点名'无对象'，不得静默（也不得读成清理失败）")
+
+        # E. 接线：main 用本轮目录，收尾不再整删预览临时区
+        src = inspect.getsource(ip.main)
+        tree = ast.parse(src)
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("make_run_scratch" in called,
+                       "E1 main 须经 make_run_scratch 取本轮目录（AST）")
+        tc.assert_true("cleanup_run_scratch" in called,
+                       "E2 main 收尾须经 cleanup_run_scratch（AST）")
+        tc.assert_true("preview_temp_dir = None" in src,
+                       "E3 须有作用域哨兵（未创建即失败时 finally 不得炸 NameError）")
+        # 反向锁：不得再出现"整删 PREVIEW_TEMP"的旧写法
+        tc.assert_true("rmtree(str(PREVIEW_TEMP)" not in src and "preview_cleanup_dir = PREVIEW_TEMP" not in src,
+                       "E4 收尾不得回到整删预览临时区（会误删并发邻居与覆盖键目录内容）")
+        # E5 由"从 finally: 切到文件尾 + 析取式"改为 AST 定位（2026-10-16）。
+        #   旧形态两处失能：①切片无右边界，把 finally 之后的全部模块代码都算进"收尾段"；
+        #   ②`"rmtree" not in seg or "cleanup_run_scratch" in seg` 是析取式，而 finally 段
+        #   本来就调用 cleanup_run_scratch（E2 断言它存在），故后半个恒真——整条断言永不失败。
+        #   现按语义直接裁定：main 的 finally 里不得出现任何直接 rmtree 调用，删除动作
+        #   唯一入口是 cleanup_run_scratch。
+        import ast as _ast101
+        _tree101 = _ast101.parse(src)
+        _main101 = next((n for n in _ast101.walk(_tree101)
+                         if isinstance(n, _ast101.FunctionDef) and n.name == "main"), None)
+        tc.assert_true(_main101 is not None, "E5a 须能定位到 main 函数本体")
+        _final_rmtree, _final_helper = [], False
+        for _n in _ast101.walk(_main101):
+            if isinstance(_n, _ast101.Try) and _n.finalbody:
+                for _m in _ast101.walk(_ast101.Module(body=_n.finalbody)):
+                    if not isinstance(_m, _ast101.Call):
+                        continue
+                    _cf = _ast101.unparse(_m.func)
+                    if _cf.endswith("rmtree"):
+                        _final_rmtree.append(_cf)
+                    if _cf.split(".")[-1] == "cleanup_run_scratch":
+                        _final_helper = True
+        tc.assert_equal(_final_rmtree, [],
+                        f"E5 main 的 finally 段不得直接 rmtree（删除唯一入口是 cleanup_run_scratch），"
+                        f"实得 {_final_rmtree}")
+        tc.assert_true(_final_helper,
+                       "E5b main 的 finally 段须经 cleanup_run_scratch（否则 E5 的"
+                       "\"没有直接 rmtree\"可能只是没接线）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("preview scratch isolation error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_chapter_bar_structure_consistency() -> RegressionTestCase:
+    """用例102：章级常驻条结构闭环（preflight check 7c，2026-10-15 面板建议接入）。
+
+    存在理由：章级常驻条（#clN 章名格 / #cfN 刻度格）由手写 HTML 承载、编译器不产出
+    （常设观感默认而非必填项，无条项目属正常），条上格子、场景 tag 自报归属、GSAP
+    切换语句三个环节各自独立书写——实证 building-perf-craft 曾缺第 6 章刻度
+    （tag 有 06 无 cf6），成片结构与自报不符而全链绿灯。与 check_element_reveal 的
+    分工：那条管"整体不可见"，本条管"结构性错位"。
+
+    夹具段：A tag 自报而无对应 cl（craft 原形态）/ B 点亮锚落到收束场 / C 有 DOM 无
+    点亮语句 / D 锚不在 T 块 / E L1 两向差集 / F 修好后 0 违规 + 计数自报 / G 无条
+    不适用 / H T 块取不到 fail-closed / I 点亮语句缺锚 / J 真身接线 + audit 降档 /
+    K 存量真实项目只读冒烟 / L 注释里的语句字面不得凭空造点亮。
+    """
+    tc = RegressionTestCase(
+        "chapter_bar_structure_consistency",
+        "验证章级常驻条三腿判据：cl/cf 配对、tag 自报归属闭环、点亮语句锚点可核"
+    )
+    try:
+        import ast
+        import inspect
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        import preflight_check as pf
+
+        def _mk(scene_tags, bar_ids, lit_stmts, t_keys):
+            """最小 HTML：scene_tags {场景号: tag 文本}、bar_ids id 名列表、
+            lit_stmts 原样语句、t_keys T 块键（None=不产出 T 块）。"""
+            scenes = "".join(
+                f'<div id="s{n}" data-scene-id="s{n}">'
+                f'<div id="s{n}-tag">{txt}</div></div>'
+                for n, txt in sorted(scene_tags.items()))
+            bars = "".join(f'<span id="{i}">·</span>' for i in bar_ids)
+            t_block = ("var T = {" + ", ".join(f"s{k}: {k * 5.0}" for k in t_keys) + "};"
+                       if t_keys is not None else "")
+            js = t_block + "\n" + "\n".join(lit_stmts)
+            return (f'<!DOCTYPE html><html><head></head><body>'
+                    f'<div id="root" data-composition-id="main">{scenes}{bars}</div>'
+                    f"<script>{js}</script></body></html>")
+
+        def _run(html_text, mode="render"):
+            d = Path(tempfile.mkdtemp(prefix="chbar_"))
+            p = d / "index.html"
+            p.write_text(html_text, encoding="utf-8")
+            r = pf.PreflightResult(mode=mode)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                pf.check_chapter_bar(p, r)
+            return r, buf.getvalue()
+
+        # A. tag 自报第 6 章而无 cl6 —— craft 原形态（tag 有 06、刻度格缺）
+        html_a = _mk({1: "01 · 甲", 6: "06 · 己"}, ["cl1", "cf1"],
+                     ['tl.set("#cl1", { opacity: 1 }, T.s1);',
+                      'tl.set("#cf1", { opacity: 1 }, T.s1);'], [1, 6])
+        r_a, _ = _run(html_a)
+        tc.assert_true(any("第 6 章自报" in e and "无 cl6" in e for e in r_a.errors),
+                       f"A1 tag 自报章归属而无对应章名格须判错并点名，实得 {r_a.errors}")
+        tc.assert_equal(len(r_a.errors), 1, "A2 该形态恰一条错（不得连带其它腿）")
+
+        # B. cl2 点亮锚落在收束场（T.s5）而非章首场（T.s3）
+        html_b = _mk({3: "02 · 乙"}, ["cl2", "cf2"],
+                     ['tl.set("#cf2", { opacity: 1 }, T.s3);',
+                      'tl.set("#cl2", { opacity: 1 }, T.s5);'], [3, 5])
+        r_b, _ = _run(html_b)
+        tc.assert_true(any("cl2" in e and "T.s5" in e and "T.s3" in e for e in r_b.errors),
+                       f"B1 锚收束场须判错并同时点名实际/期望场号，实得 {r_b.errors}")
+        tc.assert_equal(len(r_b.errors), 1, "B2 恰一条错")
+
+        # C. 有 DOM 无点亮语句 = 条上死格子（该章永不点亮）
+        html_c = _mk({}, ["cl3", "cf3"],
+                     ['tl.set("#cf3", { opacity: 1 }, T.s1);'], [1])
+        r_c, _ = _run(html_c)
+        tc.assert_true(any("cl3" in e and "有 DOM 无点亮语句" in e for e in r_c.errors),
+                       f"C1 无点亮语句须判错并点名死格子，实得 {r_c.errors}")
+        tc.assert_equal(len(r_c.errors), 1, "C2 恰一条错（cf3 有合法点亮不得连带）")
+
+        # D. 锚 T.s99 不在 T 块（改时间后必漂移的形态）
+        html_d = _mk({}, ["cl4", "cf4"],
+                     ['tl.set("#cf4", { opacity: 1 }, T.s1);',
+                      'tl.set("#cl4", { opacity: 1 }, T.s99);'], [1])
+        r_d, _ = _run(html_d)
+        tc.assert_true(any("cl4" in e and "T.s99" in e and "不在 T 块" in e
+                           for e in r_d.errors),
+                       f"D1 锚不在 T 块须判错，实得 {r_d.errors}")
+
+        # E. L1 两向差集（cl1 无 cf1、cf2 无 cl2）
+        html_e = _mk({}, ["cl1", "cf2"],
+                     ['tl.set("#cl1", { opacity: 1 }, T.s1);',
+                      'tl.set("#cf2", { opacity: 1 }, T.s1);'], [1])
+        r_e, _ = _run(html_e)
+        tc.assert_true(any("cl1" in e and "无配对 cf1" in e for e in r_e.errors),
+                       f"E1 cl 有而 cf 缺须判错，实得 {r_e.errors}")
+        tc.assert_true(any("cf2" in e and "无配对 cl2" in e for e in r_e.errors),
+                       f"E2 cf 有而 cl 缺须判错（另一向），实得 {r_e.errors}")
+        tc.assert_equal(len(r_e.errors), 2, "E3 恰两条错（两向各一）")
+
+        # F. 修好后：0 违规 + 计数自报 + 通过行文案
+        html_f = _mk({1: "01 · 甲", 2: "02 · 乙"}, ["cl1", "cf1", "cl2", "cf2"],
+                     ['tl.set("#cl1", { opacity: 1 }, T.s1);',
+                      'tl.set("#cf1", { opacity: 1 }, T.s1);',
+                      'tl.set("#cl2", { opacity: 1 }, T.s2);',
+                      'tl.set("#cf2", { opacity: 1 }, T.s2);'], [1, 2])
+        r_f, out_f = _run(html_f)
+        tc.assert_equal(r_f.errors, [], "F1 三腿全闭合不得判错")
+        tc.assert_equal(r_f.counts.get("chapter_bar"),
+                        {"cl": 2, "cf": 2, "tagged_chapters": 2,
+                         "lit_ids": 4, "violations": 0},
+                        "F2 计数自报须与实况一致（测试侧不另算一套）")
+        tc.assert_true("章级条结构闭环" in out_f, "F3 通过侧须印正证据文案")
+
+        # G. 无章级条 → 不适用（计数 0、不判红）
+        html_g = _mk({1: "01 · 甲"}, [], ['var x = 1;'], None)
+        r_g, out_g = _run(html_g)
+        tc.assert_equal(r_g.errors, [], "G1 无条项目不得判红")
+        tc.assert_equal(r_g.counts.get("chapter_bar"),
+                        {"cl": 0, "cf": 0, "tagged_chapters": 0,
+                         "lit_ids": 0, "violations": 0},
+                        "G2 不适用须计数 0（非缺键）")
+        tc.assert_true("不适用" in out_g, "G3 不适用须点名，不得读成通过")
+
+        # H. 有 cl 条而 T 块取不到 → fail-closed ERROR（预检是阻断位点）
+        html_h = _mk({}, ["cl1", "cf1"],
+                     ['tl.set("#cl1", { opacity: 1 }, T.s1);',
+                      'tl.set("#cf1", { opacity: 1 }, T.s1);'], None)
+        r_h, _ = _run(html_h)
+        tc.assert_true(any("T 块取不到" in e for e in r_h.errors),
+                       f"H1 锚无从核对须判错点名，实得 {r_h.errors}")
+        tc.assert_equal(len(r_h.errors), 1, "H2 恰一条（不得逐 id 重复点名）")
+
+        # I. 点亮语句缺 T 锚（第三参不是 T.sX）
+        html_i = _mk({}, ["cl1", "cf1"],
+                     ['tl.set("#cl1", { opacity: 1 });',
+                      'tl.set("#cf1", { opacity: 1 });'], [1])
+        r_i, _ = _run(html_i)
+        tc.assert_equal(len(r_i.errors), 2, f"I1 两格缺锚各一条，实得 {r_i.errors}")
+        tc.assert_true(all("缺 T 锚点" in e for e in r_i.errors),
+                       f"I2 文案须点名缺锚形态，实得 {r_i.errors}")
+
+        # J. 真身接线：main() 调它 + check_id 进 RENDER_CRITICAL_CHECKS + audit 降档留痕
+        src = inspect.getsource(pf.main)
+        tree = ast.parse(src)
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_chapter_bar" in called,
+                       "J1 main() 须真调 check_chapter_bar（AST 锚，非源码文本）")
+        tc.assert_true("chapter_bar" in pf.RENDER_CRITICAL_CHECKS,
+                       "J2 check_id 须登记 RENDER_CRITICAL_CHECKS（渲染前硬阻断）")
+        r_audit, _ = _run(html_a, mode="audit")
+        tc.assert_true(not r_audit.errors and r_audit.warnings,
+                       "J3 audit 模式降为警告不阻断，且仍留痕（不得两模式同判）")
+
+        # K. 存量真实项目只读冒烟：零误杀（发布仓面按脱敏三件套切分支）
+        named = ["agent-decision-map", "building-perf-acoustics", "building-perf-color",
+                 "building-perf-craft", "building-perf-safety-health",
+                 "standard-system-explainer"]
+        checked, failed = 0, []
+        for name in named:
+            h = pf.HTML_BASE / name / "index.html"
+            if not h.exists():
+                continue
+            r_k = pf.PreflightResult(mode="render")
+            with redirect_stdout(io.StringIO()):
+                pf.check_chapter_bar(h, r_k)
+            checked += 1
+            if r_k.errors:
+                failed.append((name, r_k.errors))
+        face = export_repo_face(tc)
+        if face == "dev":
+            tc.assert_true(checked >= 6, f"K1 普查覆盖 6 份含条项目（实查 {checked} 份）")
+            tc.assert_true(not failed, f"K2 存量零误杀：{failed}")
+        else:
+            # 发布仓面：业务项目不随导出（详见 export_repo_face docstring）。
+            # 夹具项目照常参与冒烟，并断分支确被切过来（非恒真）。
+            demo = pf.HTML_BASE / "quickstart-demo" / "index.html"
+            if demo.exists():
+                r_demo = pf.PreflightResult(mode="render")
+                with redirect_stdout(io.StringIO()):
+                    pf.check_chapter_bar(demo, r_demo)
+                tc.assert_true(not r_demo.errors,
+                               f"K1-发布仓面：夹具项目冒烟零误杀，实得 {r_demo.errors}")
+            tc.assert_equal(face, "published",
+                            "K2-发布仓面：分支确由脱敏三件套缺席切过来（非恒真）")
+
+        # L. 注释里的语句字面不得凭空造出点亮（cue 声明接入时实测踩过的同族形态）
+        html_l = _mk({}, ["cl1", "cf1", "cl2", "cf2"],
+                     ['tl.set("#cl1", { opacity: 1 }, T.s1);',
+                      'tl.set("#cf1", { opacity: 1 }, T.s1);',
+                      '/* 停用备用：tl.set("#cl2", { opacity: 1 }, T.s2); */',
+                      '// tl.set("#cf2", { opacity: 1 }, T.s2);'], [1, 2])
+        r_l, _ = _run(html_l)
+        tc.assert_true(any("cl2" in e and "有 DOM 无点亮语句" in e for e in r_l.errors),
+                       f"L1 /* */ 注释里的语句字面不得认出点亮（cl2 仍须判死格子），实得 {r_l.errors}")
+        tc.assert_true(any("cf2" in e and "有 DOM 无点亮语句" in e for e in r_l.errors),
+                       f"L2 // 注释同判，实得 {r_l.errors}")
+        _lit = (r_l.counts.get("chapter_bar") or {}).get("lit_ids")
+        tc.assert_equal(_lit, 2,
+                        "L3 实登记点亮 id 恰 2（cl1/cf1），注释不入；"
+                        f"取数实得 {_lit}（取不到须点名而非炸整案）")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("chapter bar structure error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_text_punct_scan() -> RegressionTestCase:
+    """用例103：画面文本中文语境夹半角标点（preflight check 7d，2026-10-15 面板建议接入）。
+
+    存在理由：字幕侧有 SRT 口径（subtitle_format / subtitle_overflow），画面文本侧
+    此前没有任何口径——手写 HTML 正文里的中文引号写成半角双引号（"…"）在成片上显示
+    为英文式直引号。实证七域系列 _修订01 交付自查抓到三处，而字幕侧扫描 0 命中
+    （病灶只存在于 HTML 正文，SRT 侧是全角）。半角逗号/句号/问号后接中文同属该形态。
+
+    判据（主表 8 字符 , . ; : ! ? " '）：该字符左邻或右邻命中中文语境集（CJK 汉字
+    + 中式标点 U+3000-303F + 全角区 U+FF00-FFEF）即违规；`.` 例外＝右邻 ASCII
+    字母/数字（扩展名/域名/版本号/小数，首轮普查 4 处 `.` 全部该形态，无例外即 4 处
+    误杀）；参考表（() % ~ - +）刻意不入判据（中文技术文本有合法用法，普查 79 处
+    命中全为合法形态）。取数用 html.parser（convert_charrefs=True）：注释不进 data、
+    属性值不进 data、script/style/title 整体跳过；data 不 strip（保段边缘邻接关系）；
+    跨元素边界不判（保守方向是漏判而非误杀）。
+
+    夹具段：A 病灶四连 / B 全角与纯 ASCII 不误杀 / C `.` 例外两向 / D 全角区扩集 /
+    E 取数纪律（注释·属性·script·style·title 不进 + 反面正文须判）/ F 跨元素边界 /
+    G 零文本段不适用 / H 文件缺失 fail-closed / I 真身接线 + audit 降档 /
+    K 存量冒烟零误杀 + 固定提交锚哨兵（pilot@fe87020 恰 2 处）。
+
+    变异对应（15 枚，全红且逐枚落到对位断言原文）：
+    M1 摘 main() 接线 → I1        M2 摘 RENDER_CRITICAL_CHECKS 登记 → I2
+    M3 违规改 r.warn → A1         M4 邻接语境判定摘除 → B3
+    M5 `.` 例外摘除 → C1          M6 `.` 例外 and 链改 or → C2
+    M7 语境集去中式标点区 → D1     M8 语境集去全角区 → D1
+    M9 空白段过滤退回不判空 → E2   M10 SKIP 去 script → E1
+    M11 SKIP 去 style → E1        M12 counts 改空 dict → A2
+    M13 上下文切片摘除 → A3        M14 全角替换提示摘除 → A4
+    M15 文件缺失分支摘 r.error 保 return → H1
+    """
+    tc = RegressionTestCase(
+        "text_punct_scan",
+        "验证画面文本半角标点判据：中文邻接的 8 类半角标点逐处点名，`.` 例外与取数纪律不误杀"
+    )
+    try:
+        import ast
+        import inspect
+        import io
+        import subprocess
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        import preflight_check as pf
+
+        def _doc(body):
+            return (f'<!DOCTYPE html><html><head></head><body>'
+                    f'{body}</body></html>')
+
+        def _run(html_text, mode="render"):
+            d = Path(tempfile.mkdtemp(prefix="tpunct_"))
+            p = d / "index.html"
+            p.write_text(html_text, encoding="utf-8")
+            r = pf.PreflightResult(mode=mode)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                pf.check_text_punctuation(p, r)
+            return r, buf.getvalue()
+
+        # A. 病灶四连：两段文本里半角引号 ×2、半角冒号/逗号各 1 —— 逐处点名
+        html_a = _doc('<p>每次"成功"都有</p><p>他说:先做,再做</p>')
+        r_a, _ = _run(html_a)
+        tc.assert_equal(len(r_a.errors), 4, f"A1 四处半角标点须逐处判错，实得 {r_a.errors}")
+        tc.assert_equal(r_a.counts.get("text_punct"),
+                        {"texts": 2, "violations": 4},
+                        "A2 计数自报须与实况一致（测试侧不另算一套）")
+        tc.assert_true(any('每次【"】成功' in e for e in r_a.errors),
+                       f"A3 须带 ±14 字上下文与【】标出位点，实得 {r_a.errors}")
+        tc.assert_true(any('（" → “”）' in e for e in r_a.errors),
+                       f"A4 须附全角替换提示，实得 {r_a.errors}")
+        tc.assert_true(any('（, → ，）' in e for e in r_a.errors),
+                       f"A5 逗号同判并给提示，实得 {r_a.errors}")
+
+        # B. 全角标点不判 + 通过侧正证据；纯 ASCII 文本不得误杀（邻接门守）
+        r_b, out_b = _run(_doc('<p>每次“成功”都有背书，方向对，节奏稳。</p>'))
+        tc.assert_equal(r_b.errors, [], "B1 全角标点不得判错")
+        tc.assert_true("无中文夹半角标点" in out_b and "扫描 1 文本段" in out_b,
+                       f"B2 通过侧须印正证据（文本段计数），实得 {out_b!r}")
+        r_b2, _ = _run(_doc("<p>Level 3: ready, go. It's fine!</p>"))
+        tc.assert_equal(r_b2.errors, [], "B3 纯英文 ASCII 文本不得误杀（左右邻皆非中文）")
+
+        # C. `.` 例外两向：扩展名/版本号/小数跳过；句号用法与接汉字仍判
+        r_c, _ = _run(_doc('<p>参见 01_工作规矩.md 一节</p>'
+                           '<p>生成 v1.2 版</p><p>宽 3.5 倍</p>'))
+        tc.assert_equal(r_c.errors, [], "C1 `.` 右邻 ASCII 字母数字须跳过（扩展名/版本号/小数）")
+        r_c2, _ = _run(_doc('<p>这就是中文.</p><p>先说结论.再做解释</p>'))
+        tc.assert_equal(len(r_c2.errors), 2,
+                        f"C2 `.` 左邻汉字（右邻空）与右邻汉字各判一处，实得 {r_c2.errors}")
+        tc.assert_true(any('这就是中文【.】' in e and '（. → 。）' in e
+                           for e in r_c2.errors),
+                       f"C3 句号形态须点名位点与替换，实得 {r_c2.errors}")
+
+        # D. 全角区扩集：`。"` / `，"` 段尾闭合形态（引号左/右邻是中式标点与全角逗号）
+        r_d, _ = _run(_doc('<p>结束。"</p><p>完，"</p>'))
+        tc.assert_equal(len(r_d.errors), 2,
+                        f"D1 段尾闭合形态须判（纯汉字集实测漏判，扩集后覆盖），实得 {r_d.errors}")
+        tc.assert_true(any('结束。【"】' in e for e in r_d.errors),
+                       f"D2 右邻中式句号须命中，实得 {r_d.errors}")
+        tc.assert_true(any('完，【"】' in e for e in r_d.errors),
+                       f"D3 左邻全角逗号须命中，实得 {r_d.errors}")
+
+        # E. 取数纪律：注释/属性值/script/style/title 一律不进判据面；
+        #    同一段文字放进正文反面必须判（防"整个扫描面被关掉也全绿"）
+        html_e = ('<!DOCTYPE html><html><head>'
+                  '<title>标"题</title>'
+                  '<style>.a::before{content:"中,";}</style>'
+                  '<script>var s = "中文";</script></head>'
+                  '<body>\n  <!-- 注释 "中文" -->\n'
+                  '<p title="中,文">内容</p>\n<p>好。</p>\n</body></html>')
+        r_e, _ = _run(html_e)
+        tc.assert_equal(r_e.errors, [],
+                        f"E1 注释/属性/script/style/title 不得进判据面，实得 {r_e.errors}")
+        tc.assert_equal(r_e.counts.get("text_punct"), {"texts": 2, "violations": 0},
+                        "E2 文本段取数须剔空白段（跨标签空隙不进），恰 2 段")
+        r_e2, _ = _run(_doc('<p>var s = "中文";</p>'))
+        tc.assert_equal(len(r_e2.errors), 2,
+                        f"E3 反面：同段文字在正文里须逐处判（script 例外不是普遍豁免），实得 {r_e2.errors}")
+
+        # F. 跨元素边界不判（保守漏判方向）：`<b>完</b>"` 的引号左邻是标签边界
+        r_f, _ = _run(_doc('<p>他说<b>完</b>"</p>'))
+        tc.assert_equal(r_f.errors, [], "F1 跨元素边界不判（左邻非汉字，保守漏判）")
+        r_f2, _ = _run(_doc('<p>他说完"</p>'))
+        tc.assert_equal(len(r_f2.errors), 1, f"F2 同一引号在同一文本段内须判，实得 {r_f2.errors}")
+
+        # G. 零文本段 → 不适用（印 ok 并计数 0，不得静默略过）
+        r_g, out_g = _run('<div><script>x</script></div>')
+        tc.assert_equal(r_g.errors, [], "G1 无文本段不得判红")
+        tc.assert_equal(r_g.counts.get("text_punct"), {"texts": 0, "violations": 0},
+                        "G2 不适用须计数 0（非缺键）")
+        tc.assert_true("不适用" in out_g, "G3 不适用须点名，不得静默略过")
+
+        # H. 文件缺失 → fail-closed ERROR（预检是阻断位点，A06 同族）
+        d_h = Path(tempfile.mkdtemp(prefix="tpunct_"))
+        r_h = pf.PreflightResult(mode="render")
+        with redirect_stdout(io.StringIO()):
+            pf.check_text_punctuation(d_h / "nope.html", r_h)
+        tc.assert_true(any("HTML file not found" in e for e in r_h.errors),
+                       f"H1 文件缺失须判错点名（不得静默跳过），实得 {r_h.errors}")
+        tc.assert_equal(len(r_h.errors), 1, "H2 恰一条")
+
+        # I. 真身接线：main() 调它 + check_id 进 RENDER_CRITICAL_CHECKS + audit 降档
+        src = inspect.getsource(pf.main)
+        tree = ast.parse(src)
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_text_punctuation" in called,
+                       "I1 main() 须真调 check_text_punctuation（AST 锚，非源码文本）")
+        tc.assert_true("text_punct" in pf.RENDER_CRITICAL_CHECKS,
+                       "I2 check_id 须登记 RENDER_CRITICAL_CHECKS（渲染前硬阻断）")
+        r_audit, _ = _run(html_a, mode="audit")
+        tc.assert_true(not r_audit.errors and r_audit.warnings,
+                       "I3 audit 模式降为警告不阻断，且仍留痕（不得两模式同判）")
+
+        # K. 存量冒烟：干净项目零误杀 + 固定提交锚哨兵（判据：拿历史版本当反面
+        #    夹具一律不得锚 HEAD——HEAD 会随修复提交自指失效，沿用用例92 立的判据）。
+        named = ["building-perf-acoustics", "building-perf-color", "building-perf-craft",
+                 "building-perf-safety-health", "standard-system-explainer"]
+        checked, failed = 0, []
+        for name in named:
+            h = pf.HTML_BASE / name / "index.html"
+            if not h.exists():
+                continue
+            r_k = pf.PreflightResult(mode="render")
+            with redirect_stdout(io.StringIO()):
+                pf.check_text_punctuation(h, r_k)
+            checked += 1
+            if r_k.errors:
+                failed.append((name, r_k.errors))
+        face = export_repo_face(tc)
+        if face == "dev":
+            tc.assert_true(checked >= 5, f"K1 普查覆盖 5 份存量项目（实查 {checked} 份）")
+            tc.assert_true(not failed, f"K2 存量零误杀：{failed}")
+            HIT_REV = "fe87020"      # 本批之前最后一次触及 vertical-style-pilot 的提交
+            before = subprocess.run(
+                ["git", "-C", str(pf.ROOT), "show",
+                 f"{HIT_REV}:程序文件/源码/hyperframes/vertical-style-pilot/index.html"],
+                capture_output=True)
+            if before.returncode != 0:
+                tc.assert_true(True, f"K3 标定件提交 {HIT_REV} 取不回，本组按无对象通过")
+            else:
+                d_k = Path(tempfile.mkdtemp(prefix="tpunct_"))
+                p_k = d_k / "index.html"
+                p_k.write_bytes(before.stdout)
+                r_k2 = pf.PreflightResult(mode="render")
+                with redirect_stdout(io.StringIO()):
+                    pf.check_text_punctuation(p_k, r_k2)
+                cnt = r_k2.counts.get("text_punct") or {}
+                tc.assert_equal(cnt.get("violations"), 2,
+                                f"K3 标定件（{HIT_REV}）须恰 2 处命中（实得 {cnt}）")
+                tc.assert_equal(cnt.get("texts"), 53,
+                                "K4 计数自报须与标定读数一致（测试侧不另算一套）")
+        else:
+            # 发布仓面：业务项目不随导出（详见 export_repo_face docstring）。
+            # 夹具项目照常参与冒烟，并断分支确被切过来（非恒真）。
+            demo = pf.HTML_BASE / "quickstart-demo" / "index.html"
+            if demo.exists():
+                r_demo = pf.PreflightResult(mode="render")
+                with redirect_stdout(io.StringIO()):
+                    pf.check_text_punctuation(demo, r_demo)
+                tc.assert_true(not r_demo.errors,
+                               f"K1-发布仓面：夹具项目冒烟零误杀，实得 {r_demo.errors}")
+            tc.assert_equal(face, "published",
+                            "K2-发布仓面：分支确由脱敏三件套缺席切过来（非恒真）")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("text punct scan error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_bar_overflow_gate_adjudicates_container_overflow() -> RegressionTestCase:
+    """用例104：底部对齐容器纵向溢出（柱压字）预览期判据（2026-10-15 面板建议接入生效路径）。
+
+    存在理由：柱状图画在"底部对齐容器"里（flex 容器、子项贴底），柱子写高后整体越过
+    容器顶边、压在前文标题上——2026-10-15 用户在一支交付件上肉眼报"数值柱压住了标题"，
+    而当时六维审计与全部既有预览判据（字幕安全区、视觉边界、text_fit）全绿：它们量
+    "是否越出画布"与"字框是否过窄"，没有一条量"容器内元素是否探出容器顶"。
+
+    判据：`overflow_px = contentTop（rect.top + borderTop + paddingTop）− 后代可见元素
+    union 顶边`，findings 边界 `> tolerance_px`（严格大于；`overflow_px` 为负是正常态，
+    内容在容器内）。与 text_fit 三处刻意不同（各有存在理由，不得对称化）：① JS 侧逐容器
+    跨采样取最坏（溢出是几何事实，取最优会被稳态前读数洗白）；② 阈值不下传取数面
+    （结构识别无阈值参数，候选表全量回报含未溢出者）；③ tolerance 合法域含 0（零容忍
+    ＝最严方向，放宽方向是负值；text_fit 那边 0 会把门禁放宽到永不触发故判断链）。
+
+    夹具段：A 阈值 fail-closed（八形态断链一律无读数 + tol=0 合法对照 + NaN/Inf 判定）/
+    B 裁定面（四态 + 严格大于边界 + 断链面点名到节点与字段 + FAIL 优先于 UNTESTED）/
+    C 阈值真驱动翻转（含 tol=0 最严方向）/ D 接线驱动真身 main()（退出码链·通过路径
+    留痕·放行开关独立不越界·阈值断链不进裁定面·阈值不下传 JS）/ E 取数面锚定（结构
+    识别·公式方向·取最坏·三条排除·序号先于可见性检查·键契约双向锁）。
+
+    本用例不重复用例87 的 F 段：preview 步指纹登记面（capture_script 与
+    video_quality_rules.json 同属两条判据的取数面）已由用例87 锁定。
+
+    变异对应（19 枚，全红且逐枚落到对位断言原文）：
+    M1 JS contentTop 摘 paddingTop → E2 红；
+    M2 取最坏改取最优 → E3 红；
+    M3 后代不排 absolute/fixed → E4a 红；
+    M4 后代不排不可见（摘 chainOpacity）→ E4b 红；
+    M5 序号挪到可见性检查之后 → E5 红；
+    M6 JS 侧 content_top 改名 → E8 红（消费面缺键＝静默断链）；
+    M7 裁定面缺 overflow_px 退回默认 0 → B8 组红（B8b/B8c/B8e 点名断链 + B9/B9b/B9c/B10c
+       候选/断链分账，断链被读成"正好达标"）；
+    M8 findings 边界 > 改 >= → B3 红（C3b 同批红）；
+    M9 缺文件形态回退默认阈值 → A3 红（A9 同批红）；
+    M10 tol=0 判非法（>= 0 改 > 0）→ A8b 红；
+    M11 删 bar FAIL 阻断分支 → D1 红（D1b/D5 同批红）；
+    M12 删 bar UNTESTED 阻断分支 → D2 红（D4/D6a 同批红："没测成"被读成"没查出问题"）；
+    M13 放行不留痕（decision 恒 None）→ D3b 红；
+    M14 PASS 提前 return 不留痕 → D0c 红（D0d/D6b 同批红）；
+    M15 放行开关越界覆盖 FAIL → D5 红；
+    M16 bar 未测分支读 text 开关 → D6a 红（D3 同批红）；
+    M17 fit 未测分支读 bar 开关 → D6c 红；
+    M18 阈值断链仍进裁定面（摘 if bar_rules is not None 守卫）→ D4d 红；
+    M19 阈值下传取数面（node 命令加 --bar-tol）→ D7 红。
+    """
+    tc = RegressionTestCase(
+        "bar_overflow_gate_adjudicates_container_overflow",
+        "验证底部对齐容器纵向溢出判据：fail-closed 阈值面、四态裁定、退出码链与取数面三处刻意不同的契约"
+    )
+    try:
+        import contextlib
+        import inspect
+        import io
+        import re as _re
+        from types import SimpleNamespace
+        from PIL import Image
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _gate_status as gs
+        import _script_env
+        import visual_boundary_check  # noqa: F401
+        # ^ 必须在驱动 main() 之前先导入：`check_preview_safety` 内部是惰性 import，
+        #   而该模块链上 `_script_env` 的 GBK 控制台修复要 sys.stdout.reconfigure——
+        #   用例把 stdout 换成 StringIO 后再触发这次 import 即炸 AttributeError，
+        #   并被 main() 的 except 吞掉，令 D 段断言跑在"部分失败"的路径上。
+        ip = _safe_import_rebinding_module("instant_preview")
+
+        def _rules_file(tmp, payload, name):
+            p = tmp / name
+            p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            return p
+
+        FIT_RULES = {"text_fit": {"min_chars_per_line": 6, "min_lines": 2, "min_chars": 6}}
+        BAR_RULES = {"bar_overflow": {"tolerance_px": 2}}
+        # fit 面在 D 段恒给达标件：bar 轮次的退出码只由 bar 面驱动（fit 未测会以 rc=3
+        # 掺进期望值，把单因断言变成两因共果）。
+        FIT_OK_BAR = {"time_src": "S-block", "has_timeline": True, "timeline_duration": 40.0,
+                      "samples": 9, "measured_nodes": 1,
+                      "nodes": [{"key": "body:正文", "cpl": 8.0, "capacity": 12.0, "lines": 3,
+                                 "chars": 24, "font_px": 22.0, "box_w": 264, "at": 3.0}]}
+        BAR_PASS = {"time_src": "S-block", "samples": 9, "measured_nodes": 1,
+                    "nodes": [{"key": "s1:#chart:bar-group", "overflow_px": -12.0,
+                               "content_top": 900.0, "union_top": 912.0,
+                               "box_h": 240, "at": 12.0}]}
+        # 真病灶读数（2026-10-15 已交付件实测几何）：s3 容器溢出 38.2px、s8 溢出 44px。
+        BAR_FAIL = {"time_src": "S-block", "samples": 13, "measured_nodes": 2,
+                    "nodes": [{"key": "s3:#bars:bar-group", "overflow_px": 38.2,
+                               "content_top": 1500.0, "union_top": 1461.8,
+                               "box_h": 380, "at": 5.5},
+                              {"key": "s8:#axis:bar-group", "overflow_px": 44.0,
+                               "content_top": 350.2, "union_top": 306.2,
+                               "box_h": 300, "at": 227.2}]}
+        BAR_EMPTY = {"time_src": "S-block", "samples": 9, "measured_nodes": 0, "nodes": []}
+        BAR_UNREADABLE = {"time_src": "S-block", "samples": 9, "measured_nodes": 4,
+                          "nodes": [{"key": "s1:#a:bar-group", "content_top": 500.0},
+                                    {"key": "s2:#b:bar-group", "overflow_px": None,
+                                     "content_top": 600.0},
+                                    {"key": "s3:#c:bar-group", "overflow_px": "x",
+                                     "content_top": 700.0},
+                                    "oops"]}
+        BAR_MIXED_BROKEN = {"time_src": "S-block", "samples": 9, "measured_nodes": 2,
+                            "nodes": [{"key": "s1:ok:bar-group", "overflow_px": -3.0,
+                                       "content_top": 900.0, "union_top": 903.0,
+                                       "box_h": 200, "at": 3.0},
+                                      {"key": "s2:bad:bar-group", "content_top": 800.0}]}
+        BAR_FAIL_BROKEN = {"time_src": "S-block", "samples": 9, "measured_nodes": 2,
+                           "nodes": [{"key": "s1:over:bar-group", "overflow_px": 38.2,
+                                      "content_top": 1500.0, "union_top": 1461.8,
+                                      "box_h": 380, "at": 5.5},
+                                     {"key": "s2:bad:bar-group", "content_top": 800.0}]}
+        BAR_EDGE_EQ = {"time_src": "S-block", "samples": 9, "measured_nodes": 1,
+                       "nodes": [{"key": "s1:edge:bar-group", "overflow_px": 2.0,
+                                  "content_top": 900.0, "union_top": 898.0,
+                                  "box_h": 200, "at": 3.0}]}
+        BAR_EDGE_GT = {"time_src": "S-block", "samples": 9, "measured_nodes": 1,
+                       "nodes": [{"key": "s1:edge:bar-group", "overflow_px": 2.1,
+                                  "content_top": 900.0, "union_top": 897.9,
+                                  "box_h": 200, "at": 3.0}]}
+        BAR_TINY = {"time_src": "S-block", "samples": 9, "measured_nodes": 1,
+                    "nodes": [{"key": "s1:tiny:bar-group", "overflow_px": 0.5,
+                               "content_top": 900.0, "union_top": 899.5,
+                               "box_h": 200, "at": 3.0}]}
+        BAR_EDGE_EQ0 = {"time_src": "S-block", "samples": 9, "measured_nodes": 1,
+                        "nodes": [{"key": "s1:zero:bar-group", "overflow_px": 0.0,
+                                   "content_top": 900.0, "union_top": 900.0,
+                                   "box_h": 200, "at": 3.0}]}
+
+        # ── A 阈值 fail-closed（含 tol=0 合法对照——与 text_fit 刻意不同的一处） ──
+        rules, reason = ip.load_bar_overflow_rules()
+        tc.assert_true(rules is not None and reason is None,
+                       f"A0 权威文件可读（归因 {reason}）")
+        if rules:
+            tc.assert_equal(sorted(rules), sorted(ip.BAR_OVERFLOW_REQUIRED_KEYS),
+                            f"A1 键集齐读：{rules}")
+            tc.assert_true(all(v >= 0 and v < float("inf") for v in rules.values()),
+                           "A2 值域为有限非负数（0=零容忍合法，负值才是非法方向）")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            broken = []
+
+            def _read(path, tag):
+                r, why = ip.load_bar_overflow_rules(path)
+                broken.append((tag, r, why))
+                return r, why
+
+            r, why = _read(tmp / "nope.json", "A3")
+            tc.assert_true(r is None and "缺失" in (why or ""), f"A3 缺文件点名：{why}")
+            bad_json = tmp / "bad.json"
+            bad_json.write_text("{ not json", encoding="utf-8")
+            r, why = _read(bad_json, "A4")
+            tc.assert_true(r is None and "不可解析" in (why or ""), f"A4 不可解析点名：{why}")
+            r, why = _read(_rules_file(tmp, {"other": 1}, "b1.json"), "A5")
+            tc.assert_true(r is None and "bar_overflow" in (why or ""), f"A5 缺节点名：{why}")
+            r, why = _read(_rules_file(tmp, {"bar_overflow": {}}, "b2.json"), "A6")
+            tc.assert_true(r is None and "tolerance_px" in (why or ""), f"A6 缺键点名：{why}")
+            r, why = _read(_rules_file(
+                tmp, {"bar_overflow": {"tolerance_px": "两"}}, "b3.json"), "A7")
+            tc.assert_true(r is None and "不可解析" in (why or ""), f"A7 值不可解析点名：{why}")
+            r, why = _read(_rules_file(
+                tmp, {"bar_overflow": {"tolerance_px": -1}}, "b4.json"), "A8")
+            tc.assert_true(r is None and "非法" in (why or "") and "tolerance_px" in (why or ""),
+                           f"A8 负值判非法（放宽方向是负值，不是 0）：{why}")
+            # A8b tol=0 合法对照：与 text_fit 的"非正数即断链"刻意不同——那边 0 会把门禁
+            # 放宽到永不触发；这边 0 只是"不许任何溢出"，属最严方向故必须放行。
+            r0, why0 = ip.load_bar_overflow_rules(
+                _rules_file(tmp, {"bar_overflow": {"tolerance_px": 0}}, "b_zero.json"))
+            tc.assert_true(r0 == {"tolerance_px": 0.0} and why0 is None,
+                           f"A8b tol=0 合法（零容忍＝最严方向）：{r0} {why0}")
+            for tag, raw in (("A8c", float("nan")), ("A8d", float("inf"))):
+                r, why = _read(_rules_file(
+                    tmp, {"bar_overflow": {"tolerance_px": raw}}, f"b_{tag}.json"), tag)
+                tc.assert_true(r is None and "非法" in (why or ""),
+                               f"{tag} {raw} 经 JSON（NaN/Infinity）亦判非法：{why}")
+            # A9 反 fail-open：**八种**断链形态逐一都不得返回"某个数字"
+            # （只查最后一枚的话，中途回退默认值的变异体会从其余形态的读数里漏网）
+            opened = [t for t, rr, _w in broken if rr is not None]
+            tc.assert_equal(opened, [],
+                            f"A9 断链形态一律无读数（有默认值即把断链读成干净）：{opened}")
+
+        # ── B 裁定面：四态 + 严格大于边界 + 断链面 ──
+        st, lines, finds, meta = ip.adjudicate_bar_overflow(BAR_FAIL, rules)
+        tc.assert_equal(st, gs.FAIL, f"B1 溢出件判 FAIL：{st}")
+        tc.assert_equal(sorted(f["key"] for f in finds),
+                        ["s3:#bars:bar-group", "s8:#axis:bar-group"],
+                        f"B1b 逐枚落 findings（记录面全量不截断）：{[f['key'] for f in finds]}")
+        # 排序契约住报告行不在返回值：生产者（JS）已按最坏降序发 nodes，裁定面保序透传；
+        # 用户看到的那 10 行才是"最严重者先点名"的载体（超 10 枚时截断方向必须从轻者起）。
+        _xlines = [ln for ln in lines if "✗" in ln]
+        tc.assert_true(len(_xlines) == 2 and "s8:#axis:bar-group" in _xlines[0]
+                       and "s3:#bars:bar-group" in _xlines[1],
+                       f"B1c 报告行按溢出量降序（最严重者先点名）：{_xlines}")
+        rep = " ".join(lines)
+        tc.assert_true("2 个底部对齐容器内元素探出容器顶" in rep, f"B1d FAIL 行点名形态：{lines}")
+        tc.assert_true("溢出 38.2px" in rep
+                       and "内容顶边 y1500.0 / 后代顶边 y1461.8，盒高 380px）@5.5s" in rep,
+                       f"B1e 报告行带实测几何（不带原值就无从复核）：{lines}")
+        tc.assert_true("加高容器" in rep, f"B1f 修向随报告行给出：{lines}")
+        tc.assert_equal((meta.get("candidates"), meta.get("measured_nodes"),
+                         meta.get("samples")), (2, 2, 13),
+                        f"B1g meta 复述取数面原值（供留痕与报告透出）：{meta}")
+
+        _many = {"time_src": "S-block", "samples": 5, "measured_nodes": 12,
+                 "nodes": [{"key": f"m{i}:bar-group", "overflow_px": float(100 - i * 5),
+                            "content_top": 100.0, "union_top": 0.0,
+                            "box_h": 10, "at": 1.0} for i in range(12)]}
+        stm, linesm, findsm, _ = ip.adjudicate_bar_overflow(_many, rules)
+        _xm = [ln for ln in linesm if "✗" in ln]
+        tc.assert_equal(len(findsm), 12, "B1h 12 枚超限件全进 findings（记录面不截断）")
+        tc.assert_true(len(_xm) == 10 and "m0:bar-group" in _xm[0]
+                       and "m10:bar-group" not in " ".join(_xm)
+                       and "m11:bar-group" not in " ".join(_xm),
+                       f"B1i 报告行只列最严重 10 枚（截断方向从轻者起）：{_xm}")
+
+        st2, lines2, finds2, _ = ip.adjudicate_bar_overflow(BAR_PASS, rules)
+        tc.assert_equal(st2, gs.PASS, f"B2 负溢出＝正常态（内容在容器内）仍判 PASS：{st2}")
+        tc.assert_true("内容均未探出容器顶" in " ".join(lines2), "B2b PASS 行点名对象数")
+        tc.assert_equal(finds2, [], "B2c 达标件无 findings")
+
+        st_eq, _, finds_eq, _ = ip.adjudicate_bar_overflow(BAR_EDGE_EQ, rules)
+        tc.assert_equal(st_eq, gs.PASS, "B3 溢出恰等于阈值不判（边界是严格大于，非 >=）")
+        st_gt, _, finds_gt, _ = ip.adjudicate_bar_overflow(BAR_EDGE_GT, rules)
+        tc.assert_equal(st_gt, gs.FAIL, "B3b 超出阈值一丝即判（B3 不是恒绿）")
+
+        st4, lines4, finds4, meta4 = ip.adjudicate_bar_overflow(BAR_EMPTY, rules)
+        tc.assert_equal(st4, gs.NOT_APPLICABLE, f"B4 测量面无对象判 N/A：{st4}")
+        tc.assert_true(st4 != gs.PASS and "不裁定也不计通过" in " ".join(lines4),
+                       "B4b N/A 行明说'不裁定也不计通过'（0 个候选 ≠ 查过且干净）")
+        tc.assert_equal((meta4.get("candidates"), meta4.get("unreadable")), (0, 0),
+                        "B4c meta 候选与断链双计数为 0")
+
+        st5, lines5, _, meta5 = ip.adjudicate_bar_overflow(None, rules)
+        tc.assert_equal(st5, gs.UNTESTED, "B5 无 bar_overflow 段 → UNTESTED")
+        tc.assert_true("未产出 bar_overflow 段" in " ".join(lines5), f"B5b 归因点名：{lines5}")
+        st5b, lines5b, _, meta5b = ip.adjudicate_bar_overflow([1, 2], rules)
+        tc.assert_equal(st5b, gs.UNTESTED, "B5c 段非对象 → UNTESTED（不得炸掉整轮预览）")
+        tc.assert_equal(meta5b.get("reason"), "bar_overflow_not_mapping", "B5d 非对象归因入 meta")
+
+        for hint, sub in [("measure_failed", "取数异常"), ("no_time_source", "时刻")]:
+            h = {"status_hint": hint, "error": "boom", "samples": 0, "nodes": []}
+            st_h, lines_h, _, _ = ip.adjudicate_bar_overflow(h, rules)
+            tc.assert_equal(st_h, gs.UNTESTED, f"B6 {hint} → UNTESTED")
+            tc.assert_true(sub in " ".join(lines_h), f"B6b {hint} 归因点名（{sub}）：{lines_h}")
+
+        st7, lines7, _, meta7 = ip.adjudicate_bar_overflow({"nodes": 14}, rules)
+        tc.assert_equal(st7, gs.UNTESTED, "B7 nodes 非列表 → UNTESTED（整数节点数不得当空表）")
+        tc.assert_equal(meta7.get("reason"), "nodes_not_list", "B7b 归因入 meta")
+
+        st8, lines8, finds8, meta8 = ip.adjudicate_bar_overflow(BAR_UNREADABLE, rules)
+        tc.assert_equal(st8, gs.UNTESTED, f"B8 候选容器缺核心读数 → UNTESTED：{st8}")
+        rep8 = " ".join(lines8)
+        tc.assert_true("4 个候选容器缺核心读数" in rep8, f"B8b 计数点名：{lines8}")
+        tc.assert_true("s1:#a:bar-group" in rep8 and "overflow_px" in rep8,
+                       f"B8c 归因须点名到节点与字段（不看节点名无从定位）：{lines8}")
+        tc.assert_true("节点不是对象" in rep8, f"B8d 非对象节点单独归因：{lines8}")
+        tc.assert_equal((meta8.get("candidates"), meta8.get("unreadable")), (0, 4),
+                        "B8e 可读候选与断链分账（缺读数不得读成达标，也不得读成无对象）")
+        tc.assert_equal(finds8, [], "B8f UNTESTED 不得伪造 findings")
+
+        st9, _, _, meta9 = ip.adjudicate_bar_overflow(BAR_MIXED_BROKEN, rules)
+        tc.assert_equal(st9, gs.UNTESTED,
+                        "B9 断链面位置在 PASS 之前（其余容器全部达标不得把它洗白）")
+        tc.assert_equal(meta9.get("unreadable"), 1, "B9b 断链计数 1")
+        tc.assert_equal(meta9.get("candidates"), 1, "B9c 好容器仍计候选")
+
+        st10, _, finds10, meta10 = ip.adjudicate_bar_overflow(BAR_FAIL_BROKEN, rules)
+        tc.assert_equal(st10, gs.FAIL,
+                        "B10 真溢出优先于断链面（不得因有断链把 FAIL 降级成 UNTESTED）")
+        tc.assert_equal(len(finds10), 1, "B10b 真溢出仍逐枚落 findings")
+        tc.assert_equal(meta10.get("unreadable"), 1, "B10c 断链计数不因 FAIL 消失（复核面完整）")
+
+        st11, lines11, _, _ = ip.adjudicate_bar_overflow(BAR_PASS, dict(rules, tolerance_px=7.5))
+        tc.assert_true("> 7.5px 判溢出" in " ".join(lines11),
+                       f"B11 报告门槛字面随阈值变（阈值真被消费）：{lines11}")
+        tc.assert_true("> 2px 判溢出" in rep,
+                       f"B11b 权威值时字面为 2（{'{:g}'.format} 格式化非手抄）：{rep[:120]}")
+
+        # ── C 阈值真驱动裁定（同输入随阈值翻转；tol=0 即最严方向） ──
+        wide = dict(rules, tolerance_px=100.0)
+        st_c1, _, finds_c1, _ = ip.adjudicate_bar_overflow(BAR_FAIL, wide)
+        tc.assert_equal(st_c1, gs.PASS, f"C1 放宽到 100px 即无对象（真溢出件随阈值翻转）：{finds_c1}")
+        tc.assert_equal(ip.adjudicate_bar_overflow(BAR_FAIL, rules)[0], gs.FAIL,
+                        "C2 恢复阈值即转红（C1 不是恒绿）")
+        zero_r = dict(rules, tolerance_px=0.0)
+        st_c3, _, finds_c3, _ = ip.adjudicate_bar_overflow(BAR_TINY, zero_r)
+        tc.assert_equal(st_c3, gs.FAIL, f"C3 tol=0 时 0.5px 也判（零容忍＝最严方向）：{finds_c3}")
+        tc.assert_equal(ip.adjudicate_bar_overflow(BAR_EDGE_EQ0, zero_r)[0], gs.PASS,
+                        "C3b tol=0 时恰 0 仍不判（边界仍是严格大于，非零即判）")
+
+        # ── D 接线：驱动真实 main()（桩 node 子进程，零 Chrome、零渲染） ──
+        def _drive(manifest_obj, fit_rules_payload=FIT_RULES, bar_rules_payload=BAR_RULES,
+                   extra=(), run_raises=None):
+            """跑一次真实 main()：HTML/config 为夹具，node 与截图为桩。
+
+            桩的是"取数动作"（Chrome+node），不是裁定——main() 的阈值读取、四态裁定、
+            留痕落盘、退出码分支全部真跑。与用例87 的 _drive 同款但独立内嵌：那边的
+            装置把留痕文件名硬编码成 TEXT_FIT_RECORD_NAME，直接复用会读到 fit 面的档。
+            fit 面两参数恒给，使 bar 轮次的退出码只由 bar 面驱动（见 FIT_OK_BAR 注释）。
+            run_raises 非空即让子进程调用抛该异常，用来驱动 Phase 2 外层 except →
+            bar_status 兜底分支（"取数无落盘证据"）。
+            """
+            with tempfile.TemporaryDirectory() as td2:
+                tmp = Path(td2)
+                html_dir = tmp / "proj"
+                html_dir.mkdir()
+                h = html_dir / "index.html"
+                h.write_text('<div id="root" data-width="1080" data-height="1920" '
+                             'data-duration="40"><div data-scene-id="s1">x</div></div>'
+                             '<script>var T = { s1: 3.0 };</script>', encoding="utf-8")
+                cfg_path = tmp / "cfg.json"
+                cfg_path.write_text(json.dumps({
+                    "cover_duration": 0, "video_duration": 40,
+                    "scenes": [{"scene_id": "s1", "start": 0.0, "end": 40.0}],
+                    "paths": {"temp_subdir": "case104_preview"}}, ensure_ascii=False),
+                    encoding="utf-8")
+                # main() 会先确认取数脚本在位（ROOT 已被搬到夹具目录），缺该文件即
+                # "Capture script not found" 早退——桩的是子进程，不是这条存在性检查。
+                (tmp / "程序文件" / "脚本").mkdir(parents=True, exist_ok=True)
+                (tmp / "程序文件" / "脚本" / "preview_capture.js").write_text(
+                    "// stub", encoding="utf-8")
+                argv = [f"--text-fit-rules="
+                        f"{_rules_file(tmp, fit_rules_payload, 'fit_rules.json')}"]
+                if bar_rules_payload is not None:
+                    argv.append(f"--bar-overflow-rules="
+                                f"{_rules_file(tmp, bar_rules_payload, 'bar_rules.json')}")
+                cmds = []
+
+                def fake_run(cmd, *a, **k):
+                    cmds.append(list(cmd))
+                    if run_raises is not None:
+                        raise run_raises
+                    cd = Path(cmd[4])
+                    cd.mkdir(parents=True, exist_ok=True)
+                    for e in manifest_obj.get("scenes", []):
+                        Image.new("RGB", (40, 40), (0, 0, 0)).save(cd / e["file"])
+                    (cd / "capture_manifest.json").write_text(
+                        json.dumps(manifest_obj, ensure_ascii=False), encoding="utf-8")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                saved = (ip.ROOT, ip.PREVIEW_TEMP, ip.QUALITY_DIR, ip.subprocess.run)
+                saved_grid = ip.generate_grid
+                buf = io.StringIO()
+                ebuf = io.StringIO()
+                try:
+                    ip.ROOT = tmp
+                    ip.PREVIEW_TEMP = tmp / "chrome_preview"
+                    ip.QUALITY_DIR = tmp / "quality"
+                    ip.subprocess.run = fake_run
+                    sys.argv = ["instant_preview.py", "--html", str(h),
+                                "--config", str(cfg_path), "--chrome", sys.executable] \
+                        + argv + list(extra)
+                    with contextlib.redirect_stdout(buf), \
+                            contextlib.redirect_stderr(ebuf):
+                        rc = ip.main()
+                finally:
+                    sys.argv = saved_argv
+                    (ip.ROOT, ip.PREVIEW_TEMP, ip.QUALITY_DIR, ip.subprocess.run) = saved
+                    ip.generate_grid = saved_grid
+                rp = (tmp / "过程产物" / "临时产物" / "case104_preview"
+                      / ip.BAR_OVERFLOW_RECORD_NAME)
+                record = json.loads(rp.read_text(encoding="utf-8")) if rp.exists() else None
+                # stderr 一并返回：main() 的 Phase 2 外层有 try/except 会
+                # `traceback.print_exc()`，只收 stdout 的用例看不见"崩了但被吞掉"。
+                return rc, buf.getvalue() + ebuf.getvalue(), cmds, record
+
+        saved_argv = list(sys.argv)
+        SCENES = {"scenes": [{"sceneId": 1, "frame": "start", "time": 3.0,
+                              "file": "scene_1_start.png"}]}
+
+        def _line(cmds):
+            """最后一次子进程的命令行；一次都没跑即返回空串，让对应断言自己转红而不是截断用例。"""
+            return " ".join(cmds[-1]) if cmds else "<子进程一次都没被调用>"
+
+        M_PASS = dict(SCENES, text_fit=FIT_OK_BAR, bar_overflow=BAR_PASS)
+        M_FAIL = dict(SCENES, text_fit=FIT_OK_BAR, bar_overflow=BAR_FAIL)
+        M_NOBAR = dict(SCENES, text_fit=FIT_OK_BAR)
+        M_NOFIT = dict(SCENES, bar_overflow=BAR_PASS)
+
+        rc, out, cmds, record = _drive(M_PASS)
+        tc.assert_equal(rc, 0, f"D0 达标轮退出码：{rc}\n{out[-400:]}")
+        tc.assert_true("[BAR-OVERFLOW] PASS" in out,
+                       f"D0b 达标轮真跑到裁定（退出码 0 不等于跑过）：\n{out[-300:]}")
+        tc.assert_equal((record or {}).get("status"), gs.PASS,
+                        f"D0c 通过路径亦写留痕（只在失败时出声＝正证据缺失）：{record}")
+        tc.assert_equal((record or {}).get("thresholds"), {"tolerance_px": 2.0},
+                        f"D0d 留痕带出当轮阈值：{record}")
+        line0 = _line(cmds)
+        tc.assert_true("--fit-min-cpl=6" in line0,
+                       f"D0e 前提：阈值下传通道确实在用（fit 面在传），D7 的否定断言非空跑：{line0}")
+        tc.assert_true("--bar" not in line0 and "tolerance" not in line0,
+                       f"D7 阈值不下传取数面（结构识别无阈值参数，候选表全量回报）：{line0}")
+
+        rc, out, cmds, record = _drive(M_FAIL)
+        tc.assert_equal(rc, 2, f"D1 溢出 → 退出码 2（与字幕越界同档）\n{out[-400:]}")
+        tc.assert_true("探出容器顶" in out and "禁止带此形态进入全量渲染" in out,
+                       f"D1b 失败行点名形态与后果：\n{out[-300:]}")
+        tc.assert_equal((record or {}).get("status"), gs.FAIL, f"D1c 留痕状态 FAIL：{record}")
+        tc.assert_equal(len((record or {}).get("findings", [])), 2,
+                        f"D1d 留痕逐枚落 findings：{record}")
+
+        rc, out, cmds, record = _drive(M_NOBAR)
+        tc.assert_equal(rc, 3, f"D2 无 bar 段 → 退出码 3（盲区档，与零截图同判据）\n{out[-400:]}")
+        tc.assert_equal((record or {}).get("status"), gs.UNTESTED,
+                        f"D2b 未测写进留痕：{record}")
+        tc.assert_true("捕获脚本未产出 bar_overflow 段" in out,
+                       f"D2c 归因点名段缺失：\n{out[-300:]}")
+
+        rc, out, cmds, record = _drive(M_PASS, run_raises=OSError("chrome died"))
+        tc.assert_equal(rc, 3, f"D2d 取数链整体异常 → 兜底 UNTESTED 阻断（不得归 0）：{rc}")
+        tc.assert_true("捕获脚本未成功返回，bar_overflow 取数无落盘证据" in out,
+                       f"D2e 兜底分支点名（与'段缺失'分开归因）：\n{out[-400:]}")
+        tc.assert_equal((record or {}).get("status"), gs.UNTESTED,
+                        f"D2f 兜底亦写留痕：{record}")
+
+        rc, out, cmds, record = _drive(M_NOBAR, extra=["--accept-bar-overflow-untested"])
+        tc.assert_equal(rc, 0, f"D3 知情放行后退出码归 0：{rc}")
+        tc.assert_equal((record or {}).get("decision"), "accepted_untested",
+                        f"D3b 放行必须留痕（不留即放行无从追溯）：{record}")
+        tc.assert_equal((record or {}).get("status"), gs.UNTESTED,
+                        "D3c 放行只改阻断，不改裁定本身")
+
+        rc, out, cmds, record = _drive(M_PASS, bar_rules_payload={"other": 1})
+        tc.assert_equal(rc, 3, f"D4 阈值断链 → 阻断：{rc}")
+        tc.assert_true("缺 bar_overflow 节" in out and "阈值断链" in out,
+                       f"D4b 断链归因点名：\n{out[-400:]}")
+        tc.assert_true((record or {}).get("thresholds") is None
+                       and (record or {}).get("status") == gs.UNTESTED,
+                       f"D4c 断链轮留痕：状态未测、阈值为空（不得带猜测值）：{record}")
+        tc.assert_true("Traceback" not in out,
+                       f"D4d 断链轮不得有被吞掉的异常（断链即不进裁定面，"
+                       f"adjudicate 带 None 会 TypeError 被外层 except 吞）：\n{out[-400:]}")
+
+        rc, out, cmds, record = _drive(M_FAIL, extra=["--accept-bar-overflow-untested"])
+        tc.assert_equal(rc, 2, "D5 放行开关只覆盖未测面，测出的溢出永不可放行")
+
+        rc, out, cmds, record = _drive(M_NOBAR, extra=["--accept-text-fit-untested"])
+        tc.assert_equal(rc, 3, "D6a text_fit 开关不覆盖 bar 面（一个开关只覆盖一项）")
+
+        rc, out, cmds, record = _drive(M_NOFIT, extra=["--accept-bar-overflow-untested"])
+        tc.assert_true((record or {}).get("status") == gs.PASS,
+                       f"D6b 前提：bar 面本轮确为 PASS（若它未测，rc=3 就是两因共果）：{record}")
+        tc.assert_equal(rc, 3, "D6c bar 开关不覆盖 text_fit 面")
+
+        # ── E 取数面锚定（JS 无行为接缝可跑：云端 runner 无 Chrome，故按源码面锁契约） ──
+        js = (script_dir / "preview_capture.js").read_text(encoding="utf-8")
+        bar_start = js.index("async function measureBarOverflow")
+        bar_body = js[bar_start:js.index("async function main")]
+        tc.assert_true("if (disp !== 'flex' && disp !== 'inline-flex') continue;" in bar_body
+                       and "if (al !== 'flex-end' && al !== 'end') continue;" in bar_body,
+                       "E1 结构识别＝computed display:flex/inline-flex 且子项底部对齐（容器识别无阈值参数）")
+        tc.assert_true("const contentTop = box.top + (parseFloat(cs.borderTopWidth) || 0)" in bar_body
+                       and "+ (parseFloat(cs.paddingTop) || 0);" in bar_body,
+                       "E2 contentTop＝内容盒顶边（rect.top + borderTop + paddingTop），"
+                       "非盒边框顶（漏两项即把正常内边距报成溢出）")
+        tc.assert_true("overflow_px: +(contentTop - unionTop).toFixed(1)," in bar_body,
+                       "E2b 溢出量＝内容盒顶边 − 后代 union 顶边（方向反了会把正常态全报成溢出）")
+        tc.assert_true("if (!worst[row.key] || row.overflow_px > worst[row.key].overflow_px) "
+                       "worst[row.key] = row;" in bar_body,
+                       "E3 逐容器跨采样取最坏（溢出是几何事实，取最优会被稳态前读数洗白）")
+        tc.assert_true("if (dcs.position === 'absolute' || dcs.position === 'fixed') continue;"
+                       in bar_body, "E4a 脱离文档流的后代不参与 union")
+        tc.assert_true("if (chainOpacity(d) < 0.5) continue;" in bar_body
+                       and "if (chainOpacity(el) < 0.5) continue;" in bar_body,
+                       "E4b 不可见容器/后代不进测量面（隐藏大块会把最坏值稀释）")
+        tc.assert_true("if (r.width < 1 || r.height < 1) continue;" in bar_body,
+                       "E4c 零面积后代不参与（其 rect.top 无几何意义）")
+        tc.assert_true("if (!visible) continue;" in bar_body, "E4d 无可见后代即无'探出'可言")
+        tc.assert_true("const label = (el.id" in bar_body and "idx++" in bar_body
+                       and bar_body.index("const label = (el.id")
+                       < bar_body.index("if (chainOpacity(el) < 0.5) continue;"),
+                       "E5 序号先于可见性检查分配（否则跨采样 key 错位、最坏值聚合到别的容器上）")
+        tc.assert_true("verdict" not in bar_body and "PASS" not in bar_body
+                       and "FAIL" not in bar_body,
+                       "E6 JS 只取数不裁定（裁定单点住 Python，否则一条判据两处写）")
+        tc.assert_true("function measureBarOverflow(page, fallbackWindows)" in js
+                       and "threshold" not in bar_body and "tolerance" not in bar_body,
+                       "E7 阈值不下传取数面（与 text_fit 的'必须下传'刻意不同级）")
+        # E8 键契约双向锁：JS 发什么键、Python 读什么键，两侧各取一次源码对撞。
+        # 存在理由——"缺 overflow_px 即静默达标"的形态靠这个空档发生：改名不发一言，
+        # 裁定面把断链读成干净。现在两条防线都在：裁定面缺键即 UNTESTED（B8），
+        # 且套件在改名的那一刻就直接红（E8），不必等真实预览撞上。
+        bar_push = bar_body[bar_body.index("out.push({"):]
+        bar_push = bar_push[:bar_push.index("});")]
+        js_keys = set(_re.findall(r'([A-Za-z_][A-Za-z0-9_]*)\s*:', bar_push))
+        adj_src = inspect.getsource(ip.adjudicate_bar_overflow)
+        py_node_keys = set(_re.findall(r'n\.get\(\s*["\']([A-Za-z_]+)["\']', adj_src)) \
+            | set(_re.findall(r'_num\(n\.get\(\s*["\']([A-Za-z_]+)["\']', adj_src))
+        _missing = sorted(py_node_keys - js_keys)
+        tc.assert_true(bool(js_keys),
+                       f"E8a 从 JS 取到 out.push 的节点键名册（否则本条是空跑）：{sorted(js_keys)}")
+        tc.assert_true(bool(py_node_keys),
+                       f"E8b 从裁定面取到节点键消费面（否则本条是空跑）：{sorted(py_node_keys)}")
+        tc.assert_true(not _missing,
+                       f"E8 取数面缺裁定面所需键＝静默断链：{_missing}"
+                       f"（JS 侧名册 {sorted(js_keys)}）")
+        tc.assert_true("await computeSampleState(page, fallbackWindows)" in bar_body
+                       and "tl.seek(time, false)" in bar_body
+                       and "gsap.ticker.tick()" in bar_body,
+                       "E9 复用同一采样状态机与 seek 通道（各造一套即两处漂移）")
+        tc.assert_true("return { status_hint: 'no_time_source', samples: 0, "
+                       "measured_nodes: 0, nodes: [] };" in bar_body,
+                       "E10 无时刻源显式回吐 hint 而非空表（空表会被读成'候选 0 个=不适用'）")
+        tc.assert_true("const bar = await measureBarOverflow(page, fitWindows);" in js
+                       and "manifest.bar_overflow = bar;" in js,
+                       "E11 main() 接线：读数进 manifest")
+        tc.assert_true("manifest.bar_overflow = { status_hint: 'measure_failed'," in js,
+                       "E11b 取数异常也显式回吐 hint（不得让 manifest 缺键）")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("bar overflow gate error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_stream_wrapper_keepalive_chain() -> RegressionTestCase:
+    """流包装保活链：重绑 sys.stdout/stderr 必须「持旧 + 持新」，级联关闭不得复发。
+
+    存在理由（机制实测，非推演）：TextIOWrapper 引用归零即 finalize（无需
+    gc.collect），其析构关闭各代共享的底层 buffer——此后任何仍活着的 wrapper
+    都是哑弹，写入报 ValueError: I/O operation on closed file。当前 14 个脚本
+    的模块级/函数级重绑均已按「持旧+持新」落码，但该形态此前无任何回归覆盖：
+    谁再顺手改一行（把 kept 挪前、删掉 prev、append 只留一处），事故只在
+    某次真实运行里以"打印炸掉"形态出现。本用例把形态锁死。
+
+    三段分工：
+      A 模块级（静态 AST，全脚本目录）：12 个模块级重绑文件逐流断言
+        「首重绑前有持旧行 ∧ 末重绑后有持新行」；模块级不得出现非 wrapper 的
+        sys.<流> 赋值（未知形态＝漏保活）；死件 _v2.py 不得被任何活件 import。
+      B 函数级（静态 AST）：script_interface.Logger.__init__（stderr）与
+        _forced_align.main()（stdout）两站点——保活表模块级初始化在位、首重绑
+        前 append 持旧、末重绑后 append 持新，且 append 实参须是该流本身。
+      C 行为级（子进程真跑，-B -c）：六正向场景＝先裸重绑制造无主代 → import
+        目标模块（其保活链必须救活共享 buffer）→ 再裸重绑 → 打印双流探针行；
+        一负向对照＝两次连续裸重绑的 canary 脚本必须 rc!=0（换五件套安全版即
+        转绿，证明该断言真在测行为）。
+
+    实测判据（2026-10-15 三向实验）：「只加 prev 不够」——两次连续重绑时被顶掉
+    的中间代才是无主者，prev 只持首代；故 M8 变异须换完整五件套（prev+重绑+
+    mid+重绑+kept）才能让 C2 显形（三行版实测仍炸、变异存活）。
+
+    平台前提：修法分支住 win32 条件内（script_interface 显式，其余为平台无关的
+    防御式补丁），本用例不分叉——CI 为 windows-latest，与事故平台一致。
+
+    卫生：探针以 -c 内联执行、canary 落 TemporaryDirectory 用后即删，脚本目录
+    不得多出文件（沿用用例86 落点判据）。
+    """
+    tc = RegressionTestCase("stream_wrapper_keepalive_chain",
+                            "流包装保活链：重绑持旧+持新（静态AST+行为子进程）")
+    try:
+        import ast as _ast105
+        import re as _re105
+        import subprocess as _sub105
+
+        _sq = Path(__file__).resolve().parent
+
+        MODULE_REBIND_FILES = {
+            "adjust_timeline.py": ("stderr", "stdout"),
+            "doc_to_markdown.py": ("stderr", "stdout"),
+            "enhance_video_audio.py": ("stderr", "stdout"),
+            "generate_completion_report.py": ("stdout",),
+            "instant_preview.py": ("stderr", "stdout"),
+            "openmontage_runner.py": ("stderr", "stdout"),
+            "pipeline_runner.py": ("stderr", "stdout"),
+            "project_audit.py": ("stderr", "stdout"),
+            "project_cleanup.py": ("stderr", "stdout"),
+            "scene_config_generator.py": ("stderr", "stdout"),
+            "scene_patch_render.py": ("stderr", "stdout"),
+            "test_compiler_smoke.py": ("stderr", "stdout"),
+        }
+        DEAD_V2_FILES = ("enhance_video_audio_v2.py", "pipeline_runner_v2.py",
+                         "verify_tts_product_v2.py")
+        FUNC_REBIND_SITES = {
+            ("script_interface.py", "__init__", "stderr"): "_stream_keepalive",
+            ("_forced_align.py", "main", "stdout"): "_stdout_keepalive",
+        }
+        STREAMS_105 = ("stdout", "stderr")
+
+        def _is_sys_attr105(node, attr):
+            return (isinstance(node, _ast105.Attribute) and node.attr == attr
+                    and isinstance(node.value, _ast105.Name)
+                    and node.value.id == "sys")
+
+        def _is_wrapper_call105(node):
+            if not isinstance(node, _ast105.Call):
+                return False
+            f = node.func
+            if isinstance(f, _ast105.Attribute):
+                return f.attr == "TextIOWrapper"
+            if isinstance(f, _ast105.Name):
+                return f.id == "TextIOWrapper"
+            return False
+
+        def _holds_stream105(value, stream):
+            # 值持流：sys.<stream> 本身或容器含之。刻意不含 sys.<s>.buffer——
+            # 持 buffer 不阻止 wrapper finalize（buffer 恰会被无主 wrapper 关掉）。
+            if _is_sys_attr105(value, stream):
+                return True
+            if isinstance(value, (_ast105.Tuple, _ast105.List, _ast105.Set)):
+                return any(_holds_stream105(e, stream) for e in value.elts)
+            return False
+
+        def _scan105(path):
+            try:
+                tree = _ast105.parse(path.read_text(encoding="utf-8",
+                                                    errors="replace"))
+            except SyntaxError:
+                return None
+            res = {"mod_holds": {}, "mod_rebinds": {}, "func_rebinds": {},
+                   "func_holds": {}, "func_appends": [], "mod_other": [],
+                   "mod_lists": []}
+
+            def _walk(node, func):
+                # 必须 iter_child_nodes 全下钻（含 If/For/Try 块）：win32 分支
+                # 里的重绑/保活首版曾因不钻条件块而漏检。
+                for child in _ast105.iter_child_nodes(node):
+                    if isinstance(child, (_ast105.FunctionDef,
+                                          _ast105.AsyncFunctionDef)):
+                        _walk(child, child.name)
+                        continue
+                    if isinstance(child, _ast105.Assign):
+                        for tgt in child.targets:
+                            if (_is_sys_attr105(tgt, "stdout")
+                                    or _is_sys_attr105(tgt, "stderr")):
+                                s = tgt.attr
+                                if _is_wrapper_call105(child.value):
+                                    if func is None:
+                                        res["mod_rebinds"].setdefault(
+                                            s, []).append(child.lineno)
+                                    else:
+                                        res["func_rebinds"].setdefault(
+                                            (func, s), []).append(child.lineno)
+                                elif func is None:
+                                    res["mod_other"].append(
+                                        (child.lineno,
+                                         "assign sys.%s non-wrapper" % s))
+                            else:
+                                held = [s for s in STREAMS_105
+                                        if _holds_stream105(child.value, s)]
+                                if held:
+                                    d = (res["mod_holds"] if func is None
+                                         else res["func_holds"])
+                                    for s in held:
+                                        key = s if func is None else (func, s)
+                                        d.setdefault(key, []).append(
+                                            child.lineno)
+                        if (func is None and len(child.targets) == 1
+                                and isinstance(child.targets[0], _ast105.Name)
+                                and isinstance(child.value, _ast105.List)
+                                and not child.value.elts):
+                            res["mod_lists"].append(child.targets[0].id)
+                    if (isinstance(child, _ast105.Call)
+                            and isinstance(child.func, _ast105.Attribute)
+                            and child.func.attr == "append"
+                            and isinstance(child.func.value, _ast105.Name)
+                            and func is not None):
+                        arg = child.args[0] if child.args else None
+                        res["func_appends"].append(
+                            (func, child.lineno, child.func.value.id, arg))
+                    _walk(child, func)
+
+            _walk(tree, None)
+            return res
+
+        # ---- A 段：模块级 ----
+        universe = [p for p in sorted(_sq.glob("*.py"))
+                    if p.name not in DEAD_V2_FILES]
+        tc.assert_true(len(universe) >= 30,
+                       f"A0a 扫描面须非空（脚本目录活件 {len(universe)} 个"
+                       f"；路径解析断裂即空跑）")
+        scans = {}
+        for p in universe:
+            scans[p.name] = _scan105(p)
+
+        missing = [n for n in MODULE_REBIND_FILES if n not in scans]
+        if export_repo_face(tc) == "published":
+            # 钉名单里有两件（project_audit.py 工作区体检、test_compiler_smoke.py 编译器冒烟）
+            # 属开发侧件，按清单 §2.1 未列而不进公开面。它们的缺席**直接改变本段取数面**——
+            # A1 的"缺失"集合会把它们报成回归坏了，故按实得点名、并把本段裁定收到在位件上。
+            # 刻意写成"恰等于"而非"允许缺席"：该名单取自 2026-10-16 导出批在发布仓的实测读数，
+            # 公开面哪天多出或少了这两件，本条即转红，逼下批更新，不留成静默放宽。
+            published_absent = ["project_audit.py", "test_compiler_smoke.py"]
+            tc.assert_equal(sorted(missing), sorted(published_absent),
+                            f"A0-发布仓面：钉名单缺席须恰等于已知不导出件 {published_absent}，"
+                            f"实得 {missing}")
+            MODULE_REBIND_FILES = {k: v for k, v in MODULE_REBIND_FILES.items()
+                                   if k not in missing}
+        else:
+            tc.assert_true(not missing, f"A0 钉名单文件必须在位：缺 {missing}")
+
+        found = {n for n, r in scans.items() if r and r["mod_rebinds"]}
+        extra = sorted(found - set(MODULE_REBIND_FILES))
+        gone = sorted(set(MODULE_REBIND_FILES) - found)
+        tc.assert_true(not extra and not gone,
+                       f"A1 有模块级重绑的文件集合必须==钉名单"
+                       f"（多出={extra}；缺失={gone}）")
+
+        for name, streams in MODULE_REBIND_FILES.items():
+            r = scans.get(name)
+            if r is None:
+                continue
+            got = set(r["mod_rebinds"])
+            tc.assert_true(got == set(streams),
+                           f"A2 {name} 重绑流集合={sorted(got)}"
+                           f" 与钉名单 {sorted(streams)} 不符")
+            for s in streams:
+                holds = r["mod_holds"].get(s, [])
+                rebs = r["mod_rebinds"].get(s, [])
+                tc.assert_true(bool(holds) and bool(rebs) and min(holds) < min(rebs),
+                               f"A4 {name} 流 {s} 首重绑前须有持旧行"
+                               f"（holds={holds} rebinds={rebs}）")
+                tc.assert_true(bool(holds) and bool(rebs) and max(holds) > max(rebs),
+                               f"A5 {name} 流 {s} 末重绑后须有持新行"
+                               f"（holds={holds} rebinds={rebs}）")
+
+        other = [(n, r["mod_other"]) for n, r in scans.items()
+                 if r and r["mod_other"]]
+        tc.assert_true(not other,
+                       f"A3 模块级不得出现非 wrapper 的 sys.<流> 赋值"
+                       f"（未知形态＝漏保活）：{other}")
+
+        _base = _sq.parent
+        _skip_parts = {"运行环境", "venv", ".venv", "node_modules",
+                       "__pycache__"}
+        _n_py = 0
+        _v2_hits = []
+        for p in _base.rglob("*.py"):
+            if any(x in p.parts for x in _skip_parts):
+                continue
+            if p.name in DEAD_V2_FILES:
+                continue
+            _n_py += 1
+            try:
+                _txt = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for _nm in DEAD_V2_FILES:
+                if _re105.search(r"\b(?:from|import)\s+" + _nm[:-3] + r"\b",
+                                 _txt):
+                    _v2_hits.append((str(p.relative_to(_base)), _nm))
+        # 扫描面非空的判据取**结构关系**而非固定数：rglob 的根是 程序文件/，它必然覆盖
+        # 脚本目录全部活件。原先写死 `>= 60` 是按开发仓规模定的，公开面只带清单 §2.1 那批
+        # 件（实测 37 个 py）即被读成"路径断"——那是把"不导出"误读成"取数面坏了"。
+        # 换成关系判据后两仓同一条、且路径真断时（_n_py=0）照样转红。
+        tc.assert_true(_n_py >= len(universe),
+                       f"A6a v2 引用扫描面须至少覆盖脚本目录活件（实测 {_n_py} 个 py vs "
+                       f"脚本目录 {len(universe)} 个；不足即 rglob 根路径断裂，本段空跑）")
+        tc.assert_true(not _v2_hits,
+                       f"A6 死件须无任何活件 import（v2 自身文档行不计）："
+                       f"{_v2_hits}")
+
+        # ---- B 段：函数级 ----
+        sites_found = set()
+        for n, r in scans.items():
+            if r:
+                for k in r["func_rebinds"]:
+                    sites_found.add((n,) + k)
+        extra_f = sorted(sites_found - set(FUNC_REBIND_SITES))
+        gone_f = sorted(set(FUNC_REBIND_SITES) - sites_found)
+        tc.assert_true(not extra_f and not gone_f,
+                       f"B0 函数级重绑站点集合必须==钉名单"
+                       f"（多出={extra_f}；缺失={gone_f}）")
+
+        for (name, func, stream), list_name in FUNC_REBIND_SITES.items():
+            r = scans.get(name)
+            if r is None:
+                continue
+            tc.assert_true(list_name in r["mod_lists"],
+                           f"B1 {name} 保活表 `{list_name} = []` 须在模块级"
+                           f"初始化（实测模块级空表={r['mod_lists']}）")
+            rebs = r["func_rebinds"].get((func, stream), [])
+            if not rebs:
+                continue
+            first_r, last_r = min(rebs), max(rebs)
+            before = [l for (fn, l, ln, a) in r["func_appends"]
+                      if fn == func and l < first_r and ln == list_name
+                      and _is_sys_attr105(a, stream)]
+            after = [l for (fn, l, ln, a) in r["func_appends"]
+                     if fn == func and l > last_r and ln == list_name
+                     and _is_sys_attr105(a, stream)]
+            tc.assert_true(bool(before),
+                           f"B2 {name}:{func} 首重绑({first_r})前须 append 持旧"
+                           f"（表={list_name}，实参=sys.{stream}，"
+                           f"实测 appends={r['func_appends']}）")
+            tc.assert_true(bool(after),
+                           f"B3 {name}:{func} 末重绑({last_r})后须 append 持新"
+                           f"（表={list_name}，实参=sys.{stream}，"
+                           f"实测 appends={r['func_appends']}）")
+
+        # ---- C 段：行为（子进程真跑） ----
+        _PROBE_TEMPLATE = r'''import io, sys
+
+def bare(streams="both"):
+    if streams in ("both", "stdout"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if streams in ("both", "stderr"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+def probe(tag):
+    print("PROBE-%s-OUT" % tag)
+    sys.stdout.flush()
+    print("PROBE-%s-ERR" % tag, file=sys.stderr)
+    sys.stderr.flush()
+
+SCENARIO = "__SCENARIO__"
+if SCENARIO == "logger":
+    import script_interface
+    bare("stderr")
+    log = script_interface.Logger("probe105")
+    bare("stderr")
+    log.warn("canary-105")
+    sys.stderr.flush()
+    probe("LOGGER")
+elif SCENARIO == "adjust_timeline":
+    bare()
+    import adjust_timeline
+    bare()
+    probe("ADJUST")
+elif SCENARIO == "enhance":
+    bare()
+    import enhance_video_audio
+    bare()
+    probe("ENHANCE")
+elif SCENARIO == "doc_to_markdown":
+    bare()
+    import doc_to_markdown
+    bare()
+    probe("DOCMD")
+elif SCENARIO == "forced_align":
+    import _forced_align
+    bare("stdout")
+    sys.argv = ["_forced_align", "--definitely-not-a-flag-105"]
+    try:
+        _forced_align.main()
+    except SystemExit:
+        pass
+    bare("stdout")
+    probe("ALIGN")
+elif SCENARIO == "pipeline_runner":
+    bare()
+    import pipeline_runner
+    bare()
+    probe("PIPELINE")
+print("ALL-PROBES-OK")
+sys.stdout.flush()
+'''
+        _CANARY_BODY = r'''import io
+import sys
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+print("PROBE-CANARY-OUT")
+print("ALL-PROBES-OK")
+sys.stdout.flush()
+'''
+
+        def _run105(scenario):
+            code = _PROBE_TEMPLATE.replace("__SCENARIO__", scenario)
+            p = _sub105.run([sys.executable, "-B", "-c", code],
+                            cwd=str(_sq), capture_output=True, timeout=180)
+            return (p.returncode,
+                    p.stdout.decode("utf-8", "replace"),
+                    p.stderr.decode("utf-8", "replace"))
+
+        scn = [("logger", "LOGGER", "C0"),
+               ("adjust_timeline", "ADJUST", "C1"),
+               ("enhance", "ENHANCE", "C3"),
+               ("doc_to_markdown", "DOCMD", "C4"),
+               ("forced_align", "ALIGN", "C5"),
+               ("pipeline_runner", "PIPELINE", "C6")]
+        errs105 = {}
+        for scenario, tag, cid in scn:
+            rc, out, err = _run105(scenario)
+            errs105[scenario] = err
+            tail = "rc=%s out_tail=%r err_tail=%r" % (rc, out[-200:], err[-200:])
+            tc.assert_true(rc == 0, f"{cid} 场景 {scenario} rc==0：{tail}")
+            tc.assert_true("ALL-PROBES-OK" in out,
+                           f"{cid} 场景 {scenario} 须打印 ALL-PROBES-OK：{tail}")
+            tc.assert_true(("PROBE-%s-OUT" % tag) in out,
+                           f"{cid} 场景 {scenario} stdout 探针行在位：{tail}")
+            tc.assert_true(("PROBE-%s-ERR" % tag) in err,
+                           f"{cid} 场景 {scenario} stderr 探针行在位：{tail}")
+        tc.assert_true("canary-105" in errs105.get("logger", ""),
+                       "C0b logger 场景 canary-105 须经重绑后的 stderr 真实写出"
+                       f"（err_tail={errs105.get('logger', '')[-200:]!r}）")
+
+        tmp105 = tempfile.mkdtemp(prefix="case105_canary_")
+        try:
+            canary_py = Path(tmp105) / "bare_canary_105.py"
+            canary_py.write_text(_CANARY_BODY, encoding="utf-8")
+            cp = _sub105.run([sys.executable, "-B", str(canary_py)],
+                             capture_output=True, timeout=60)
+            cout = cp.stdout.decode("utf-8", "replace")
+            cerr = cp.stderr.decode("utf-8", "replace")
+            tc.assert_true(cp.returncode != 0,
+                           f"C2 负向对照：两次连续裸重绑必须崩"
+                           f"（rc={cp.returncode}，out={cout[:150]!r}，"
+                           f"err_tail={cerr[-200:]!r}）")
+            tc.assert_true("ALL-PROBES-OK" not in cout,
+                           f"C2b 负向对照不得打印 ALL-PROBES-OK"
+                           f"（崩不得被吞）：out={cout[:200]!r}")
+        finally:
+            shutil.rmtree(tmp105, ignore_errors=True)
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("stream wrapper keepalive error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_fingerprint_registry_matches_reading_face() -> RegressionTestCase:
+    """用例106：指纹登记面＝真实读取路径（2026-10-16 全面审计批）。
+
+    存在理由：A06 的判据是"登记面与真实读取路径对齐"，此前每批各补一处（preview 批
+    补 preview_capture.js、10-13 批补报告自身、10-14 批补 pause_marks），从未做过一次
+    全量对撞。本批现查补登五处真断链，并把"补登"这件事本身变成机算判据：
+
+    A 五处断链键在登记面且指向真身文件；
+    B compiled_scenes 登记路径须跟随读取方表达式（dirname(config_path)），不得回到
+      source_dir 形态——夹具把 config 放在与 source_dir 不同的子目录，使两种写法可区分
+      （否则本条断言在两种实现下同形＝空跑）；
+    C 跨步基座真身（_gate_status / _gsap_time_utils / _narration_lint）按消费者登记；
+    D 登记面里指向 SCRIPTS 与 config/quality 的对象全部在盘（登记一个不存在的路径＝
+      该项零贡献、静默空转，正是本批要防的形态）；
+    E 行为级：缺失的 _timeline_manifest.json 被 [FP-MISS] 点名，齐备时不点名——
+      点名面靠常量集合真起作用，不是常量存在而未接线；
+    F 零全量渲染冲击见证：render 步键集恰为 config/html/render_rules 三件，本批一件
+      未加（这条是"本批不付渲染"这句结论的载体，不得只写在注释里）；
+    G preview 登记 narration（改窗口不改旁白的修订，预览此前免检）。
+    """
+    tc = RegressionTestCase(
+        "fingerprint_registry_matches_reading_face",
+        "A06 全量对撞：补登的五处断链、基座件消费者登记、登记路径在盘、运行时产物点名、render 面零冲击"
+    )
+    try:
+        import ast
+        import tempfile
+        import subprocess
+        import sys
+        from pipeline_runner import PipelineRunner, PipelineState, _RUNTIME_ARTIFACT_INPUTS
+        from pathlib import Path
+
+        SCRIPT_DIR = Path(__file__).resolve().parent
+        QUALITY = SCRIPT_DIR.parent / "配置" / "config" / "quality"
+
+        def build_runner(root, cfg_dir=None):
+            r = PipelineRunner.__new__(PipelineRunner)
+            r.state = PipelineState(root / "pipeline_state.json")
+            r.force = False
+            r.config = {}
+            r.html_project = "probe_proj"
+            r.source_dir = root
+            r.html_path = root / "index.html"
+            r.temp_dir = root
+            r.tts_dir = root / "tts_44k"
+            r.render_raw = root / "render_raw.mp4"
+            r.output_file = root / "probe_proj.mp4"
+            r.gate_mode = "render"
+            r.quick_fix = False
+            # config 刻意落在 source_dir 之外的一层子目录：读取方 enhance_video_audio
+            # .load_config 第2层按 dirname(config_path) 找 _compiled_scenes.json，
+            # 只有两者不同目录时，"跟随 config"与"跟随 source_dir"两种写法才可区分。
+            base = cfg_dir or root
+            base.mkdir(parents=True, exist_ok=True)
+            r.config_path = base / "cfg.json"
+            r.config_path.write_text("{}", encoding="utf-8")
+            return r
+
+        tmp = Path(tempfile.mkdtemp(prefix="fp106_"))
+        try:
+            cfg_sub = tmp / "config"
+            runner = build_runner(tmp, cfg_sub)
+
+            # ── A. 五处断链补登，且指向真身文件 ──────────────────────────
+            a_expect = {
+                ("tts", "tts_verify"): "verify_tts_product.py",
+                ("postprocess", "timeline_manifest"): "_timeline_manifest.json",
+                ("preview", "boundary_module"): "visual_boundary_check.py",
+                ("completion_report", "gate_rules"): "delivery_gate_rules.json",
+                ("completion_report", "media_qa_script"): "media_qa_gate.py",
+            }
+            for (step, key), tail in a_expect.items():
+                got = runner._step_inputs(step).get(key, "")
+                tc.assert_true(got.endswith(tail),
+                               f"A {step}.{key} 须登记 {tail}，实得 {got!r}")
+            # A2 反面见证：这些键在补登前根本不存在（键名不得被别件顶替）
+            tc.assert_true(runner._step_inputs("postprocess").get("timeline_manifest", "") ==
+                           str(tmp / "_timeline_manifest.json"),
+                           "A2 postprocess 的 timeline_manifest 须指向 temp 根（与 timeline 步同一表达式）")
+
+            # ── B. compiled_scenes 跟随读取方表达式，不回到 source_dir ──────
+            compiled_reg = runner._step_inputs("tts").get("compiled_scenes", "")
+            tc.assert_equal(compiled_reg, str(cfg_sub / "_compiled_scenes.json"),
+                            f"B compiled_scenes 须按 dirname(config_path) 登记，实得 {compiled_reg!r}")
+            tc.assert_true(compiled_reg != str(tmp / "_compiled_scenes.json"),
+                           "B2 反面：不得退回 source_dir 形态（该写法在全仓任何真实配置下"
+                           "都退化为 notfound: 常量＝零贡献）")
+
+            # ── C. 跨步基座真身按消费者登记 ──────────────────────────────
+            c_expect = {
+                "_gate_status.py": ("preview", "visual_check", "postprocess"),
+                "_gsap_time_utils.py": ("preflight", "timeline", "tts", "preview",
+                                        "verify", "postprocess"),
+                "_narration_lint.py": ("preflight", "postprocess"),
+            }
+            for fname, steps in c_expect.items():
+                for step in steps:
+                    got = " ".join(runner._step_inputs(step).values())
+                    tc.assert_true(fname in got,
+                                   f"C {fname} 须登记在 {step} 步（该步的真实消费者）")
+            # C2 反向：未在该步消费的不许顺手登记（登记面宽于事实＝噪声，且会把无关
+            # 文件的字节变化算成该步输入变化，制造无意义重跑）
+            tc.assert_true("_gate_status" not in " ".join(runner._step_inputs("render").values()),
+                           "C2 render 步不得出现 _gate_status（本批零全量渲染冲击的前提）")
+
+            # ── D. 登记面里指向脚本与配置的条目全部在盘 ──────────────────
+            steps_all = ["preflight", "tts", "timeline", "preview", "render", "verify",
+                         "visual_check", "postprocess", "delivery", "completion_report"]
+            off_disk = []
+            for step in steps_all:
+                for name, path in runner._step_inputs(step).items():
+                    sp = str(path)
+                    if SCRIPT_DIR.as_posix() in sp.replace("\\", "/") or \
+                            str(QUALITY).replace("\\", "/").lower() in sp.replace("\\", "/").lower():
+                        if not Path(sp).exists():
+                            off_disk.append(f"{step}.{name}={sp}")
+            tc.assert_equal(off_disk, [],
+                            f"D 登记面不得含磁盘上不存在的路径（缺失＝该项零贡献、静默空转）：{off_disk}")
+
+            # ── E. [FP-MISS] 行为级点名（子进程真跑 _fingerprint）────────
+            probe = tmp / "_fpmiss.py"
+            probe.write_text(
+                "import sys, tempfile\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+                "from pipeline_runner import PipelineRunner, PipelineState\n"
+                "root = Path(tempfile.mkdtemp(prefix='fp106e_'))\n"
+                "r = PipelineRunner.__new__(PipelineRunner)\n"
+                "r.state = PipelineState(root/'pipeline_state.json'); r.force = False; r.config = {}\n"
+                "r.html_project='p'; r.source_dir=root; r.html_path=root/'index.html'\n"
+                "r.temp_dir=root; r.tts_dir=root/'tts_44k'; r.render_raw=root/'render_raw.mp4'\n"
+                "r.output_file=root/'p.mp4'; r.gate_mode='render'; r.quick_fix=False\n"
+                "r.config_path=root/'cfg.json'; r.config_path.write_text('{}', encoding='utf-8')\n"
+                "(root/'tts_manifest.json').write_text('{}', encoding='utf-8')\n"
+                "(root/'render_raw.mp4').write_bytes(b'x')\n"
+                "r._fingerprint('postprocess')\n"
+                "(root/'_timeline_manifest.json').write_text('{}', encoding='utf-8')\n"
+                "print('==WITH==')\n"
+                "r._fingerprint('postprocess')\n",
+                encoding="utf-8")
+            py = sys.executable
+            cp = subprocess.run([py, "-B", "-X", "utf8", str(probe)],
+                                capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", cwd=str(tmp))
+            out = cp.stdout
+            tc.assert_true(cp.returncode == 0,
+                           f"E0 探针须跑成（rc={cp.returncode}，err_tail={cp.stderr[-200:]!r}）")
+            head, tail_part = out.split("==WITH==")
+            tc.assert_true("[FP-MISS]" in head and "timeline_manifest=" in head,
+                           f"E1 缺失的运行时产物须被点名，实得 {head.strip()[:200]!r}")
+            tc.assert_true("timeline_manifest" not in tail_part,
+                           f"E2 在盘后不得继续点名（不得把常驻警告当信号）：{tail_part.strip()[:200]!r}")
+            # E3 点名面真由常量集合驱动：常量缺该枚即不点名（防"常量存在而未接"）
+            tc.assert_true("timeline_manifest" in _RUNTIME_ARTIFACT_INPUTS,
+                           "E3 _RUNTIME_ARTIFACT_INPUTS 须含 timeline_manifest")
+            _pr_src = (SCRIPT_DIR / "pipeline_runner.py").read_text(encoding="utf-8")
+            _tree = ast.parse(_pr_src)
+            _fn = next(n for n in ast.walk(_tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "_step_inputs")
+            _keys_by_step = {}
+            for node in ast.walk(_fn):
+                if isinstance(node, ast.Dict):
+                    step_name = None
+                    for k, v in zip(node.keys, node.values):
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str) \
+                                and k.value in steps_all and isinstance(v, ast.Dict):
+                            _keys_by_step[k.value] = {kk.value for kk in v.keys
+                                                      if isinstance(kk, ast.Constant)}
+            tc.assert_true("timeline_manifest" in _keys_by_step.get("postprocess", set()),
+                           f"E4 键须在 _step_inputs 字面量里真存在（AST 取数，非源码子串）：{_keys_by_step.get('postprocess')}")
+
+            # ── F. render 步登记面三件未动（零全量渲染冲击的载体）────────
+            tc.assert_equal(sorted(runner._step_inputs("render").keys()),
+                            ["config", "html", "render_rules"],
+                            "F render 步登记面须恰为 config/html/render_rules 三件——本批不得"
+                            "把任何新件加进 render，否则每支存量项目下轮都付一次全量渲染")
+
+            # ── G. preview 登记 narration ────────────────────────────────
+            tc.assert_true(runner._step_inputs("preview").get("narration", "")
+                           .endswith("narration.json"),
+                           "G preview 须登记 narration.json（instant_preview:911 经 "
+                           "resolve_narration_scenes 真读场景窗口）")
+
+            # ── H. 每步登记面非空且不出现同名键覆盖 ──────────────────────
+            for step in steps_all:
+                tc.assert_true(len(runner._step_inputs(step)) >= 2,
+                               f"H {step} 登记面不得退化为空/单件")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("fingerprint registry face error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_mutation_matrix_engine_adjudicates_its_own_criteria() -> RegressionTestCase:
+    """用例108：变异矩阵引擎自证（2026-10-16 自进化建议收口批）。
+
+    存在理由：本批把 7 份一次性探针（骨架 90% 同构、每批手抄一遍）抽成
+    `mutation_matrix.py`，并修掉抄写造成的两处口径漂移——其中"只按 status==failed
+    且有失败断言就记 RED-OK、无基线对照"这一条，在首批真跑里就把一枚整案 KeyError
+    截断（后半段断言从未执行）读成了对位红。引擎自己承载三条判据，就必须能被证明
+    这三条判据不是恒真：故本用例用**因果夹具**（fake runner 真去读被注入的目标文件，
+    变异改变其输出）逐态显形，而非打桩返回值。
+
+    A 对位红与基线全绿；B 落红未落对位；C 空跑显形（SURVIVED）；D 未声明 expect；
+    E 连带越界点名；F 锚命中 0/2 处；G 整案异常与断言被截断两形态各判 CRASH；
+    H 基线不干净整体判未测（退出码 2，不得读成已验证）；I 反向对照须附 note、
+      有 note 时"期望不红且实测未红"记对位而非空跑；J 行尾自适应（CRLF 不被写成 LF）；
+    K --only 前缀不得撞号（M1 不得连带 M10）；L 复位按字节自证；
+    M 入仓变异表的锚在当前生产文件命中 1 处（数据件腐坏即在 CI 显形，不注入）；
+    N 本件不进 ci_gate、不进任何步骤指纹登记面；O 判据文案单源。
+    D 开发仓面：取证三件套在位、路径单源同仓、变异表落点等于引擎默认值、
+      且三件均已登记进 never_in_target（不得被后续导出批顺手带走）；
+    P 发布仓面：三件套缺席即锁（半缺席判红），并仍裁公开面流水线未接进本件。
+    """
+    tc = RegressionTestCase(
+        "mutation_matrix_engine_adjudicates_its_own_criteria",
+        "变异矩阵引擎三条判据的逐态显形、基线不干净判未测、行尾自适应、复位自证、入仓变异表不腐坏"
+    )
+    try:
+        import importlib
+        import json
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        ENGINE = SUITE_SCRIPT_DIR / "mutation_matrix.py"
+        MATRIX = SUITE_SCRIPT_DIR / "mutation_matrices.json"
+        CI_GATE = SUITE_SCRIPT_DIR / "ci_gate.py"
+        assert_true = tc.assert_true
+        assert_equal = tc.assert_equal
+
+        # ── 仓库角色分岔（缺席即锁，与用例67/77/78 同手法，切面取 export_repo_face 单点）──
+        # 存在理由：本件是**取证工具**——它会改写生产文件字节，且变异表逐枚抄了生产脚本的
+        # 锚点字面。它按 `publish_redact_terms.json → never_in_target` 不进公开面，故发布仓里
+        # 引擎、变异表、ci_gate 三件同时缺席，A-M/O 那些"跑真身"的裁定在此无对象。照字面
+        # 要求三件在位，下一次导出的 §8.2 两仓回归即必红（把"不导出"读成"回归坏了"）。
+        face = export_repo_face(tc)
+        forensic = [ENGINE, MATRIX, CI_GATE]
+        present = [p for p in forensic if p.is_file()]
+        if 0 < len(present) < len(forensic):
+            assert_true(False,
+                        f"取证三件套仅部分在位（{[p.name for p in present]}）：半导出＝机制半生效，"
+                        "两侧读数都不可信")
+        elif face == "published":
+            assert_equal(face, "published",
+                         "P0 分支确由脱敏三件套缺席切过来（非恒真）")
+            for p in forensic:
+                assert_true(not p.is_file(), f"P1 {p.name} 不得在发布仓（never_in_target 不变量）")
+            runner = SUITE_SCRIPT_DIR / "pipeline_runner.py"
+            assert_true(runner.is_file(), "P2 取数对象 pipeline_runner.py 须在盘")
+            assert_true("mutation_matrix" not in runner.read_text(encoding="utf-8"),
+                        "P2b 公开面那份流水线不得接进本件（进任一步骤指纹登记面＝登记即自造重跑）")
+            tc.mark_passed()
+            return tc
+        assert_equal(len(present), len(forensic),
+                     f"D0 开发仓面取证三件套须全在位，缺 "
+                     f"{[p.name for p in forensic if not p.is_file()]}")
+        terms_src = (SUITE_SCRIPT_DIR.parent / "配置" / "config_dev" /
+                     "publish_redact_terms.json")
+        assert_true(terms_src.is_file(), "D3a 词表须在盘（never_in_target 的权威源）")
+        never = json.loads(terms_src.read_text(encoding="utf-8")).get("never_in_target") or []
+        unregistered = [f"程序文件/脚本/{p.name}" for p in forensic if f"程序文件/脚本/{p.name}" not in never]
+        assert_equal(unregistered, [],
+                     f"D3 取证三件套须逐件登记进 never_in_target，缺 {unregistered}——"
+                     "未登记即下一次导出批可被顺手带走，而公开面回归会红在跑不到真身的段上")
+
+        # 引擎自身导出的 SCRIPT_DIR/ROOT 作为路径单源（本套件内 SCRIPT_DIR 是各用例
+        # 局部名，另写一份推导即第二个真相源）
+        mm = importlib.import_module("mutation_matrix")
+        assert_equal(Path(str(mm.SCRIPT_DIR)).resolve(), SUITE_SCRIPT_DIR,
+                     "D1 路径单源：引擎侧 SCRIPT_DIR 与套件侧 SUITE_SCRIPT_DIR 须同源，"
+                     "两处各写一份推导即第二个真相源")
+        assert_equal(Path(str(mm.MATRICES_DEFAULT)), MATRIX,
+                     "D2 变异表落点须等于引擎默认值（不得两侧各推一次路径）")
+        assert_true(ENGINE.is_file(), "A0 引擎须在 程序文件/脚本/ 下（本用例的对象本体）")
+
+        # ── 因果夹具：runner 真读 target 文件，注入即改变其裁定 ──────────────
+        TARGET_TEXT = (
+            "# fake target\n"
+            "LEG_A = False\n"
+            "LEG_B = False\n"
+            "LEG_AB = False\n"
+            "LEG_UNUSED = False\n"
+            "TRUNC = False\n"
+            "BOOM = False\n"
+            "BASE_RED = False\n"
+            "DUP = False\n"
+            "DUP = False\n"
+        )
+        RUNNER_TEXT = r'''# -*- coding: utf-8 -*-
+import json, os, sys
+NL = chr(10)
+argv = sys.argv
+out = argv[argv.index("--output") + 1]
+c = os.environ.get("MM_CALLED")
+if c:
+    open(c, "a", encoding="utf-8").write("ran" + NL)
+txt = open(os.environ["MM_TARGET"], encoding="utf-8").read()
+def flag(n):
+    return (n + " = True") in txt
+A = []
+def add(label, ok):
+    A.append({"type": "assert_true", "condition": bool(ok),
+              "message": "%s 夹具断言 %s" % (label, label), "passed": bool(ok)})
+add("A1", not flag("LEG_A"))
+add("B1", not flag("LEG_B"))
+add("AB1", not flag("LEG_AB"))
+add("AB2", not flag("LEG_AB"))
+if not flag("TRUNC"):
+    add("C1", True)
+err = ""
+if flag("BOOM"):
+    A = A[:2]
+    err = ("fake runner error: 'boom'\nTraceback (most recent call last):\n"
+           "  File \"fake\", line 1, in <module>\nKeyError: 'boom'")
+elif flag("BASE_RED"):
+    add("A0", False)
+    err = "Assertion failed: A0 夹具断言 A0"
+if any(not x["passed"] for x in A) and not err:
+    err = "Assertion failed: " + [x for x in A if not x["passed"]][0]["message"]
+status = "passed" if all(x["passed"] for x in A) and not err else "failed"
+json.dump({"results": [{"name": "MM-CASE", "status": status, "error": err,
+                        "assertions": A}]},
+          open(out, "w", encoding="utf-8"), ensure_ascii=False)
+sys.exit(0 if status == "passed" else 1)
+'''
+
+        def _mk(mutations, target_text=TARGET_TEXT, crlf=False):
+            root = Path(tempfile.mkdtemp(prefix="mmfix_"))
+            tp = root / "target.py"
+            blob = target_text.replace("\n", "\r\n").encode("utf-8") if crlf \
+                else target_text.encode("utf-8")
+            tp.write_bytes(blob)
+            (root / "fake_runner.py").write_text(RUNNER_TEXT, encoding="utf-8")
+            mx = root / "matrix.json"
+            mx.write_text(json.dumps(
+                {"cases": {"MM-CASE": {"mutations": mutations}}},
+                ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+            return root, tp, mx
+
+        def _eng(root, mx, only=()):
+            cmd = [sys.executable, "-B", "-X", "utf8", str(ENGINE),
+                   "--matrix", str(mx), "--root", str(root),
+                   "--runner", str(root / "fake_runner.py"),
+                   "--out", str(root / "out")]
+            if only:
+                cmd += ["--only"] + list(only)
+            called = root / "called.log"
+            if called.exists():
+                called.unlink()
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+                       MM_TARGET=str(root / "target.py"),
+                       MM_CALLED=str(called))
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", env=env,
+                               timeout=300)
+            rep = None
+            js = sorted((root / "out").glob("mutation_matrix_report_*.json"))
+            if js:
+                rep = json.loads(js[-1].read_text(encoding="utf-8"))
+            return (p.returncode, (p.stdout or "") + (p.stderr or ""), rep,                    called.read_text(encoding="utf-8").count("ran")                    if called.exists() else 0)
+
+        def _mark(rep, idx=0):
+            return rep["rows"][idx]["mark"] if rep and rep.get("rows") else None
+
+        def _mut(mid, anchor, repl, **kw):
+            d = {"id": mid, "target": "target.py",
+                 "anchor": anchor, "replacement": repl}
+            d.update(kw)
+            return d
+
+        # ── A. 对位红 + 基线全绿 ────────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M1", "LEG_A = False", "LEG_A = True",
+                              expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "RED-OK", f"A1 摘 LEG_A 须落对位，实得 {_mark(rep)}")
+        assert_equal(rc, 0, f"A2 全落对位时退出码 0，实得 {rc}")
+        assert_true("[BASELINE] 全绿" in so, "A3 基线读数须显式打印（无全绿基线即无法归因）")
+
+        # ── B. 落红未落对位 ─────────────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M2", "LEG_AB = False", "LEG_AB = True",
+                              expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "WRONG-SPOT",
+                     f"B1 摘 LEG_AB 却声明 expect=[A1] 须判落错位置，实得 {_mark(rep)}")
+        assert_equal(rc, 1, f"B2 落错位置不得判绿，实得 {rc}")
+
+        # ── C. 空跑显形（判据三）────────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M3", "LEG_UNUSED = False", "LEG_UNUSED = True",
+                              expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "SURVIVED",
+                     f"C1 摘一条无人消费的腿，断言在两实现下读数相同须判空跑，实得 {_mark(rep)}")
+        assert_true("空跑" in rep["rows"][0]["why"],
+                    f"C2 归因须点名空跑语义，实得 {rep['rows'][0]['why']}")
+
+        # ── D/E. 未声明 expect 与连带越界（判据一）──────────────────────────
+        r, tp, mx = _mk([_mut("MM-M4", "LEG_AB = False", "LEG_AB = True")])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "OVERRANGE",
+                     f"D1 未声明 expect 时不得默认判对位，实得 {_mark(rep)}")
+        r, tp, mx = _mk([_mut("MM-M5", "LEG_AB = False", "LEG_AB = True",
+                              expect=["AB1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "OVERRANGE",
+                     f"E1 命中 AB1 但连带 AB2 须点名越界，实得 {_mark(rep)}")
+        assert_true("AB2" in rep["rows"][0]["why"],
+                    f"E2 越界说明须列出连带标签，实得 {rep['rows'][0]['why']}")
+
+        # ── F. 锚命中数（判据一前半）────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M6", "DUP = False", "DUP = True", expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "ANCHOR_PROBLEM",
+                     f"F1 锚命中 2 处须判锚问题而非注入，实得 {_mark(rep)}")
+        r, tp, mx = _mk([_mut("MM-M7", "LEG_ZZ = False", "LEG_ZZ = True",
+                              expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "ANCHOR_PROBLEM",
+                     f"F2 锚命中 0 处须判锚问题，实得 {_mark(rep)}")
+        assert_equal(ncall, 1,
+                     "F3 锚失配时该枚不得被执行（计数须只有基线那一次；复位后比字节"
+                     "会恒真，故取可观测侧）")
+
+        # ── G. CRASH 两形态（判据二）────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M8", "BOOM = False", "BOOM = True", expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "CRASH",
+                     f"G1 整案异常（含 Traceback）须判 CRASH 而非对位红，实得 {_mark(rep)}")
+        assert_true("Traceback" in rep["rows"][0]["why"]
+                    or "异常首行" in rep["rows"][0]["why"],
+                    f"G2 归因须点名异常，实得 {rep['rows'][0]['why']}")
+        r, tp, mx = _mk([_mut("MM-M9", "TRUNC = False", "TRUNC = True", expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "CRASH",
+                     f"G3 断言被截断（无异常文本）亦须判 CRASH，实得 {_mark(rep)}")
+        assert_true("截断" in rep["rows"][0]["why"],
+                    f"G4 归因须点名整案被截断，实得 {rep['rows'][0]['why']}")
+        # 反面对照：断言失败形态（error 为 Assertion failed、无 Traceback、数不减）
+        # 不得判 CRASH —— 与 G1/G3 构成两态区分的正反面，摘一条真腿必须落对位。
+        r, tp, mx = _mk([_mut("MM-M10", "LEG_B = False", "LEG_B = True",
+                              expect=["B1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "RED-OK",
+                     f"G5 正常断言失败形态不得被误判成 CRASH（两态区分的反面见证），"
+                     f"实得 {_mark(rep)}")
+
+        # ── H. 基线不干净 → 整体未测 ────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M11", "LEG_A = False", "LEG_A = True",
+                              expect=["A1"])],
+                        target_text=TARGET_TEXT.replace("BASE_RED = False",
+                                                        "BASE_RED = True"))
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(rc, 2, f"H1 基线不干净须退出码 2（未测档），实得 {rc}")
+        assert_true("UNTESTED" in so and "基线" in so,
+                    f"H2 须点名基线不干净，实得 {so[-300:]}")
+        assert_true(rep is None, "H3 未测时不得产出矩阵报告（不得由没跑成读成跑过）")
+
+        # ── I. 反向对照 ─────────────────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M12", "LEG_UNUSED = False", "LEG_UNUSED = True",
+                              expect_survive=True)])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "ANCHOR_PROBLEM",
+                     f"I1 expect_survive 无 note 须判配置问题，实得 {_mark(rep)}")
+        r, tp, mx = _mk([_mut("MM-M13", "LEG_UNUSED = False", "LEG_UNUSED = True",
+                              expect_survive=True, note="该腿无消费者，本就不该转红")])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(_mark(rep), "RED-OK",
+                     f"I2 反向对照成立须记对位而非空跑，实得 {_mark(rep)}")
+        assert_equal(rc, 0, f"I3 反向对照全部成立时退出码 0，实得 {rc}")
+
+        # ── J. 行尾自适应（in-process 直测取数函数）─────────────────────────
+        crlf_root = _mk([], crlf=True)[0]
+        crlf_tp = crlf_root / "target.py"
+        assert_true(b"\r\n" in crlf_tp.read_bytes(), "J0 夹具须确为 CRLF 文件")
+        text, crlf = mm.load_text(crlf_tp)
+        assert_equal(crlf, True, f"J1 须探测出 CRLF 主导行尾，实得 {crlf}")
+        assert_true("\r\n" not in text, "J2 归一后文本内不得残留 CR")
+        blob = mm.dump_text("a\nb\n", True)
+        assert_equal(blob, b"a\r\nb\r\n",
+                     "J3 crlf=True 时写回须全为 CRLF——直测 dump 不经 load，"
+                     "否则与 J1 同因（都读探测值），对『探测被摘』这一变异空跑")
+        assert_equal(mm.dump_text("a\nb\n", False), b"a\nb\n",
+                     "J3b LF 文本不得被写成 CRLF（两向各自独立显形）")
+        lf_tp = _mk([])[0] / "target.py"
+        ltext, lcrlf = mm.load_text(lf_tp)
+        assert_equal(lcrlf, False, f"J4 LF 文件须探测为 crlf=False，实得 {lcrlf}")
+        assert_true(mm.dump_text(ltext, lcrlf) == lf_tp.read_bytes(),
+                    "J5 LF 文件往返须逐字节相等（不得顺带改行尾）")
+
+        # ── K. --only 前缀不撞号 ────────────────────────────────────────────
+        two = [_mut("MM-M1", "LEG_A = False", "LEG_A = True", expect=["A1"]),
+               _mut("MM-M10", "LEG_B = False", "LEG_B = True", expect=["B1"])]
+        r, tp, mx = _mk(two)
+        rc, so, rep, ncall = _eng(r, mx, only=["MM-M1"])
+        assert_equal(len(rep["rows"]) if rep else None, 1,
+                     f"K1 --only MM-M1 不得连带 MM-M10，实得 "
+                     f"{[x['id'] for x in rep['rows']] if rep else None}")
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_equal(len(rep["rows"]) if rep else None, 2,
+                     f"K2 不带 --only 时两枚都须跑到，实得 "
+                     f"{[x['id'] for x in rep['rows']] if rep else None}")
+
+        # ── L. 复位自证 ─────────────────────────────────────────────────────
+        assert_equal(tp.read_bytes(), TARGET_TEXT.encode("utf-8"),
+                     "L1 全量跑完后目标字节须逐字节等于备份（复位非声明而是实测）")
+
+        # ── M. 入仓变异表的锚不腐坏（只读，不注入）──────────────────────────
+        real = MATRIX
+        assert_true(real.is_file(), "M1 入仓变异表须在盘（判据数据件的版本化载体）")
+        doc = json.loads(real.read_text(encoding="utf-8"))
+        mutating = os.environ.get("MM_MUTATING_TARGET", "")
+        bad_anchor, bad_expect, skipped, checked, total = [], [], 0, 0, 0
+        for cname, blk in doc.get("cases", {}).items():
+            for m in blk.get("mutations", []):
+                total += 1
+                tgt = mm.ROOT / m["target"]
+                if not tgt.is_file():
+                    bad_anchor.append(f"{m['id']} 目标不在盘")
+                    continue
+                if mutating and str(tgt.resolve()) == mutating:
+                    skipped += 1      # 引擎正注入该文件，锚失配属预期，交由该枚自己裁定
+                    continue
+                checked += 1
+                t, _ = mm.load_text(tgt)
+                a = m["anchor"].replace("\r\n", "\n")
+                if t.count(a) != 1:
+                    bad_anchor.append(f"{m['id']} 锚命中 {t.count(a)} 处")
+                if not (m.get("expect") or (m.get("expect_survive") and m.get("note"))):
+                    bad_expect.append(m["id"])
+        assert_equal(bad_anchor, [], f"M2 每枚锚须在当前生产字节命中 1 处（失配即在 CI 显形）：{bad_anchor}")
+        assert_equal(bad_expect, [], f"M3 每枚须声明 expect 或带 note 的反向对照：{bad_expect}")
+        assert_true(total > 0 and (checked + skipped) == total,
+                    f"M4 校验须覆盖矩阵全部条目（实得 checked={checked} "
+                    f"skipped={skipped} total={total}），否则 M2 是空跑")
+        assert_true(skipped == 0 or mutating,
+                    f"M5 跳过只允许由 MM_MUTATING_TARGET 传达，不得按文件名猜："
+                    f"skipped={skipped} mutating={mutating!r}")
+
+        # ── N. 取证工具不得进验收路径 ───────────────────────────────────────
+        ci_src = CI_GATE.read_text(encoding="utf-8")
+        pr_src = (SUITE_SCRIPT_DIR / "pipeline_runner.py").read_text(encoding="utf-8")
+        assert_true("mutation_matrix" not in ci_src,
+                    "N1 本件不得进 ci_gate——它会改写生产文件字节，进 CI 即等于在验收路径上瞬时篡改")
+        assert_true("mutation_matrix" not in pr_src,
+                    "N2 本件不得出现在任何步骤的指纹登记面（同上，且登记即自造重跑）")
+
+        # ── O. 判据文案单源 ─────────────────────────────────────────────────
+        r, tp, mx = _mk([_mut("MM-M14", "LEG_A = False", "LEG_A = True",
+                              expect=["A1"])])
+        rc, so, rep, ncall = _eng(r, mx)
+        assert_true(rep and all(c in so for c in rep["criteria"]),
+                    "O1 控制台打印的判据须与报告 JSON 同源（不得两处各写一份）")
+        assert_equal(len(rep["criteria"]), 3,
+                     f"O2 三条内置判据须齐备，实得 {rep['criteria']}")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("mutation matrix engine error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_single_source_and_repo_hygiene() -> RegressionTestCase:
+    """用例107：单源收敛与仓库卫生（2026-10-16 全面审计批）。
+
+    A 交付禁用词的包含关系（交付裁定那份 ⊆ 工作区卫生那份），并且 AGENTS.md 不再手抄；
+    B 词级 cue 偏弱档真由配置驱动（值来自文件、来源字符串可见）；
+    C 画面占用主体区下界按权威推导，取不回时退回字面量且**退回必须可见**；
+    D 僵尸键已消除而消费方仍取到值（删键不等于删判据）；
+    E 21 个零引用死件不得复活，且活件不 import 它们；三个 _v2 守卫件仍在（守卫有对象）；
+    F 源码目录不再承载日志/业务文档；
+    G SCRIPT_INVENTORY 的 `_deprecated/` 假声明不得复活，且声明与磁盘一致。
+    """
+    tc = RegressionTestCase(
+        "single_source_and_repo_hygiene",
+        "禁用词包含关系、cue 阈值与占用口径的配置驱动、僵尸键消除、死件不复活、源码目录卫生"
+    )
+    try:
+        import ast
+        import json
+        import sys
+        import tempfile
+        import builtins
+        from pathlib import Path
+
+        SCRIPT_DIR = Path(__file__).resolve().parent
+        QUALITY = SCRIPT_DIR.parent / "配置" / "config" / "quality"
+        CFG_ROOT = SCRIPT_DIR.parent / "配置"
+
+        # ── A. 禁用词：交付裁定那份须被工作区卫生那份逐项覆盖 ────────────
+        dg = json.loads((QUALITY / "delivery_gate_rules.json").read_text(encoding="utf-8"))
+        delivery_terms = [str(t).lower() for t in dg.get("audit", {}).get("prohibited_terms", [])]
+        tc.assert_true(len(delivery_terms) >= 1,
+                       f"A0 交付裁定禁用词权威源不得为空（实得 {delivery_terms}）")
+        yaml_path = CFG_ROOT / "audit_rules.yaml"
+        hygien = set()
+        if yaml_path.is_file():
+            in_list = False
+            for line in yaml_path.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("forbidden_tech_words:"):
+                    in_list = True
+                    continue
+                if in_list:
+                    s = line.strip()
+                    if s.startswith("#"):
+                        continue
+                    if s.startswith("- "):
+                        hygien.add(s[2:].strip().strip('"').strip("'").lower())
+                    elif s and not s.startswith("-"):
+                        break
+        # 卫生那份按 §3.3 不导出，故它在发布仓缺席属预期；但在开发仓缺席即权威源断链。
+        # 两侧共用一条判据：**取不到内容只允许发生在发布仓面**——写成断言而非静默跳过，
+        # 使"开发仓里有人删了 audit_rules.yaml"仍能显形。
+        if not hygien:
+            tc.assert_equal(export_repo_face(tc), "published",
+                            "A1 工作区卫生那份取不到内容——只允许发生在发布仓面（该件按 §3.3 "
+                            "不导出）；开发仓面取不到即禁用词包含关系无从核对")
+        else:
+            tc.assert_true(len(hygien) >= 20,
+                           f"A1 工作区卫生那份须为超集（实得 {len(hygien)} 项）")
+            missing = sorted(t for t in delivery_terms if t not in hygien)
+            tc.assert_equal(missing, [],
+                            f"A2 交付裁定项必须逐项被卫生扫描覆盖，缺 {missing}——"
+                            f"漏一项即\'同一文件名一判过一判红\'（v01 曾是该形态）")
+        agents_md = (SCRIPT_DIR.parent.parent / "AGENTS.md").read_text(encoding="utf-8")
+        tc.assert_true("清单不在此处手抄" in agents_md,
+                       "A3 AGENTS.md 的交付命名节须为指针（手抄清单一复活，A2 那条包含关系就没人看了）")
+        tc.assert_true("'final`, `v01`, `render`" not in agents_md,
+                       "A4 AGENTS.md 不得复活逐项枚举形态")
+
+        # ── B. cue 偏弱档：值真来自配置文件 ─────────────────────────────
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import cue_resolve as cr
+        vqr = json.loads((QUALITY / "video_quality_rules.json").read_text(encoding="utf-8"))
+        cfg_thr = int(vqr["cue_placement"]["min_observable_offset_chars"])
+        tc.assert_equal(cr.MIN_OBSERVABLE_OFFSET_CHARS, cfg_thr,
+                        "B1 生效阈值须等于配置权威值（写死字面量即第二个真相源）")
+        tc.assert_true("video_quality_rules.json" in cr.CUE_OFFSET_SOURCE,
+                       f"B2 来源须点名配置文件，实得 {cr.CUE_OFFSET_SOURCE!r}")
+
+        # ── C. 画面占用口径：权威推导 + 退回可见 ─────────────────────────
+        import frame_occupancy as fo
+        import visual_boundary_check as vbc
+        ratio, src = fo.authority_body_ratio(1080)
+        expect = vbc.subtitle_safety_line(1080) / 1080.0
+        tc.assert_true(abs(ratio - expect) < 1e-9,
+                       f"C1 主体区下界须等于同源判据推导值（{ratio} vs {expect}）")
+        tc.assert_equal(src, "subtitle_safety_line", "C2 正常态来源须为权威函数")
+        saved_vbc = sys.modules.get("visual_boundary_check")
+        sys.modules["visual_boundary_check"] = None      # 令 from ... import 抛 ImportError
+        try:
+            r2, src2 = fo.authority_body_ratio(1080)
+            tc.assert_equal(src2.startswith("兜底字面量"), True,
+                            f"C3 权威取不回时须点名退回原因，实得 {src2!r}")
+            tc.assert_true(abs(r2 - fo.SUBTITLE_LINE_RATIO) < 1e-9,
+                           "C4 兜底值仍须可用（描述面不得因缺依赖而崩）")
+        finally:
+            sys.modules["visual_boundary_check"] = saved_vbc
+        r3, src3 = fo.authority_body_ratio(1920)
+        tc.assert_true(abs(r3 - vbc.subtitle_safety_line(1920) / 1920.0) < 1e-9,
+                       "C5 竖屏同比例（安全线按实测画布高推导，非常量）")
+        # C6 关键对照：1080/1920 两处推导值与抄来的常量本就相等（等比缩放），故 C1/C5
+        # 单独存在时"退回字面量"与"走权威"同形＝空跑。把权威侧的预留带参数挪开，
+        # 只有真去取权威值的实现才会跟着动，抄常量的不会。
+        saved_band = getattr(vbc, "SUBTITLE_BAND_1LINE_RATIO", None)
+        if saved_band is None:
+            tc.assert_true(False, "C6 权威模块须暴露预留带参数，否则本对照条无从构造（取数面变了）")
+        else:
+            try:
+                vbc.SUBTITLE_BAND_1LINE_RATIO = saved_band + 0.10
+                moved, _ = fo.authority_body_ratio(1080)
+                tc.assert_true(abs(moved - fo.SUBTITLE_LINE_RATIO) > 1e-6,
+                               f"C6 权威参数挪动后本件须跟着动（实得 {moved}，抄常量的会停在 "
+                               f"{fo.SUBTITLE_LINE_RATIO}）")
+            finally:
+                vbc.SUBTITLE_BAND_1LINE_RATIO = saved_band
+
+        # ── D. 僵尸键已消除而消费方仍取到值 ────────────────────────────
+        asr = json.loads((QUALITY / "audio_sync_rules.json").read_text(encoding="utf-8"))
+        tc.assert_true("auto_shape_source" not in asr.get("pause_declaration", {}),
+                       "D1 无人消费的指针键不得留在权威源里（它承诺的对照用例从未存在）")
+        npr = json.loads((QUALITY / "narration_prosody_rules.json").read_text(encoding="utf-8"))
+        tc.assert_true("min_sample_seconds" not in npr.get("pause_measurement", {}),
+                       "D2 零消费者键须删除，不得靠注释声称\'可选\'")
+        tc.assert_true(all(k in npr.get("segment_overload", {})
+                           for k in ("min_chars", "min_enumeration_marks")),
+                       "D3 形状阈值权威值仍在位（删的是指针，不是判据）")
+        import pause_marks as pmz
+        _auto = pmz.load_rules()
+        tc.assert_true(int(_auto.get("min_segment_chars", 0)) == int(npr["segment_overload"]["min_chars"]),
+                       "D4 pause_marks 须真从 prosody 引用该值（引用而非抄第二份）")
+
+        # ── E. 死件不复活 + 活件不 import 它们 ─────────────────────────
+        DELETED = ["quality_gates_runner.py", "html_template_validator.py", "storyboard_validator.py",
+                   "find_failing_test.py", "architecture_self_check.py", "verify_render_output.py",
+                   "project_completion_report.py", "simulate_tts_generation.py", "generate_tts_offline.py",
+                   "cleanup_pollution.py", "preflight_simple.py", "workflow_router.py",
+                   "capture_doc_diagrams.py", "project_init.py", "composite_video_final.py",
+                   "exec_render_correct.py", "final_correct_workflow.py", "generate_tts_narration.py",
+                   "generate_technical_charts.py", "encrypt_html_doc.js", "encrypt_doc_shell.html"]
+        revived = [f for f in DELETED if (SCRIPT_DIR / f).exists()]
+        tc.assert_equal(revived, [], f"E1 零引用死件不得复活：{revived}")
+        stems = {f.split(".")[0] for f in DELETED}
+        offenders = []
+        for p in SCRIPT_DIR.rglob("*.py"):
+            if "__pycache__" in str(p) or p.name == "regression_test.py":
+                continue
+            try:
+                tree = ast.parse(p.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module]
+                for nm in names:
+                    if nm.split(".")[0] in stems:
+                        offenders.append(f"{p.name}:{node.lineno} import {nm}")
+        tc.assert_equal(offenders, [], f"E2 活件不得 import 死件（用例105 同族）：{offenders}")
+        v2_files = ("enhance_video_audio_v2.py", "pipeline_runner_v2.py", "verify_tts_product_v2.py")
+        v2_present = [v2 for v2 in v2_files if (SCRIPT_DIR / v2).exists()]
+        if export_repo_face(tc) == "published":
+            # 三件 _v2 死件按清单未列不导出，故"守卫有对象"这一读数在本面无对应物。
+            # 按实得份数取证（非恒真）：公开面一旦多出其中任一件，本条即转红。
+            tc.assert_equal(v2_present, [],
+                            f"E3-发布仓面：_v2 死件不随导出，DEAD_V2_FILES 守卫在本面无对象"
+                            f"（实得 {v2_present}）；E1「死件不复活」与 E2「活件不得 import 死件」"
+                            f"在本面仍逐件裁定，对象是公开面实有件")
+        else:
+            for v2 in v2_files:
+                tc.assert_true((SCRIPT_DIR / v2).exists(),
+                               f"E3 {v2} 须在场——它是 DEAD_V2_FILES 守卫的对象，删件等于删判据")
+
+        # ── F. 源码目录卫生 ────────────────────────────────────────────
+        junk = sorted(p.name for p in SCRIPT_DIR.iterdir()
+                      if p.suffix.lower() in (".log", ".html") or
+                      (p.suffix.lower() == ".md" and p.name != "SCRIPT_INVENTORY.md"))
+        tc.assert_equal(junk, [], f"F1 脚本目录不得承载日志/业务文档：{junk}")
+        tc.assert_true((SCRIPT_DIR.parent.parent / "成果文件/视频").is_dir() and
+                       not (SCRIPT_DIR / "装配式轻钢龙骨隔墙防开裂治理_旁白脚本.md").exists(),
+                       "F2 业务旁白文档须归素材/项目层，不住源码目录")
+
+        # ── G. 管理文档与磁盘一致 ──────────────────────────────────────
+        inv_path = SCRIPT_DIR / "SCRIPT_INVENTORY.md"
+        tc.assert_true(not (SCRIPT_DIR / "_deprecated").exists(),
+                       "G2 声明与磁盘须一致：该目录在两仓均不存在（发布仓亦不得新建）")
+        if inv_path.is_file():
+            inv = inv_path.read_text(encoding="utf-8")
+            tc.assert_true("程序文件/脚本/_deprecated/`**" not in inv,
+                           "G1 不得声明一个不存在的归档目录（假管理文档比没有文档更糟）")
+            tc.assert_true("V2装饰器模式完成 | 永久参考" not in inv.replace(" ", ""),
+                           "G3 不得再把 _v2 死件写成主件的替代方案（方向曾写反）")
+        else:
+            tc.assert_equal(export_repo_face(tc), "published",
+                            "G 载体 SCRIPT_INVENTORY.md 取不到——只允许发生在发布仓面（该件按清单"
+                            "未列不导出）；开发仓面取不到即管理文档断链，G1/G3 两条判据将无人执行")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("single source / hygiene error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
 class RegressionTestRunner:
 
-    """回归测试运行器"""
-    
+    """回归测试运行器"""    
     def __init__(self):
         self.test_cases = [
             test_scene_compile_basic,
@@ -16878,6 +20149,19 @@ class RegressionTestRunner:
             test_element_reveal_hidden_container_blocked,
             test_narration_prosody_pause_precheck,
             test_pause_declaration_effective_face,
+            test_timeline_registry_binding_blocked,
+            test_delivery_notes_name_mismatch_attributed,
+            test_vacuum_probe_carries_referenced_assets,
+            test_config_path_field_extensions_checked,
+            test_hash_break_does_not_restore_baseline,
+            test_preview_scratch_isolated_per_run,
+            test_chapter_bar_structure_consistency,
+            test_text_punct_scan,
+            test_bar_overflow_gate_adjudicates_container_overflow,
+            test_stream_wrapper_keepalive_chain,
+            test_fingerprint_registry_matches_reading_face,
+            test_single_source_and_repo_hygiene,
+            test_mutation_matrix_engine_adjudicates_its_own_criteria,
         ]
         self.results = []
     

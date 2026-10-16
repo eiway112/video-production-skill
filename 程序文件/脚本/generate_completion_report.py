@@ -36,9 +36,12 @@ from typing import Dict, Any, Optional
 import sys
 import io
 
-# 持住旧流对象，理由同 pipeline_runner（旧包装被 GC 会关掉底层 buffer）
+# 持住旧流对象，理由同 pipeline_runner（旧包装引用归零即 finalize，会关掉底层
+# buffer）；另须持住本次造出的新代——它没有别的持有者，下个重绑点一顶掉它即
+# 引用归零。用例105 锁定。
 _stdout_prev = sys.stdout
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+_stdout_kept = sys.stdout
 
 # 交付门禁自适应参数表（单一权威源：config/quality/delivery_gate_rules.json）
 _DELIVERY_RULES_PATH = (
@@ -397,10 +400,17 @@ def run_delivery_audit(report: Dict[str, Any],
                        "(纯 BGM 或终检未记录该事实) — 本节不适用")
     else:
         from media_qa_gate import (delivery_notes_path, extract_subtitle_source_section,
-                                   format_subtitle_source_line)
+                                   find_mismatched_delivery_notes,
+                                   format_notes_name_mismatch, format_subtitle_source_line)
         notes = delivery_notes_path(video_file)
         if not notes.exists():
-            d6_reasons.append(f"交付说明未创建: {notes}")
+            # 归因分岔同 pipeline_runner 的打印面：错名 ≠ 未建，判红文案须给出改名这条路
+            cands = find_mismatched_delivery_notes(notes)
+            if cands:
+                d6_reasons.append(f"未按推导名创建（应为 {notes.name}）："
+                                  f"{format_notes_name_mismatch(notes, cands)}")
+            else:
+                d6_reasons.append(f"交付说明未创建: {notes}")
         else:
             section = extract_subtitle_source_section(notes.read_text(encoding='utf-8'))
             expected = format_subtitle_source_line(facts)

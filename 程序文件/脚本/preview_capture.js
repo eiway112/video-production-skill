@@ -39,30 +39,14 @@ function readCompositionSize(htmlPath) {
 }
 
 /**
- * 版面塌陷（每行字数）取数面（2026-10-12 接入；判据住在 instant_preview.py，本函数只取数）。
+ * 稳态采样时刻计算（text_fit 与 bar_overflow 共用）。
  *
- * 为什么在预览里加这一条：既有三条判据（字幕安全区、视觉边界、画面内容终检）管"越界"
- * 与"空场"，没有一条管"字框过窄"。消费者副本一份已交付竖屏片的正文塌成每行 3 字的
- * 竖排列，全程绿到交付（读数见 操作日志.md [2026-10-12] 同名条）。
- *
- * 取数口径（两条必修，均为该轮实测踩到后写入）：
- *  ① 行盒用 Range.getClientRects() 数浏览器**实际渲染出的行**，不用"容器宽／字号"几何
- *    推算——中文实际字宽、letter-spacing、flex 挤压都不在几何式里；
- *  ② 时刻取各场**稳态**（S-block 优先，无则 T-block，再无则调用方传入的场景窗口），
- *    每场 start+2.5 与 end-1.5 两点，经页面全局 tl.seek() 落位（与本项目既有预览
- *    同一 seek 通道，不另造第二套时间语义）。在 t=0 量会把宽度动画中的元素误判成
- *    塌陷（假阳，实测 .fr-bar）、并漏掉晚揭示的长句（假阴）。
- *  ③ 聚合＝**逐元素跨采样取最优（最大）读数**：一个文本框在它最舒展那一刻仍不达标才算
- *    真塌陷；取最坏读数等于把入场过程当结论。
- *
- * 本函数只返回原始读数（候选节点列表 + 取数面元数据），不做四态裁定，也不写阈值——
- * 阈值由调用方（instant_preview 读 video_quality_rules.json → text_fit）传入。
+ * 两个判据的采样点语义相同（各场稳态：S-block 优先，无则 T-block，再无则 config 场景窗口；
+ * 每场 start+2.5 与 end-1.5），住两处必漂移——一份实现单点导出。t=0 取数会把入场
+ * 动画中途的元素当结论（text_fit 探针实测踩到过假阳），故所有几何判据共用本函数。
  */
-async function measureTextFit(page, thresholds, fallbackWindows) {
-    const minLines = thresholds.minLines;
-    const minChars = thresholds.minChars;
-
-    const sampling = await page.evaluate((fb) => {
+async function computeSampleState(page, fallbackWindows) {
+    return await page.evaluate((fb) => {
         const out = [];
         const T = (typeof window.T !== 'undefined' && window.T) ? window.T : null;
         const S = (typeof window.S !== 'undefined' && window.S) ? window.S : null;
@@ -92,6 +76,33 @@ async function measureTextFit(page, thresholds, fallbackWindows) {
             .filter(x => x >= 0 && x <= dur).sort((a, b) => a - b);
         return { times, timeSrc, hasTimeline: !!tl, timelineDuration: +dur.toFixed(1) };
     }, fallbackWindows);
+}
+
+/**
+ * 版面塌陷（每行字数）取数面（2026-10-12 接入；判据住在 instant_preview.py，本函数只取数）。
+ *
+ * 为什么在预览里加这一条：既有三条判据（字幕安全区、视觉边界、画面内容终检）管"越界"
+ * 与"空场"，没有一条管"字框过窄"。消费者副本一份已交付竖屏片的正文塌成每行 3 字的
+ * 竖排列，全程绿到交付（读数见 操作日志.md [2026-10-12] 同名条）。
+ *
+ * 取数口径（两条必修，均为该轮实测踩到后写入）：
+ *  ① 行盒用 Range.getClientRects() 数浏览器**实际渲染出的行**，不用"容器宽／字号"几何
+ *    推算——中文实际字宽、letter-spacing、flex 挤压都不在几何式里；
+ *  ② 时刻取各场**稳态**（S-block 优先，无则 T-block，再无则调用方传入的场景窗口），
+ *    每场 start+2.5 与 end-1.5 两点，经页面全局 tl.seek() 落位（与本项目既有预览
+ *    同一 seek 通道，不另造第二套时间语义）。在 t=0 量会把宽度动画中的元素误判成
+ *    塌陷（假阳，实测 .fr-bar）、并漏掉晚揭示的长句（假阴）。
+ *  ③ 聚合＝**逐元素跨采样取最优（最大）读数**：一个文本框在它最舒展那一刻仍不达标才算
+ *    真塌陷；取最坏读数等于把入场过程当结论。
+ *
+ * 本函数只返回原始读数（候选节点列表 + 取数面元数据），不做四态裁定，也不写阈值——
+ * 阈值由调用方（instant_preview 读 video_quality_rules.json → text_fit）传入。
+ */
+async function measureTextFit(page, thresholds, fallbackWindows) {
+    const minLines = thresholds.minLines;
+    const minChars = thresholds.minChars;
+
+    const sampling = await computeSampleState(page, fallbackWindows);
 
     if (sampling.timeSrc === 'none') {
         // 三个时刻源都没有＝稳态采样无从落位，属取数断链，不得由"没发现问题"短路成通过
@@ -158,6 +169,114 @@ async function measureTextFit(page, thresholds, fallbackWindows) {
         sample_times: sampling.times.slice(0, 40),
         min_lines: minLines,
         min_chars: minChars,
+        measured_nodes: nodes.length,
+        nodes: nodes.slice(0, 200),
+    };
+}
+
+/**
+ * 底部对齐容器纵向溢出取数面（2026-10-15 接入；判据住在 instant_preview.py，本函数只取数）。
+ *
+ * 为什么在预览里加这一条：柱状图是"底座容器 + 竖向柱"的结构，柱高改大后柱顶会探出
+ * 底座上沿——三处已交付件人工标定过该形态（容器高与柱高各调一档即修复），而既有判据
+ * 没有一条管"容器内容纵向探出容器顶"：字幕安全区量内容底边越界、视觉边界量画布四边、
+ * text_fit 量每行字数，三者都看不见"柱顶穿出底座"。
+ *
+ * 取数口径：
+ *  ① 结构识别＝computed display 为 flex/inline-flex 且 align-items 为 flex-end/end 的
+ *    容器（"底部对齐的 flex 容器"正是柱状图底座形态），不按类名猜；
+ *  ② 溢出量＝内容盒顶边（rect.top + border-top + padding-top）− 可见后代 union 顶边；
+ *    排除 position:absolute/fixed 后代（角标装饰不参与该容器的高度分配）与零面积
+ *    后代（transform 缩成 0 的入场态），避免把装饰与入场过程读成溢出；
+ *  ③ 时刻复用 computeSampleState（各场稳态），逐容器**跨采样取最坏（最大）读数**——
+ *    与 text_fit 取最优方向相反：溢出是布局几何事实，晚场动画让柱顶探出同样算数，
+ *    取最优会漏判；容器在该采样时刻不可见（链式 opacity < 0.5）则该时刻整体跳过；
+ *  ④ 序号在可见性检查之前按 DOM 顺序分配，跨采样同一容器得同一 key，否则某时刻的
+ *    不可见会让后续序号前移、最坏值聚合错位。
+ *
+ * 本函数只返回原始读数（候选容器全量回报，含未溢出者），不做四态裁定，也不写阈值——
+ * 阈值由调用方（instant_preview 读 video_quality_rules.json → bar_overflow）裁定；
+ * "候选 0 个"与"全体达标"是两回事，故未溢出者也必须回报。
+ */
+async function measureBarOverflow(page, fallbackWindows) {
+    const sampling = await computeSampleState(page, fallbackWindows);
+    if (sampling.timeSrc === 'none') {
+        return { status_hint: 'no_time_source', samples: 0, measured_nodes: 0, nodes: [] };
+    }
+
+    const worst = {};
+    for (const t of sampling.times) {
+        const rows = await page.evaluate(({ time }) => {
+            if (typeof tl !== 'undefined' && tl && tl.seek) {
+                tl.seek(time, false);
+                if (typeof gsap !== 'undefined') gsap.ticker.tick();
+            }
+            const out = [];
+            const chainOpacity = (el) => {
+                let o = 1, n = el;
+                while (n && n !== document.body) {
+                    const cs = getComputedStyle(n);
+                    o *= parseFloat(cs.opacity || '1');
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return 0;
+                    n = n.parentElement;
+                }
+                return o;
+            };
+            const sceneOf = (el) => {
+                let n = el;
+                while (n && n !== document.body) {
+                    if (n.dataset && n.dataset.sceneId) return n.dataset.sceneId;
+                    n = n.parentElement;
+                }
+                return '?';
+            };
+            let idx = 0;
+            for (const el of document.querySelectorAll('body *')) {
+                const cs = getComputedStyle(el);
+                const disp = cs.display;
+                if (disp !== 'flex' && disp !== 'inline-flex') continue;
+                const al = cs.alignItems;
+                if (al !== 'flex-end' && al !== 'end') continue;
+                // 序号先于可见性检查分配（见 doc ④），保证 key 跨采样稳定
+                const label = (el.id ? '#' + el.id
+                      : (String(el.className).split(' ')[0] || el.tagName)) + '#' + (idx++);
+                if (chainOpacity(el) < 0.5) continue;
+                const box = el.getBoundingClientRect();
+                const contentTop = box.top + (parseFloat(cs.borderTopWidth) || 0)
+                    + (parseFloat(cs.paddingTop) || 0);
+                let unionTop = Infinity, visible = 0;
+                for (const d of el.querySelectorAll('*')) {
+                    const dcs = getComputedStyle(d);
+                    if (dcs.position === 'absolute' || dcs.position === 'fixed') continue;
+                    if (chainOpacity(d) < 0.5) continue;
+                    const r = d.getBoundingClientRect();
+                    if (r.width < 1 || r.height < 1) continue;
+                    if (r.top < unionTop) unionTop = r.top;
+                    visible++;
+                }
+                if (!visible) continue;                 // 无可见后代即无"探出"可言
+                out.push({
+                    key: sceneOf(el) + ':' + label,
+                    overflow_px: +(contentTop - unionTop).toFixed(1),
+                    content_top: +contentTop.toFixed(1),
+                    union_top: +unionTop.toFixed(1),
+                    box_h: Math.round(box.height), at: time,
+                });
+            }
+            return out;
+        }, { time: t });
+        for (const row of rows) {
+            if (!worst[row.key] || row.overflow_px > worst[row.key].overflow_px) worst[row.key] = row;
+        }
+    }
+
+    const nodes = Object.values(worst).sort((a, b) => b.overflow_px - a.overflow_px);
+    return {
+        time_src: sampling.timeSrc,
+        has_timeline: sampling.hasTimeline,
+        timeline_duration: sampling.timelineDuration,
+        samples: sampling.times.length,
+        sample_times: sampling.times.slice(0, 40),
         measured_nodes: nodes.length,
         nodes: nodes.slice(0, 200),
     };
@@ -389,6 +508,24 @@ async function main() {
             }
         }
 
+        // ── 底部对齐容器纵向溢出取数：只取数，裁定归 instant_preview.py ──
+        // 不传阈值：本判据的阈值只在 Python 裁定面消费；JS 全量回报候选容器（含未溢出者），
+        // 与 text_fit 的"调用方必须传阈值"刻意不同级——那里的阈值决定取数对象的入选门槛，
+        // 这里的结构识别（flex-end 容器）无阈值参数，候选表本身就是裁定面的证据面。
+        const barStarted = Date.now();
+        try {
+            const bar = await measureBarOverflow(page, fitWindows);
+            manifest.bar_overflow = bar;
+            console.log(`  [BAR-OVERFLOW] 时刻源=${bar.time_src || 'none'} `
+                + `采样 ${bar.samples} 次，候选容器 ${bar.measured_nodes} 个`
+                + `（${((Date.now() - barStarted) / 1000).toFixed(1)}s）`);
+        } catch (e) {
+            manifest.bar_overflow = { status_hint: 'measure_failed',
+                                      error: String((e && e.message) || e),
+                                      samples: 0, measured_nodes: 0, nodes: [] };
+            console.error(`  [BAR-OVERFLOW] 取数异常: ${(e && e.message) || e}`);
+        }
+
         // Write manifest
         const manifestPath = path.join(outputDir, 'capture_manifest.json');
         fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -408,7 +545,14 @@ async function main() {
     }
 }
 
-main().catch(err => {
-    console.error(err);
-    process.exit(1);
-});
+// 取数函数对外导出：普查/探针经 require 复用同一份实现，禁止拷贝第二份取数面。
+// main 仅在直接执行时自启（被 require 时不自跑浏览器）。
+if (require.main === module) {
+    main().catch(err => {
+        console.error(err);
+        process.exit(1);
+    });
+}
+
+module.exports = { measureTextFit, measureBarOverflow, computeSampleState };
+

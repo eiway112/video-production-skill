@@ -183,7 +183,7 @@ tl.fromTo("#s2-title", {...}, {...}, 26.1);         // ❌ 绝对数字
 
 **约束**：
 - 本节示例中的 `T` 是符号，须落地为 `T.sN`（如 `T+0.5` → `T.s3+0.5`），**不得手工代入成具体秒数**。
-- 唯一允许的字面量时间位是**封面窗口 0–3s**（§3.2）：封面不入 T-block、时长由 `data-cover-duration` 固定并受 `html_template_validator.check_cover_duration` 校验。
+- 唯一允许的字面量时间位是**封面窗口 0–3s**（§3.2）：封面不入 T-block、时长由 `data-cover-duration` 固定，现役承载者是 `preflight_check.py:703`（读该声明参与预检）与 `scene_patch_render.py:242`（head 段时间见证：声明值须等于首个 T 起点，容差 0.05s，不吻合即点名退回全量）。**原写的 `html_template_validator.check_cover_duration` 已于 2026-10-16 退役**——该件唯一调用者是零引用的 `quality_gates_runner.py`，且其安全区判据在用户验收通过的项目上判 FAIL（推荐带 150-170px vs 实际 240px），接链即造第二个安全区口径；裁定与读数见 `操作日志.md` [2026-10-16] 机制 条。
 - 自查判据：一个场景 div 的入场/转场/装饰语句里出现裸数字，且该数字 ≥ 首个内容场景起点，即为待改项。
 
 ### 3.1 时间轴初始化

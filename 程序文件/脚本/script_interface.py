@@ -96,6 +96,14 @@ class EXIT_CODE:
 
 
 # === Logger 类 ===
+# 流包装保活表：换包装前先持住被顶掉的旧代、换完后持住本次造出的新代。
+# TextIOWrapper 引用归零即 finalize（无需 gc.collect），其析构会关闭共享的底层
+# buffer，随后任何 print 都报 "I/O operation on closed file"。只持旧不足以防住
+# 本模块自己造出的新代——它没有别的持有者，下个重绑点一顶掉它即引用归零。
+# 用例105 锁定。
+_stream_keepalive = []
+
+
 class Logger:
     """统一日志记录器
     
@@ -110,11 +118,13 @@ class Logger:
         self.level = level
         self.min_level = self.LEVELS.get(level, 1)
         
-        # 配置 stderr 编码为 UTF-8
+        # 配置 stderr 编码为 UTF-8（保活理由见 _stream_keepalive 定义处）
         if sys.platform == "win32":
+            _stream_keepalive.append(sys.stderr)   # 持旧：被本次顶掉的那一代
             sys.stderr = io.TextIOWrapper(
                 sys.stderr.buffer, encoding='utf-8', errors='replace'
             )
+            _stream_keepalive.append(sys.stderr)   # 持新：本次造出的这一代
     
     def _format_message(self, level: str, message: str) -> str:
         """格式化日志消息"""
