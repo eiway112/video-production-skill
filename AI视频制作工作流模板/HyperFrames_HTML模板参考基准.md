@@ -340,6 +340,60 @@ python 程序文件/脚本/cue_resolve.py --narration 程序文件/源码/hyperf
 
 **现状（2026-10-12 更新，覆盖此前的"从未使用"）**：本仓第一个正式使用 `data-cue-at` 的真实业务交付已落地（`agent-decision-map`，13 个内容场景共 27 条，词级与句级实测差值 1.82–7.38s，成片抽帧 27/27 确认构件起亮落在词上，取证见 `过程产物/临时产物/_取证/20261012/`）。**发布仓与使用者副本仍无带 cue 的项目**，不得读成"消费端已在用"。取舍照旧：**不要给每个元素都挂 cue**，只挂在"亮早了会被观众看出来"的构件上（结论卡、强调数字、对比项），标题与装饰层用固定秒数往往更稳。
 
+#### 3.6.1 点亮形态：说到即亮、亮住不灭（2026-10-17 修订实证，用户反馈的原话形态是"音频到词级点了，但词级却没有给予反馈"）
+
+**这一节管的不是时刻算得对不对，而是亮的那一下观众看不看得见。** 上述反馈发生在时刻完全正确的一批 cue 上：解析、CUE-MAP、落点全部合格，病灶在动画写法——点亮写成亚秒级脉冲（`duration:0.38, yoyo:true, repeat:1` + `clearProps` 收尾），全程 0.76s 即回到原状；浅色系底上蓝框光晕的对比本就弱，一闪即灭读作"没有反应"。**脉冲形态禁止用于 cue 点亮**（它在深色底、饱和强调色的项目上侥幸可用，随主题翻转即失效，属"缺省值决定观感"那一类，不是判据）。
+
+判据＝**亮住不灭，下一锚点亮时前一锚让位**。三段式：过冲 `0.22s`（`power2.out`）→ 收敛到保持态 `0.34s`（`power1.inOut`）→ 让位时 `0.55s` 淡出（`power2.inOut`）。三条配套约束，缺一即出现"该亮的没亮／该灭的不灭"：
+
+1. **句级降级锚必须晚于元素自身入场完成。** `C` 值可能是该场句首时刻（实测形态：s3 首句 147 字符里仅 85 个有实测对齐，降级后 `C["s3:入口路由"] = 0.0`）。此时 `T.sN + C[...]` 落在卡片入场动画之前，观众看到的是一张"本来就亮着"的卡——cue 等于没挂。修法给元素传入场完成时刻（本文档记作 `enterAt`），点亮时刻取 `max(cue_at, enterAt)`。**不放宽降级判据**：降级那条"宁可早亮，不亮在虚构时刻上"是设计内取舍，`enterAt` 只把它接回正确时刻。
+2. **成组同时点亮的锚，熄灭对象须向前扫描。** 默认取"排序后的下一条"时，同刻组内互取 → `off ≤ on + 0.62` → 淡出分支永不成立 → 整组不灭。改为向前找第一条 `at > onAt + 0.62` 的锚。
+3. **向前扫描必须封顶**（经验值 `onAt + 8s`）。不封顶会取到下一场的锚，本场元素跨场长亮；观众语境已切换，长亮即噪声。
+
+可复制实现（一次收集、统一排序后挂到主时间轴 `tl` 上，与 §3.0 的"全部挂 `tl`"同规）：
+
+```javascript
+window.__cuePlan = [];
+function cueGlow(sel, key, base, opts){
+  if (!window.C || typeof C[key] !== "number") return;
+  var el = document.querySelector(sel); if (!el) return;
+  window.__cuePlan.push({ el: el, at: base + C[key],
+    enterAt: (opts && typeof opts.enterAt === "number") ? opts.enterAt : 0,
+    offAt:   (opts && typeof opts.offAt   === "number") ? opts.offAt   : null });
+}
+function flushCuePlan(){                        // 在构造时间轴的 script 末尾调用一次
+  var plan = window.__cuePlan.slice().sort(function(a,b){ return a.at - b.at; });
+  for (var i = 0; i < plan.length; i++){
+    var cur = plan[i], cs = getComputedStyle(cur.el);
+    var bs = cs.boxShadow; if (!bs || bs === "none") bs = "0px 0px 0px rgba(0,0,0,0)";
+    var bg = cs.backgroundColor || "rgba(0,0,0,0)";
+    /* 深色底卡片（白字）不走背景腿，只动边框与光晕——否则点亮把字糊掉 */
+    var doBg = /rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(bg) ||
+               (function(m){ return m && m.length >= 3 && (0.299*m[0]+0.587*m[1]+0.114*m[2]) > 150; })(bg.match(/\d+/g));
+    var on = { boxShadow:"0px 16px 40px rgba(37,99,235,0.45)", borderColor:"#2563eb" };
+    var off = { boxShadow:bs, borderColor:(cs.borderColor || "rgba(0,0,0,0)") };
+    if (doBg){ on.backgroundColor = "#eef5ff"; off.backgroundColor = bg; }
+    var onAt = Math.max(cur.at, cur.enterAt), offAt = cur.offAt;
+    if (offAt === null){
+      offAt = onAt + 8;                          // 约束三：封顶
+      for (var j = i + 1; j < plan.length; j++){ // 约束二：向前扫描
+        if (plan[j].at > onAt + 0.62){ offAt = Math.min(plan[j].at, onAt + 8); break; }
+      }
+    }
+    tl.fromTo(cur.el, off, Object.assign({}, on, { duration:0.22, ease:"power2.out" }), onAt);
+    tl.to(cur.el, Object.assign({}, on, { boxShadow:"0px 8px 24px rgba(37,99,235,0.26)", duration:0.34, ease:"power1.inOut" }), onAt + 0.22);
+    if (offAt > onAt + 0.62) tl.to(cur.el, Object.assign({}, off, { duration:0.55, ease:"power2.inOut" }), offAt);
+  }
+}
+```
+
+**两条取证事实（写文档时容易猜错，均为实测）**：
+
+- **cue 落点能在预览上验，不必付一次全量渲染。** `CUE-MAP` 块由 timeline 步写进 `index.html` 后**常驻该文件**，因此预览期 `window.C` 存在、cue 动画在 `instant_preview.py` 的截图里真实执行。本轮正是从预览截图读出了"同一场里 l2/l3 亮、l1/l4 灭"这一不一致，才定位到约束 1 与 2。前提：本轮新增/改动的声明要先跑过一次 timeline 步（块是它写的），否则预览期 `window.C` 不存在、`cueGlow` 全部跳过——**"预览里 cue 没亮"有两种成因，先分辨是哪一种再动手**。
+- **`getComputedStyle` 取到的初始态才是熄灭态的正确答案。** 上例把元素原始 `boxShadow/borderColor/backgroundColor` 在收集阶段之后、挂载之前读出来当 `off` 态，因此不必为每种卡片另写一套"恢复"值；手写固定 `off` 值会在深色底／浅底混排的项目里把卡片恢复成错的样式。
+
+**是否加机算门禁：不加**（对齐 2026-10-10 常设裁定"不为观感问题新增代码门禁"，且本节三条都是 HTML 写法层判据，静态可判但收益低于一次预览截图自查）。翻转前置＝若再次出现"cue 时刻全部合格而观众报'没反应'"且预览自查已无法兜住，则把"脉冲形态（`yoyo:true` 且 `duration < 0.5`）挂在与 `C[...]` 同一元素上"这一形态接进 `preflight_check` 只报不拦，先积累一轮读数再定档。
+
 ---
 
 ## 四、场景设计模式
@@ -417,6 +471,8 @@ python 程序文件/脚本/cue_resolve.py --narration 程序文件/源码/hyperf
 </div>
 ```
 
+> 两侧各列 4-5 条时本节合适（对比的是"清单内容"）。若对比只剩**一个可变量且可量化**（耗时、成本、道数），改用同量纲横向条形让差值直接可见，见 §4.8 形态三——它的三条硬约束（同量纲、真实比值、两条分别对齐被说出的时刻）也住那里。
+
 ### 4.4 工具/架构展示场景
 
 ```html
@@ -448,6 +504,8 @@ python 程序文件/脚本/cue_resolve.py --narration 程序文件/源码/hyperf
 </div>
 ```
 
+> 本节两种是**列表型**步骤（条目之间不强调"必须依次通过"）。要画"依次通过的关卡 + 不合格退回"的**节点流程图与回流环**（含 SVG 描画动效）见 §4.8 形态一，实现与时间位纪律住那里。
+
 ### 4.6 数据/统计场景
 
 ```html
@@ -478,6 +536,108 @@ python 程序文件/脚本/cue_resolve.py --narration 程序文件/源码/hyperf
   </div>
 </div>
 ```
+
+### 4.8 结构化图形承载（把"并列要点"画成它本来的形状）
+
+**为什么单列一节**：卡片阵列能装下任何内容，因此写作者会一直用它，代价是观众只能逐条读、看不出关系。2026-10-17 一支已交付的 5 分钟介绍片收到的原话是"视频画面缺乏流程图等结构化的表达形式"，而同一份素材由消费侧按同一流水线做出的另一支片，画面形态明显更丰富——**差距不在素材、不在时长，在分镜阶段有没有为每场决定"这场的图形是什么形"**。本节给出五类已验证形态与三条共用纪律；每场的"要不要图形、要哪一类"属分镜裁定，见 `分镜设计模板_AI导演模式.md`「常设观感默认」的"结构化图形承载"行（判据住那张表，本节只给实现）。
+
+**通用件一：SVG 描画（不依赖 drawSVG 插件）**——凡"线沿着走一遍"的动效都用这三行，路径可以是回流环、连线、坐标轴：
+
+```javascript
+var p = document.getElementById("s3-looppath");
+var L = p.getTotalLength();
+p.style.strokeDasharray = L; p.style.strokeDashoffset = L;
+tl.to(p, { strokeDashoffset: 0, duration: 1.8, ease: "power1.inOut" }, T.s3 + 13.2);
+```
+
+**通用件二：填充类动画不改布局**——条形/色带用 `scaleX`（配 `transformOrigin:"left center"`），轨道先出、填充后长；`scaleY/scaleX` 不改变布局高度，故不引发布局跳动（与踩坑清单 §4.4"有效修复方向"同族）。
+
+**形态一：横向节点流程图 + 回流环**（用于"依次通过的几道关卡"，且存在"不合格则退回"的语义）
+
+```html
+<div class="s3-flow">                      <!-- display:flex; align-items:stretch; gap:14px -->
+  <div class="card s3-gate"><span class="g">闸1</span><div class="t">约束确认</div><div class="d">一句话补充</div></div>
+  <div class="s3-farrow">→</div>
+  <div class="card s3-gate">…闸2…</div><div class="s3-farrow">→</div>
+  <div class="card s3-gate">…闸3…</div><div class="s3-farrow">→</div>
+  <div class="card s3-gate">…闸4…</div>
+</div>
+<div class="s3-loop">                      <!-- position:relative; height:72px -->
+  <svg viewBox="0 0 1732 72" preserveAspectRatio="none">
+    <path id="s3-looppath" d="M 1500 6 C 1462 66, 300 66, 250 6" fill="none" stroke="#d97706" stroke-width="2.5"/>
+  </svg>
+  <div class="s3-loop-tag">证据不齐 → 回退上一道闸</div>
+</div>
+```
+
+闸门卡逐个 `fromTo(… y:18,opacity:0 …)` 错落入场，箭头随后；回流环在"讲完四道闸"的那一刻描画（时间位取该句的 cue 或 `T.sN + 秒数`），标签再晚 1.4s——**回流环必须晚于它所指的关系被说出来**，否则观众先看见结论再听见理由。`viewBox` 配 `preserveAspectRatio="none"` 让弧线随容器宽自适应，但描边粗细会随宽度轻微变形，故只在整幅宽度的横向流程上用。
+
+**形态二：分层色带**（用于"自上而下的层级/栈"，且需要区分"栈内层级"与"外围约束"）
+
+```html
+<div class="s7-cols">                       <!-- display:grid; grid-template-columns: 1fr 320px; gap:20px -->
+  <div class="s7-stack">
+    <div class="s7-l">L1 …</div>            <!-- 白底 -->
+    <div class="s7-l">L2 …</div>            <!-- #eff6ff -->
+    <div class="s7-l main">L3 …</div>       <!-- linear-gradient(135deg,#1d4ed8,#3b82f6)，白字 -->
+  </div>
+  <div class="s7-side">
+    <div class="s7-side-card">判据／约束一</div>   <!-- border-style:dashed; border-color:#93c5fd -->
+    <div class="s7-side-card">判据／约束二</div>
+  </div>
+</div>
+```
+
+配色纪律：一层一色阶（白 → 浅蓝 → 主色实底），**主层用实底渐变、辅助栏用虚线框**——虚线在观众那里读作"不构成层级、只作约束"，实底读作"栈里的一层"，两套语义不得互换（换成实线就变成"另一层"，信息即错）。主层是深底，其上的 cue 点亮须走 §3.6.1 的"深色底不走背景腿"分支。
+
+**形态三：同量纲横向对比条形**（用于"过去 vs 现在"这类只有一个可变量的对照）
+
+```html
+<div class="s6-bar">
+  <span class="lab">过去 · 跨 3 个专业</span>
+  <div class="track"><div class="fill" id="s6-bf1" style="background:#94a3b8;width:100%;"></div></div>
+  <span class="val" style="color:#64748b;">约 2 天</span>
+</div>
+<div class="s6-bar">
+  <span class="lab">现在 · 一句话</span>
+  <div class="track"><div class="fill" id="s6-bf2" style="background:#2563eb;width:3.2%;min-width:16px;"></div></div>
+  <span class="val" style="color:#2563eb;">约 10 分钟</span>
+</div>
+```
+
+```javascript
+tl.fromTo("#s6-bf1", { scaleX:0 }, { scaleX:1, duration:1.1, ease:"power2.out" }, T.s6 + 4.2);
+tl.fromTo("#s6-bf2", { scaleX:0 }, { scaleX:1, duration:0.8, ease:"power2.out" }, T.s6 + 9.5);
+```
+
+三条硬约束：①**同量纲才并置**（两条必须量同一件事，"2 天"与"10 分钟"换算后同属时长可并置；把"耗时"和"满意度"画进同一坐标即假对比）；②`width` 按真实比值给，并置 `min-width` 防极小值渲成看不见的细线；③两条的填充时刻分别对齐各自被说出的时刻（用 cue 或 `T.sN+秒数`），**禁止同时伸长**——同时伸长等于把对比压成一个动作，观众来不及读第一条。参照色（灰）与主色（蓝）分工固定，全片单色贯穿。
+
+**形态四：等宽代码块隐喻**（用于"这套东西的执行方式本身就是指令序列"——门禁、流水线、规则注入类题材）
+
+```html
+<div class="s5-term">                       <!-- font-family: mono; 左色标 + 正文，三行 -->
+  <div><span class="ln-k">[注入]</span> 新增门禁，先故意植入缺陷</div>
+  <div><span class="ln-r">[确认]</span> 报错才允许合入</div>
+  <div><span class="ln-g">[对照]</span> 判定前先跑已知有问题的对象</div>
+</div>
+```
+
+它替代"①②③ 圆号列表"：同样的三句话，加方括号色标后观众读作"真在跑的机制"而非"三条建议"。色标语义固定为 注入=蓝／失败=红／校验=绿，别为美观换序。
+
+**形态五：中轴延伸**（用于封面或单一主张场——一条竖线把标题"顶天立地"，给孤立论点以结构感）
+
+```css
+.s1-claim::before, .s1-claim::after { content:""; position:absolute; left:50%; width:2px; height:26px; background:rgba(37,99,235,0.35); }
+.s1-claim::before { top:-40px; } .s1-claim::after { bottom:-40px; }
+```
+
+**共用纪律三条**（五类形态都受约束）：
+
+1. **图形上的数字必须来自旁白**（口画一致）。参考件里有、本片旁白没有的数据一律不引入——否则出现"画上有 59→79 的折线、耳朵里没听到这两个数"，观众要么去核要么失信任；这是取舍而非遗漏，须在交付说明里写明未引入的理由。
+2. **数值/标签不得压在图形上**（既有常设观感）。条形右侧的 `val`、色带上的层级名一律留出轨道宽度，不叠印。
+3. **一场一个主形态**。两类以上并置时须有从属关系（流程图为主体、回流环为其附属），不得并列两块同等体量的图形——那会把"看结构"变成"找结构"。
+
+**形态从哪来（参考件对照法）**：手上有一支同素材／同类型的更好看的片子时，按 15–25s 间隔抽 ≥12 帧，逐帧只回答一个问题——"这一帧的形状在我这一版里有没有对应物？"缺的形态按本节五类补，不缺的不动。**对照取的是"形状"不是"数据"**：把对方画面里的数字搬过来属越界（见共用纪律 1）。本仓首次兑现该法的对象是一支 5 分钟信息片的原版与 `_修订02`（取证件按临时落点纪律不入 git，故本处只留方法、不留路径指针）。
 
 ---
 
@@ -536,6 +696,8 @@ python 程序文件/脚本/cue_resolve.py --narration 程序文件/源码/hyperf
 - [ ] GSAP 只有一个 `tl`（paused:true）
 - [ ] 内容场景的动画时间位全部写成 `T.sN + offset`，除封面窗口（0–3s）外无裸数字时间位（§3.0）
 - [ ] 若挂了 `data-cue-at`：词逐字在该场旁白里、属性在带 `data-scene-id` 的 div 内、tween 写成 `T.sN + C["sN:词"]`，且 `CUE-MAP` 块未被手工编辑（§3.6）
+- [ ] 挂了 cue 的元素，点亮是"亮住不灭 + 下一锚让位"形态而非亚秒脉冲；句级降级锚（`C` 值≈场首）已配 `enterAt`；同刻组锚的熄灭向前扫描并封顶（§3.6.1）——**预览截图即可验，不必等渲染**
+- [ ] 每个信息场景有结构化图形承载（流程/层级/对比/趋势/序列），非纯卡片阵列；图形上出现的每个数字都能在旁白里听到（§4.8）
 - [ ] 封面淡出在 2.5s，body offset 在 3s
 - [ ] 转场类型交替使用
 - [ ] 卡片 stagger 间隔 2-3s

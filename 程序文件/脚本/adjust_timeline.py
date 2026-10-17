@@ -128,11 +128,17 @@ def measure_tts_durations(tts_dir, num_scenes, config_scenes=None):
         with open(manifest_path, 'r', encoding='utf-8') as f:
             manifest = json.load(f)
 
-    for i in range(1, num_scenes + 1):
+    # 场景 id 列表：与 boundaries 按位置对齐，必须按 cfg scenes 顺序遍历。
+    # scene_id 可能是 1 基（存量）或 0 基（本项目），不能假设 1..N——
+    # 0 基项目 manifest 键是 "0".."N-1"，假设 1..N 会查 "N" 必然 miss。
+    sid_list = ([str(s.get('scene_id', i + 1)) for i, s in enumerate(config_scenes)]
+                if config_scenes else
+                [str(i) for i in range(1, num_scenes + 1)])
+
+    for i, sid in enumerate(sid_list):
         hq_file = None
 
         # Try hash-based name from manifest
-        sid = str(i)
         if sid in manifest:
             entry = manifest[sid]
             h = entry.get('hash') if isinstance(entry, dict) else entry
@@ -141,9 +147,11 @@ def measure_tts_durations(tts_dir, num_scenes, config_scenes=None):
                 if candidate.exists():
                     hq_file = candidate
 
-        # Fall back to legacy naming
+        # Fall back to legacy naming. 旧 TTS 写盘按位置命名（scene_1..scene_N，
+        # 1 基），与 scene_id 形态无关——改判读 scene_id 会把存量夹具/项目的
+        # 位置命名 wav 漏判。此路径刻意保持位置口径，与改前逐字一致。
         if hq_file is None:
-            candidate = tts_dir / f"scene_{i}_hq.wav"
+            candidate = tts_dir / f"scene_{i + 1}_hq.wav"
             if candidate.exists():
                 hq_file = candidate
 
@@ -153,7 +161,7 @@ def measure_tts_durations(tts_dir, num_scenes, config_scenes=None):
             # 硬失败：dur=0 会让 --shrink 把该场景窗口坍缩到 ~1s，
             # 产出画面一闪而过的废片。缺 TTS 只能是上游步骤没跑/文本已改，
             # 必须先重跑 TTS，不允许带 0 值继续算时间轴。
-            print(f"  ERROR: TTS file not found for scene {i} — "
+            print(f"  ERROR: TTS file not found for scene {sid} — "
                   f"run TTS step first (narration text may have changed).")
             sys.exit(EXIT_CODE.GATE_FAILURE)
         durations.append(dur)
@@ -551,7 +559,7 @@ def _default_shrink_basis():
         return "tts_wav"
 
 
-def measure_speech_ends(tts_dir, num_scenes):
+def measure_speech_ends(tts_dir, num_scenes, sid_list=None):
     """逐场 ASR 末句收尾时刻（场内相对秒），取自生产落盘的 `_timeline_manifest.json`。
 
     与词级 cue 同一个时间源（`load_cue_time_source`），不新起第二套取数：
@@ -560,10 +568,12 @@ def measure_speech_ends(tts_dir, num_scenes):
 
     返回 `{scene_id(str): rel_end}`，缺项即不返回该键——调用侧按"无实测"回退 wav，
     禁止用 0.0 或整场时长兜底（前者会把窗口裁到音频开头，后者等于没改）。
+    sid_list 与 measure_tts_durations 同一约定：显式传入时按它遍历（位置对齐），
+    缺省回退 1..N（存量行为）。
     """
     by_id = load_cue_time_source(tts_dir)
     out = {}
-    for sid in range(1, num_scenes + 1):
+    for sid in (sid_list if sid_list is not None else range(1, num_scenes + 1)):
         sc = by_id.get(str(sid))
         if not sc:
             continue
@@ -772,14 +782,20 @@ def main():
     # Measure TTS durations
     tts_durations = measure_tts_durations(tts_dir, num_scenes, cfg.get('scenes'))
 
+    # 与 measure_tts_durations 同一 scene-id 列表（位置对齐 boundaries），
+    # 不能在这里再独立假设 1..N——0 基项目场 0 会被静默漏掉。
+    sid_list = ([str(s.get('scene_id', i + 1)) for i, s in enumerate(cfg.get('scenes'))]
+                if cfg.get('scenes') else
+                [str(i) for i in range(1, num_scenes + 1)])
+
     # 收缩侧基准：CLI > 项目 config 的 shrink_basis > audio_sync_rules.json → shrink.basis
     # 三级里任何一级没声明就落到下一级，缺省 tts_wav ＝ 既有行为逐字不变。
     basis = resolve_shrink_basis(args.shrink_basis, cfg.get('shrink_basis'),
                                  _default_shrink_basis())
     trim_durations = None
     if basis == "speech_end" and args.shrink:
-        speech_ends = measure_speech_ends(tts_dir, num_scenes)
-        missing = [i + 1 for i in range(num_scenes) if str(i + 1) not in speech_ends]
+        speech_ends = measure_speech_ends(tts_dir, num_scenes, sid_list)
+        missing = [sid_list[i] for i in range(num_scenes) if sid_list[i] not in speech_ends]
         if missing:
             print(f"  [SHRINK-BASIS] {len(missing)}/{num_scenes} 场无末句实测"
                   f"（场 {missing}）— 这些场按 wav 基准")
@@ -789,7 +805,7 @@ def main():
         else:
             # 可裁基准永不得高于 wav：末句若晚于 wav（异常记录）由 measure_speech_ends 拦掉，
             # 这里再兜一层 min 使"换基准"在结构上不可能把音频裁掉哪怕 0.01s。
-            trim_durations = [min(tts_durations[i], speech_ends.get(str(i + 1), tts_durations[i]))
+            trim_durations = [min(tts_durations[i], speech_ends.get(sid_list[i], tts_durations[i]))
                               for i in range(num_scenes)]
             reclaim = sum(t - m for t, m in zip(tts_durations, trim_durations))
             print(f"  [SHRINK-BASIS] speech_end 生效：可裁尾部静音合计 {reclaim:.2f}s"

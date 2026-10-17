@@ -426,7 +426,12 @@ async function main() {
         // Capture screenshots for each scene
         for (let i = 0; i < scenes.length; i++) {
             const scene = scenes[i];
-            const sceneId = scene.scene_id || (i + 1);
+            // scene_id 为 0 合法（cover_duration=0 时首场景即 0 起，2026-10-16 prefab-agent-intro
+            // 实测：`0 || (i+1)` 把首场景压成 1，与次场景同 id，覆盖率裁定误报"缺: [0]"）。
+            // 只兜底 undefined/null，不得用 || —— 0 会被 || 吞掉。
+            const sceneId = (scene.scene_id === undefined || scene.scene_id === null)
+                ? (i + 1)
+                : scene.scene_id;
             const sceneStart = parseFloat(scene.start) + coverDuration;
             const sceneEnd = parseFloat(scene.end) + coverDuration;
             const sceneDur = sceneEnd - sceneStart;

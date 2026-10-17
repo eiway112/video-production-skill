@@ -14146,6 +14146,15 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         tc.assert_true("--fit-min-cpl" in js and "return null" in js,
                        "E7 缺传阈值即显式回吐，不给 JS 侧默认值")
 
+        # E9 sceneId 归属：scene_id=0 合法（cover_duration=0 时首场景 0 起），
+        # `|| (i+1)` 会把 0 压成 1 与次场景同 id，覆盖率裁定误报缺场（2026-10-16
+        # 一支 0 基场景 id 的真实业务项目实测：24 张截图在位却报"缺: [0]"）。只兜底 undefined/null。
+        tc.assert_true("scene.scene_id || (i + 1)" not in js,
+                       "E9a 旧的 || 兜底不得复活（0 是合法 scene_id，|| 会把它吞成 i+1）")
+        tc.assert_true("scene.scene_id === undefined" in js
+                       and "scene.scene_id === null" in js,
+                       "E9b sceneId 只兜底 undefined/null 两形态")
+
         # E8 键契约双向锁：JS 发什么键、Python 读什么键，两侧各取一次源码对撞。
         # 存在理由——B10 之前"缺 capacity 即视为达标"正是靠这个空档发生的：改名不发一言，
         # 裁定面把断链读成干净。现在两条防线都在：裁定面缺键即 UNTESTED（B10），
@@ -15589,10 +15598,14 @@ def test_shrink_basis_speech_end_opt_in() -> RegressionTestCase:
                 d.mkdir(parents=True, exist_ok=True)
             cover = 2.0
             s1b, s2b = cover + W1 + pad[0], cover + W1 + pad[0] + W2 + pad[1]
+            # 生产不变量：narration scene_id 与 _timeline_manifest scenes[].scene_id
+            # 同源同命名空间（全部由 narration.json 派生，真实项目全为 int——本仓 69 份
+            # 存量 1 基、首个 0 基生产项目 0..11）。夹具不得再混用 "s1" 字符串旁白 id
+            # + int manifest id 的双命名空间虚构（用例110批前该虚构被旧代码的位置口径掩盖）。
             narr = {"scenes": [
-                {"scene_id": "s1", "type": "content", "start": cover, "end": s1b,
+                {"scene_id": 1, "type": "content", "start": cover, "end": s1b,
                  "narration": "龙骨隔墙由三层构造"},
-                {"scene_id": "s2", "type": "content", "start": s1b, "end": s2b,
+                {"scene_id": 2, "type": "content", "start": s1b, "end": s2b,
                  "narration": "密封决定开裂风险"}]}
             (html_dir / "narration.json").write_text(json.dumps(narr, ensure_ascii=False),
                                                      encoding="utf-8")
@@ -15718,7 +15731,9 @@ def test_shrink_basis_speech_end_opt_in() -> RegressionTestCase:
                 code, log = _drive(cfg, tts)
                 w_mix, _ = _windows(cfg, tts)
                 rw_mix = _real_wavs(tts)
-                tc.assert_true("无末句实测" in log and "[2]" in log,
+                # sid_list 自用例110批起统一为 str（measure_speech_ends 内部 str(sid)
+                # 归一），missing 名单打印为 ['2']——点名语义不变：场号逐个点出。
+                tc.assert_true("无末句实测" in log and "['2']" in log,
                                f"F19 缺记录的场须被逐场点名（不得汇成一句整体回退）：{log[-320:]}")
                 tc.assert_true(abs(w_mix[1] - round(rw_mix[1] + MARGIN, 1)) < 0.12,
                                f"F20 无实测的场回退 wav：{w_mix[1]:.2f} vs "
@@ -17476,7 +17491,7 @@ def test_vacuum_probe_carries_referenced_assets() -> RegressionTestCase:
             # cwd=脚本目录"这一组合恒 0 命中，而两个因素各自单独都不致命（仓根 cwd 下
             # 绝对 pathspec 可用）。98-M7 摘的正是 cwd 这条腿。
             # 开发仓按设计业务项目全量入 git，故 tracked 面应等于磁盘面；
-            # 出现差额即有项目未跟踪，照常放行但点名。
+            # 出现差额即有项目未跟踪——硬判红并点名（新增项目须随批入库）。
             dev_tracked = _tracked_index_html(base)
             tc.assert_true(dev_tracked is not None,
                            "H2c 开发仓 tracked 取数腿断了（helper 返回 None）——"
@@ -20237,6 +20252,7 @@ class RegressionTestRunner:
             test_single_source_and_repo_hygiene,
             test_mutation_matrix_engine_adjudicates_its_own_criteria,
             test_managed_names_reject_path_values_at_concat_face,
+            test_timeline_zero_based_scene_id_resolution,
         ]
         self.results = []
     
@@ -20566,6 +20582,320 @@ def test_managed_names_reject_path_values_at_concat_face() -> RegressionTestCase
         import traceback
         tc.mark_failed("managed_names_reject_path_values error: " + str(e) + "\n"
                        + traceback.format_exc())
+    return tc
+
+
+def test_timeline_zero_based_scene_id_resolution() -> RegressionTestCase:
+    """用例110：adjust_timeline 场景 id 取 config scenes 声明的 scene_id，不假设 1..N
+    （2026-10-16 首跑批；生产首证，非推测。业务项目代号不进测试源码——公开面按清单
+    不导出业务项目，代号写进本件即把它带上公开面；立据现场由 E 段按项目名册动态发现）。
+
+    背景（生产现场逐字兑现）：该项目是全仓首个 scene_id 取 0..11 的生产
+    项目——narration.json 场景 id 0 基、tts_manifest.json 键 "0".."11"。旧实现三处
+    假设 1 基：
+      - measure_tts_durations `for i in range(1, num_scenes+1)` 查 manifest 键 "1".."12"
+        → "12" 必然 miss → 硬失败 "TTS file not found for scene 12"，流水线死在
+        时间轴调整步（该项目 runB 运行日志逐字兑现）；
+      - measure_speech_ends `for sid in range(1, num_scenes+1)` 查句级记录键
+        → 0 基项目的场 "0" 被**静默**漏掉（不报错、该场回退 wav 基准＝收缩侧静默失效）；
+      - main 调用侧 `str(i + 1)` 作 speech_ends 的 get 键与 missing 名单 → 同族错位。
+    下游为纯位置对齐（durations[i] ↔ boundaries[i]，boundaries 按 narration_source
+    场景顺序），故修复＝id 列表从 cfg scenes 的 scene_id 按序构造、位置穿透三处消费点；
+    无 config_scenes 时回退 1..N＝存量 1 基项目逐字不变（B 段正证据＋反向证据）。
+
+    本用例锁定：
+    A 0 基夹具：manifest 键 "0".."2" + config_scenes scene_id 0..2
+      → 三场合乎位置地取到时长（顺序与 scenes 一致）；缺键硬失败且报错点名**真实 sid**
+      （非 i+1）——"抛/不抛"两态断言等数（用例109判据）
+    B 存量零变化两向：1 基 manifest 无 scenes → 正常取齐（既有行为正证据）；
+      0 基 manifest 无 scenes → 仍必失败（修复只经 config_scenes 路由，默认语义未被改写）
+    C speech_end 基准两向对照：显式 sid_list 时场 "0" 入场；缺省回退 1..N 在 0 基源上
+      静默丢 "0"——既有语义与修复路径同锁
+    D 接线 AST 实证（非源码文本锚）：measure_tts_durations 三参调用、
+      measure_speech_ends 第三参为 Name sid_list、trim_durations 生成以 sid_list[i]
+      作 speech_ends.get 的键、调用侧 sid_list 真由 cfg scenes 构造——四处各自独立显形
+    E 真实 narration.json 冒烟（repo 受控面）：0 基立据项目由名册动态发现（源码不写代号），
+      场景 id 0..N-1 +
+      合成 manifest → 12 场按旁白序取齐；同 manifest 无 scenes 必失败（runB 死法锁为对照）
+    F 夹具卫生：受管临时区不留测试项目（用例109判据）
+    """
+    tc = RegressionTestCase(
+        "timeline_zero_based_scene_id_resolution",
+        "验证 adjust_timeline 场景 id 从 config scenes 声明值按序取（0 基/1 基均可），三处消费点接线由 AST 实证"
+    )
+    work = None
+    try:
+        import ast as _ast
+        import io as _io
+        import json as _json
+        import tempfile
+        from contextlib import redirect_stdout
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _script_env as se
+        # adjust_timeline 模块级重设 sys.stdout，必须在任何捕获之前导入（用例88判据）
+        import adjust_timeline as at
+        orig_gd = at.get_duration
+
+        def _make_tts_fixture(root: Path, ids, hash_of):
+            """造 tts_44k 目录 + 父级 manifest + 空 wav；返回 (tts_dir, dur_map)。"""
+            d = root / "tts_44k"
+            d.mkdir(parents=True, exist_ok=True)
+            dur_map = {}
+            manifest = {}
+            for sid in ids:
+                h = hash_of(sid)
+                manifest[str(sid)] = {"hash": h}
+                name = f"tts_{h}_hq.wav"
+                (d / name).write_bytes(b"")
+                dur_map[name] = 10.0 + float(sid)
+            (d.parent / "tts_manifest.json").write_text(
+                _json.dumps(manifest), encoding="utf-8")
+            return d, dur_map
+
+        # ── A 0 基夹具：修复路径正证据 ──
+        work = Path(tempfile.mkdtemp(prefix="regr110_", dir=se.TEMP_BASE))
+        tts_dir, dur_map = _make_tts_fixture(work / "a_audio", [0, 1, 2],
+                                             lambda sid: f"h{sid}")
+        scenes0 = [{"scene_id": 0}, {"scene_id": 1}, {"scene_id": 2}]
+        at.get_duration = lambda p: dur_map[Path(p).name]
+        try:
+            buf = _io.StringIO()
+            durs = None
+            crashed = False
+            try:
+                with redirect_stdout(buf):
+                    durs = at.measure_tts_durations(tts_dir, 3, scenes0)
+            except SystemExit:
+                crashed = True
+            if crashed:
+                tc.assert_true(False,
+                               "A1 0 基 scene_id 的 manifest 未按位置取齐——硬失败逃逸"
+                               f"（输出尾段：{buf.getvalue()[-160:]}）")
+            else:
+                tc.assert_equal(durs, [10.0, 11.0, 12.0],
+                                "A1 0 基 scene_id 的 manifest 键须按位置取齐，顺序与 scenes 一致")
+
+            # A2 缺键硬失败 + 归因点名真实 sid（"抛/不抛"两态断言等数——用例109判据）
+            (tts_dir / "tts_h1_hq.wav").unlink()
+            buf2 = _io.StringIO()
+            msg = None
+            try:
+                with redirect_stdout(buf2):
+                    at.measure_tts_durations(tts_dir, 3, scenes0)
+            except SystemExit:
+                msg = buf2.getvalue()
+            if msg is None:
+                tc.assert_true(False, "A2 缺 TTS 文件未硬失败（判据失效，A3 同失据）")
+                tc.assert_true(False, "A3 同上（报错须点名真实 sid '1' 而非位置 i+1='2'）")
+            else:
+                tc.assert_true("scene 1" in msg,
+                               f"A2 报错须点名真实 sid（0 基场 id=1）：…{msg[-160:]}")
+                tc.assert_true("scene 2" not in msg.split('ERROR')[-1][:80],
+                               f"A3 报错不得按位置 i+1 点名（'scene 2' 即旧错位形态）：…{msg[-160:]}")
+            (tts_dir / "tts_h1_hq.wav").write_bytes(b"")
+
+            # ── B 存量零变化两向 ──
+            # B1 正向：1 基 manifest + 无 scenes（旧调用形态）→ 逐字正常。
+            # 用例自有夹具（与 A 隔离）：A 目录只造了 h0/h1/h2，1 基键 "3"→h3
+            # 在 A 夹具里不存在——复用 A 目录会让 B1 死在缺文件上而非被测语义。
+            tts_dir_b, dur_map_b = _make_tts_fixture(work / "b1_audio", [1, 2, 3],
+                                                     lambda sid: f"h{sid}")
+            at.get_duration = lambda p: dur_map_b[Path(p).name]
+            bufB = _io.StringIO()
+            durs1 = None
+            try:
+                with redirect_stdout(bufB):
+                    durs1 = at.measure_tts_durations(tts_dir_b, 3, None)
+            except SystemExit:
+                durs1 = None
+            if durs1 is None:
+                tc.assert_true(False,
+                               "B1 1 基 manifest 无 scenes 应逐字正常，却硬失败逃逸"
+                               f"（输出尾段：{bufB.getvalue()[-160:]}）")
+            else:
+                tc.assert_equal(durs1, [11.0, 12.0, 13.0],
+                                "B1 无 scenes 回退 1..N：1 基 manifest 正常取齐（存量零变化正证据）")
+            # B1b 显式 1 基 scenes 声明同样按声明值取（防"只认 0 基"反向漂移）
+            scenes1 = [{"scene_id": 1}, {"scene_id": 2}, {"scene_id": 3}]
+            bufB1b = _io.StringIO()
+            durs1b = None
+            try:
+                with redirect_stdout(bufB1b):
+                    durs1b = at.measure_tts_durations(tts_dir_b, 3, scenes1)
+            except SystemExit:
+                durs1b = None
+            if durs1b is None:
+                tc.assert_true(False,
+                               "B1b 显式 1 基 scenes 声明应正常取齐，却硬失败逃逸"
+                               f"（输出尾段：{bufB1b.getvalue()[-160:]}）")
+            else:
+                tc.assert_equal(durs1b, [11.0, 12.0, 13.0],
+                                "B1b scene_id 按声明值取（1 基声明同样成立），不按位置硬编")
+            # B2 反向：0 基 manifest + 无 scenes → 仍必失败（修复不经默认路由改写存量语义）
+            manifest0 = {str(i): {"hash": f"h{i}"} for i in (0, 1, 2)}
+            (tts_dir.parent / "tts_manifest.json").write_text(
+                _json.dumps(manifest0), encoding="utf-8")
+            bufB2 = _io.StringIO()
+            raised_b2 = False
+            try:
+                with redirect_stdout(bufB2):
+                    at.measure_tts_durations(tts_dir, 3, None)
+            except SystemExit:
+                raised_b2 = True
+            tc.assert_true(raised_b2,
+                           "B2 无 scenes 时维持 1..N：0 基 manifest 必失败——"
+                           "修复只经 config_scenes 路由，存量假设未被顺手改写")
+        finally:
+            at.get_duration = orig_gd
+
+        # ── C speech_end 基准两向对照 ──
+        src0 = {"0": {"sentences": [{"rel_end": 5.0}], "tts_duration": 10.0},
+                "1": {"sentences": [{"rel_end": 6.0}], "tts_duration": 11.0},
+                "2": {"sentences": [{"rel_end": 7.0}], "tts_duration": 12.0}}
+        orig_load = at.load_cue_time_source
+        at.load_cue_time_source = lambda d: src0
+        try:
+            bufC = _io.StringIO()
+            with redirect_stdout(bufC):
+                se_fixed = at.measure_speech_ends(tts_dir, 3, ["0", "1", "2"])
+            tc.assert_equal(sorted(se_fixed.keys()), ["0", "1", "2"],
+                            "C1 显式 sid_list 时场 '0' 的末句实测须入场（修复路径正证据）")
+            bufC2 = _io.StringIO()
+            with redirect_stdout(bufC2):
+                se_legacy = at.measure_speech_ends(tts_dir, 3)
+            tc.assert_equal(sorted(se_legacy.keys()), ["1", "2"],
+                            "C2 缺省回退 1..N 在 0 基源上静默丢 '0'——既有语义逐字保留、两向对照锁死")
+        finally:
+            at.load_cue_time_source = orig_load
+
+        # ── D 接线 AST 实证（四处各自独立显形）──
+        src_at = (script_dir / "adjust_timeline.py").read_text(encoding="utf-8")
+        tree = _ast.parse(src_at)
+        calls_tts = [c for c in _ast.walk(tree)
+                     if isinstance(c, _ast.Call)
+                     and getattr(c.func, "id", "") == "measure_tts_durations"]
+        tc.assert_true(any(len(c.args) >= 3 for c in calls_tts),
+                       "D1 measure_tts_durations 须存在三参调用（config_scenes 真被传入）")
+        calls_se = [c for c in _ast.walk(tree)
+                    if isinstance(c, _ast.Call)
+                    and getattr(c.func, "id", "") == "measure_speech_ends"]
+        tc.assert_true(any(len(c.args) >= 3 and isinstance(c.args[2], _ast.Name)
+                           and c.args[2].id == "sid_list" for c in calls_se),
+                       "D2 measure_speech_ends 第三参须为 Name sid_list（句级基准同一路由）")
+        trim_ok = False
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Assign) and any(
+                    isinstance(t, _ast.Name) and t.id == "trim_durations"
+                    for t in node.targets):
+                for sub in _ast.walk(node.value):
+                    if (isinstance(sub, _ast.Call)
+                            and getattr(sub.func, "attr", "") == "get"
+                            and sub.args
+                            and isinstance(sub.args[0], _ast.Subscript)
+                            and isinstance(sub.args[0].value, _ast.Name)
+                            and sub.args[0].value.id == "sid_list"):
+                        trim_ok = True
+        tc.assert_true(trim_ok,
+                       "D3 trim_durations 生成中 speech_ends.get 的键须为 sid_list[i]"
+                       "（摘改回 str(i+1) 即变异形态）")
+        sid_ok = False
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Assign) and any(
+                    isinstance(t, _ast.Name) and t.id == "sid_list"
+                    for t in node.targets):
+                for sub in _ast.walk(node.value):
+                    if (isinstance(sub, _ast.Call)
+                            and getattr(sub.func, "attr", "") == "get"
+                            and isinstance(sub.func.value, _ast.Name)
+                            and sub.func.value.id == "cfg"):
+                        sid_ok = True
+        tc.assert_true(sid_ok, "D4 调用侧 sid_list 须由 cfg.get('scenes') 构造（数据源接线）")
+
+        # ── E 真实 narration.json 冒烟（repo 受控面，非临时产物面）──
+        # 立据现场按项目名册动态发现，不在本件源码里写业务项目代号：代号写进测试源码即把它
+        # 带上公开面（发布仓按导出清单不携带业务项目，dev 面那条路径在发布仓也不存在）。
+        # 判据＝名册中 scene_id 序列恰为 0..N-1 的项目（0 基正是本用例的立据形态）。
+        def _zero_based_roster(base):
+            found = []
+            for p in sorted(base.glob("*/narration.json")):
+                try:
+                    d = _json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                sc = d.get("scenes") or []
+                got = [s.get("scene_id") for s in sc]
+                if got and all(isinstance(i, int) for i in got) and got == list(range(len(got))):
+                    found.append((p, got, sc))
+            return found
+
+        roster_e = _zero_based_roster(se.HTML_BASE)
+        if export_repo_face(tc) == "published":
+            # 发布面：业务项目按清单不导出 → 名册里不得出现 0 基生产项目；
+            # 但本段不得因此空跑，立据形态改由合成 0 基 12 场重放（E2/E3 照常裁定）。
+            tc.assert_true(not roster_e,
+                           "E0p 发布面名册含 0 基生产项目＝业务件进了公开面")
+            ids = list(range(12))
+            scenes_e = [{"scene_id": i, "narration": "h%d" % i} for i in ids]
+        else:
+            if roster_e:
+                ids = roster_e[0][1]
+                scenes_e = roster_e[0][2]
+                tc.assert_equal(ids, list(range(len(ids))),
+                                "E1 该项目 scene_id 序须为 0..N-1（本判据的立据现场）")
+            else:
+                # 名册无对象时点名而非索引空表——旧形态 assert 后仍 roster_e[0] 即 IndexError
+                # 把整案截断（E2/E3 不记账），"红了"不等于"红在该条"。
+                tc.assert_true(False,
+                               "E0 开发仓须有 0 基生产项目作立据现场（名册动态发现，"
+                               "取不到即本判据无对象）——E2/E3 改按合成 0 基形态跑，不静默跳过")
+                ids = list(range(12))
+                scenes_e = [{"scene_id": i, "narration": "h%d" % i} for i in ids]
+        tts_e, dur_e = _make_tts_fixture(work / "e_audio", ids, lambda sid: f"h{sid}")
+        at.get_duration = lambda p: dur_e[Path(p).name]
+        try:
+            bufE = _io.StringIO()
+            durs_e = None
+            crashed_e = False
+            try:
+                with redirect_stdout(bufE):
+                    durs_e = at.measure_tts_durations(tts_e, len(ids), scenes_e)
+            except SystemExit:
+                crashed_e = True
+            if crashed_e:
+                tc.assert_true(False,
+                               "E2 真实 0..N narration 未取齐——硬失败逃逸"
+                               f"（输出尾段：{bufE.getvalue()[-160:]}）")
+            else:
+                tc.assert_equal(durs_e, [10.0 + float(s) for s in ids],
+                                "E2 0 基 narration（dev 面取名册真实项目／发布面取合成同形态）"
+                                "+ 合成 manifest：各场按旁白序取齐时长")
+            bufE2 = _io.StringIO()
+            raised_e = False
+            try:
+                with redirect_stdout(bufE2):
+                    at.measure_tts_durations(tts_e, len(ids), None)
+            except SystemExit:
+                raised_e = True
+            tc.assert_true(raised_e,
+                           "E3 0 基形态下无 scenes 的 1..N 假设仍必失败（runB 'scene 12' 死法锁为对照）")
+        finally:
+            at.get_duration = orig_gd
+
+        # ── F 夹具卫生（受管临时区不留测试项目——用例109判据）──
+    except Exception as e:
+        import traceback
+        tc.mark_failed("timeline_zero_based_scene_id_resolution error: " + str(e) + "\n"
+                       + traceback.format_exc())
+        return tc
+    finally:
+        if work is not None and work.exists():
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+        tc.assert_true(work is None or not work.exists(),
+                       "F1 夹具不得在受管临时区留测试项目（同用例109判据）")
+    tc.mark_passed()
     return tc
 
 
