@@ -20655,6 +20655,10 @@ def test_timeline_zero_based_scene_id_resolution() -> RegressionTestCase:
             return d, dur_map
 
         # ── A 0 基夹具：修复路径正证据 ──
+        # TEMP_BASE 在干净 clone / CI 上不存在（空目录不入 git），mkdtemp(dir=…) 不自动建父目录
+        # → 直接 FileNotFoundError。本机工作树因长期在用该目录而恒存在，故本机绿、异机红。
+        # 与用例101 B 段"父目录缺失须按需创建"同族判据。
+        se.TEMP_BASE.mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix="regr110_", dir=se.TEMP_BASE))
         tts_dir, dur_map = _make_tts_fixture(work / "a_audio", [0, 1, 2],
                                              lambda sid: f"h{sid}")
