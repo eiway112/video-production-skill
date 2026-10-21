@@ -2147,6 +2147,91 @@ class PipelineRunner:
         self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
         return False
 
+    def _record_vacuum_precheck(self, entry: Dict[str, Any]) -> None:
+        """空窗预判留痕唯一写盘点（PASS/UNTESTED/BLOCKED 三态均写）。
+
+        与 `_record_duration_check`/`_record_budget_check` 同族：通过路径也留痕，
+        使"这个检查点跑过且结论为何"成为 state 里的正证据，而不是由"查不到记录"
+        反推——后者分不清"跑过且干净"与"没跑成"。
+        """
+        entry.setdefault("at", datetime.now().isoformat(timespec="seconds"))
+        if getattr(self, "last_log_path", None):
+            entry.setdefault("log_path", str(self.last_log_path))
+        self.state.data["vacuum_precheck"] = entry
+        self.state.save()
+
+    def _vacuum_precheck_ok(self) -> bool:
+        """全量渲染前空窗预判（2026-10-21 审计批，把判据接进生效路径）。
+
+        存在理由（真实交付实证）：`content_vacuum_precheck.py` 的预判值与渲后
+        `visual_boundary_check` 实测逐档吻合（build-expert-overview s7：预判
+        0.311→0.522 vs 成片 27%→52%，±1%），但此前它只是手动入口、不在流水线里，
+        于是同一形态白付两次全量渲染（1016s + 572s = 26.5 分钟）。本方法把已有
+        判据前移到全量渲染启动前，不是新增一条观感门禁——渲后的 CONTENT VACUUM
+        本来就是 FAIL 阻断，前移只省一次注定失败的渲染。
+
+        三态归属（四态纪律）：
+          PASS(0)      → 放行，留痕 decision=passed；
+          UNTESTED(2)  → 放行并点名，留痕 decision=not_adjudicated——预判器取数未成
+                         （无 Chrome、T 块无从推导等）不得读成"画面有问题"，也不得
+                         读成"查过且干净"；
+          FAIL(1)      → 阻断并 `_fail`，留痕 decision=blocked。预判器必要不充分
+                         （曾与渲后门禁在 s13 上分叉），故给出 `--force` 知情放行出口，
+                         与既有门禁的放行语义一致。
+
+        位点：全量渲染分支内、渲染预算门禁之后、备份 render_raw 之前。PATCH 分支
+        不跑它：PATCH 只改场景内容且有自己的像素自校验，渲后 visual_check 仍兜底；
+        把预判加到 PATCH 上会让每次小改动多付 40s 且收益未经验证。
+
+        指纹面：本判据**刻意不登记**进 render 步输入。它是拦截器，不改变渲染产物；
+        改预判逻辑后，下一轮需要全量渲染时自然会用新判据，已通过的缓存无需作废。
+        （这与"判据文件影响该步结论就必须登记"不同：登记面问的是产物内容是否可能
+        不同，本判据只决定要不要启动渲染。）
+        """
+        detail: Dict[str, Any] = {"source": "content_vacuum_precheck.py"}
+        if self.force:
+            detail.update({"decision": "bypassed_via_force"})
+            self._record_vacuum_precheck(detail)
+            print("  [VACUUM-PRECHECK] bypassed via --force")
+            return True
+        script = SCRIPTS / "content_vacuum_precheck.py"
+        html = self.source_dir / "index.html"
+        if not script.exists() or not html.exists():
+            detail.update({"decision": "not_adjudicated",
+                           "reason": "script-or-html-missing"})
+            self._record_vacuum_precheck(detail)
+            print("  [VACUUM-PRECHECK] UNTESTED — 脚本或 HTML 不在位，本判据未执行（不阻断）")
+            return True
+
+        rc = self._run(
+            [str(VENV_PYTHON), str(script), str(html)],
+            cwd=str(SCRIPTS), env=self.env, desc="content vacuum precheck"
+        )
+        detail["exit_code"] = rc
+        if rc == 0:
+            detail["decision"] = "passed"
+            self._record_vacuum_precheck(detail)
+            print("  [VACUUM-PRECHECK] PASS — 无场景预判为空窗，继续渲染")
+            return True
+        if rc == 2 or rc < 0:
+            detail.update({"decision": "not_adjudicated",
+                           "reason": "precheck-untested-or-launch-failed"})
+            self._record_vacuum_precheck(detail)
+            print("  [VACUUM-PRECHECK] UNTESTED — 预判取数未成（原因见上），"
+                  "不阻断；不得读成已验证")
+            return True
+
+        detail["decision"] = "blocked"
+        self._record_vacuum_precheck(detail)
+        msg = ("Content vacuum precheck failed before full render — a scene's main "
+               "content enters too late (same criterion as visual_boundary_check "
+               "CONTENT VACUUM). Full render skipped; fix the scene or use --force.")
+        self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
+        print("  BLOCKED: 空窗预判未通过——渲后 visual_boundary_check 也会判 FAIL，"
+              "本次全量渲染已省下。")
+        print("  预判器必要不充分；若已人工确认画面无空窗，可追加 --force 放行并留痕。")
+        return False
+
     # ── 技能版本身份（2026-10-10 根因批）────────────────────────────────
     # 存在理由：本仓所有对齐判据（--drift / 发布回执 / 双端点 ls-remote）都住在开发仓，
     # 消费者侧一个都没有——"我用的是哪一版技能"在消费者侧从未被定义，因此"落后"不可见，
@@ -2417,14 +2502,22 @@ class PipelineRunner:
             rec = self._read_patch_verdict() or {}
             if rc == 0:
                 patched = True
-                _metrics = self._render_metrics()
-                _metrics["scene_patch_hits"] = int(_metrics.get("scene_patch_hits", 0)) + 1
-                self.state.save()
-                verdict = "PATCH"
+                verdict = rec.get("verdict") or "PATCH"
+                reason = rec.get("reason") or reason
                 outcome = rec.get("outcome") or "applied"
-                print(f"  [SCENE-PATCH] Patch applied — full render skipped "
-                      f"(changed: {', '.join(rec.get('changed_scenes') or [])}"
-                      f"{'; time witness: ' + str(rec['time_witness']) if rec.get('time_witness') else ''})")
+                if verdict == "PATCH":
+                    _metrics = self._render_metrics()
+                    _metrics["scene_patch_hits"] = int(_metrics.get("scene_patch_hits", 0)) + 1
+                    self.state.save()
+                    print(f"  [SCENE-PATCH] Patch applied — full render skipped "
+                          f"(changed: {', '.join(rec.get('changed_scenes') or [])}"
+                          f"{'; time witness: ' + str(rec['time_witness']) if rec.get('time_witness') else ''})")
+                else:
+                    # REUSE（2026-10-21 审计批）：场景内容逐字未变、render_raw 在位且比
+                    # render_rules 新。不计入 scene_patch_hits——它不是"增量渲染命中"，
+                    # 而是"本次无需渲染"；hits 的语义保持"段渲染+拼接真的跑过"。
+                    print("  [REUSE] No scene content change — render_raw.mp4 reused, "
+                          "no render (hits counter unchanged)")
             else:
                 verdict = "FULL"
                 reason = rec.get("reason") or (
@@ -2440,6 +2533,10 @@ class PipelineRunner:
             # ── 渲染成本预算门禁（P1，2026-08-19）：全量渲染启动前拦截，
             #    超预算需 --accept-over-render 显式放行（见 _render_budget_gate_ok）──
             if not self._render_budget_gate_ok():
+                return False
+            # ── 空窗预判（2026-10-21 审计批）：把渲后 CONTENT VACUUM 判据前移，
+            #    避免"注定失败的渲染"白付一次全量。三态与放行出口见方法 docstring。
+            if not self._vacuum_precheck_ok():
                 return False
             # ── 渲染中断恢复（P1 整改，prefab 复盘根因5）：全量重渲前备份上一版
             #    render_raw——prefab 两次渲染中止于 87%/53% 后毫无恢复路径，只能

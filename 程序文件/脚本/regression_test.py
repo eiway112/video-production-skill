@@ -3688,8 +3688,11 @@ def test_scene_patch_default_route_and_time_witness() -> RegressionTestCase:
 
                 write_sidecar(html1)
                 v, ch, r, _ = pr.classify()
-                tc.assert_equal((v, r), ("FULL", "no-scene-content-change"),
-                                "B1 identical html → FULL (patching nothing is not a hit)")
+                # 2026-10-21 审计批：identical html 由 FULL 改为 REUSE——渲染结果
+                # 没有变化理由，旧实现白付一次全量。REUSE 不计 scene_patch_hits
+                # （不是"段渲染命中"），在位性两腿与计数口径由用例113 锁定。
+                tc.assert_equal((v, r), ("REUSE", "no-scene-content-change"),
+                                "B1 identical html → REUSE (no render, not a PATCH hit)")
 
                 bodies2 = dict(bodies1, s2="<p>酒店项目案例（隔声 45dB）</p>")
                 html2 = build_html(bodies2)
@@ -20254,6 +20257,9 @@ class RegressionTestRunner:
             test_managed_names_reject_path_values_at_concat_face,
             test_timeline_zero_based_scene_id_resolution,
             test_sentence_pause_cut_point_and_cache_invalidation,
+            test_vacuum_precheck_blocks_before_full_render,
+            test_scene_patch_reuse_and_frame_grid_tolerance,
+            test_cue_consumption_warn_only,
         ]
         self.results = []
     
@@ -21219,6 +21225,349 @@ def test_sentence_pause_cut_point_and_cache_invalidation() -> RegressionTestCase
     finally:
         shutil.rmtree(str(tmp), ignore_errors=True)
 
+    return tc
+
+
+def test_vacuum_precheck_blocks_before_full_render() -> RegressionTestCase:
+    """用例112：空窗预判接进全量渲染前置（2026-10-21 审计批）。
+
+    背景：`content_vacuum_precheck.py` 的预判值与渲后 visual_boundary_check
+    实测逐档吻合（build-expert-overview s7：0.311→0.522 vs 27%→52%），但它
+    此前只是手动入口，同一形态白付两次全量（1016s+572s=26.5 分钟）。
+
+    本用例锁：三态（PASS/UNTESTED/FAIL）各自的放行与留痕、--force 出口、
+    HTML/脚本缺失不阻断，以及接线位点在预算门禁之后、备份 render_raw 之前。
+    """
+    tc = RegressionTestCase(
+        "vacuum_precheck_blocks_before_full_render",
+        "验证空窗预判在全量渲染前置位点的三态裁定与留痕"
+    )
+    try:
+        import sys, tempfile, inspect
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+        import pipeline_runner as prmod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            proj = tmp / "proj"
+            proj.mkdir()
+            (proj / "index.html").write_text("<html></html>", encoding="utf-8")
+
+            def make(rc, idx, force=False):
+                st = PipelineState(tmp / f"state_{idx}.json")
+                st.mark_started("render")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = st
+                runner.force = force
+                runner.env = {}
+                runner.source_dir = proj
+                runner.last_log_path = None
+                calls = []
+
+                def fake_run(cmd, cwd=None, env=None, desc="", **kw):
+                    calls.append(list(cmd))
+                    runner.last_log_path = None
+                    return rc
+
+                runner._run = fake_run
+                return runner, st, calls
+
+            # (a) PASS(0) → 放行，留痕是正证据（不是"查不到记录"反推）
+            r1, s1, c1 = make(0, 1)
+            tc.assert_true(r1._vacuum_precheck_ok(), "PASS must not block")
+            tc.assert_equal((s1.data.get("vacuum_precheck") or {}).get("decision"),
+                            "passed",
+                            "passing path must leave a positive record")
+            tc.assert_equal(len(c1), 1, "precheck should run exactly once")
+            _c0 = c1[0] if c1 else []
+            tc.assert_true(any("content_vacuum_precheck.py" in str(x) for x in _c0),
+                           "the real precheck script must be the one invoked")
+            tc.assert_true(str(proj / "index.html") in _c0,
+                           "the project's own index.html must be measured")
+
+            # (b) FAIL(1) → 阻断并写 failed；渲染不得启动
+            r2, s2, _ = make(1, 2)
+            tc.assert_true(not r2._vacuum_precheck_ok(),
+                           "VACUUM verdict must block the full render")
+            tc.assert_equal((s2.data.get("vacuum_precheck") or {}).get("decision"),
+                            "blocked", "blocked decision must be recorded")
+            tc.assert_equal(((s2.data.get("steps") or {}).get("render") or {}).get("status"),
+                            "failed", "render marked failed when precheck blocks")
+
+            # (c) UNTESTED(2) → 不阻断，但不得读成通过
+            r3, s3, _ = make(2, 3)
+            tc.assert_true(r3._vacuum_precheck_ok(),
+                           "precheck UNTESTED must not block (offline/no-Chrome is legal)")
+            tc.assert_equal((s3.data.get("vacuum_precheck") or {}).get("decision"),
+                            "not_adjudicated",
+                            "untested must be recorded as not adjudicated, not passed")
+
+            # (d) --force → 省掉预判本身，留痕 bypassed
+            r4, s4, c4 = make(1, 4, force=True)
+            tc.assert_true(r4._vacuum_precheck_ok(), "--force bypasses precheck")
+            tc.assert_equal((s4.data.get("vacuum_precheck") or {}).get("decision"),
+                            "bypassed_via_force", "force bypass must be recorded")
+            tc.assert_equal(len(c4), 0, "force must not spend 40s on the precheck")
+
+            # (e) 脚本/HTML 缺失 → 不阻断并点名（取数未成 ≠ 画面有问题）
+            old_scripts = prmod.SCRIPTS
+            try:
+                prmod.SCRIPTS = tmp / "no_scripts"
+                r5, s5, _ = make(1, 5)
+                tc.assert_true(r5._vacuum_precheck_ok(),
+                               "missing script must not block (not a画面 verdict)")
+                tc.assert_equal((s5.data.get("vacuum_precheck") or {}).get("decision"),
+                                "not_adjudicated",
+                                "missing script recorded as not adjudicated")
+            finally:
+                prmod.SCRIPTS = old_scripts
+
+            # (f) 接线位点：预算门禁之后、备份 render_raw 之前（AST/源码区间锚定）
+            src = inspect.getsource(PipelineRunner.step_render)
+            i_budget = src.index("_render_budget_gate_ok()")
+            i_vac = src.index("_vacuum_precheck_ok()")
+            i_backup = src.index("render_raw.prev.mp4")
+            tc.assert_true(i_budget < i_vac < i_backup,
+                           "precheck must sit after budget gate and before render_raw backup")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("vacuum_precheck_blocks_before_full_render error: "
+                       + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_scene_patch_reuse_and_frame_grid_tolerance() -> RegressionTestCase:
+    """用例113：增量渲染的 ±1 帧容差与 no-scene-content-change 复用（2026-10-21 审计批）。
+
+    背景：ffprobe nb_frames 与 round(duration*fps) 在 0.5 帧边界会差 1，
+    实测 parts-atlas 5593/5592、intro 8016/8015、craft 9053/9052 三个活跃
+    项目因此永久失去增量资格；而"场景内容逐字未变"旧判 FULL，使改一个
+    video_name 白付 867.7s。
+
+    本用例锁：±1 放行、>1 仍 FULL、REUSE 的在位性两腿（render_raw /
+    render_rules 新旧）、以及"旧判据在该夹具上会判 FULL"的分辨力见证。
+    """
+    tc = RegressionTestCase(
+        "scene_patch_reuse_and_frame_grid_tolerance",
+        "验证帧网格 ±1 容差与无场景变化时的 REUSE 裁定"
+    )
+    try:
+        import sys, tempfile, json, time
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import scene_patch_render as sp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            proj = tmp / "proj"
+            proj.mkdir()
+            (proj / "index.html").write_text("<html></html>", encoding="utf-8")
+            tempdir = tmp / "temp"
+            tempdir.mkdir()
+            render_raw = tempdir / "render_raw.mp4"
+            render_raw.write_bytes(b"x")
+
+            pr = sp.PatchRenderer.__new__(sp.PatchRenderer)
+            pr.config = {"fps": 25, "video_duration": 8.2}
+            pr.fps = 25
+            pr.html_path = proj / "index.html"
+            pr.source_dir = proj
+            pr.temp_dir = tempdir
+            pr.render_raw = render_raw
+            pr.sidecar_path = tempdir / sp.SIDECAR_NAME
+            pr.verdict_path = tempdir / sp.VERDICT_NAME
+
+            cur = {
+                "scene_order": ["s0", "s1"],
+                "scene_hashes": {"s0": "a", "s1": "b"},
+                "residual_hash": "r", "style_hash": "st", "script_hash": "sc",
+                "config_hash": "c", "narration_hash": "n",
+            }
+            times = [{"id": "s0", "start": 0.0, "end": 5.0},
+                     {"id": "s1", "start": 5.0, "end": 8.2}]
+            # 8.2*25 = 205.0；基线 ffprobe 记 206 → delta=1（真实项目的形态）
+            base = dict(cur, version=sp.SIDECAR_VERSION, fps=25, has_audio=False,
+                        scene_times=times, total_frames=206)
+
+            def write_base(frames):
+                rec = dict(base)
+                rec["total_frames"] = frames
+                pr.sidecar_path.write_text(json.dumps(rec, ensure_ascii=False),
+                                           encoding="utf-8")
+
+            old_fp, old_times, old_cfg_dir = (
+                sp.extract_fingerprints, sp.extract_scene_times, sp.CONFIG_DIR)
+            sp.extract_fingerprints = lambda *a, **k: dict(cur)
+            sp.extract_scene_times = lambda *a, **k: (times, None)
+            try:
+                write_base(206)
+                tc.assert_true(base["total_frames"] != round(8.2 * 25),
+                               "fixture must exercise the old off-by-one (206 != 205), "
+                               "otherwise the assertion below is vacuous")
+                verdict, changed, reason, ctx = pr.classify()
+                tc.assert_equal(verdict, "REUSE",
+                                "±1 frame grid must no longer be FULL")
+                tc.assert_equal(changed, [], "no scene content changed")
+                tc.assert_equal(ctx.get("frame_grid_delta"), 1,
+                                "delta must be recorded for later review")
+
+                write_base(209)   # delta=4 → 仍必须 FULL
+                verdict2, _, reason2, _ = pr.classify()
+                tc.assert_equal(verdict2, "FULL", ">1 frame delta must still be FULL")
+                tc.assert_true("frame-grid-mismatch" in reason2,
+                               "reason must name the frame-grid mismatch")
+
+                # 内容真变了 → PATCH，不得被 REUSE 吞掉
+                write_base(206)
+                cur_changed = dict(cur)
+                cur_changed["scene_hashes"] = {"s0": "a", "s1": "X"}
+                sp.extract_fingerprints = lambda *a, **k: dict(cur_changed)
+                verdict3, changed3, _, _ = pr.classify()
+                tc.assert_equal(verdict3, "PATCH", "real scene change must stay PATCH")
+                tc.assert_equal(changed3, ["s1"], "changed scene must be named")
+                sp.extract_fingerprints = lambda *a, **k: dict(cur)
+
+                # REUSE 的两条在位性腿：render_rules 不比 render_raw 新才允许复用
+                rules_dir = tmp / "config"
+                (rules_dir / "quality").mkdir(parents=True)
+                rules = rules_dir / "quality" / "render_rules.json"
+                rules.write_text("{}", encoding="utf-8")
+                older = time.time() - 7200
+                past = time.time() - 3600
+                os.utime(render_raw, (past, past))
+                os.utime(rules, (older, older))
+                sp.CONFIG_DIR = rules_dir
+                ok, why = pr._reuse_allowed()
+                tc.assert_true(ok, "rules older than render_raw → reuse allowed")
+                future = time.time() + 3600
+                os.utime(rules, (future, future))
+                ok2, why2 = pr._reuse_allowed()
+                tc.assert_true(not ok2 and why2 == "render-rules-changed",
+                               "render_rules newer than render_raw must fall back")
+                os.utime(rules, (older, older))
+                ok3, _ = pr._reuse_allowed()
+                tc.assert_true(ok3, "restored rules → reuse allowed again")
+
+                # patch() 在 REUSE 时返回 0 且写 verdict=REUSE，不启动段渲染
+                rc = pr.patch()
+                tc.assert_equal(rc, 0, "REUSE patch() must return success")
+                rec = json.loads(pr.verdict_path.read_text(encoding="utf-8"))
+                tc.assert_equal(rec.get("verdict"), "REUSE",
+                                "verdict file must say REUSE, not PATCH")
+                tc.assert_equal(rec.get("outcome"), "reused",
+                                "outcome must distinguish reuse from applied patch")
+
+                # render_raw 缺失 → 不允许复用
+                render_raw.unlink()
+                ok4, why4 = pr._reuse_allowed()
+                tc.assert_true(not ok4 and why4 == "no-render-raw",
+                               "missing render_raw must fall back to FULL")
+            finally:
+                sp.extract_fingerprints = old_fp
+                sp.extract_scene_times = old_times
+                sp.CONFIG_DIR = old_cfg_dir
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_patch_reuse_and_frame_grid_tolerance error: "
+                       + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_cue_consumption_warn_only() -> RegressionTestCase:
+    """用例114：cue 消费面只报不拦（2026-10-21 审计批）。
+
+    背景：`data-cue-at` 可定位只证明"键算出来了"，不证明"画面读了它"。
+    repo-mesh 的 `s1:治理件为零` 是跨三次交付的死声明，而预检/终检/审计全绿。
+
+    本用例锁：无字面消费且无包装函数 → WARN 点名；有 cue()/cueGlow() 包装
+    时取数口径放宽容忍（不误报 atlas/intro）；无 CUE-MAP 的首次项目不报；
+    且 WARN 不影响 `errors`（只报不拦）。
+    """
+    tc = RegressionTestCase(
+        "cue_consumption_warn_only",
+        "验证 cue 消费面 WARN 点名、包装函数不误报、首轮项目不报"
+    )
+    try:
+        import sys, tempfile
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import preflight_check as pfc
+
+        html = """<html><body>
+        <div data-scene-id="s1">
+          <span data-cue-at="甲">甲</span>
+          <span data-cue-at="乙">乙</span>
+        </div>
+        <script>
+        /* CUE-MAP-START */
+        var C = {"s1:甲": 1.0, "s1:乙": 2.0};
+        /* CUE-MAP-END */
+        tl.to('#x', {}, C["s1:甲"]);
+        </script></body></html>"""
+        cfg = {"scenes": [{"scene_id": "s1", "narration": "甲乙丙"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "index.html"
+            p.write_text(html, encoding="utf-8")
+            r = pfc.PreflightResult()
+            pfc.check_cue_declarations(p, cfg, r)
+            tc.assert_equal(len(r.errors), 0,
+                            "dead cue must stay WARN, never block")
+            tc.assert_equal(len(r.warnings), 1,
+                            "exactly the unconsumed key must be warned")
+            _w0 = r.warnings[0] if r.warnings else ""
+            tc.assert_true("s1:乙" in _w0,
+                           "the dead key must be named")
+            tc.assert_true("s1:甲" not in _w0,
+                           "the consumed key must not be warned")
+
+            # 包装函数（atlas/intro 的真实形态）：静态无法逐键判定 → 不报
+            wrapped = html.replace("C[\"s1:甲\"]", "cue('s1','甲')").replace(
+                "<script>", "<script>function cue(s,w){return C[s+':'+w];}")
+            p.write_text(wrapped, encoding="utf-8")
+            r2 = pfc.PreflightResult()
+            pfc.check_cue_declarations(p, cfg, r2)
+            tc.assert_equal(len(r2.warnings), 0,
+                            "wrapper consumption must not be reported as dead")
+
+            # 无 CUE-MAP（首次项目，timeline 尚未写入）→ 无从判定，不报
+            no_map = html.replace("/* CUE-MAP-START */", "").replace(
+                "/* CUE-MAP-END */", "")
+            p.write_text(no_map, encoding="utf-8")
+            r3 = pfc.PreflightResult()
+            pfc.check_cue_declarations(p, cfg, r3)
+            tc.assert_equal(len(r3.warnings), 0,
+                            "first-run project without CUE-MAP must not warn")
+
+            # 真实实例只读冒烟：repo-mesh 的 s1 死声明应被点名
+            real = script_dir.parent / "源码" / "hyperframes" / \
+                "repo-mesh-governance-promo" / "index.html"
+            if real.exists():
+                keys, wrapper, has_map = pfc._cue_unconsumed_keys(
+                    real.read_text(encoding="utf-8"))
+                tc.assert_true(has_map, "real project must carry a CUE-MAP block")
+                tc.assert_true("s1:治理件为零" in keys,
+                               "real dead cue must be named (repo-mesh s1)")
+            else:
+                # 该业务项目不随发布仓导出；夹具断言仍覆盖同一形态
+                tc.assert_true(True, "real project absent (not exported); "
+                                     "fixture-level coverage stands")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("cue_consumption_warn_only error: "
+                       + str(e) + "\n" + traceback.format_exc())
     return tc
 
 

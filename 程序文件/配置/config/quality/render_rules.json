@@ -10,9 +10,9 @@
     "post_capture_description": "站立放行后的绝对墙钟上限（2026-10-02 登记，据外部 WorkBuddy 副本 build-expert-promo 2026-10-01 实测）：stdout 进度到 POST_CAPTURE_PCT(75%) 即 capture 已完成，此后不再按'零进度'裁定——encode/assemble 无增量 stdout，按零进度杀等于丢弃一个已捕获完成的渲染（正是 09-25 修掉的误杀形态）。但完全没有上限等于：子进程打印 100% Render complete 之后不退出时，流水线无限等待。实测该形态真实发生：render_raw.mp4 22:41:20 已完整落盘（ffprobe 84.72s），子进程静默 311s 后才以 exit 1 结束；渲染器自带的 --protocol-timeout 是其内部协议超时，管不到这一段。本值从'站立放行那一刻'起算（与视频时长无关），命中即杀进程树并置 deadline_exceeded，交由 step_render 先判 render_raw 内容完整性再裁定：产物完整则不丢弃（仍走既有内容门禁与 step_verify 时长一致性裁定），产物缺失或空则照常 FAIL。阈值取实测 encode/assemble 上界的宽裕余量（4015 帧交付次全片渲染 569.9s）→ 900s。"
   },
   "render_budget": {
-    "max_full_renders": 3,
+    "max_full_renders": 5,
     "enforcement": "soft",
-    "description": "渲染成本预算门禁（2026-08-19，P1 渲染成本治理）：单项目生命周期内全量渲染次数（含失败/中断，按尝试计）达到该值后拦截。soft（默认）：阻断并要求 --accept-over-render 显式放行，决策留痕 state.render_budget_decision；hard：直接 FAIL。阈值来源非拍脑袋：prefab 批次复盘实证'裸渲染覆盖、3 次 40 分钟级重渲、9 小时失败收尾'——第 3 次全量重渲之后问题已不是渲染能解决的，必须停下来诊断。计数器在 pipeline_state.render_metrics.full_render_attempts，--fresh 重置（真实重跑语义）。scene-patch/quick-fix 不计入。真实基线数据由 render_metrics 度量积累后再校准本阈值。"
+    "description": "渲染成本预算门禁（2026-08-19，P1 渲染成本治理；2026-10-21 审计批 3→5）：单项目生命周期内全量渲染次数（含失败/中断，按尝试计）达到该值后拦截。soft（默认）：阻断并要求 --accept-over-render 显式放行，决策留痕 state.render_budget_decision；hard：直接 FAIL。初值 3 来自 prefab 批次复盘（'裸渲染覆盖、3 次 40 分钟级重渲、9 小时失败收尾'），但 2026-10 的实测分布显示长片观感修订轮实际会用到第 5 次：build-expert-overview 五轮（两次为 VACUUM 失败后的返工）、standard-system-explainer 六轮、prefab-parts-atlas 五轮——阈值 3 使这类修订每次都要走放行，放行失去'异常情况'的含义。调到 5 后仍保留'第 5 次之后必须停下来诊断'的原意；不是取消约束。计数器在 pipeline_state.render_metrics.full_render_attempts，--fresh 重置（真实重跑语义）。scene-patch/quick-fix 不计入。阈值校准的依据是 render_metrics 的真实分布，不按单批观感修订次数无限上调。"
   },
   "upgrade_sentinel": {
     "$schema": "Upgrade-sentinel thresholds for render_env_sentinel.py",

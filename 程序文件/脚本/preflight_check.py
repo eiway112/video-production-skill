@@ -774,6 +774,30 @@ def _scene_hidden_state(content: str, attrs: str, scene_id) -> tuple:
     return inline_opacity_zero, css_opacity_zero, css_visibility_hidden
 
 
+def _cue_unconsumed_keys(html_text: str):
+    """CUE-MAP 键中"声明了但没有消费迹象"的部分 → (keys, has_wrapper, has_map)。
+
+    这是**只报不拦**的观测面（2026-10-21 审计批），不是门禁。存在理由：
+    `data-cue-at` 能证明"键算出来了"，不能证明"画面真的读了它"——repo-mesh 的
+    `s1:治理件为零` 写了 7 个键、脚本只引用 6 个，该 cue 跨三次交付都是死声明，
+    而预检/终检/审计全绿。这类缺陷只能靠人读脚本才发现。
+
+    取数口径刻意取宽，宁漏不误报：
+      · 页面存在 `cue(...)` / `cueGlow(...)` 包装消费时，key 是运行期拼接
+        （scene + ':' + word），静态无法逐键判定——有包装就不再逐键报；
+      · 没有 CUE-MAP 块（首次项目，timeline 尚未写入）时无从判定，返回空。
+    """
+    m = re.search(r'CUE-MAP-START([\s\S]*?)CUE-MAP-END', html_text)
+    if not m:
+        return [], False, False
+    keys = re.findall(r'"([^"]+)"\s*:', m.group(1))
+    has_wrapper = bool(re.search(r'\b(?:cue|cueGlow)\s*\(', html_text))
+    if has_wrapper:
+        return [], True, True
+    literal = set(re.findall(r'C\[\s*["\']([^"\']+)["\']\s*\]', html_text))
+    return [k for k in keys if k not in literal], False, True
+
+
 def check_cue_declarations(html_path: Path, cfg: dict, r: PreflightResult):
     """[Cue] 词级 cue 声明的结构校验（2026-10-12 词级 cue 批）。
 
@@ -856,6 +880,20 @@ def check_cue_declarations(html_path: Path, cfg: dict, r: PreflightResult):
 
     if problems == 0:
         r.ok(f"cue 声明全部可定位：{len(decls)} 条", check_id="cue_declaration")
+        # 消费面只报不拦（2026-10-21 审计批）：声明可定位 ≠ 画面读了它。
+        # 读不到 CUE-MAP（首次项目）时不报——timeline 尚未写入，无从判定。
+        try:
+            _unconsumed, _wrapper, _has_map = _cue_unconsumed_keys(
+                html_path.read_text(encoding="utf-8"))
+        except OSError:
+            _unconsumed, _wrapper, _has_map = [], False, False
+        if _has_map and not _wrapper and _unconsumed:
+            r.warn(f"cue 消费面：CUE-MAP 有 {len(_unconsumed)} 个键在脚本里没有字面引用"
+                   f"（页面也没有 cue()/cueGlow() 包装消费）-> "
+                   + ", ".join(_unconsumed[:6])
+                   + ("…" if len(_unconsumed) > 6 else "")
+                   + "。只报不拦；若该 cue 本就不需要动画，删除声明比留着更清楚",
+                   check_id="cue_declaration")
 
 
 def check_scene_contracts(html_path: Path, r: PreflightResult):

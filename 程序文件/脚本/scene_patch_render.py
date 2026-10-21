@@ -446,7 +446,14 @@ class PatchRenderer:
     # ── classify ──
 
     def classify(self):
-        """返回 (verdict, changed_scene_ids, reason, ctx)。verdict ∈ {"PATCH","FULL"}"""
+        """返回 (verdict, changed_scene_ids, reason, ctx)。
+
+        verdict ∈ {"PATCH","FULL","REUSE"}。REUSE 是 2026-10-21 审计批新增：当
+        style/script/config-render-fields/narration/scene_hashes 全部相等时，渲染
+        结果不存在变化理由——旧实现返回 FULL 白付一次全量（实测 building-perf-color
+        改 video_name 一个键，场景内容逐字未变，仍重渲 867.7s）。REUSE 的实际去留
+        由 patch() 再按 render_raw 在位性与 render_rules 新旧裁定，见 _reuse_allowed。
+        """
         def full(reason):
             return "FULL", [], reason, {}
 
@@ -483,16 +490,25 @@ class PatchRenderer:
         if times != base.get("scene_times"):
             return full("scene-timing-changed")
 
-        # 帧网格：总帧数必须与时长×fps吻合（拼接前提）
+        # 帧网格：总帧数必须与时长×fps吻合（拼接前提）。
+        # 2026-10-21 审计批：容差由 0 放宽到 1 帧。ffprobe 的 nb_frames 与
+        # round(duration*fps) 在 0.5 帧边界上本来就会差 1（实测 parts-atlas
+        # 5593 vs 5592、intro 8016 vs 8015、craft 9053 vs 9052），旧判据把这三个
+        # 活跃项目的增量资格永久打死。拼接侧同样按 ±1 复核，且像素自校验与
+        # duration_consistency（1.0s 容差）仍兜底，1 帧差异不会静默变成错片。
         duration = times[-1]["end"]
-        if base.get("total_frames") != round(duration * self.fps):
+        frame_grid_delta = int(base.get("total_frames") or 0) - round(duration * self.fps)
+        if abs(frame_grid_delta) > 1:
             return full(f"frame-grid-mismatch(frames={base.get('total_frames')}, "
                         f"dur*fps={duration * self.fps})")
 
         changed = [sid for sid in cur["scene_order"]
                    if cur["scene_hashes"][sid] != base["scene_hashes"].get(sid)]
         if not changed:
-            return full("no-scene-content-change")
+            # 场景内容逐字未变：渲染结果没有变化理由。旧实现返回 FULL，使
+            # "只改 config 元数据/HTML 注释"也白付一次全量（2026-10-21 审计批）。
+            return "REUSE", [], "no-scene-content-change", {
+                "frame_grid_delta": frame_grid_delta}
         # 封面 head 不参与段渲染：它没有 T 条目，wrapper 又必须剥掉 root 的
         # data-cover-duration（否则段长与封面长度叠加），seek 不出这一段。
         # 因此"改的是封面"只能全量——不否决的话，拼接产物会静默保留旧封面，
@@ -643,12 +659,17 @@ class PatchRenderer:
                 ok = False
         return ok
 
-    def _record_verdict(self, verdict, reason, changed, outcome, witness, t0):
+    def _record_verdict(self, verdict, reason, changed, outcome, witness, t0,
+                        frame_grid_delta=None):
         """裁定留痕（数据而非仅 stdout）：供 pipeline_runner 写入 state 与完工报告。
 
         2026-09-03：增量渲染长期零投产的原因之一是"没用上"只体现在 stdout，
         state 里没有任何字段能证明分类器跑过、为何降级。写盘失败不改变返回值——
         留痕是观测面，不得反过来影响渲染判定。
+
+        `frame_grid_delta`（2026-10-21）：基线 total_frames 与 round(duration*fps)
+        的差。±1 属可接受取整，写进留痕使下一次复核能区分"容差内放行"与
+        "判据被放宽到无对象"。缺键不写 null——旧 verdict 文件没有该字段是历史态。
         """
         rec = {
             "at": datetime.now().isoformat(timespec="seconds"),
@@ -659,6 +680,8 @@ class PatchRenderer:
             "outcome": outcome,
             "elapsed_seconds": round(time.time() - t0, 1),
         }
+        if frame_grid_delta is not None:
+            rec["frame_grid_delta"] = frame_grid_delta
         try:
             self.temp_dir.mkdir(parents=True, exist_ok=True)
             with open(self.verdict_path, "w", encoding="utf-8") as f:
@@ -667,9 +690,45 @@ class PatchRenderer:
             print(f"  WARNING: verdict record failed: {e}")
         return rec
 
+    def _reuse_allowed(self):
+        """REUSE 的最后两道在位性裁定 → (ok, reason)。
+
+        前置条件（classify 已证）：场景内容与其他分类哈希全部相等。此处只补两件
+        classify 看不见的事：
+
+        ① `render_raw.mp4` 必须在位——否则"复用"没有对象；
+        ② `render_rules.json` 不能比 render_raw 更新——它是渲染器行为的输入，却不在
+           classify 的哈希面里。用 mtime 而不是内容哈希：内容哈希需要把规则文件纳入
+           sidecar（旧 sidecar 缺该键会一律不可复用），而 mtime 是 O(1)、且误差方向
+           安全（被 touch 过的规则文件只会让本项目退回全量，不会让旧产物冒充分新）。
+
+        刻意不在这里跑抽帧内容门禁：调用方 step_render 在 patched=True 后照常执行
+        `_render_content_status`，空片仍会被拦下（复用不等于放行）。
+        """
+        if not self.render_raw.exists() or self.render_raw.stat().st_size <= 0:
+            return False, "no-render-raw"
+        rules = CONFIG_DIR / "quality" / "render_rules.json"
+        try:
+            if rules.exists() and rules.stat().st_mtime > self.render_raw.stat().st_mtime:
+                return False, "render-rules-changed"
+        except OSError:
+            return False, "render-rules-unreadable"
+        return True, ""
+
     def patch(self):
         t0 = time.time()
         verdict, changed, reason, ctx = self.classify()
+        if verdict == "REUSE":
+            ok, why = self._reuse_allowed()
+            if not ok:
+                print(f"  CLASSIFY: FULL ({why})")
+                self._record_verdict("FULL", why, changed, "fallback-full", None, t0)
+                return EXIT_FALLBACK
+            print("  CLASSIFY: REUSE — no scene content change; render_raw is in place "
+                  "and newer than render_rules")
+            self._record_verdict("REUSE", reason, changed, "reused", None, t0,
+                                 frame_grid_delta=ctx.get("frame_grid_delta"))
+            return 0
         if verdict != "PATCH":
             print(f"  CLASSIFY: FULL ({reason})")
             self._record_verdict(verdict, reason, changed, "fallback-full", None, t0)
@@ -718,11 +777,17 @@ class PatchRenderer:
 
             info = probe_video(patched)
             base_frames = ctx["base"]["total_frames"]
-            if not info or info["frames"] != base_frames:
+            # 与 classify 的帧网格容差同源：ffprobe nb_frames 与
+            # round(duration*fps) 在 0.5 帧边界可差 1，拼接产物按段边界求和
+            # 得到的正是后者。差 1 帧（40ms）由像素自校验与
+            # duration_consistency（1.0s）兜底；差 >1 仍判拼接失败。
+            delta = (info["frames"] - base_frames) if info else None
+            if not info or delta is None or abs(delta) > 1:
                 print(f"  FRAME COUNT MISMATCH: patched={info and info['frames']}, "
                       f"baseline={base_frames}")
                 return EXIT_FALLBACK, "frame-count-mismatch"
-            print(f"  Frame count verified: {info['frames']} == baseline")
+            print(f"  Frame count verified: {info['frames']} (baseline {base_frames}, "
+                  f"delta {delta:+d})")
 
             if not self._self_check(patched, segs, times, changed, patch_dir / "shots"):
                 print("  SELF-CHECK FAILED — falling back to FULL")
@@ -754,10 +819,14 @@ def main():
         t0 = time.time()
         verdict, changed, reason, ctx = pr.classify()
         pr._record_verdict(verdict, reason, changed, "classify-only",
-                           ctx.get("witness"), t0)
+                           ctx.get("witness"), t0,
+                           frame_grid_delta=ctx.get("frame_grid_delta"))
         print(json.dumps({"verdict": verdict, "changed": changed, "reason": reason,
-                          "time_witness": ctx.get("witness")}, ensure_ascii=False))
-        sys.exit(0 if verdict == "PATCH" else EXIT_FALLBACK)
+                          "time_witness": ctx.get("witness"),
+                          "frame_grid_delta": ctx.get("frame_grid_delta")},
+                         ensure_ascii=False))
+        # REUSE 与 PATCH 都表示"本轮无需全量"；FULL 才返回 EXIT_FALLBACK。
+        sys.exit(0 if verdict in ("PATCH", "REUSE") else EXIT_FALLBACK)
     sys.exit(pr.patch())
 
 

@@ -439,6 +439,93 @@ tl.set("body", {}, /* COVER_DURATION */);
 箭头指引 | 动态箭头指向关键区域 | 招商培训视频 | src/components/arrow.html | from, to, color | 流程指引、重点标注
 ```
 
+## 观感组件（2026-10-21 审计批，可复制）
+
+> 这两节来自用户实际验收后的修订，不是推测。复制时保留语义、按项目改参数；
+> 出处项目只作对照，不随模板更新。判据面仍住 `分镜设计模板_AI导演模式.md`
+> 「常设观感默认」与 `HyperFrames_HTML模板参考基准.md` §3.6.1 / §4.8。
+
+### cue 点亮三段式（说到即亮 / 组让位 / 入场保护）
+
+**适用**：任何用 `data-cue-at` 声明的元素。契约：
+
+- `C["sN:词"]` 是 timeline 步写入的**场内相对秒**，不要手写绝对秒，也不要另建第二套时间；
+- 元素入场锚 `T.sN + C["sN:词"]`，不要绕开 CUE-MAP；
+- 同组元素只亮当前项，前一项在后续项亮起时退到"已读"态（组让位）；
+- 首元素设建立拍上限（默认 2.2s），避免整场等第一个词。
+
+最小实现（约 25 行，与 `prefab-agent-intro/index.html` 的 `cueGlow` 同形）：
+
+```js
+function cueGlow(sel, key, base, opts) {
+  opts = opts || {};
+  if (!window.C || typeof C[key] !== "number") return;
+  var el = document.querySelector(sel);
+  if (!el) return;
+  var at = base + C[key];
+  // 1) 说到即亮
+  tl.to(el, {opacity: 1, y: 0, duration: opts.duration || 0.35,
+             ease: "power2.out"}, at);
+  // 2) 组让位：同组其他元素退到已读态
+  (opts.group || []).forEach(function (other) {
+    if (other === sel) return;
+    tl.to(other, {opacity: 0.55, duration: 0.25}, at + 0.05);
+  });
+  // 3) 入场保护：首元素不超过建立拍上限
+  if (opts.first) {
+    var at2 = Math.min(at, base + (opts.establish || 2.2));
+    tl.set(el, {opacity: 1, y: 0}, at2);
+  }
+}
+```
+
+用法：
+
+```js
+cueGlow("#s3-card2", "s3:第二条判据", T.s3,
+        {first: true, group: ["#s3-card1", "#s3-card2"]});
+```
+
+出处：`prefab-agent-intro/index.html`（§3.6.1 的首次实现，40 条声明）；
+`build-expert-overview` 的 83 个 cue 点只用"入场跟随语音"这一层，没有组让位，
+不作为三段式的对照件。
+
+### 卡片视觉分层三件套 + 六色语义色板
+
+层次感来自"角色 → 色相"的稳定映射，不是随机换色。三件套同源：左侧色轨 +
+同色相极淡填充 + 略深投影。
+
+```css
+:root{
+  --rc: #0f766e;      /* 角色色相：按语义选，不随机 */
+  --rc-f: #ccfbf1;    /* 同色相极淡填充 */
+  --rc-l: #5eead4;    /* 同色相描边 */
+}
+.card{
+  background: linear-gradient(155deg, var(--rc-f), rgba(255,255,255,.96) 56%);
+  border: 1.5px solid var(--rc-l);
+  border-left: 7px solid var(--rc);   /* 左侧色轨 */
+  border-radius: 16px;
+  box-shadow: 0 4px 18px rgba(17,32,46,.05); /* 略深投影 */
+  padding: 22px 26px;
+}
+```
+
+语义角色（固定映射，不按场随机）：
+
+| 角色 | 色相 | 用途 |
+|---|---|---|
+| 判据 | teal | 规则、阈值、硬约束 |
+| 工具链 | blue | 流程、链路、接口 |
+| 架构 | violet | 分层、模块、结构 |
+| 体系 | amber | 全景、章级、重点 |
+| 边界 | red | 反例、禁止、风险 |
+| 中性 | slate | 背景信息、脚注 |
+
+约束：同屏不超过 3 个色相；同族卡片用 `:nth-child` 拉开明度，不换色相；
+浅底上用深墨字（`#0f172a`），对比度按 WCAG 4.5:1 复算。
+出处：`build-expert-overview/index.html` 修订02（用户验收"颜色有层次"）。
+
 ## 复用规则
 
 - 新组件必须先在这里注册，再在新项目中使用。
