@@ -501,12 +501,21 @@ def _shift_chars_for_inserted_silence(chars, cut_t, inserted):
     生效"，而句级走的是返回值，两条路径一旦分叉就只有一条能被用例证伪（2026-10-12 定）。
     """
     out = []
+    # 起点落在切点**或之后**即整段后移——插入的静音就落在该字符之前，
+    # 字符整段都在静音之后。原实现用严格大于号（`s > cut_t`），于是"起点
+    # 正好等于切点"的字符不后移；而句级同一处平移走的是 `max(rel_start,
+    # cut_t)`（**含**边界）——同一处平移两套判据，后果是跨句界的词在字符流
+    # 里被劈成两半：实测 build-expert-overview 第 2 场「写文案」在字符流里
+    # 断成 写 | 文案（0.60s），词级 cue 会照着断掉的那一刻点亮。
+    # 容差 1ms：字符时刻是四舍五入到毫秒的、切点是采样点换算的连续值，
+    # 二者在边界上可能差不到 1ms。
+    cut_c = round(float(cut_t), 3)
     for item in chars:
         s, e, m = float(item[0]), float(item[1]), item[2]
-        if s > cut_t:
+        if s >= cut_c - 0.001:
             s, e = s + inserted, e + inserted
-        elif e > cut_t:
-            e = cut_t
+        elif e > cut_c:
+            e = cut_c
         out.append([round(s, 3), round(e, 3), m])
     return out
 
@@ -555,13 +564,27 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
     for i in deficits:
         gap = sentences[i + 1]['rel_start'] - sentences[i]['rel_end']
         deficit = min_pause - gap
-        boundary = (sentences[i]['rel_end'] + sentences[i + 1]['rel_start']) / 2.0
-        # 窗口收紧到 ±0.08s：只允许在 ASR 边界附近微调下刀点。±0.25s 实测会
-        # 漂进前一句词内部（低能量起音段被误判为句间谷底），把静音插在词中间
-        lo = max(0, int((boundary - 0.08) * sr))
-        hi = min(len(audio), int((boundary + 0.08) * sr))
+        # 下刀点只能落在**字间隙**里：前段末字的结束 → 后段首字的开始。
+        #
+        # 旧实现（boundary±0.08s 取窗内最低能量点）有一处未覆盖的形态：当引擎在
+        # 句号处不留静音时（ASR 给出的段间间隔为 0.00s），该窗口的正半边整段落在
+        # **下一段首字**上，窗内最低能量点必然落进那个字内部或其后——实测
+        # build-expert-overview 第 2 场「照着验收，就用。写文案」：刀落在 7.0588s
+        # （正好在「写」字之后），结果是句界仍无停顿、「写」被压成 80ms、且被劈离
+        # 「文案」。收紧到 ±0.08s 只挡住了"漂进**前**一句词内部"，没挡住"落进
+        # **后**一段首字"——两者是同一处窗口的两个方向。
+        #
+        # 收敛到字间隙即从根上排除这一形态：间隙宽度为 0（两字相接）时切点取间隙
+        # 端点，即两字之间的那条缝，不切任何字；间隙有宽度时仍取窗内最低能量点，
+        # 但窗口就是这条字间隙本身，不会越界。
+        gap_lo = float(sentences[i]['rel_end'])
+        gap_hi = float(sentences[i + 1]['rel_start'])
+        if gap_hi < gap_lo:
+            gap_hi = gap_lo
+        lo = max(0, int(round(gap_lo * sr)))
+        hi = min(len(audio), int(round(gap_hi * sr)))
         if hi - lo < 2:
-            cut = min(len(audio), max(0, int(boundary * sr)))
+            cut = min(len(audio), max(0, int(round(gap_lo * sr))))
         else:
             env = np.abs(audio[lo:hi].astype(np.int32)).sum(axis=1).astype(np.float64)
             win = max(1, int(0.015 * sr))
@@ -640,6 +663,82 @@ def _wave_sha256(wav_path):
 ALIGN_ALGO_VERSION = "v3"
 
 
+# 停顿强制的实现版本（2026-10-20 修法批）
+#
+# 存在理由：强制停顿会**就地改写** hq wav，而 hq wav 的缓存键只有文本哈希，
+# 不含"停顿强制逻辑"这一维度。于是改了强制逻辑（下刀点从 boundary±0.08s
+# 收敛到字间隙），缓存照常命中 → 存量项目的波形仍是旧逻辑切出来的（切字、
+# 句界无停顿），新逻辑对全部存量项目**静默不生效**。这与 AGENTS.md 登记的
+# A06「登记面＝真实读取路径」同族：preview 批改 preview_capture.js 而预览
+# 缓存照常命中（= 新判据对全部存量项目静默不生效）是同一形态。
+#
+# 版本号只能记在**产物旁**（hq wav 同目录的 .enfver 戳记），不能只记在
+# timeline manifest 里：manifest 在 temp 根、可被单独清理，而 hq wav 留在
+# tts_44k/；只记 manifest 就会出现"manifest 没了、波形还在"的组合，此时
+# 无从判别该波形是哪个版本切出来的。
+#
+# 戳记取值：
+#   "raw"  = 未经停顿强制的干净波形（刚从原始 TTS 上采样得到）
+#   本常量 = 已由该版本逻辑处理过
+# 改动停顿强制的裁定逻辑（下刀点、插入量、fade 等）时必须 bump。
+PAUSE_ENFORCE_VERSION = "v2"
+_ENF_STAMP_RAW = "raw"
+
+
+def _enf_stamp_path(hq_file):
+    """停顿强制版本戳记路径：与 hq wav 同目录、同基名的 `.enfver` 旁文件。"""
+    return hq_file.with_name(hq_file.stem + ".enfver")
+
+
+def _read_enf_stamp(hq_file):
+    """读停顿强制版本戳记；读不到即返回空串（不得当"已是当前版本"）。"""
+    try:
+        return _enf_stamp_path(hq_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_enf_stamp(hq_file, value):
+    """写停顿强制版本戳记。写失败只告警不抛——戳记缺失的后果是"下一轮重建
+    一次波形"（本地重上采样，零网络成本），不是出片失败。"""
+    try:
+        _enf_stamp_path(hq_file).write_text(value, encoding="utf-8")
+    except OSError as e:
+        print(f"  [WARN] 停顿强制戳记写入失败 {hq_file.name}: {e}")
+
+
+def _ensure_current_enforcement(hq_file, raw_file):
+    """确保 hq wav 是**当前停顿强制版本**的产物；必要时从原始 TTS 重建。
+
+    返回 True 表示发生了重建（重建后该波形尚未经停顿强制，须由调用方随后执行）。
+
+    重建而非"在旧波形上再强制一次"的理由：旧逻辑已经在波形里切出了损伤
+    （切进下一个字、句界无停顿），在它上面再跑一遍新逻辑只会得到"间隔已达标
+    → 不动"的假绿，损伤被永久留在成片里。重建的原料是**原始 TTS mp3**
+    （`scene_{id}_{hash}.mp3`，按文本哈希缓存），上采样是本地 ffmpeg 调用，
+    **零网络成本**——不碰 `tts_hash`，故不会击穿已付费的合成缓存。
+    """
+    stamp = _read_enf_stamp(hq_file)
+    if stamp == PAUSE_ENFORCE_VERSION:
+        return False
+    if not raw_file.exists():
+        print(f"  [WARN] {hq_file.name}: 停顿强制戳记={stamp or '缺失'}"
+              f"（当前版本 {PAUSE_ENFORCE_VERSION}），但原始 TTS {raw_file.name} 不在位，"
+              f"无法重建波形——本次沿用现有波形，该场停顿可能仍是旧逻辑切出来的")
+        return False
+    ok = run_ffmpeg([
+        "ffmpeg", "-y", "-i", str(raw_file),
+        "-ar", str(SAMPLE_RATE), "-ac", "2",
+        "-sample_fmt", "s16",
+        str(hq_file)
+    ], f"rebuild hq from raw (enforce {PAUSE_ENFORCE_VERSION})")
+    if not ok:
+        print(f"  [WARN] {hq_file.name}: 从原始 TTS 重建失败，本次沿用现有波形")
+        return False
+    _write_enf_stamp(hq_file, _ENF_STAMP_RAW)
+    return True
+
+
 def _build_timeline_manifest(temp_dir):
     """生成/刷新 _timeline_manifest.json —— 句级时间戳单一权威文件（P0-a）。
 
@@ -680,6 +779,14 @@ def _build_timeline_manifest(temp_dir):
         if not hq_file.exists():
             print(f"  [WARN] timeline manifest: TTS missing for scene {scene_id}, skipped")
             continue
+        # 停顿强制版本闸门：波形旁戳记不是当前版本时，先从原始 TTS 重建再对齐。
+        # 位置在 wave_sha 计算之前——重建会改写字节，哈希必须取重建后的值，
+        # 否则下面那道"波形字节实测未变"的缓存条件会拿旧哈希比新波形。
+        prev_stamp = _read_enf_stamp(hq_file)
+        rebuilt = _ensure_current_enforcement(hq_file, temp_dir / f"scene_{scene_id}_{h}.mp3")
+        if rebuilt:
+            print(f"  Scene {scene_id}: 停顿强制版本 {prev_stamp or '缺失'} → {PAUSE_ENFORCE_VERSION}，"
+                  f"hq 波形已从原始 TTS 重建（零网络成本）")
         tts_dur = get_duration(str(hq_file))
         wave_sha = _wave_sha256(hq_file)
         entry = {
@@ -766,6 +873,12 @@ def _build_timeline_manifest(temp_dir):
                 entry['wave_sha256'] = _wave_sha256(hq_file)
                 print(f"  Scene {scene_id}: sentence-pause enforced "
                       f"(+{ins:.2f}s silence → {entry['tts_duration']:.2f}s)")
+        # 戳记收口：波形旁记下"这份波形已经是当前停顿强制逻辑的产物"。
+        # 只在两种情形写当前版本——本轮刚从原始 TTS 重建（重建物必为干净波形），
+        # 或进来时戳记本就是 raw/当前版本。重建失败（原始 TTS 不在位）时**不写**，
+        # 保持旧戳记，下一轮重试重建；不得把"没能重建"记成"已是当前版本"。
+        if rebuilt or prev_stamp in (_ENF_STAMP_RAW, PAUSE_ENFORCE_VERSION):
+            _write_enf_stamp(hq_file, PAUSE_ENFORCE_VERSION)
         scenes_out.append(entry)
 
     data = {
@@ -1636,6 +1749,10 @@ async def step1_generate_tts(temp_dir):
             ], f"upsample scene {scene_id}")
             if not ok:
                 return False
+            # 新建的 hq wav 是**未经停顿强制的干净波形**——戳记写 raw。
+            # 强制停顿在 timeline 步就地改写它，写 raw 才能让那一侧知道
+            # "这份波形还是原料"，改写完再由那一侧写成当前版本。
+            _write_enf_stamp(hq_file, _ENF_STAMP_RAW)
             manifest[str(scene_id)] = {'hash': h, 'file': str(hq_file.relative_to(temp_dir))}
             new_entries += 1
 

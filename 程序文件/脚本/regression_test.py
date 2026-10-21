@@ -20253,6 +20253,7 @@ class RegressionTestRunner:
             test_mutation_matrix_engine_adjudicates_its_own_criteria,
             test_managed_names_reject_path_values_at_concat_face,
             test_timeline_zero_based_scene_id_resolution,
+            test_sentence_pause_cut_point_and_cache_invalidation,
         ]
         self.results = []
     
@@ -20900,6 +20901,324 @@ def test_timeline_zero_based_scene_id_resolution() -> RegressionTestCase:
         tc.assert_true(work is None or not work.exists(),
                        "F1 夹具不得在受管临时区留测试项目（同用例109判据）")
     tc.mark_passed()
+    return tc
+
+
+# ============================================================================
+# 2026-10-20 修订批：停顿强制的下刀点 + 缓存失效闸门（用例111）
+# ============================================================================
+
+def test_sentence_pause_cut_point_and_cache_invalidation() -> RegressionTestCase:
+    """用例111：停顿强制的下刀点必须落在字间隙里；改逻辑必须让 hq 缓存失效。
+
+    事故形态（真实交付实证，build-expert-overview 第 2 场「照着验收，就用。写文案」）：
+      引擎在句号处不留静音 → ASR 给出的段间间隔 0.00s → 停顿强制下刀。
+      旧实现的取窗是「边界 ±0.08s 内最低能量点」：这个窗的**正半边整段落在下一段
+      首字上**，窗内最低能量点必然落进那个字内部或其后。实测刀落在 7.0588s
+      （正好在「写」字之后），后果三条同时发生：①句界仍然没有停顿；②「写」被压成
+      80ms；③「写」被劈离「文案」，词级 cue 照着断掉的那一刻点亮。
+
+    修法（根因层，不是打补丁）：下刀点收敛到**字间隙**（前段末字结束 → 后段首字开始），
+      间隙宽度为 0 时取间隙端点（两字之间的那条缝），不切任何字。
+      配套的缓存闸门：停顿强制的裁定逻辑改了（版本号 bump）时，已落盘的 hq wav
+      必须重建——否则下一轮"当前波形 vs 记录哈希"照旧命中，存量项目静默沿用
+      被旧逻辑切坏的波形，而所有下游门禁照常通过（A06 同族）。
+
+    本用例锁定：
+    A 负向对照：段间间隔 0.00s 时，下刀点必须落在字间隙——**两个字的内容逐样本
+      逐字节不变**（切进任一个字即红）。切口处 8ms 防咔哒淡入淡出属实现细节，
+      断言按"除淡化窗外逐字节不变 + 受损样本数 ≤ 2×淡化窗"表述。
+    A' 夹具分辨力见证：旧规则（边界 ±0.08s 窗内最低能量点）在本夹具上**必须**
+      落进某一个字内部——否则该夹具在旧实现下也过，锁不住任何东西。
+    B 真实间隙：间隙有宽度时仍取窗内最低能量点，但**不得越出这条间隙**；
+      两个词的内容同样除淡化窗外逐字节不变。
+    C 字符级平移与句级同判据：起点**恰好等于**切点的字符必须整段后移
+      （含边界），跨切点的字符被截到切点；入参不得被原地改写。
+    D 缓存闸门：戳记＝当前版本 → 不重建；戳记缺失/陈旧且原始 TTS 在位 → 重建；
+      原始 TTS 缺失 → 不重建且**点名告警**（不得静默沿用）。
+    E 接线实证（AST）：`_build_timeline_manifest` 内「重建 → 算哈希 → 强制停顿 →
+      重绑哈希」的先后次序成立；`step1_generate_tts` 落"raw"戳记。
+    """
+    tc = RegressionTestCase(
+        "sentence_pause_cut_point_and_cache_invalidation",
+        "停顿强制的下刀点必须落在字间隙（两字内容逐字节不变），改逻辑必须让 hq 缓存失效"
+    )
+    import sys
+    import wave as _wave
+    import numpy as _np
+    script_dir = Path(__file__).parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import enhance_video_audio as eva
+
+    SR = 44100
+    FADE = int(0.008 * SR)          # 实现里的防咔哒淡化窗（8ms）
+    tmp = Path(tempfile.mkdtemp(prefix="case110_"))
+
+    def _tone(freq, dur, amp):
+        n = int(round(dur * SR))
+        t = _np.arange(n) / SR
+        return (amp * _np.sin(2 * _np.pi * freq * t)).astype(_np.int16)
+
+    def _write_wav(path, samples, sr=SR):
+        with _wave.open(str(path), 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(samples.astype(_np.int16).tobytes())
+
+    def _read_wav(path):
+        with _wave.open(str(path), 'rb') as wf:
+            raw = wf.readframes(wf.getnframes())
+        return _np.frombuffer(raw, dtype=_np.int16).astype(_np.int64)
+
+    try:
+        # ── A. 段间间隔 0.00s：刀必须落在两字之间的缝里 ──
+        w1 = _tone(440.0, 0.5, 8000)
+        w2 = _tone(880.0, 0.5, 8000)
+        orig = _np.concatenate([w1, w2])
+        hq = tmp / "a_hq.wav"
+        _write_wav(hq, orig)
+        n1 = len(w1)
+        sents = [{"rel_start": 0.0, "rel_end": 0.5, "text": "甲"},
+                 {"rel_start": 0.5, "rel_end": 1.0, "text": "乙"}]
+        chars = [[0.0, 0.25, 1.0], [0.25, 0.5, 1.0],
+                 [0.5, 0.75, 1.0], [0.75, 1.0, 1.0]]
+        modified, out_sents, inserted, out_chars = eva._enforce_sentence_pauses(
+            hq, sents, 0.4, chars=chars)
+        tc.assert_true(modified, "a 0.00s sentence gap must trigger enforcement")
+        tc.assert_true(inserted > 0.3, "a measurable amount of silence must be inserted")
+        gap_out = out_sents[1]['rel_start'] - out_sents[0]['rel_end']
+        tc.assert_true(gap_out >= 0.4 - 0.02,
+                       "the sentence gap after enforcement must reach min_pause "
+                       f"(got {gap_out:.3f}s)")
+        out = _read_wav(hq)
+        ins_n = len(out) - len(orig)
+        tc.assert_equal(ins_n, int(round(inserted * SR)),
+                        "the waveform grew by exactly the reported inserted amount")
+        tc.assert_true(_np.array_equal(out[:n1 - FADE], w1[:n1 - FADE].astype(_np.int64)),
+                       "the first word must survive byte-for-byte apart from the 8ms "
+                       "anti-click fade at the cut (the old ±0.08s window landed "
+                       "inside a word)")
+        tail = out[n1 + ins_n:]
+        tc.assert_true(len(tail) == len(w2)
+                       and _np.array_equal(tail[FADE:], w2[FADE:].astype(_np.int64)),
+                       "the second word must survive byte-for-byte apart from the "
+                       "anti-click fade — the old implementation cut into the NEXT "
+                       "segment's first word (crushed it to 80ms and split it from "
+                       "the following word)")
+        damaged = int((out[:n1] != w1.astype(_np.int64)).sum()) \
+            + int((tail != w2.astype(_np.int64)).sum())
+        tc.assert_true(damaged <= 2 * FADE,
+                       f"the damaged span must stay inside the two 8ms fade windows "
+                       f"(got {damaged} samples) — a cut inside a word destroys far "
+                       f"more than that")
+        sil = out[n1:n1 + ins_n]
+        tc.assert_true(int(_np.abs(sil).max()) <= 200,
+                       "the inserted region must be silence (8ms fade aside)")
+
+        # ── A'. 夹具分辨力见证：旧规则在本夹具上必须切进某个字 ──
+        # 旧规则＝「边界 ±0.08s 窗内最低能量点」。若旧规则在本夹具上也落在缝里，
+        # 则本节 A 的断言在修复前后同样成立，锁不住任何东西（空跑）。
+        old_lo = max(0, int(round((0.5 - 0.08) * SR)))
+        old_hi = min(len(orig), int(round((0.5 + 0.08) * SR)))
+        old_env = _np.abs(orig[old_lo:old_hi].astype(_np.int32)).astype(_np.float64)
+        old_win = max(1, int(0.015 * SR))
+        old_env = _np.convolve(old_env, _np.ones(old_win) / old_win, mode='same')
+        old_cut = old_lo + int(_np.argmin(old_env))
+        tc.assert_true(old_cut != n1,
+                       "the fixture must discriminate: the old ±0.08s rule's "
+                       f"lowest-energy point must NOT land exactly on the word "
+                       f"boundary (old_cut={old_cut}, boundary={n1}) — otherwise "
+                       f"section A would pass under the old behavior too")
+        tc.assert_true(old_cut < n1 or old_cut > n1,
+                       "the old rule's cut must land strictly inside one of the two "
+                       f"words (old_cut={old_cut}) so that the byte-for-byte "
+                       f"assertions have teeth")
+
+        # ── B. 真实间隙：仍取窗内最低能量点，但不得越出这条间隙 ──
+        w1b = _tone(440.0, 0.4, 9000)
+        rng = _np.random.RandomState(7)
+        gapb = rng.randint(-40, 40, size=int(0.2 * SR)).astype(_np.int16)
+        w2b = _tone(880.0, 0.4, 9000)
+        origb = _np.concatenate([w1b, gapb, w2b])
+        hq_b = tmp / "b_hq.wav"
+        _write_wav(hq_b, origb)
+        nb1 = len(w1b)
+        sents_b = [{"rel_start": 0.0, "rel_end": 0.4, "text": "甲"},
+                   {"rel_start": 0.6, "rel_end": 1.0, "text": "乙"}]
+        mod_b, sents_b2, ins_b, _ = eva._enforce_sentence_pauses(
+            hq_b, sents_b, 0.4, chars=None)
+        tc.assert_true(mod_b, "a 0.20s gap below min_pause must trigger enforcement")
+        out_b = _read_wav(hq_b)
+        tc.assert_true(_np.array_equal(out_b[:nb1 - FADE],
+                                        w1b[:nb1 - FADE].astype(_np.int64)),
+                       "the first word must survive byte-for-byte when the gap is real")
+        tail_b = out_b[-len(w2b):]
+        tc.assert_true(_np.array_equal(tail_b[FADE:], w2b[FADE:].astype(_np.int64)),
+                       "the second word must survive byte-for-byte when the gap is "
+                       "real — the cut must stay inside the gap, not inside a word")
+        tc.assert_true(sents_b2[1]['rel_start'] - sents_b2[0]['rel_end'] >= 0.4 - 0.02,
+                       "the gap must reach min_pause after enforcement")
+
+        # ── C. 字符级平移与句级同判据（含边界） ──
+        cut = 1.0
+        ins_c = 0.4
+        src = [[0.20, 0.60, 1.0],       # 完全在切点之前 → 不动
+               [0.90, 1.10, 1.0],       # 跨切点 → 截到切点，不后移
+               [1.00, 1.30, 1.0],       # 起点**恰等于**切点 → 整段后移
+               [1.40, 1.60, 1.0]]       # 切点之后 → 整段后移
+        snapshot = [list(x) for x in src]
+        out_c = eva._shift_chars_for_inserted_silence(src, cut, ins_c)
+        tc.assert_true(src == snapshot,
+                       "the char shifter must not mutate its input in place "
+                       "(an in-place shift makes 'forgot to write back' look correct)")
+        tc.assert_equal(out_c[0], [0.20, 0.60, 1.0],
+                        "a char entirely before the cut must not move")
+        tc.assert_equal(out_c[1], [0.9, 1.0, 1.0],
+                        "a char straddling the cut must be truncated at the cut, "
+                        "not moved (the sentence-level rule is max(rel_start, cut_t))")
+        tc.assert_equal(out_c[2], [1.4, 1.7, 1.0],
+                        "a char starting exactly at the cut must move with the "
+                        "inserted silence (inclusive boundary — the strict '>' "
+                        "form split 写|文案 into two chars)")
+        tc.assert_equal(out_c[3], [1.8, 2.0, 1.0],
+                        "a char after the cut must move by the inserted amount")
+
+        # ── D. 缓存闸门：戳记决定是否重建 ──
+        hq_d = tmp / "d_hq.wav"
+        _write_wav(hq_d, orig)
+        raw_d = tmp / "d_raw.mp3"
+        raw_d.write_bytes(b"not-really-mp3")
+        eva._write_enf_stamp(hq_d, eva.PAUSE_ENFORCE_VERSION)
+        calls = []
+        saved_ffmpeg = eva.run_ffmpeg
+
+        def _fake_ffmpeg(cmd, desc):
+            calls.append((list(cmd), desc))
+            return True
+
+        try:
+            eva.run_ffmpeg = _fake_ffmpeg
+            tc.assert_equal(eva._ensure_current_enforcement(hq_d, raw_d), False,
+                            "a current-version stamp must NOT rebuild the waveform")
+            tc.assert_equal(len(calls), 0,
+                            "a current-version stamp must not invoke ffmpeg at all")
+
+            eva._write_enf_stamp(hq_d, "v0-stale")
+            tc.assert_equal(eva._ensure_current_enforcement(hq_d, raw_d), True,
+                            "a stale stamp must rebuild the waveform from the raw TTS")
+            tc.assert_equal(len(calls), 1,
+                            "exactly one rebuild call for a stale stamp")
+            tc.assert_true(str(raw_d) in " ".join(calls[0][0]),
+                           "the rebuild must read the raw TTS (not the damaged hq wav)")
+            tc.assert_equal(eva._read_enf_stamp(hq_d), eva._ENF_STAMP_RAW,
+                            "after a rebuild the stamp must say 'raw' — the waveform "
+                            "has not been through the current enforcement yet")
+
+            missing_raw = tmp / "nope.mp3"
+            eva._write_enf_stamp(hq_d, "v0-stale")
+            calls.clear()
+            import io as _io
+            import contextlib as _ctx
+            buf = _io.StringIO()
+            with _ctx.redirect_stdout(buf):
+                tc.assert_equal(eva._ensure_current_enforcement(hq_d, missing_raw), False,
+                                "without the raw TTS the waveform cannot be rebuilt")
+            tc.assert_true("原始 TTS" in buf.getvalue() and "不在位" in buf.getvalue(),
+                           "the unrebuildable case must be named on screen "
+                           "(silently keeping the damaged waveform is the defect)")
+            tc.assert_equal(len(calls), 0, "no ffmpeg call when the raw TTS is absent")
+        finally:
+            eva.run_ffmpeg = saved_ffmpeg
+
+        tc.assert_equal(eva._read_enf_stamp(tmp / "absent_hq.wav"), "",
+                        "a missing stamp file must read as empty (never as 'current')")
+        tc.assert_equal(eva._enf_stamp_path(hq_d).name, "d_hq.enfver",
+                        "the stamp sits beside the hq wav under the same stem "
+                        "(a stamp that can drift to another path cannot gate anything)")
+
+        # ── E. 接线实证（AST + 次序） ──
+        import ast
+        src_text = Path(eva.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(src_text)
+
+        def _func_node(name):
+            # step1_generate_tts 是 async def —— 只认 FunctionDef 会把它当成
+            # "不存在"，而"没找到"与"不存在"必须可区分（取数断链不得读成缺失）。
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and n.name == name:
+                    return n
+            return None
+
+        def _calls_in(node):
+            out = []
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    if isinstance(f, ast.Name):
+                        out.append(f.id)
+                    elif isinstance(f, ast.Attribute):
+                        out.append(f.attr)
+            return out
+
+        mf = _func_node('_build_timeline_manifest')
+        tc.assert_true(mf is not None, "_build_timeline_manifest must exist")
+        if mf is not None:
+            calls_mf = _calls_in(mf)
+            tc.assert_true('_ensure_current_enforcement' in calls_mf,
+                           "the manifest builder must consult the enforcement-version gate")
+            tc.assert_true('_write_enf_stamp' in calls_mf,
+                           "the manifest builder must write the version stamp")
+            tc.assert_true('_enforce_sentence_pauses' in calls_mf,
+                           "the manifest builder must still run the enforcement itself")
+            # 次序：重建（+_ensure_current_enforcement）必须早于首次算哈希，
+            # 且"强制停顿后重绑哈希"必须在其后 —— 否则记录面记的是旧波形。
+            seg = ast.get_source_segment(src_text, mf) or ""
+            i_gate = seg.find('_ensure_current_enforcement')
+            i_sha1 = seg.find('wave_sha = _wave_sha256')
+            i_enf = seg.find('_enforce_sentence_pauses')
+            i_sha2 = seg.find("entry['wave_sha256'] = _wave_sha256")
+            tc.assert_true(-1 < i_gate < i_sha1,
+                           "the rebuild gate must run BEFORE the waveform hash is "
+                           "taken (a hash of the pre-rebuild wave would pin the "
+                           "damaged waveform as the cache anchor)")
+            tc.assert_true(-1 < i_sha1 < i_enf,
+                           "the first hash must be taken before the enforcement runs")
+            tc.assert_true(-1 < i_enf < i_sha2,
+                           "after the enforcement rewrote the waveform, the record "
+                           "must be re-bound to the NEW hash")
+
+        st = _func_node('step1_generate_tts')
+        tc.assert_true(st is not None, "step1_generate_tts must exist")
+        if st is not None:
+            tc.assert_true('_write_enf_stamp' in _calls_in(st),
+                           "the TTS step must stamp the freshly upsampled waveform "
+                           "as 'raw' (without it the next round cannot tell a "
+                           "never-enforced waveform from an enforced one)")
+
+        consts = {}
+        for n in tree.body:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                    and isinstance(n.targets[0], ast.Name) \
+                    and isinstance(n.value, ast.Constant):
+                consts[n.targets[0].id] = n.value.value
+        tc.assert_true(isinstance(consts.get('PAUSE_ENFORCE_VERSION'), str)
+                       and consts.get('PAUSE_ENFORCE_VERSION'),
+                       "PAUSE_ENFORCE_VERSION must be a module-level string constant "
+                       "(a value computed at runtime cannot be compared against a "
+                       "stamp written by an earlier run)")
+
+        tc.mark_passed()
+
+    except Exception as e:
+        import traceback
+        tc.mark_failed("sentence_pause_cut_point_and_cache_invalidation error: "
+                       + str(e) + "\n" + traceback.format_exc())
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
     return tc
 
 
