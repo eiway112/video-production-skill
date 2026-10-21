@@ -118,12 +118,14 @@ def export_repo_face(tc: RegressionTestCase) -> str:
     return "dev" if present else "published"
 
 
-def _tracked_index_html(base: Path):
-    """返回 base 目录下**被 git 跟踪**的 index.html 列表；取数断链返回 None（不得回退磁盘普查）。
+def _tracked_files(base: Path, pattern: str):
+    """返回 base 目录下匹配 pattern 且**被 git 跟踪**的文件；取数断链返回 None（不得回退磁盘普查）。
 
     存在理由：公开面类断言裁的是"随导出发布了什么"，而磁盘目录在使用者克隆里还含
     gitignored 的实网项目——两者不等价时，按磁盘普查裁"公开面"会把"这台机器上有什么"
-    读成"公开面有什么"。tracked 集才是公开面的取数真值。
+    读成"公开面有什么"。tracked 集才是公开面的取数真值。2026-10-21 使用者克隆实测：
+    发布面名册按磁盘取数时，三个未跟踪的业务项目被读成"业务件进了公开面"（用例110
+    E0p 唯一红项），与用例98 H2 同族；故取数面抽成本函数供两处共用。
     口径沿用例67/72 那条：`-c core.quotepath=off` 且走 `-z`（两者配套，见 AGENTS.md
     对两种形态口径相反的登记）。
     """
@@ -136,7 +138,7 @@ def _tracked_index_html(base: Path):
     try:
         r = subprocess.run(
             ["git", "-c", "core.quotepath=off", "ls-files", "-z", "--",
-             rel + "/*/index.html"],
+             rel + "/" + pattern],
             capture_output=True, text=True, encoding="utf-8",
             cwd=str(root), timeout=30)
     except Exception:
@@ -151,6 +153,11 @@ def _tracked_index_html(base: Path):
         if p.is_file():
             out.append(p)
     return out
+
+
+def _tracked_index_html(base: Path):
+    """base 目录下被 git 跟踪的 index.html 列表（取数断链返回 None）。"""
+    return _tracked_files(base, "*/index.html")
 
 
 # ============================================================================
@@ -20844,7 +20851,22 @@ def test_timeline_zero_based_scene_id_resolution() -> RegressionTestCase:
         roster_e = _zero_based_roster(se.HTML_BASE)
         if export_repo_face(tc) == "published":
             # 发布面：业务项目按清单不导出 → 名册里不得出现 0 基生产项目；
+            # 取数面必须是 **tracked 集**而非磁盘普查：使用者克隆里通常还含 gitignored
+            # 的实网项目（本机工作副本），按磁盘裁会把"这台机器上有什么"读成"公开面
+            # 发布了什么"——2026-10-21 使用者克隆实测 E0p 唯一红项即此形态（三个未跟踪
+            # 的 0 基业务项目被读成业务件进公开面），与用例98 H2 同族。
             # 但本段不得因此空跑，立据形态改由合成 0 基 12 场重放（E2/E3 照常裁定）。
+            tracked_e = _tracked_files(se.HTML_BASE, "*/narration.json")
+            if tracked_e is None:
+                tc.assert_true(False,
+                               "E0p 发布面 tracked 取数断链：不得回退磁盘普查")
+                roster_e = []
+            else:
+                tracked_set = {p.resolve() for p in tracked_e}
+                tc.assert_true(bool(tracked_set),
+                               "E0t 发布面 tracked narration 名册须非空（夹具至少一份）"
+                               "——空表即取数面失效，E0p 不得因空名单假绿")
+                roster_e = [r for r in roster_e if r[0].resolve() in tracked_set]
             tc.assert_true(not roster_e,
                            "E0p 发布面名册含 0 基生产项目＝业务件进了公开面")
             ids = list(range(12))
