@@ -220,3 +220,98 @@ def validate_managed_name(value, field: str, source: str = ""):
             "造出自我嵌套目录。请改为纯目录名（如 'demo-project'）")
     return s
 
+
+def resolve_delivery_names(config, html_project):
+    """交付文件名唯一推导点：返回 (video_name, subtitle_name)。
+
+    权威源只有 paths.video_name / paths.subtitle_name（subtitle.file 为兼容别名）。
+    delivery.output_video / delivery.output_subtitle / delivery.video 是历史别名，
+    **不参与推导**——2026-10-18 的修订轮里两处名字分叉，终检与交付验收实际量的
+    是上一版基础片（AGENTS.md 2026-10-24 整改条）。别名与这里不一致时由
+    preflight check 2c 点名告警（只报不拦：推导已不读它们，陈旧别名是卫生问题
+    而非正确性风险）；本函数不静默采纳，避免同一对象两个真相源。
+    """
+    cfg = config or {}
+    paths = cfg.get("paths") or {}
+    base = str(html_project or "").strip()
+    video_name = (str(paths.get("video_name") or "").strip()
+                  or (f"{base}.mp4" if base else "output.mp4"))
+    subtitle_name = (str(paths.get("subtitle_name") or "").strip()
+                     or str((cfg.get("subtitle") or {}).get("file") or "").strip()
+                     or (f"{base}.srt" if base else "output.srt"))
+    return video_name, subtitle_name
+
+
+def delivery_name_conflicts(config, html_project, root=None):
+    """历史交付别名与单一权威源的冲突清单（preflight check 2c 的取数面）。
+
+    返回 ([(key, 声明值, 期望值), ...], video_name, subtitle_name)。root 缺省为
+    工作流根；只比较**解析后的完整路径**——`成果文件/视频/x.mp4` 与裸 `x.mp4`
+    指向同一对象时不算冲突。
+    """
+    cfg = config or {}
+    rootp = Path(root) if root else ROOT
+    video_name, subtitle_name = resolve_delivery_names(cfg, html_project)
+    video_dir = rootp / "成果文件" / "视频"
+    subtitle_dir = rootp / "成果文件" / "字幕"
+    want_video = video_dir / video_name
+    want_subtitle = subtitle_dir / subtitle_name
+    delivery = cfg.get("delivery") or {}
+
+    def _same(value, want, base_dir):
+        p = Path(str(value))
+        if not p.is_absolute():
+            p = base_dir / p
+        try:
+            return p.resolve() == want.resolve()
+        except OSError:
+            return False
+
+    conflicts = []
+    for key, base_dir, want in (
+        ("video", rootp, want_video),
+        ("subtitle", rootp, want_subtitle),
+        ("output_video", video_dir, want_video),
+        ("output_subtitle", subtitle_dir, want_subtitle),
+    ):
+        value = delivery.get(key)
+        if value and not _same(value, want, base_dir):
+            conflicts.append((f"delivery.{key}", value, str(want)))
+    return conflicts, video_name, subtitle_name
+
+
+def revision_base_stem(stem: str) -> str:
+    """去掉末尾 `_修订NN` 后的基础名；无该后缀原样返回。
+
+    修订轮的交付惯例：视频必须带修订后缀；字幕与交付说明允许沿用基础名
+    （已有 2 支修订交付如此）。审计与写入共用本函数，避免各写一套正则。
+    """
+    import re as _re
+    m = _re.search(r"_修订\d+$", str(stem or ""))
+    return str(stem)[:m.start()] if m else str(stem or "")
+
+
+def delivery_notes_candidates(video_path):
+    """交付说明候选链：修订名优先，基础名回退（审计与流水线写入共用）。"""
+    p = Path(video_path)
+    exact = p.parents[1] / f"交付说明_{p.stem}.md"
+    base = revision_base_stem(p.stem)
+    if base != p.stem:
+        return [exact, p.parents[1] / f"交付说明_{base}.md"]
+    return [exact]
+
+
+def resolve_delivery_notes(video_path):
+    """返回交付说明候选链中第一个在位文件；全不在位返回 None。"""
+    for cand in delivery_notes_candidates(video_path):
+        if cand.exists():
+            return cand
+    return None
+
+
+def subtitle_stem_candidates(video_stem: str):
+    """字幕基名候选：视频全名优先；修订轮允许沿用基础名（共享 srt 惯例）。"""
+    stem = str(video_stem)
+    base = revision_base_stem(stem)
+    return [stem] if base == stem else [stem, base]
+

@@ -40,7 +40,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_line_time, resolve_script_times, parse_scene_map
 from _narration_lint import scan_srt_file as _lint_scan_srt, format_findings as _lint_format
-from _script_env import ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE, validate_managed_name
+from _script_env import (ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE,
+                         resolve_delivery_names, validate_managed_name)
 from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _forced_align as _fa  # 叶子模块（faster_whisper 仅在 load 时导入）；版本面消费 MODEL_SIZE
@@ -1203,9 +1204,10 @@ def get_paths(config_cfg=None):
     root = WF_ROOT
     if config_cfg and 'paths' in config_cfg:
         p = config_cfg['paths']
-        video_name = p.get('video_name', '')
-        # 兼容两种配置写法：paths.subtitle_name 或 subtitle.file
-        subtitle_name = p.get('subtitle_name', '') or config_cfg.get('subtitle', {}).get('file', '')
+        # 交付文件名与 pipeline_runner._delivery_paths 共用同一推导点（2026-10-24
+        # 单源整改）：空串/缺失同形态回退，delivery.* 别名不参与。
+        video_name, subtitle_name = resolve_delivery_names(
+            config_cfg, p.get('html_project', ''))
         temp_subdir = validate_managed_name(
             p.get('temp_subdir'), "temp_subdir",
             source="config paths.temp_subdir") or 'crm_audio'

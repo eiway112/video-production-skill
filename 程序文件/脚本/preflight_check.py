@@ -442,6 +442,53 @@ def check_config_path_fields(cfg, r: PreflightResult):
         r.ok(f"{checked}/{len(mapping)} 个路径字段扩展名与权威源一致", check_id)
 
 
+def check_delivery_key_consistency(cfg, r: PreflightResult):
+    """CRITICAL: 交付名别名须与单一权威源一致（check 2c，2026-10-24）。
+
+    存在理由（真实交付实证）：config 同时声明 `paths.video_name` 与
+    `delivery.output_video` 时，渲染/落槽读前者、终检/交付验收/完工报告读后者。
+    2026-10-18 的 `_修订01` 只改了前者，后处理终检与交付验收实际量的是上一版
+    基础片（终检 31 起口 vs 新片 27 起口，双向可核）。本检查在渲染前把这类
+    分叉点名告警（只报不拦：推导已只读 paths.*，陈旧别名是卫生问题而非正确性
+    风险）；`delivery.*` 别名与权威源同路径时照常放行。
+    """
+    print("\n[2c/12] Delivery Key Consistency")
+    check_id = "delivery_key_consistency"
+    if not cfg:
+        r.error("config 未加载，交付键一致性无从核对（取数断链不得读成通过）", check_id)
+        return
+    paths = cfg.get("paths") or {}
+    html_project = str(paths.get("html_project") or "").strip()
+    if not html_project:
+        r.info("config 未声明 paths.html_project，交付名无从推导（NOT_APPLICABLE，非通过）",
+               check_id)
+        return
+    try:
+        conflicts, video_name, subtitle_name = _script_env.delivery_name_conflicts(
+            cfg, html_project, _script_env.ROOT)
+    except Exception as e:                                  # noqa: BLE001
+        r.error(f"交付键一致性核对失败：{e}", check_id)
+        return
+    for key, value, want in conflicts:
+        # 只告警不阻断：交付推导已只认 paths.video_name / paths.subtitle_name，
+        # 遗留别名不再被任何消费者读取，因此不会再把校验引到旧片；这里点名
+        # 只是让配置保持单一权威源，避免下一个人误以为它仍生效。
+        r.warn(f"{key}={value!r} 已不参与交付推导（当前权威值 {want}）——"
+               "遗留别名，请删除或改为同名；本项只告警，不改写裁定方向",
+               check_id)
+    video_stem = Path(video_name).stem
+    subtitle_stem = Path(subtitle_name).stem
+    if "_修订" in video_stem and _script_env.revision_base_stem(subtitle_stem) == subtitle_stem:
+        r.warn("视频为修订名而字幕沿用基础名：修订轮会覆盖该 srt，历史版本仅存于 "
+               "git 历史；审计接受此惯例，如需独立保留请在 paths.subtitle_name 加 _修订NN",
+               check_id)
+    r.counts[check_id] = {"conflicts": len(conflicts),
+                          "video": video_name, "subtitle": subtitle_name}
+    if not conflicts:
+        r.ok(f"交付名与单一权威源一致：video={video_name}, subtitle={subtitle_name}",
+             check_id)
+
+
 def check_html_images(html_path: Path, r: PreflightResult):
     """Validate all image references in HTML resolve to actual files."""
     print("\n[3/12] HTML Image Reference Check")
@@ -2653,6 +2700,7 @@ def main():
     check_production_readiness(project_dir, pre_cfg, r)
     cfg = check_json_config(config_path, r)
     check_config_path_fields(cfg, r)
+    check_delivery_key_consistency(cfg, r)
     check_html_images(html_path, r)
     check_gsap_timing(html_path, r)
     check_timeline_registration(html_path, r)

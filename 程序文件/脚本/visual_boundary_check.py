@@ -470,6 +470,8 @@ def run_check(video_path, scenes, ffmpeg_exe="ffmpeg", subtitle_lines=2):
                 print(f"    Scene {v['scene']}: content at y={v['content_bottom']} overflows safety line y={safety_line} by {abs(v['gap'])}px")
         print(f"\n  Fix: overflow → reduce content height; vacuum → advance GSAP entrance times.")
         print(f"  Content must stay above y={safety_line} and appear while narration plays.")
+        print("  注意：本门禁的被测对象是**无字幕**的 render_raw.mp4；若你传入的是已烧字幕")
+        print("        成片，字幕本身会落在安全线以下，制造整片溢出的假象（2026-10-24 实测踩过）。")
         if untested:
             print(f"  另有 {len(untested)} 项检查未完成（见 visual_boundary_report.json:untested）")
 

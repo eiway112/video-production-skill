@@ -3093,14 +3093,16 @@ def test_render_budget_gate() -> RegressionTestCase:
 
             # (b) 预算内（2/3 次尝试）→ 放行且无决策留痕
             r2 = make_runner(budget_soft, idx=2)
-            r2._render_metrics()["full_render_attempts"] = 2
+            _m2 = r2._render_metrics()
+            _m2["delivery_round_attempts"] = 2
+            _m2["full_render_attempts"] = 5  # 累计高于阈值也不得拦截
             tc.assert_true(r2._render_budget_gate_ok(), "within budget → pass")
             tc.assert_true("render_budget_decision" not in r2.state.data,
                            "no decision record when within budget")
 
             # (c) soft 超限（3/3）无放行标志 → 阻断，render 标记 failed
             r3 = make_runner(budget_soft, idx=3)
-            r3._render_metrics()["full_render_attempts"] = 3
+            r3._render_metrics()["delivery_round_attempts"] = 3
             tc.assert_true(not r3._render_budget_gate_ok(),
                            "soft blocks without --accept-over-render")
             tc.assert_equal(r3.state.data["steps"]["render"]["status"], "failed",
@@ -3108,7 +3110,7 @@ def test_render_budget_gate() -> RegressionTestCase:
 
             # (d) soft 超限 + 放行标志 → 通过且决策留痕
             r4 = make_runner(budget_soft, accept=True, idx=4)
-            r4._render_metrics()["full_render_attempts"] = 3
+            r4._render_metrics()["delivery_round_attempts"] = 3
             tc.assert_true(r4._render_budget_gate_ok(),
                            "soft passes with --accept-over-render")
             dec = r4.state.data.get("render_budget_decision", {})
@@ -3119,15 +3121,24 @@ def test_render_budget_gate() -> RegressionTestCase:
 
             # (e) hard 超限 → 直接 FAIL（放行标志亦无效）
             r5 = make_runner(budget_hard, accept=True, idx=5)
-            r5._render_metrics()["full_render_attempts"] = 3
+            r5._render_metrics()["delivery_round_attempts"] = 3
             tc.assert_true(not r5._render_budget_gate_ok(),
                            "hard enforcement FAILs regardless of flag")
 
             # (f) --force 越过（语义同 HARD_GATES：留痕走 forced_run 通道）
             r6 = make_runner(budget_soft, force=True, idx=6)
-            r6._render_metrics()["full_render_attempts"] = 5
+            r6._render_metrics()["delivery_round_attempts"] = 5
             tc.assert_true(r6._render_budget_gate_ok(),
                            "--force bypasses render budget")
+
+            # (g) 仅累计值超阈值、本轮未尝试 → 放行（阈值按交付轮，不按项目寿命）
+            r7 = make_runner(budget_soft, idx=7)
+            _m7 = r7._render_metrics()
+            _m7["full_render_attempts"] = 8
+            _m7["delivery_round_attempts"] = 0
+            tc.assert_true(r7._render_budget_gate_ok(),
+                           "cumulative attempts alone must not block: budget is per "
+                           "delivery round (reset on VALIDATED)")
 
             tc.mark_passed()
 
@@ -6680,6 +6691,8 @@ def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
 
         saved_qa = mq.MediaQAGate
         saved_config_dir = _pr.CONFIG_DIR
+        saved_output_dir = _pr.OUTPUT_DIR
+        saved_root = _pr.ROOT
         calls = []
         holder = {"result": None, "raise": None}
 
@@ -6729,6 +6742,8 @@ def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
                 }.items():
                     (quality / fname).write_text(json.dumps(payload), encoding='utf-8')
                 _pr.CONFIG_DIR = tmp
+                _pr.OUTPUT_DIR = tmp
+                _pr.ROOT = tmp
 
                 source_dir = tmp / "src"
                 source_dir.mkdir()
@@ -6749,9 +6764,8 @@ def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
                     runner = PipelineRunner.__new__(PipelineRunner)
                     runner.state = state
                     runner.force = False
-                    runner.config = {"delivery": {
-                        "video": str(tmp / "case53.mp4"),
-                        "subtitle": str(tmp / "case53.srt")}}
+                    runner.config = {"paths": {"video_name": "case53.mp4",
+                                       "subtitle_name": "case53.srt"}}
                     runner.config_path = cfg_path
                     runner.html_project = "case53"
                     runner.source_dir = source_dir
@@ -6928,6 +6942,8 @@ def test_final_media_qa_wired_into_postprocess() -> RegressionTestCase:
         finally:
             mq.MediaQAGate = saved_qa
             _pr.CONFIG_DIR = saved_config_dir
+            _pr.OUTPUT_DIR = saved_output_dir
+            _pr.ROOT = saved_root
 
     except Exception as e:
         tc.mark_failed(str(e))
@@ -7304,7 +7320,8 @@ def test_state_writes_atomic_and_ledger_survives_fresh() -> RegressionTestCase:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             spath = tmp / "pipeline_state.json"
-            ledger = {"full_render_attempts": 3, "full_render_total_seconds": 120.0,
+            ledger = {"full_render_attempts": 3, "delivery_round_attempts": 3,
+                      "full_render_total_seconds": 120.0,
                       "scene_patch_attempts": 0, "scene_patch_hits": 0, "watchdog_kills": 0}
 
             # ── A. 正常保存走原子替换：目录里不留 .tmp 兄弟文件 ──
@@ -7381,6 +7398,9 @@ def test_state_writes_atomic_and_ledger_survives_fresh() -> RegressionTestCase:
                             "--fresh still voids step status (that is its purpose)")
             tc.assert_equal(st.data.get("render_metrics", {}).get("full_render_attempts"), 3,
                             "the cumulative render-cost ledger survives --fresh")
+            tc.assert_equal(
+                st.data.get("render_metrics", {}).get("delivery_round_attempts"), 3,
+                "the per-round budget ledger also survives --fresh (same escape path)")
             tc.assert_true("duration_budget_check" not in st.data,
                            "per-run adjudications are previous-run evidence — dropped, not carried")
             tc.assert_true("verifications" not in st.data,
@@ -20267,6 +20287,8 @@ class RegressionTestRunner:
             test_vacuum_precheck_blocks_before_full_render,
             test_scene_patch_reuse_and_frame_grid_tolerance,
             test_cue_consumption_warn_only,
+            test_delivery_object_single_source_and_artifact_identity,
+            test_registry_reconciliation_and_revision_naming,
         ]
         self.results = []
     
@@ -21589,6 +21611,502 @@ def test_cue_consumption_warn_only() -> RegressionTestCase:
     except Exception as e:
         import traceback
         tc.mark_failed("cue_consumption_warn_only error: "
+                       + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_delivery_object_single_source_and_artifact_identity() -> RegressionTestCase:
+    """用例115：交付对象单源 + 终检结论身份绑定（2026-10-24 P0/P1）。
+
+    病灶（生产实证）：config 同时声明 `paths.video_name`（修订名）与
+    `delivery.output_video`（旧基础名）时，旧 `_delivery_paths` 读后者，而
+    render/落槽读前者——2026-10-18 的 `_修订01` 因此被终检与交付验收量成了
+    上一版基础片（终检 31 起口 vs 新片 27 起口，双向可核）。
+
+    本用例锁四件事：paths.* 为唯一推导源、别名冲突可被点名、终检身份与交付
+    实物同字节、旧记录无身份时不追溯裁定。
+    """
+    tc = RegressionTestCase(
+        "delivery_object_single_source_and_artifact_identity",
+        "验证交付名只认 paths.*、终检结论绑定交付实物字节"
+    )
+    try:
+        import ast
+        import hashlib
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _script_env as se
+        import pipeline_runner as pr
+        import preflight_check as pfc
+        import generate_completion_report as gcr
+
+        # ── A：paths.* 优先于 delivery.* 别名 ──
+        cfg = {"paths": {"video_name": "演示成片_修订01.mp4",
+                         "subtitle_name": "演示成片.srt"},
+               "delivery": {"output_video": "演示成片.mp4",
+                            "output_subtitle": "演示成片.srt"}}
+        video, srt = se.resolve_delivery_names(cfg, "演示成片")
+        tc.assert_equal(video, "演示成片_修订01.mp4",
+                        "A1 paths.video_name must win over delivery.output_video")
+        tc.assert_equal(srt, "演示成片.srt",
+                        "A2 paths.subtitle_name is authoritative for subtitles")
+
+        # A2：paths 未声明时按 subtitle.file → 基础名回退（不得读 delivery.*）
+        cfg_fb = {"paths": {}, "subtitle": {"file": "回退片.srt"},
+                  "delivery": {"output_video": "别的片.mp4"}}
+        v2, s2 = se.resolve_delivery_names(cfg_fb, "回退片")
+        tc.assert_equal(v2, "回退片.mp4",
+                        "A3 missing paths.video_name falls back to html_project name")
+        tc.assert_equal(s2, "回退片.srt",
+                        "A4 missing paths.subtitle_name falls back to subtitle.file")
+        _v_empty, _ = se.resolve_delivery_names({"paths": {"video_name": ""}}, "回退片")
+        tc.assert_equal(_v_empty, "回退片.mp4",
+                        "A5 empty video_name must fall back, same as missing")
+
+        # ── B：别名冲突取数面 ──
+        conflicts, want_v, want_s = se.delivery_name_conflicts(cfg, "演示成片")
+        keys = [c[0] for c in conflicts]
+        tc.assert_equal(keys, ["delivery.output_video"],
+                        "B1 aligned subtitle alias must not be reported; video alias must")
+        tc.assert_equal(want_v, "演示成片_修订01.mp4",
+                        "B2 conflict payload must name the authoritative value")
+        # 裸名与完整路径指向同一对象时不算冲突
+        bare = {"paths": {"video_name": "演示成片_修订01.mp4"},
+                "delivery": {"output_video": "演示成片_修订01.mp4"}}
+        c_bare, _, _ = se.delivery_name_conflicts(bare, "演示成片")
+        tc.assert_equal(c_bare, [],
+                        "B3 bare filename resolving to the same slot is not a conflict")
+
+        # ── C：preflight check 2c 只告警不阻断，且点名键与权威值 ──
+        cfg_pf = {"paths": {"html_project": "演示成片",
+                            "video_name": "演示成片_修订01.mp4",
+                            "subtitle_name": "演示成片_修订01.srt"},
+                  "delivery": {"output_video": "演示成片.mp4",
+                               "output_subtitle": "演示成片_修订01.srt"}}
+        r = pfc.PreflightResult()
+        pfc.check_delivery_key_consistency(cfg_pf, r)
+        tc.assert_equal(len(r.errors), 0,
+                        "C1 stale alias must never block rendering")
+        tc.assert_equal(len(r.warnings), 1,
+                        "C2 exactly the divergent alias must be warned")
+        w0 = r.warnings[0] if r.warnings else ""
+        tc.assert_true("delivery.output_video" in w0,
+                       "C3 warning must name the stale key")
+        tc.assert_true("演示成片_修订01.mp4" in w0,
+                       "C4 warning must name the authoritative value")
+        r_aligned = pfc.PreflightResult()
+        pfc.check_delivery_key_consistency(bare, r_aligned)
+        tc.assert_equal(len(r_aligned.warnings), 0,
+                        "C5 aligned aliases must not warn")
+
+        # ── D：runner 的交付路径 = paths.video_name（独立于别名） ──
+        obj = pr.PipelineRunner.__new__(pr.PipelineRunner)
+        obj.config = cfg
+        obj.html_project = "演示成片"
+        vpath, spath = obj._delivery_paths()
+        tc.assert_equal(vpath.name, "演示成片_修订01.mp4",
+                        "D1 _delivery_paths must select the revision name")
+        tc.assert_equal(vpath.parent, pr.OUTPUT_DIR,
+                        "D2 video must land in the delivery video slot")
+        tc.assert_equal(spath.name, "演示成片.srt",
+                        "D3 _delivery_paths subtitle follows paths.subtitle_name")
+
+        # ── E：交付校验对象 vs 本轮产物（不变式） ──
+        obj.output_file = pr.OUTPUT_DIR / "演示成片_修订01.mp4"
+        match, named = obj._delivery_object_matches_output()
+        tc.assert_true(match, "E1 same artifact must pass the invariant")
+        obj.output_file = pr.OUTPUT_DIR / "演示成片.mp4"
+        match2, named2 = obj._delivery_object_matches_output()
+        tc.assert_true(not match2 and named2.name == "演示成片_修订01.mp4",
+                       "E2 divergent output_file must fail and name the delivery target")
+
+        # ── F：文件身份四字段 ──
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "id.bin"
+            payload = b"artifact-identity-probe"
+            f.write_bytes(payload)
+            ident = pr.PipelineRunner._artifact_identity(f)
+            tc.assert_equal(ident["size_bytes"], len(payload),
+                            "F1 identity must record the measured size")
+            tc.assert_equal(ident["sha256"], hashlib.sha256(payload).hexdigest(),
+                            "F2 identity must record the measured sha256")
+            tc.assert_true(isinstance(ident["mtime_epoch"], int),
+                           "F3 identity must record an integer mtime")
+            tc.assert_equal(pr.PipelineRunner._artifact_identity(Path(tmp) / "nope.bin"),
+                            None,
+                            "F4 missing file must yield None, never a fabricated identity")
+
+            # ── G：报告侧裁定三态（匹配 / 不符 / 旧记录不追溯） ──
+            other = Path(tmp) / "other.bin"
+            other.write_bytes(b"another-artifact")
+            ident_other = gcr._file_identity(other)
+            tc.assert_true(gcr.adjudicate_media_qa_artifact(ident, f)["match"] is True,
+                           "G1 same bytes must adjudicate as match")
+            tc.assert_true(gcr.adjudicate_media_qa_artifact(ident_other, f)["match"] is False,
+                           "G2 different bytes must adjudicate as mismatch")
+            same_size_other = dict(ident)
+            same_size_other["sha256"] = "0" * 64
+            tc.assert_true(
+                gcr.adjudicate_media_qa_artifact(same_size_other, f)["match"] is False,
+                "G3 same size but different hash must still be a mismatch")
+            tc.assert_equal(gcr.adjudicate_media_qa_artifact(None, f), None,
+                            "G4 legacy record without identity must not be adjudicated")
+
+            # ── G5：后处理写入侧（enhance.get_paths）与交付校验同源 ──
+            import enhance_video_audio as eva
+            _root, _vin, _tdir, _vout, _sout = eva.get_paths(
+                {"paths": {"html_project": "演示成片",
+                           "video_name": "演示成片_修订01.mp4",
+                           "subtitle_name": "演示成片.srt"},
+                 "delivery": {"output_video": "演示成片.mp4",
+                              "output_subtitle": "演示成片.srt"}})
+            tc.assert_equal(_vout.name, "演示成片_修订01.mp4",
+                            "G5 postprocess writer must ignore delivery aliases")
+            tc.assert_equal(_sout.name, "演示成片.srt",
+                            "G6 postprocess writer subtitle follows the same resolver")
+            _root2, _vin2, _tdir2, _vout2, _sout2 = eva.get_paths(
+                {"paths": {"html_project": "演示成片",
+                           "video_name": "", "subtitle_name": ""}})
+            tc.assert_equal(_vout2.name, "演示成片.mp4",
+                            "G5b empty video_name must fall back, same as the delivery resolver")
+            tc.assert_equal(_sout2.name, "演示成片.srt",
+                            "G6b empty subtitle_name must fall back, same as the delivery resolver")
+
+            # ── H：真实 generate_report 路径上，结论随身份对撞而变 ──
+            video_f = Path(tmp) / "交付片.mp4"
+            video_f.write_bytes(b"delivered-bytes")
+            state = Path(tmp) / "pipeline_state.json"
+
+            def _report_for(qa_artifact):
+                state.write_text(json.dumps({
+                    "steps": {},
+                    "verifications": {"media_qa_final": {
+                        "passed": True, "measured_artifact": qa_artifact}},
+                }, ensure_ascii=False), encoding="utf-8")
+                return gcr.generate_report("probe", str(video_f),
+                                           state_file=str(state))
+
+            good = gcr._file_identity(video_f)
+            rep_ok = _report_for(good)
+            tc.assert_true(rep_ok["validation"].get(
+                "media_qa_artifact_matches_delivered") is True,
+                "H1 matching artifact must be recorded as True")
+            tc.assert_true(not any("artifact mismatch" in i
+                                   for i in rep_ok.get("issues", [])),
+                           "H2 matching artifact must not raise a mismatch issue")
+
+            bad = dict(good)
+            bad["sha256"] = "f" * 64
+            rep_bad = _report_for(bad)
+            tc.assert_true(rep_bad["validation"].get(
+                "media_qa_artifact_matches_delivered") is False,
+                "H3 divergent artifact must be recorded as False")
+            tc.assert_true(any("artifact mismatch" in i
+                               for i in rep_bad.get("issues", [])),
+                           "H4 divergent artifact must surface in issues")
+
+            rep_legacy = _report_for(None)
+            tc.assert_true("media_qa_artifact_matches_delivered"
+                           not in rep_legacy["validation"],
+                           "H5 legacy QA result must not be adjudicated retroactively")
+            tc.assert_true("not_recorded" in str(
+                rep_legacy["data_sources"].get("media_qa_artifact")),
+                "H6 legacy QA result must be named as not_recorded")
+
+        # ── I：接线锚（AST，不用源码文本子串） ──
+        tree = ast.parse(Path(pr.__file__).read_text(encoding="utf-8"))
+
+        def _find_func(name):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == name:
+                    return node
+            return None
+
+        f_qa = _find_func("_final_media_qa")
+        tc.assert_true(f_qa is not None, "_final_media_qa must exist")
+        f_init = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "PipelineRunner":
+                for sub in node.body:
+                    if isinstance(sub, ast.FunctionDef) and sub.name == "__init__":
+                        f_init = sub
+        tc.assert_true(
+            f_init is not None and any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "resolve_delivery_names"
+                for n in ast.walk(f_init)),
+            "D4 output_file and delivery paths must share one resolver")
+        assigns_identity = False
+        calls_identity = False
+        for node in ast.walk(f_qa):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if (isinstance(tgt, ast.Subscript)
+                            and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id == "result"
+                            and isinstance(tgt.slice, ast.Constant)
+                            and tgt.slice.value == "measured_artifact"):
+                        assigns_identity = True
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_artifact_identity"):
+                calls_identity = True
+        tc.assert_true(assigns_identity and calls_identity,
+                       "I1 final media QA must write measured_artifact from a real identity")
+
+        f_notes = _find_func("_sync_subtitle_source_section")
+        uses_chain = any(isinstance(n, ast.Name) and n.id == "delivery_notes_candidates"
+                         for n in ast.walk(f_notes))
+        tc.assert_true(uses_chain,
+                       "I2 pipeline notes writer must share the candidate chain")
+
+        pfc_tree = ast.parse(Path(pfc.__file__).read_text(encoding="utf-8"))
+        pfc_main = None
+        for node in ast.walk(pfc_tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "main":
+                pfc_main = node
+                break
+        wired_2c = bool(pfc_main) and any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "check_delivery_key_consistency"
+            for n in ast.walk(pfc_main))
+        tc.assert_true(wired_2c, "I3 preflight main must call check 2c")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("delivery_object_single_source_and_artifact_identity error: "
+                       + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_registry_reconciliation_and_revision_naming() -> RegressionTestCase:
+    """用例116：台账对账 + 修订轮命名惯例（2026-10-24 P1）。
+
+    两件事各自有生产背景：
+      · 2026-10-18 的修订轮审计判 d3「srt 与 mp4 不同基名」、d6「缺本节」，而成片
+        实际用的是基础名 srt/说明——治具把合法惯例判成缺陷，于是有人手工改台账；
+      · 交付台账是全仓唯一版本化交付账，但历史条目可能指向已清理实物，且旧条目
+        无 `source` 标记——对账必须让这两类可见，且不因历史缺失翻转本轮结论。
+    """
+    tc = RegressionTestCase(
+        "registry_reconciliation_and_revision_naming",
+        "验证修订轮命名候选链、台账在位/退役/来源对账"
+    )
+    try:
+        import ast
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import _script_env as se
+        import pipeline_runner as pr
+        import generate_completion_report as gcr
+        import media_qa_gate as mq
+
+        # ── A：修订基名与字幕候选 ──
+        tc.assert_equal(se.revision_base_stem("片名_修订01"), "片名",
+                        "A1 revision suffix must be stripped")
+        tc.assert_equal(se.revision_base_stem("片名_修订10"), "片名",
+                        "A2 multi-digit revision must be stripped")
+        tc.assert_equal(se.revision_base_stem("片名"), "片名",
+                        "A3 non-revision name must pass through")
+        tc.assert_equal(se.subtitle_stem_candidates("片名_修订01"), ["片名_修订01", "片名"],
+                        "A4 revision video accepts both exact and base subtitle stems")
+        tc.assert_equal(se.subtitle_stem_candidates("片名"), ["片名"],
+                        "A5 non-revision video accepts only the exact stem")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            slot = Path(tmp) / "成果文件" / "视频"
+            slot.mkdir(parents=True)
+            video = slot / "演示成片_修订01.mp4"
+            video.write_bytes(b"revision-artifact")
+            srt = Path(tmp) / "成果文件" / "字幕" / "演示成片.srt"
+            srt.parent.mkdir(parents=True)
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n字\n", encoding="utf-8")
+            cfg_path = Path(tmp) / "probe.json"
+            cfg_path.write_text(json.dumps({"paths": {"video_name": video.name}},
+                                           ensure_ascii=False), encoding="utf-8")
+
+            def _audit(facts=None):
+                report = {
+                    "status": "VALIDATED",
+                    "issues": [],
+                    "data_sources": {"video_file": {"ffprobe_available": True}},
+                    "validation": {
+                        "step_preflight_passed": True,
+                        "has_video_stream": True,
+                        "has_audio_stream": True,
+                        "verification_media_qa_final_passed": True,
+                        "product_state_consistent": True,
+                    },
+                }
+                if facts:
+                    report["data_sources"]["subtitle_timestamp_source"] = facts
+                return gcr.run_delivery_audit(report, str(video), str(srt),
+                                              None, str(cfg_path))
+
+            # ── B：d3 接受修订视频 + 基础字幕，并在证据面点名 ──
+            aud = _audit()
+            d3 = aud["dimensions"]["delivery_compliance"]
+            tc.assert_true(d3["passed"],
+                           "B1 revision video + base subtitle must pass d3")
+            tc.assert_true("shares base stem" in d3["evidence"],
+                           "B2 d3 must name the base-stem convention, not hide it")
+
+            # 换成真正异名的字幕 → d3 必须判红
+            srt_bad = Path(tmp) / "成果文件" / "字幕" / "别的片.srt"
+            srt_bad.write_text("1\n00:00:00,000 --> 00:00:01,000\n字\n", encoding="utf-8")
+            aud_bad = gcr.run_delivery_audit({
+                "status": "VALIDATED", "issues": [],
+                "data_sources": {"video_file": {"ffprobe_available": True}},
+                "validation": {"step_preflight_passed": True,
+                               "has_video_stream": True, "has_audio_stream": True,
+                               "verification_media_qa_final_passed": True,
+                               "product_state_consistent": True}},
+                str(video), str(srt_bad), None, str(cfg_path))
+            tc.assert_true(not aud_bad["dimensions"]["delivery_compliance"]["passed"],
+                           "B3 a genuinely different srt stem must still fail d3")
+
+            # ── C：交付说明候选链（修订名优先，基础名回退） ──
+            notes_base = Path(tmp) / "成果文件" / "交付说明_演示成片.md"
+            notes_base.write_text("# 说明\n", encoding="utf-8")
+            tc.assert_equal(se.resolve_delivery_notes(video), notes_base,
+                            "C1 base notes must be accepted when no revision notes exist")
+            tc.assert_true(not (Path(tmp) / "成果文件" /
+                                "交付说明_演示成片_修订01.md").exists(),
+                           "C2 fixture must exercise the fallback branch")
+            notes_rev = Path(tmp) / "成果文件" / "交付说明_演示成片_修订01.md"
+            notes_rev.write_text("# 说明\n", encoding="utf-8")
+            tc.assert_equal(se.resolve_delivery_notes(video), notes_rev,
+                            "C3 revision notes must take precedence when present")
+            notes_rev.unlink()
+            tc.assert_equal(se.resolve_delivery_notes(
+                slot / "不存在.mp4"), None,
+                "C4 missing notes must yield None, never a fabricated path")
+
+            # ── D：d6 接受基础说明并点名出处；数字不符仍判红 ──
+            facts = {"scenes_total": 13, "asr_forced": 13, "asr_forced_ratio": 1.0,
+                     "threshold_ratio": 0.8, "punct_gap": 0, "char_prop": 0,
+                     "adjudicable": True}
+            line = mq.format_subtitle_source_line(facts)
+            notes_base.write_text("# 说明\n\n" + mq.format_subtitle_source_section(line),
+                                  encoding="utf-8")
+            aud_notes = _audit(facts)
+            d6 = aud_notes["dimensions"]["delivery_notes_consistency"]
+            tc.assert_true(d6["passed"],
+                           "D1 base notes with the matching section must pass d6")
+            tc.assert_true("修订沿用基础说明" in d6["evidence"],
+                           "D2 d6 must name the base-notes convention")
+            facts_bad = dict(facts, asr_forced=10, asr_forced_ratio=10 / 13)
+            aud_notes_bad = _audit(facts_bad)
+            tc.assert_true(not aud_notes_bad["dimensions"]
+                           ["delivery_notes_consistency"]["passed"],
+                           "D3 report/notes numeric divergence must still fail d6")
+
+            # ── E：台账对账三态（在位 / 缺失 / 退役） + 来源标记 ──
+            reg = Path(tmp) / "成果文件" / "交付登记.json"
+            (slot / "在位片.mp4").write_bytes(b"aaaa")
+            (slot / "无来源片.mp4").write_bytes(b"bbbb")
+            reg.write_text(json.dumps({"deliveries": [
+                {"video": "在位片.mp4", "bytes": 4, "source": "pipeline"},
+                {"video": "缺失片.mp4", "bytes": 9, "source": "pipeline"},
+                {"video": "退役片.mp4", "bytes": 9, "retired": True},
+                {"video": "无来源片.mp4", "bytes": 5},
+            ]}, ensure_ascii=False), encoding="utf-8")
+            rec = gcr.reconcile_delivery_registry(reg, slot / "在位片.mp4")
+            tc.assert_equal(rec["entries"], 4, "E1 all entries must be counted")
+            tc.assert_equal(rec["missing_artifacts"], ["缺失片.mp4"],
+                            "E2 retired entries must be exempt from missing-artifact list")
+            tc.assert_equal(rec["retired"], ["退役片.mp4"],
+                            "E3 retired entries must be named")
+            tc.assert_equal(rec["unmarked_source"], 1,
+                            "E4 entries without a source marker must be counted")
+            tc.assert_equal(rec["current"],
+                            {"registered": True, "bytes_match": True,
+                             "entry_bytes": 4, "actual_bytes": 4},
+                            "E5 current delivery with matching bytes must pass")
+            rec_bad = gcr.reconcile_delivery_registry(reg, slot / "无来源片.mp4")
+            tc.assert_true(rec_bad["current"]["registered"]
+                           and rec_bad["current"]["bytes_match"] is False,
+                           "E6 current delivery with divergent bytes must be flagged")
+            rec_new = gcr.reconcile_delivery_registry(reg, slot / "未登记片.mp4")
+            tc.assert_equal(rec_new["current"], {"registered": False},
+                            "E7 unregistered current delivery must be named as such")
+            (slot / "退役片.mp4").write_bytes(b"retired-artifact-new")
+            rec_ret = gcr.reconcile_delivery_registry(reg, slot / "退役片.mp4")
+            tc.assert_equal(rec_ret["current"], {"registered": False},
+                            "E7b retired entry must not adjudicate a current delivery")
+            tc.assert_true("error" in gcr.reconcile_delivery_registry(
+                Path(tmp) / "不存在.json"), "E8 missing registry must be an explicit error")
+            corrupt = Path(tmp) / "成果文件" / "坏台账.json"
+            corrupt.write_text("{not json", encoding="utf-8")
+            tc.assert_true("error" in gcr.reconcile_delivery_registry(corrupt),
+                           "E9 corrupt registry must be an explicit error")
+
+            # ── F：登记写入带 source 且同名保留最新一条 ──
+            reg_slot = Path(tmp) / "成果文件" / "交付登记.json"
+            data_before = json.loads(reg_slot.read_text(encoding="utf-8"))
+            data_before["deliveries"].append(
+                {"video": video.name, "bytes": 1, "source": "manual"})
+            reg_slot.write_text(json.dumps(data_before, ensure_ascii=False),
+                                encoding="utf-8")
+            obj = pr.PipelineRunner.__new__(pr.PipelineRunner)
+            obj.html_project = "演示成片"
+            obj.config_path = cfg_path
+            obj._probe_duration = lambda _p: 12.5
+            old_registry = pr.DELIVERY_REGISTRY
+            pr.DELIVERY_REGISTRY = reg_slot
+            try:
+                entry = obj._record_delivery(video, srt, "VALIDATED")
+            finally:
+                pr.DELIVERY_REGISTRY = old_registry
+            tc.assert_equal(entry.get("source"), "pipeline",
+                            "F1 pipeline writes must be marked as such")
+            after = json.loads(reg_slot.read_text(encoding="utf-8"))
+            same = [e for e in after["deliveries"] if e.get("video") == video.name]
+            tc.assert_equal(len(same), 1,
+                            "F2 same-name registration must replace, not duplicate")
+            tc.assert_equal(same[-1]["bytes"], len(b"revision-artifact"),
+                            "F3 registered bytes must be measured from disk")
+
+            # ── F4：退役条目不构成"当前已交付"（同名重渲不得被空槽旧记录拦住） ──
+            ret_reg = Path(tmp) / "成果文件" / "交付登记_retired.json"
+            ret_reg.write_text(json.dumps({"deliveries": [
+                {"video": "退役片.mp4", "bytes": 1, "retired": True}]},
+                ensure_ascii=False), encoding="utf-8")
+            obj.output_file = slot / "退役片.mp4"
+            obj.temp_dir = Path(tmp) / "no_report_here"
+            obj.temp_dir.mkdir()
+            old_registry2 = pr.DELIVERY_REGISTRY
+            pr.DELIVERY_REGISTRY = ret_reg
+            try:
+                tc.assert_true(not obj._output_was_delivered(),
+                               "F4 retired entry must not count as a current delivery")
+            finally:
+                pr.DELIVERY_REGISTRY = old_registry2
+
+        # ── G：报告侧对账接线（AST） ──
+        tree = ast.parse(Path(gcr.__file__).read_text(encoding="utf-8"))
+        f_report = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "generate_report":
+                f_report = node
+                break
+        tc.assert_true(f_report is not None, "generate_report must exist")
+        calls_recon = any(isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Name)
+                          and n.func.id == "reconcile_delivery_registry"
+                          for n in ast.walk(f_report))
+        tc.assert_true(calls_recon and "registry_reconciliation" in
+                       Path(gcr.__file__).read_text(encoding="utf-8"),
+                       "G1 generate_report must run registry reconciliation")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("registry_reconciliation_and_revision_naming error: "
                        + str(e) + "\n" + traceback.format_exc())
     return tc
 

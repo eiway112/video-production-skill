@@ -30,11 +30,15 @@ from script_interface import Result, EXIT_CODE
 import json
 import re
 import subprocess
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import sys
 import io
+
+from _script_env import (delivery_notes_candidates, resolve_delivery_notes,
+                         revision_base_stem, subtitle_stem_candidates)
 
 # 持住旧流对象，理由同 pipeline_runner（旧包装引用归零即 finalize，会关掉底层
 # buffer）；另须持住本次造出的新代——它没有别的持有者，下个重绑点一顶掉它即
@@ -312,6 +316,11 @@ def run_delivery_audit(report: Dict[str, Any],
             d2_reasons.append(
                 "verification(s) ran but left no evidence (gate evidence missing): "
                 + ", ".join(absent))
+    # 终检身份绑定（2026-10-24）：结论必须属于被交付的那支成片。旧记录无身份
+    # 时不做追溯裁定（历史结论不回改）；有记录且不符即门禁不完整。
+    if validation.get("media_qa_artifact_matches_delivered") is False:
+        d2_reasons.append(
+            "final media QA measured a different artifact than the delivered video")
     dims["gate_integrity"] = {
         "passed": not d2_reasons,
         "evidence": "; ".join(d2_reasons) if d2_reasons
@@ -336,16 +345,26 @@ def run_delivery_audit(report: Dict[str, Any],
         hits = [t for t in prohibited if str(t).lower() in low]
         if hits:
             d3_reasons.append(f"prohibited term(s) {hits} in '{stem}'")
+    srt_note = "no prohibited terms, srt/mp4 same stem"
     if audit_rules.get("require_srt_same_stem", True):
         if not subtitle_file:
             d3_reasons.append("subtitle file not provided — cannot confirm same-stem delivery")
-        elif Path(subtitle_file).stem != Path(video_file).stem:
-            d3_reasons.append(
-                f"srt stem '{Path(subtitle_file).stem}' != mp4 stem '{Path(video_file).stem}'")
+        else:
+            video_stem = Path(video_file).stem
+            srt_stem = Path(subtitle_file).stem
+            allowed = subtitle_stem_candidates(video_stem)
+            if srt_stem not in allowed:
+                d3_reasons.append(
+                    f"srt stem '{srt_stem}' != mp4 stem '{video_stem}' "
+                    f"(allowed: {', '.join(allowed)})")
+            elif srt_stem != video_stem:
+                # 修订轮允许沿用基础字幕（既有 2 支交付如此）；在证据面点名，
+                # 不静默当成"逐字同名"。
+                srt_note = (f"no prohibited terms, srt shares base stem "
+                            f"'{srt_stem}' for revision")
     dims["delivery_compliance"] = {
         "passed": not d3_reasons,
-        "evidence": "; ".join(d3_reasons) if d3_reasons
-                    else f"no prohibited terms, srt/mp4 same stem",
+        "evidence": "; ".join(d3_reasons) if d3_reasons else srt_note,
     }
 
     # ── 维度4：分镜忠实度（narration 指针闭环可追溯）──
@@ -403,7 +422,9 @@ def run_delivery_audit(report: Dict[str, Any],
                                    find_mismatched_delivery_notes,
                                    format_notes_name_mismatch, format_subtitle_source_line)
         notes = delivery_notes_path(video_file)
-        if not notes.exists():
+        resolved = resolve_delivery_notes(video_file)
+        notes_note = ""
+        if resolved is None:
             # 归因分岔同 pipeline_runner 的打印面：错名 ≠ 未建，判红文案须给出改名这条路
             cands = find_mismatched_delivery_notes(notes)
             if cands:
@@ -412,6 +433,9 @@ def run_delivery_audit(report: Dict[str, Any],
             else:
                 d6_reasons.append(f"交付说明未创建: {notes}")
         else:
+            if resolved.name != notes.name:
+                notes_note = "（修订沿用基础说明）"
+            notes = resolved
             section = extract_subtitle_source_section(notes.read_text(encoding='utf-8'))
             expected = format_subtitle_source_line(facts)
             if section is None:
@@ -419,7 +443,7 @@ def run_delivery_audit(report: Dict[str, Any],
             elif expected not in section:
                 d6_reasons.append(
                     f"本节与完工报告实测不一致，应为: {expected}")
-        d6_evidence = (f"notes={notes.name}, 与完工报告 data_sources."
+        d6_evidence = (f"notes={notes.name}{notes_note}, 与完工报告 data_sources."
                        f"subtitle_timestamp_source 同源")
     dims["delivery_notes_consistency"] = {
         "passed": not d6_reasons,
@@ -513,6 +537,86 @@ def parse_srt_basic(srt_path: str) -> Dict[str, Any]:
         }
     except Exception as e:
         return {'error': str(e), 'format_valid': False}
+
+def _file_identity(path) -> Optional[Dict[str, Any]]:
+    """文件身份（path/size/mtime/sha256）：终检结论与交付实物对撞的取数点。"""
+    p = Path(path)
+    try:
+        st = p.stat()
+        h = hashlib.sha256()
+        with open(p, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return {"path": str(p.resolve()), "size_bytes": st.st_size,
+                "mtime_epoch": int(st.st_mtime), "sha256": h.hexdigest()}
+    except OSError:
+        return None
+
+
+def adjudicate_media_qa_artifact(qa_artifact, video_path) -> Optional[Dict[str, Any]]:
+    """终检结论的身份绑定：记录 → 交付实物同字节才算同一支片。
+
+    返回 None 表示旧记录没有身份字段（无从追溯，历史结论不回改）；返回 dict 时
+    `match` 是裁定结论。调用方负责把 False 计入 issues/gate_integrity。
+    """
+    if not isinstance(qa_artifact, dict) or not qa_artifact:
+        return None
+    delivered = _file_identity(video_path)
+    match = bool(
+        delivered
+        and qa_artifact.get("sha256") == delivered.get("sha256")
+        and qa_artifact.get("size_bytes") == delivered.get("size_bytes"))
+    return {"recorded": qa_artifact, "delivered": delivered, "match": match}
+
+
+def reconcile_delivery_registry(registry_path, current_video_path=None) -> Dict[str, Any]:
+    """交付台账对账：条目 → 实物在位；retired 豁免；当前交付条目字节须一致。
+
+    只报不删：历史条目缺失不翻转本次交付结论（可能是用户主动清理），但必须在
+    报告里可见；当前交付条目若已登记而字节不符，说明台账与实物分叉，判红。
+    """
+    p = Path(registry_path)
+    if not p.exists():
+        return {"error": "registry missing", "entries": 0}
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as e:
+        return {"error": f"registry unreadable: {e}", "entries": 0}
+    deliveries = data.get("deliveries") if isinstance(data, dict) else None
+    if not isinstance(deliveries, list):
+        return {"error": "registry has no deliveries list", "entries": 0}
+    video_dir = p.parent / "视频"
+    missing, retired = [], []
+    unmarked = 0
+    for entry in deliveries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("video") or ""
+        if entry.get("retired"):
+            retired.append(name)
+            continue
+        if not (video_dir / name).is_file():
+            missing.append(name)
+        if not entry.get("source"):
+            unmarked += 1
+    current = None
+    if current_video_path:
+        cur_name = Path(current_video_path).name
+        entry = next((e for e in deliveries
+                      if isinstance(e, dict) and e.get("video") == cur_name
+                      and not e.get("retired")), None)
+        if entry is None:
+            current = {"registered": False}
+        else:
+            f = video_dir / cur_name
+            actual = f.stat().st_size if f.is_file() else None
+            current = {"registered": True,
+                       "bytes_match": entry.get("bytes") == actual,
+                       "entry_bytes": entry.get("bytes"),
+                       "actual_bytes": actual}
+    return {"entries": len(deliveries), "missing_artifacts": missing,
+            "retired": retired, "unmarked_source": unmarked, "current": current}
+
 
 def generate_report(
     project_name: str,
@@ -778,6 +882,30 @@ def generate_report(
                 else:
                     report["data_sources"]["verifications"] = "not_recorded (legacy state, not traceable)"
 
+                # 终检身份绑定（2026-10-24）：结论必须与交付实物同字节。旧记录
+                # 无此字段时不做追溯裁定（历史结论不回改），但报告须点名。
+                _qa_artifact = None
+                if isinstance(verifications, dict):
+                    _qa_artifact = (verifications.get("media_qa_final") or {}).get(
+                        "measured_artifact")
+                _artifact_view = adjudicate_media_qa_artifact(_qa_artifact, video_path)
+                if _artifact_view is not None:
+                    report["data_sources"]["media_qa_artifact"] = _artifact_view
+                    report["validation"]["media_qa_artifact_matches_delivered"] = \
+                        _artifact_view["match"]
+                    if not _artifact_view["match"]:
+                        _delivered_id = _artifact_view.get("delivered") or {}
+                        report["issues"].append(
+                            "Final media QA artifact mismatch: recorded "
+                            f"{_qa_artifact.get('path')} "
+                            f"({str(_qa_artifact.get('sha256'))[:12]}) != delivered "
+                            f"{video_path} "
+                            f"({str(_delivered_id.get('sha256'))[:12]})")
+                        all_valid = False
+                else:
+                    report["data_sources"]["media_qa_artifact"] = (
+                        "not_recorded (legacy QA result; identity not adjudicated)")
+
                 # 执行位点记了"应做"、verifications 里却没有＝证据缺失。此处只透传不裁定
                 # （同 render_cost 口径），裁定在 --audit 第 2 维。
                 _expected = pipeline_state.get("verifications_expected")
@@ -857,6 +985,19 @@ def generate_report(
             "delivery rejected")
         all_valid = False
     
+    # 台账对账（2026-10-24）：台账是交付态的权威登记，必须与实物对撞。
+    # 历史条目缺失只列出、不翻转本次结论（可能是用户主动清理）；当前交付条目
+    # 已登记而字节不符＝台账与实物分叉，判红。
+    _registry_path = Path(video_file).parent.parent / "交付登记.json"
+    _recon = reconcile_delivery_registry(_registry_path, video_file)
+    report["data_sources"]["registry_reconciliation"] = _recon
+    _cur = _recon.get("current") or {}
+    if _cur.get("registered") and _cur.get("bytes_match") is False:
+        report["issues"].append(
+            "Delivery registry bytes mismatch for this artifact: recorded "
+            f"{_cur.get('entry_bytes')} != actual {_cur.get('actual_bytes')}")
+        all_valid = False
+
     # 总体判定（状态必须来自真实验证结果，禁止硬编码 COMPLETED/PASS/成功）
     if all_valid and not report["issues"]:
         report["status"] = "VALIDATED"

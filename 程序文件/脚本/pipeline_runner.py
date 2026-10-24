@@ -47,7 +47,9 @@ from typing import Any, Dict
 from pathlib import Path
 from _gsap_time_utils import parse_scene_map
 from pipeline_state_fingerprint import compute_inputs_fingerprint
-from _script_env import ROOT, VENV_PYTHON, validate_managed_name
+from _script_env import (ROOT, VENV_PYTHON, delivery_notes_candidates,
+                         resolve_delivery_names, revision_base_stem,
+                         validate_managed_name)
 from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _gate_status as gs
@@ -901,7 +903,9 @@ class PipelineRunner:
         self.sidecar_path = self.temp_dir / SCENE_PATCH_SIDECAR
         self.patch_verdict_path = self.temp_dir / SCENE_PATCH_VERDICT
 
-        video_name = paths.get("video_name", f"{self.html_project}.mp4")
+        # 与 _delivery_paths 共用同一推导点：空串/缺失同形态回退，
+        # 避免 __init__ 与交付校验各算一次（P0 单源，2026-10-24）。
+        video_name, _ = resolve_delivery_names(self.config, self.html_project)
         self.output_file = OUTPUT_DIR / video_name
 
         # P0 类型体系（2026-07-29）：video_type 声明视频类型；tts_enabled=false
@@ -1454,29 +1458,44 @@ class PipelineRunner:
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def _delivery_paths(self):
-        """交付物路径解析：config.delivery 为权威源，缺省按交付惯例推导默认。
+        """交付物路径解析：`paths.video_name` / `paths.subtitle_name` 为唯一权威源。
 
-        返回 (video_path, srt_path)。config 中声明的相对路径以仓根 ROOT 为基准；
-        既有配置惯例 delivery.output_video 只声明成片文件名，落到 成果文件/视频/。
-        缺省默认：成果文件/视频/{video_name}、成果文件/字幕/{html_project}.srt。
+        返回 (video_path, srt_path)。2026-10-24 整改：旧实现优先读
+        `delivery.output_video`，而渲染/落槽/交付保护读 `paths.video_name`——同一
+        成片两个真相源。2026-10-18 的 `_修订01` 因此被终检与交付验收量成了上一版
+        基础片（终检 31 起口 vs 新片 27 起口，代码路径与读数双向可核）。
+        `delivery.*` 别名不再参与推导；不一致由 preflight check 2c 在渲染前判错。
         """
-        delivery_cfg = self.config.get("delivery", {}) if isinstance(self.config, dict) else {}
-        if delivery_cfg.get("video"):
-            video_path = Path(delivery_cfg["video"])
-            if not video_path.is_absolute():
-                video_path = ROOT / video_path
-        elif delivery_cfg.get("output_video"):
-            video_path = OUTPUT_DIR / delivery_cfg["output_video"]
-        else:
-            video_path = self.output_file
-        if delivery_cfg.get("subtitle"):
-            srt_path = Path(delivery_cfg["subtitle"])
-            if not srt_path.is_absolute():
-                srt_path = ROOT / srt_path
-        else:
-            srt_name = self.config.get("paths", {}).get("subtitle_name", f"{self.html_project}.srt")
-            srt_path = ROOT / "成果文件" / "字幕" / srt_name
-        return video_path, srt_path
+        video_name, srt_name = resolve_delivery_names(self.config, self.html_project)
+        return OUTPUT_DIR / video_name, ROOT / "成果文件" / "字幕" / srt_name
+
+    def _delivery_object_matches_output(self):
+        """交付校验对象必须等于本轮渲染产物（同路径不同形态都算同一对象）。
+
+        单一权威源之外的防线：任何未来改动若再次让 `_delivery_paths` 与
+        `self.output_file` 分叉，终检/交付/报告三处都会在读取对象前失败，
+        而不是安静地量上一版成片。
+        """
+        video_path, _ = self._delivery_paths()
+        try:
+            return video_path.resolve() == self.output_file.resolve(), video_path
+        except OSError:
+            return False, video_path
+
+    @staticmethod
+    def _artifact_identity(path):
+        """文件身份（path/size/mtime/sha256）：终检结论与交付实物对撞的取数点。"""
+        p = Path(path)
+        try:
+            st = p.stat()
+            h = hashlib.sha256()
+            with open(p, 'rb') as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                    h.update(chunk)
+            return {"path": str(p.resolve()), "size_bytes": st.st_size,
+                    "mtime_epoch": int(st.st_mtime), "sha256": h.hexdigest()}
+        except OSError:
+            return None
 
     def _delivery_blocked_steps(self):
         """返回阻断交付的步骤清单（未满足门禁的渲染链步骤）。
@@ -1867,6 +1886,7 @@ class PipelineRunner:
             metrics = {
                 "full_render_attempts": 0,
                 "full_render_total_seconds": 0.0,
+                "delivery_round_attempts": 0,
                 "scene_patch_attempts": 0,
                 "scene_patch_hits": 0,
                 "watchdog_kills": 0,
@@ -2097,10 +2117,14 @@ class PipelineRunner:
     def _render_budget_gate_ok(self) -> bool:
         """渲染成本预算门禁（2026-08-19，P1 渲染成本治理）。
 
-        检查点设在全量渲染启动前——单项目生命周期内全量渲染尝试次数达到
-        render_rules.render_budget.max_full_renders 后拦截。阈值实证来源：
-        prefab 批次复盘"3 次 40 分钟级重渲 + 9 小时失败收尾"——第 3 次之后
-        问题已不是渲染能解决的，必须停下来定点诊断。
+        检查点设在全量渲染启动前——**单个交付轮内**全量渲染尝试次数达到
+        render_rules.render_budget.max_full_renders 后拦截。2026-10-24 客观口径
+        修正：旧实现按项目累计计数，长寿命项目在第 6 轮修订时必然撞线，5 次
+        `--accept-over-render` 全仓实测全是这种"正常修订"，放行已不再表示异常。
+        现改为按轮计数（completion_report VALIDATED 后归零）；累计值仍写
+        render_metrics.full_render_attempts，只作成本台账、不参与拦截。
+        prefab 批次复盘"3 次 40 分钟级重渲 + 9 小时失败收尾"——同一轮第 3 次
+        之后问题已不是渲染能解决的，必须停下来定点诊断。
         soft（默认）：阻断，需 --accept-over-render 显式放行并留痕
         state.render_budget_decision；hard：直接 FAIL。
         参数语义权威源：render_rules.render_budget。scene-patch/quick-fix 不计入。
@@ -2111,13 +2135,16 @@ class PipelineRunner:
         max_renders = budget.get("max_full_renders")
         if not isinstance(max_renders, int) or max_renders < 1:
             return True
-        attempts = int(self._render_metrics().get("full_render_attempts", 0))
+        _metrics = self._render_metrics()
+        attempts = int(_metrics.get("delivery_round_attempts", 0))
+        cumulative = int(_metrics.get("full_render_attempts", 0))
         if attempts < max_renders:
             return True
 
         enforcement = str(budget.get("enforcement", "soft")).strip().lower()
         msg = (f"Render budget exhausted: {attempts}/{max_renders} full-render attempts "
-               f"({self._render_metrics().get('full_render_total_seconds', 0) / 60:.0f} min accumulated)")
+               f"this delivery round (cumulative {cumulative}, "
+               f"{_metrics.get('full_render_total_seconds', 0) / 60:.0f} min accumulated)")
         if self.force:
             print(f"  WARNING: {msg} — bypassed via --force (留痕 forced_run)")
             return True
@@ -2133,6 +2160,7 @@ class PipelineRunner:
             self.state.data["render_budget_decision"] = {
                 "accepted": True,
                 "attempts": attempts,
+                "cumulative_attempts": cumulative,
                 "reason": "explicit --accept-over-render",
                 "at": datetime.now().isoformat(),
             }
@@ -2561,6 +2589,7 @@ class PipelineRunner:
             # 成本度量：尝试次数在启动前计入（含失败/中断），耗时含 compile+probe
             _metrics = self._render_metrics()
             _metrics["full_render_attempts"] = int(_metrics.get("full_render_attempts", 0)) + 1
+            _metrics["delivery_round_attempts"] = int(_metrics.get("delivery_round_attempts", 0)) + 1
             self.state.save()
             _render_t0 = time.monotonic()
             watcher.start()
@@ -2816,9 +2845,14 @@ class PipelineRunner:
         return cls._registry_load(registry_path)[0]
 
     def _registry_entry(self, video_name, registry_path=None):
-        """按成片文件名查交付登记条目；未登记返回 None。"""
+        """按成片文件名查交付登记条目；未登记或已退役返回 None。
+
+        retired 条目表示该成片已被后续修订取代（或实物已清理），不再作为
+        "当前交付"的依据——否则重渲同名基础片会被一条指向空槽位的旧记录拦住。
+        """
         for entry in self._registry_read(registry_path).get("deliveries", []):
-            if isinstance(entry, dict) and entry.get("video") == video_name:
+            if (isinstance(entry, dict) and entry.get("video") == video_name
+                    and not entry.get("retired")):
                 return entry
         return None
 
@@ -2837,6 +2871,7 @@ class PipelineRunner:
             "duration_seconds": self._probe_duration(video_path),
             "bytes": Path(video_path).stat().st_size if Path(video_path).exists() else None,
             "report_status": report_status,
+            "source": "pipeline",
             "delivered_at": datetime.now().isoformat(timespec="seconds"),
         }
         data, status = self._registry_load()
@@ -2913,6 +2948,8 @@ class PipelineRunner:
         print(f"  BLOCKED: 交付目标已是上一轮成功交付的成片：{self.output_file}")
         print("  AGENTS.md 交付纪律：已交付文件不得覆盖，需修订时加后缀。")
         print(f"  处理：config paths.video_name 改为 '{_next_revision_name(self.output_file.stem)}.mp4' 后重跑；")
+        print("        若同时声明了 delivery.output_video / delivery.video，须改为同一路径——"
+              "交付校验只认 paths.video_name（preflight check 2c 会核对）")
         print("        或将旧成片移出成果目录；紧急情况用 --force 越过（不推荐）。")
         self.state.mark_failed(
             step_name,
@@ -3031,14 +3068,25 @@ class PipelineRunner:
         收尾（模板 templates_07 照常提示）。返回一句状态供调用点打印，幂等由
         splice 的"无变化不落盘"保证。
         """
-        from media_qa_gate import (delivery_notes_path, format_subtitle_source_section,
+        from media_qa_gate import (delivery_notes_path,
+                                   format_subtitle_source_section,
                                    splice_subtitle_source_section)
         from script_interface import atomic_write_text
 
         line = self._subtitle_source_note_line()
         notes = delivery_notes_path(self.output_file)
+        notes_note = ""
         if not line:
             return f"跳过（终检未记录来源分布）: {notes.name}"
+        if not notes.exists():
+            # 修订轮惯例：说明允许沿用基础名（已有 2 支修订交付如此）。候选链
+            # 与审计第 6 维共用 media_qa_gate.delivery_notes_candidates，避免
+            # 写读两端各推一条路径。精确名优先，基础名回退。
+            existing = [c for c in delivery_notes_candidates(self.output_file)
+                        if c.exists()]
+            if existing:
+                notes = existing[0]
+                notes_note = "（修订沿用基础说明）"
         if not notes.exists():
             # 归因分岔：同层若有其它 交付说明_*.md，那是**名字不对**而非**没建**——
             # 旧文案一律报"尚未创建"，人据此会去补建或重跑全链，真实修法只是改名。
@@ -3051,9 +3099,9 @@ class PipelineRunner:
         new_text, changed = splice_subtitle_source_section(
             notes.read_text(encoding='utf-8'), format_subtitle_source_section(line))
         if not changed:
-            return f"已是最新: {notes.name}"
+            return f"已是最新: {notes.name}{notes_note}"
         atomic_write_text(notes, new_text)
-        return f"已写入: {notes}"
+        return f"已写入: {notes}{notes_note}"
 
     def step_postprocess(self):
         if self._can_skip("postprocess"):
@@ -3107,6 +3155,13 @@ class PipelineRunner:
         from media_qa_gate import MediaQAGate, adjudicate
 
         video_path, srt_path = self._delivery_paths()
+        _matches, _ = self._delivery_object_matches_output()
+        if not _matches:
+            self._fail("postprocess",
+                       f"交付校验对象与本轮产物不一致：{video_path} != {self.output_file}"
+                       "（交付路径单源被破坏，拒绝在错误对象上跑终检）",
+                       VERIFY_FAILED)
+            return False
         if self.quick_fix:
             visual = "not_applicable"
         else:
@@ -3125,6 +3180,9 @@ class PipelineRunner:
             return False
 
         result["checked_at"] = datetime.now().isoformat()
+        # 结论绑定被测对象：旧片 PASS 不得被读成新片 PASS（2026-10-18 实证）。
+        # 身份取数住 runner（media_qa_gate 字节不动，postprocess 指纹零冲击）。
+        result["measured_artifact"] = self._artifact_identity(video_path)
         result["mode"] = "quick-fix" if self.quick_fix else "full"
         out_path = self.temp_dir / "media_qa_final_result.json"
         try:
@@ -3188,6 +3246,14 @@ class PipelineRunner:
 
         # ── 门禁 2：成果文件存在且非零（纯BGM项目豁免字幕）──
         video_path, srt_path = self._delivery_paths()
+        _matches, _ = self._delivery_object_matches_output()
+        if not _matches:
+            self.state.mark_failed(
+                "delivery",
+                f"Delivery object mismatch: {video_path} != {self.output_file}",
+                error_code=OUTPUT_MISSING)
+            print(f"  BLOCKED: 交付校验对象与本轮产物不一致：{video_path} != {self.output_file}")
+            return False
         checks = [("视频", video_path)]
         if self.tts_enabled:
             checks.append(("字幕", srt_path))
@@ -3244,6 +3310,13 @@ class PipelineRunner:
         self.state.mark_started("completion_report")
 
         video_path, srt_path = self._delivery_paths()
+        _matches, _ = self._delivery_object_matches_output()
+        if not _matches:
+            self._fail("completion_report",
+                       f"交付校验对象与本轮产物不一致：{video_path} != {self.output_file}"
+                       "（拒绝在错误对象上生成完工报告/登记交付）",
+                       VERIFY_FAILED)
+            return False
         report_out = self.temp_dir / "completion_report.json"
         cmd = [str(VENV_PYTHON), "generate_completion_report.py",
                "--project-name", self.html_project,
@@ -3284,6 +3357,14 @@ class PipelineRunner:
                 print(f"  [DELIVERY-NOTES] {self._sync_subtitle_source_section()}")
             except OSError as e:
                 print(f"  WARNING: 交付说明节写入失败（--audit 一致性维会判 FAIL）: {e}")
+            # 渲染预算按交付轮计数：本轮到此刻已验证交付，下一轮从 0 起算。
+            # 累计 full_render_attempts 照常保留作成本台账，不再作为拦截阈值。
+            _metrics = self._render_metrics()
+            if int(_metrics.get("delivery_round_attempts", 0) or 0) != 0:
+                _metrics["delivery_round_attempts"] = 0
+                _metrics["round_reset_at"] = datetime.now().isoformat()
+                _metrics["round_reset_reason"] = "validated_delivery"
+                self.state.save()
         return True
 
     def run(self, start_from=None):
