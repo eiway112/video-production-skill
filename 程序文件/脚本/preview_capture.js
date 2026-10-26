@@ -311,6 +311,21 @@ async function main() {
         minChars: flagNumber('--fit-min-chars='),
     };
 
+    // 额外时刻（--extra-times=62.5,88）：绝对秒，逐枚全幅截图。
+    // 刻意不判"属于哪一场"——调用方问的是"这个时刻画面对不对"，
+    // 场归属由人看；工具去猜场界只会把越界时刻包装成合法读数。
+    const extraTimes = (() => {
+        for (const a of args.slice(3)) {
+            if (a.startsWith('--extra-times=')) {
+                return a.slice('--extra-times='.length)
+                    .split(',')
+                    .map(s => parseFloat(s.trim()))
+                    .filter(v => Number.isFinite(v));
+            }
+        }
+        return [];
+    })();
+
     if (!fs.existsSync(htmlPath)) {
         console.error(`HTML not found: ${htmlPath}`);
         process.exit(1);
@@ -388,6 +403,7 @@ async function main() {
 
     let browser;
     const manifest = { scenes: [], errors: [] };
+    if (extraTimes.length) manifest.custom_frames = [];
 
     // Use D: drive for Chrome profile (avoids C: drive accumulation)
     const userDataDir = process.env.CHROME_USER_DATA_DIR || undefined;
@@ -476,6 +492,34 @@ async function main() {
             } catch (err) {
                 console.error(`  Scene ${sceneId} error: ${err.message}`);
                 manifest.errors.push({ sceneId, error: err.message });
+            }
+        }
+
+        // ── 额外时刻全幅截图（--extra-times）：场首/场尾两点盖不到的版式核对 ──
+        // 截图尺寸＝视口＝组合画布（见上方 setViewport），不另设缩放参数：
+        // 缩略图判断不出"浮空箭头""批注压安全线"这类缺陷，全幅才有判断力。
+        for (const t of extraTimes) {
+            try {
+                if (gsapOk) {
+                    await page.evaluate((time) => {
+                        if (typeof tl !== 'undefined' && tl.seek) {
+                            tl.seek(time, false);
+                            gsap.ticker.tick();
+                        }
+                    }, t);
+                    await new Promise(r => setTimeout(r, 200));
+                }
+                const file = `frame_t${t}.png`;
+                await page.screenshot({ path: path.join(outputDir, file), type: 'png' });
+                manifest.custom_frames.push({
+                    time: t, file,
+                    width: compositionSize.width, height: compositionSize.height,
+                });
+                console.log(`  Extra frame @${t}s -> ${file} `
+                    + `(${compositionSize.width}x${compositionSize.height})`);
+            } catch (err) {
+                console.error(`  Extra frame @${t}s error: ${err.message}`);
+                manifest.errors.push({ sceneId: null, time: t, error: err.message });
             }
         }
 

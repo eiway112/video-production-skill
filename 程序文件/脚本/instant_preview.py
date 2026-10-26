@@ -892,6 +892,10 @@ def main():
     parser.add_argument("--bar-overflow-rules", default=None,
                         help="覆盖 bar_overflow 阈值文件路径（回归取证用；默认读 "
                              "config/quality/video_quality_rules.json 单一权威源）")
+    parser.add_argument("--times", default=None,
+                        help="额外按绝对秒抽帧（逗号分隔，如 62.5,88）。产出为组合画布全幅 PNG，"
+                             "落项目 temp 的 preview_frame_<秒>.png；服务场首/场尾两点盖不到的"
+                             "版式核对（浮空箭头、批注压线等）。与 --density-only 互斥")
     args = parser.parse_args()
 
     html_path = Path(args.html)
@@ -918,6 +922,34 @@ def main():
     scenes = config.get("scenes", [])
     video_duration = float(config.get("video_duration", 0))
 
+    # 额外时刻（--times）：只裁"问得出、答得到"。越界时刻会截到封面帧或黑帧，
+    # 那种读数最容易被误读成"画面缺失"，故在起跑前 fail-loud，不截了再说。
+    extra_times = []
+    if args.times is not None:
+        if args.density_only:
+            print("ERROR: --times 需要截图，与 --density-only 互斥")
+            return 1
+        for raw in args.times.split(','):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                t = float(raw)
+            except ValueError:
+                print(f"ERROR: --times 含非数字项：{raw!r}")
+                return 1
+            if t < 0:
+                print(f"ERROR: --times 不得为负：{t:g}")
+                return 1
+            if video_duration > 0 and t >= video_duration:
+                print(f"ERROR: --times {t:g}s 超出视频时长 {video_duration:g}s"
+                      "（会截到片尾之后，读数不可信）")
+                return 1
+            extra_times.append(t)
+        if not extra_times:
+            print("ERROR: --times 解析后为空")
+            return 1
+
     # Determine output paths
     # 受管目录名单段性校验，口径同 pipeline_runner（2026-10-16 回灌批）：
     # 带路径的 temp_subdir 会穿透拼接造出 过程产物/临时产物/过程产物/临时产物/...
@@ -935,11 +967,19 @@ def main():
     print(f"  HTML:   {html_path.name}")
     print(f"  Config: {config_path.name}")
     print(f"  Scenes: {len(scenes)}, Duration: {video_duration}s")
+    if extra_times:
+        print(f"  Extra frames: {', '.join(f'{t:g}s' for t in extra_times)}")
     print()
 
     # --- Phase 1: Animation Density Analysis (always runs) ---
     print("--- Phase 1: Animation Density Analysis ---")
     html_content = html_path.read_text(encoding='utf-8')
+    # CUE-MAP 缺块会静默改变预览读数：`C` 未定义时 cueGlow 直接 return，元素永不亮，
+    # 画面看起来像排版缺件。块由 timeline 步写，故"新挂 cue 先预览"这一序错须点名，
+    # 不能让人按排版去改两轮（同族：文档已写明两种成因，这里让机算也说得出口径）。
+    if 'data-cue-at' in html_content and 'CUE-MAP-START' not in html_content:
+        print("  [WARN] 声明了 data-cue-at 但 HTML 无 CUE-MAP 块（timeline 步尚未跑过）："
+              "预览期 C 未定义，cue 点亮不会执行——先跑 timeline 再据预览判断画面")
     density = analyze_animation_density(html_content, scenes, cover_duration)
 
     desert_windows = []
@@ -1072,6 +1112,10 @@ def main():
                 cmd += [f"--fit-min-cpl={text_fit_rules['min_chars_per_line']:g}",
                         f"--fit-min-lines={text_fit_rules['min_lines']:g}",
                         f"--fit-min-chars={text_fit_rules['min_chars']:g}"]
+            # 时刻值随命令行下传（取数在 node、裁定在此）；两侧字面必须一致，
+            # 改名而不改对面＝静默不出图（用例87 D12 段锁同一枚字面）
+            if extra_times:
+                cmd += ["--extra-times=" + ",".join(f"{t:g}" for t in extra_times)]
             print(f"  Running: {' '.join(cmd[:3])} ...")
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
@@ -1095,7 +1139,12 @@ def main():
                     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
                     capture_count = len(manifest.get("scenes", []))
                     for err in manifest.get("errors", []):
-                        print(f"    capture error: scene {err.get('sceneId')}: {err.get('error')}")
+                        if err.get("sceneId") is None:
+                            print(f"    capture error: extra frame "
+                                  f"@{err.get('time')}s: {err.get('error')}")
+                        else:
+                            print(f"    capture error: scene {err.get('sceneId')}: "
+                                  f"{err.get('error')}")
 
                     # 覆盖率裁定：Chrome 渲染进程中途崩溃时 manifest 只含部分场景
                     # （2026-09-03 实测：某商业类项目截到 5/11 后 Target closed），
@@ -1146,6 +1195,19 @@ def main():
                             dst = temp_dir / f"preview_{entry['file']}"
                             if src.exists():
                                 shutil.copy2(str(src), str(dst))
+
+                        # 额外时刻帧：本就走组合画布全幅截图（不是网格缩略图），
+                        # 落项目 temp 以便交付前肉眼核对；缺失即点名，不得静默少图
+                        for entry in manifest.get("custom_frames", []):
+                            src = capture_dir / entry["file"]
+                            dst = temp_dir / f"preview_frame_{entry['time']:g}.png"
+                            if src.exists():
+                                shutil.copy2(str(src), str(dst))
+                                print(f"  Frame @{entry['time']:g}s → {dst.name}"
+                                      f"（{entry.get('width')}x{entry.get('height')} 全幅）")
+                            else:
+                                print(f"  [WARN] 额外时刻 @{entry['time']:g}s 未产出图片："
+                                      f"{entry['file']}")
 
                         # 安全区预检（prefab 复盘决策一）：溢出在此阻断，
                         # 不把布局问题拖到全量渲染后才暴露。

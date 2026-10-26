@@ -13776,10 +13776,14 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         above subtitle safety line" 伪文案、点名 [UNTESTED]；且 accept 开关不覆盖它
       D9  判据模块装不上（ImportError）→ 按取舍**不阻断**（本机缺依赖不得报成成片有缺陷），
         但伪 PASS 撤掉、未测点名——本条锁的是"报而不拦"这一取舍，两个方向的漂移都拦
+      D12 额外时刻抽帧（`--times`）：下传 `--extra-times=` 并落盘点名（D12a/D12b）；
+        越界（≥ video_duration）起跑前拒绝且不启动子进程（D12c 三断言）；
+        非数字与 `--density-only` 同用各自归因点名（D12d/D12e）
     E 取数面锚定（`preview_capture.js`）：行盒取 `getClientRects()`、时刻含 start+2.5 与
       end-1.5、E8 键契约双向锁（JS 的 out.push 名册 ⊇ 裁定面消费的节点键，改名即红；
       单靠 B10 的缺键判未测只兜住运行时，兜不住"静默少测"这一长期形态）、经 `tl.seek` 落位、逐元素取**跨采样最优**读数、JS 侧不写死阈值且不出裁定
-      （JS 无 verdict 字样——裁定单点住 Python）
+      （JS 无 verdict 字样——裁定单点住 Python）；E10 额外时刻的两向字面契约
+      （`--extra-times=` 与 `custom_frames` 两侧须同字面，只改一侧即静默不出图）
     F 生效路径：`_step_inputs("preview")` 登记 `preview_capture.js` 与 `video_quality_rules.json`，
       且**改这两个文件的字节真的使预览指纹变化**（只登记不生效＝A06 同族；未登记＝
       新判据对全部存量项目静默不生效）
@@ -14068,6 +14072,8 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
                     cd.mkdir(parents=True, exist_ok=True)
                     for e in manifest_obj.get("scenes", []):
                         Image.new("RGB", (40, 40), (0, 0, 0)).save(cd / e["file"])
+                    for e in manifest_obj.get("custom_frames", []):
+                        Image.new("RGB", (40, 40), (0, 0, 0)).save(cd / e["file"])
                     (cd / "capture_manifest.json").write_text(
                         json.dumps(manifest_obj, ensure_ascii=False), encoding="utf-8")
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -14208,6 +14214,36 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         tc.assert_true("All scenes stay above subtitle safety line" not in out,
                        f"D9d skipped 不得读成 PASS：\n{out[-400:]}")
 
+        # ── D12 额外时刻抽帧（--times）：接线、越界与互斥三态 ──
+        # 存在理由：场首/场尾两点盖不到的形态（场初浮空箭头、批注压安全线）此前
+        # 只能每次现写 puppeteer 探针；探针写法各有各的坑，读数不可比。现按绝对秒
+        # 点名要帧，故"点了名没出图"必须在三处出声：未下传、越界、与 --density-only 同用。
+        _CF = {"scenes": [{"sceneId": 1, "frame": "start", "time": 3.0,
+                           "file": "scene_1_start.png"}],
+               "custom_frames": [{"time": 12.0, "file": "frame_t12.png",
+                                  "width": 1080, "height": 1920}],
+               "text_fit": FIT_OK, "bar_overflow": BAR_OK}
+        rc, out, cmds, record = _drive(_CF, rules_payload=GOOD, extra=["--times", "12"])
+        tc.assert_equal(rc, 0, f"D12 带 --times 仍正常出报告：{rc}\n{out[-400:]}")
+        tc.assert_true("--extra-times=12" in cmds[-1] if cmds else False,
+                       f"D12a 时刻须下传给取数侧（未下传＝静默不出图）：{cmds[-1] if cmds else '<无子进程>'}")
+        tc.assert_true("preview_frame_12.png" in out,
+                       f"D12b 额外帧须落到项目 temp 并点名（只截不留＝下次还得现写探针）：\n{out[-400:]}")
+
+        rc, out, cmds, record = _drive(MANIFEST_OK, rules_payload=GOOD, extra=["--times", "40"])
+        tc.assert_equal(rc, 1, f"D12c 时刻 ≥ video_duration 须起跑前拒绝（截到片尾之后）：{rc}")
+        tc.assert_true("超出视频时长" in out, f"D12c2 越界归因点名：\n{out[-300:]}")
+        tc.assert_true(not cmds, f"D12c3 越界轮不得启动取数子进程（拒绝要在付代价之前）：{cmds}")
+
+        rc, out, cmds, record = _drive(MANIFEST_OK, rules_payload=GOOD, extra=["--times", "abc"])
+        tc.assert_equal(rc, 1, f"D12d 非数字时刻须拒绝：{rc}")
+        tc.assert_true("非数字项" in out, f"D12d2 归因区分于越界（不得都报一句成片缺陷）：\n{out[-300:]}")
+
+        rc, out, cmds, record = _drive(MANIFEST_OK, rules_payload=GOOD,
+                                       extra=["--times", "12", "--density-only"])
+        tc.assert_equal(rc, 1, f"D12e 与 --density-only 互斥须拒绝（无截图何来额外帧）：{rc}")
+        tc.assert_true("互斥" in out, f"D12e2 互斥归因点名：\n{out[-300:]}")
+
         # ── E 取数面锚定（JS 无行为接缝可跑：云端 runner 无 Chrome，故按源码面锁契约） ──
         js = (script_dir / "preview_capture.js").read_text(encoding="utf-8")
         tc.assert_true("getClientRects()" in js and "createRange()" in js,
@@ -14235,6 +14271,15 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
         tc.assert_true("scene.scene_id === undefined" in js
                        and "scene.scene_id === null" in js,
                        "E9b sceneId 只兜底 undefined/null 两形态")
+
+        # E10 额外时刻的**两向字面契约**：开关名与 manifest 键名必须两侧同字面。
+        # 只改一侧＝调用方点了名、取数侧不认识 → 静默不出图（与 E8 的键契约同族）：
+        import inspect as _inspect
+        _main_src = _inspect.getsource(ip.main)
+        tc.assert_true("--extra-times=" in js and "custom_frames" in js,
+                       "E10a JS 侧须解析 --extra-times= 并写 custom_frames（改名即红）")
+        tc.assert_true("--extra-times=" in _main_src and 'custom_frames' in _main_src,
+                       "E10b Python 侧须用同一枚开关名与同一 manifest 键（两侧各写各的即断链）")
 
         # E8 键契约双向锁：JS 发什么键、Python 读什么键，两侧各取一次源码对撞。
         # 存在理由——B10 之前"缺 capacity 即视为达标"正是靠这个空档发生的：改名不发一言，
