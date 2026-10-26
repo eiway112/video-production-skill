@@ -108,6 +108,357 @@ def extract_root_attrs(html):
     return dict(re.findall(r'\bdata-([\w-]+)="([^"]*)"', m.group(0)))
 
 
+# ── 脚本变更的归属解析（2026-10-26 效率批 3） ──
+#
+# 病灶：白名单要求"脚本/时间轴/旁白全等"，而卡片点亮时刻按定义住在 <script> 里 ⇒
+# 每一轮节奏/观感修订都判 FULL（一支已交付项目实测 attempts 5 / hits 0，
+# 原因逐字 html-outside-scenes-changed）。本批把"变了哪些场景"从"script 字节变没变"
+# 改为"改动的语句瞄准哪些场景的元素"，逐语句裁定。
+#
+# 判据是**结构**而非文本相似度。一条语句要能归给某场，须同时满足：
+#   ① 语句里至少有一个静态选择器（GSAP 目标字面量 / querySelector* 实参 /
+#      形如 "#id"、".cls" 的字面量），且每个都能在 DOM 里解析到**场景内**的元素；
+#   ② 这些元素不得在场景 div 之外另有实例（#chapter 这类常驻标识 → 无从归属）；
+#   ③ 语句带显式时间位（to/from/set 的第 3 参、fromTo 的第 4 参），且锚里的
+#      `T.<场>` 必须落在①解出的场景集合内——`tl.to("#scene7", …, T.s8)` 这类
+#      跨窗口语句因此判 FULL（元素属 s7，被改的帧却在 s8 的窗口里）。
+# 任一条不满足即**点名**退回全量，不得由"没解析到"读成"无影响"。
+#
+# 刻意不做的三件事：
+#   - 不做数据流分析：变量目标（`tl.to(el, …)`）单独出现时判 FULL；只有同一条语句
+#     里另有静态选择器、且 T 锚落在该选择器的场景集合内才放行（IIFE 形态
+#     `querySelectorAll(".s2-drops span").forEach(el => tl.fromTo(el, …, T.s2+…))`
+#     即此类）。共享 helper 的函数体通常没有静态选择器 → 仍判 FULL（硬约束）。
+#   - 不按时间位反推受影响窗口：窗口外的尾段（转场重叠、repeat:-1 动画）与既有
+#     "场景 div 内容改动"同族、既有实现同口径，属设计边界而非本批新增。
+#   - 不 bump SIDECAR_VERSION：旧 sidecar 缺 script_attribution 时，只要脚本变了
+#     即判 FULL（＝修复前行为），下一次全量渲染写入新键后生效。存量项目零额外重渲。
+
+_GSAP_CALL_RE = re.compile(r'\.(to|from|fromTo|set)\s*\(')
+_SELECTOR_CALL_RE = re.compile(
+    r'(?:document\s*\.\s*querySelectorAll|document\s*\.\s*querySelector|'
+    r'document\s*\.\s*getElementById|gsap\s*\.\s*utils\s*\.\s*toArray)'
+    r'\s*\(\s*(["\'])(.*?)\1')
+_QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\'')
+_HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{3,8}$')
+_IDENT_RE = re.compile(r'([#.])([A-Za-z0-9_-]+)')
+_T_REF_RE = re.compile(r'\bT\s*(?:\.\s*([A-Za-z_]\w*)|\[\s*["\']([A-Za-z_]\w*)["\']\s*\])')
+
+
+def strip_js_comments(src):
+    """去 `//` 与 `/* */` 注释（字符串字面量内的斜杠不算注释）。"""
+    out, i, n, state = [], 0, len(src), None
+    while i < n:
+        c = src[i]
+        if state is None:
+            if c in "'\"`":
+                state = c
+                out.append(c)
+                i += 1
+            elif c == "/" and i + 1 < n and src[i + 1] == "/":
+                while i < n and src[i] != "\n":
+                    i += 1
+            elif c == "/" and i + 1 < n and src[i + 1] == "*":
+                i += 2
+                while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                    i += 1
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if c == state:
+                state = None
+            i += 1
+    return "".join(out)
+
+
+def _norm_js(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_js_statements(src):
+    """按顶层 `;` 与收尾 `}` 切语句（字符串与括号深度内不切）。
+
+    IIFE/函数体因此是一个整体：其内部对变量的动画调用与常量数组不会各自成句，
+    归属判定在整句面上做（见模块注释"刻意不做数据流分析"）。
+    """
+    stmts, buf, i, n, state, depth = [], [], 0, len(src), None, 0
+    while i < n:
+        c = src[i]
+        if state is not None:
+            buf.append(c)
+            if c == "\\" and i + 1 < n:
+                buf.append(src[i + 1])
+                i += 2
+                continue
+            if c == state:
+                state = None
+            i += 1
+            continue
+        if c in "'\"`":
+            state = c
+            buf.append(c)
+        elif c in "([{":
+            depth += 1
+            buf.append(c)
+        elif c in ")]}":
+            depth -= 1
+            buf.append(c)
+            if c == "}" and depth == 0:
+                st = _norm_js("".join(buf))
+                if st:
+                    stmts.append(st)
+                buf = []
+        elif c == ";" and depth == 0:
+            st = _norm_js("".join(buf))
+            if st:
+                stmts.append(st)
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    tail = _norm_js("".join(buf))
+    if tail:
+        stmts.append(tail)
+    return stmts
+
+
+def _match_paren(text, open_idx):
+    """返回与 text[open_idx]=='(' 配对的 ')' 下标；配不上返 None。"""
+    state, depth = None, 0
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if state is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == state:
+                state = None
+        elif c in "'\"`":
+            state = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _split_args(text):
+    """按顶层逗号切实参。"""
+    args, buf, state, depth = [], [], None, 0
+    for c in text:
+        if state is not None:
+            buf.append(c)
+            if c == state:
+                state = None
+            continue
+        if c in "'\"`":
+            state = c
+            buf.append(c)
+        elif c in "([{":
+            depth += 1
+            buf.append(c)
+        elif c in ")]}":
+            depth -= 1
+            buf.append(c)
+        elif c == "," and depth == 0:
+            args.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(c)
+    tail = "".join(buf).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _gsap_calls(stmt):
+    """语句内的 GSAP 调用：[{name, args}]，跨行链式调用按各自实参表分开。"""
+    calls = []
+    for m in _GSAP_CALL_RE.finditer(stmt):
+        open_idx = stmt.index("(", m.end() - 1)
+        end = _match_paren(stmt, open_idx)
+        if end is None:
+            continue
+        calls.append({"name": m.group(1), "args": _split_args(stmt[open_idx + 1:end])})
+    return calls
+
+
+def _quoted_head(arg):
+    """实参若整体是一个字符串字面量则返回其内容，否则 None。"""
+    m = re.fullmatch(r'\s*(["\'])(.*?)\1\s*', arg, re.S)
+    return m.group(2) if m else None
+
+
+def outside_elements_text(html):
+    """场景 div 之外、且去掉 style/script 内容的元素面（判"常驻元素"用）。"""
+    residual = html
+    for _, text, _, _ in reversed(extract_scene_blocks(html)):
+        residual = residual.replace(text, "", 1)
+    residual = re.sub(r'<style\b[^>]*>[\s\S]*?</style>', "", residual)
+    residual = re.sub(r'<script\b[^>]*>[\s\S]*?</script>', "", residual)
+    return residual
+
+
+def _element_marker(kind, token):
+    if kind == "#":
+        return re.compile(r'\bid\s*=\s*["\']' + re.escape(token) + r'["\']')
+    return re.compile(r'\bclass\s*=\s*["\'][^"\']*(?<![\w-])'
+                      + re.escape(token) + r'(?![\w-])[^"\']*["\']')
+
+
+def resolve_selector(selector, blocks, outside):
+    """选择器 → 场景 id 集合。
+
+    返回 (scenes, cause)：cause 非 None 时 scenes 无意义。语义是"该选择器只可能命中
+    这些场景里的元素"——逗号分隔的各编译单元先各自把 #id/.class 记号取交集，再取
+    并集；任一单元有记号在场景外另有实例、或解析不到，即点名退回全量。
+    """
+    parts = [p for p in selector.split(",") if p.strip()]
+    if not parts:
+        return set(), f"selector-without-id-or-class({selector.strip()[:40]})"
+    union = set()
+    for part in parts:
+        marks = _IDENT_RE.findall(part)
+        if not marks:
+            return set(), f"selector-without-id-or-class({selector.strip()[:40]})"
+        scenes = None
+        for kind, token in marks:
+            marker = _element_marker(kind, token)
+            inside = {sid for sid, text, _, _ in blocks if marker.search(text)}
+            if marker.search(outside):
+                return set(), f"selector-outside-scenes({selector.strip()[:40]})"
+            if not inside:
+                return set(), f"selector-unresolved({selector.strip()[:40]})"
+            scenes = inside if scenes is None else (scenes & inside)
+        if not scenes:
+            return set(), f"selector-split-across-scenes({selector.strip()[:40]})"
+        union |= scenes
+    return union, None
+
+
+def _statement_selectors(stmt):
+    """语句内的静态选择器：GSAP 目标字面量 ＋ querySelector* 实参 ＋ #/. 字面量。"""
+    sels = []
+    for call in _gsap_calls(stmt):
+        if call["args"]:
+            head = _quoted_head(call["args"][0])
+            if head:
+                sels.append(head)
+    for m in _SELECTOR_CALL_RE.finditer(stmt):
+        sels.append("#" + m.group(2) if "getElementById" in m.group(0) else m.group(2))
+    for m in _QUOTED_RE.finditer(stmt):
+        val = (m.group(1) if m.group(1) is not None else m.group(2) or "").strip()
+        if val[:1] in ("#", ".") and not _HEX_COLOR_RE.match(val):
+            sels.append(val)
+    return sels
+
+
+def attribute_statement(stmt, blocks, outside):
+    """单条语句 → (目标场景集合, cause)。cause 非 None 即"无从归属"。"""
+    sels = _statement_selectors(stmt)
+    if not sels:
+        return set(), f"no-static-target(:{stmt[:70]})"
+
+    targets = set()
+    for sel in sels:
+        scenes, cause = resolve_selector(sel, blocks, outside)
+        if cause:
+            return set(), cause
+        targets |= scenes
+
+    for call in _gsap_calls(stmt):
+        need = 4 if call["name"] == "fromTo" else 3
+        if len(call["args"]) < need:
+            return set(), f"append-position(:{stmt[:70]})"
+
+    anchors = {a or b for a, b in _T_REF_RE.findall(stmt)}
+    if not anchors:
+        return set(), f"no-time-anchor(:{stmt[:70]})"
+    stray = sorted(anchors - targets)
+    if stray:
+        return set(), (f"anchor-outside-target({', '.join('T.' + s for s in stray)}"
+                       f"∉{','.join(sorted(targets))})")
+    return targets, None
+
+
+def _all_script_text(html):
+    return strip_js_comments(
+        "\n".join(re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html)))
+
+
+def script_attribution_map(html):
+    """每条脚本语句的归属结论（写 sidecar，供下一轮 classify 对撞）。
+
+    键＝归一化语句文本的 sha256 前 16 位；值＝{"scenes": [...]} 或
+    {"err": cause, "sample": 语句前 80 字}。缺该键的旧 sidecar 由 classify 判
+    FULL（修复前行为）。
+    """
+    blocks = extract_scene_blocks(html)
+    outside = outside_elements_text(html)
+    out = {}
+    for stmt in split_js_statements(_all_script_text(html)):
+        key = _sha256(stmt)[:16]
+        if key in out:
+            continue
+        scenes, cause = attribute_statement(stmt, blocks, outside)
+        out[key] = ({"err": cause, "sample": stmt[:80]} if cause
+                    else {"scenes": sorted(scenes)})
+    return out
+
+
+def diff_script_attribution(base_map, cur_map):
+    """脚本差分 → (归属场景集合, cause)。
+
+    两边的键是同一套归一化语句哈希；值是该语句在**当轮 DOM** 上的归属结论。
+    新增语句用当前结论，被删语句用 sidecar 里当轮的结论（旧 DOM 上的结论，
+    不能拿新 DOM 重判）。
+    """
+    added = [rec for k, rec in cur_map.items() if k not in base_map]
+    removed = [rec for k, rec in base_map.items() if k not in cur_map]
+    if not added and not removed:
+        return set(), "script-format-or-order-changed"
+
+    scenes = set()
+    for label, recs in (("added", added), ("removed", removed)):
+        for rec in recs:
+            if rec.get("err"):
+                return set(), (f"script-{label}-unattributable({rec['err']}"
+                               f" @{rec.get('sample', '')[:60]})")
+            scenes |= set(rec.get("scenes") or [])
+    return scenes, None
+
+
+def outside_scene_hash(html):
+    """场景外、且**不含 <script> 内容**的残余哈希（脚本体已被独立归属）。
+
+    2026-10-26 效率批 3：`residual_hash` 把 `<script>` 正文也算进"场景外残余"，
+    于是任何脚本改动在抵达脚本归属腿之前就被 `html-outside-scenes-changed` 全量
+    否决（本项目 5 次尝试的 reason 逐字即此）。本键把脚本体挖空后再哈希，
+    只保留"结构与场景外元素"这一层；标签本身（含 `src` 属性）保留在面内，故换库
+    或改 src 仍判 FULL。
+
+    旧 sidecar 没有本键 → classify 退回 `residual_hash` 的整份口径（＝修复前行为），
+    下一次全量渲染写入本键后生效。两个键并存不是双源：`residual_hash` 是粗粒度
+    "场景外有没有变"，本键只用于解释该差异是否可由脚本改动承担。
+    """
+    residual = html
+    for _, text, _, _ in reversed(extract_scene_blocks(html)):
+        residual = residual.replace(text, "", 1)
+    residual = re.sub(r'(<script\b[^>]*>)[\s\S]*?(</script>)', r'\1\2', residual)
+    return _sha256(residual)
+
+
 def extract_fingerprints(html, config, narration_path):
     """场景指纹 + 白名单外全部内容的指纹。"""
     blocks = extract_scene_blocks(html)
@@ -135,10 +486,12 @@ def extract_fingerprints(html, config, narration_path):
         "scene_order": scene_order,
         "scene_hashes": scene_hashes,
         "residual_hash": residual_hash,
+        "outside_scene_hash": outside_scene_hash(html),
         "style_hash": style_hash,
         "script_hash": script_hash,
         "config_hash": config_hash,
         "narration_hash": narration_hash,
+        "script_attribution": script_attribution_map(html),
     }
 
 
@@ -480,15 +833,33 @@ class PatchRenderer:
 
         if cur["scene_order"] != base.get("scene_order"):
             return full("scene-structure-changed")
-        # 白名单外一律全量：style/script/config时间字段/narration/残余HTML
-        for key, label in (("residual_hash", "html-outside-scenes"),
-                           ("style_hash", "style"), ("script_hash", "script"),
+        # 场景外残余：旧 sidecar 只有含脚本正文的粗粒度哈希，一差即全量（修复前
+        # 行为）；新 sidecar 另有"脚本正文已摘出"的细粒度键，用于判断差异是否
+        # 只由脚本体承担（能承担的交给下面的语句归属腿）。
+        if cur["residual_hash"] != base.get("residual_hash"):
+            if ("outside_scene_hash" not in base
+                    or cur["outside_scene_hash"] != base["outside_scene_hash"]):
+                return full("html-outside-scenes-changed")
+        # 白名单外一律全量：style/config时间字段/narration
+        for key, label in (("style_hash", "style"),
                            ("config_hash", "config-render-fields"),
                            ("narration_hash", "narration")):
             if cur[key] != base.get(key):
                 return full(f"{label}-changed")
         if times != base.get("scene_times"):
             return full("scene-timing-changed")
+
+        # 脚本变更：按"改动语句瞄准哪些场景的元素"归属，不再按字节全等否决
+        # （2026-10-26 效率批 3）。任一改动语句无从归属即点名退回全量。
+        script_scenes = set()
+        if cur["script_hash"] != base.get("script_hash"):
+            base_map = base.get("script_attribution")
+            if not isinstance(base_map, dict):
+                return full("sidecar-no-script-attribution")
+            script_scenes, script_err = diff_script_attribution(
+                base_map, cur["script_attribution"])
+            if script_err:
+                return full(script_err)
 
         # 帧网格：总帧数必须与时长×fps吻合（拼接前提）。
         # 2026-10-21 审计批：容差由 0 放宽到 1 帧。ffprobe 的 nb_frames 与
@@ -502,8 +873,9 @@ class PatchRenderer:
             return full(f"frame-grid-mismatch(frames={base.get('total_frames')}, "
                         f"dur*fps={duration * self.fps})")
 
-        changed = [sid for sid in cur["scene_order"]
-                   if cur["scene_hashes"][sid] != base["scene_hashes"].get(sid)]
+        div_changed = {sid for sid in cur["scene_order"]
+                       if cur["scene_hashes"][sid] != base["scene_hashes"].get(sid)}
+        changed = [sid for sid in cur["scene_order"] if sid in (div_changed | script_scenes)]
         if not changed:
             # 场景内容逐字未变：渲染结果没有变化理由。旧实现返回 FULL，使
             # "只改 config 元数据/HTML 注释"也白付一次全量（2026-10-21 审计批）。
@@ -517,12 +889,15 @@ class PatchRenderer:
                     if sid not in {t["id"] for t in times}]
         changed_head = [sid for sid in head_ids if sid in changed]
         if changed_head:
+            if all(sid in script_scenes and sid not in div_changed for sid in changed_head):
+                return full("cover-head-animation-changed(" + ",".join(changed_head) + ")")
             return full("cover-head-changed(" + ",".join(changed_head) + ")")
         if len(changed) * 2 > len(cur["scene_order"]):
             return full(f"too-many-scenes-changed({len(changed)}/{len(cur['scene_order'])})")
 
         ctx = {"base": base, "times": times, "html": html, "head_ids": head_ids,
-               "witness": base.get("scene_times_witness") or "s-block-end"}
+               "witness": base.get("scene_times_witness") or "s-block-end",
+               "script_scenes": sorted(script_scenes)}
         return "PATCH", changed, "", ctx
 
     # ── patch（段渲染 + 拼接 + 自校验） ──

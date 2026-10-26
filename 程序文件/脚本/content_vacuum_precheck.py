@@ -15,8 +15,13 @@ start+3.0 / end-2.0，覆盖不到这两个时刻，故不能替代本工具。
     python content_vacuum_precheck.py <index.html> [sid:start:dur ...]
     # 省略场景清单时，自动从 HTML 的 `var T = {...}` 与场景 div 推导全部场景窗口
     # 窗口结束＝下一场起点；末场无下一场，取组合自身声明的 data-duration
+    python content_vacuum_precheck.py <index.html> --boundaries
+    # 场边界零渲染采样（观测面）：按 T 块每个场起点取窗，逐帧量覆盖，
+    # 出现"占用恰为 0"的纯平帧即点名该边界。不设门禁、不新增阈值——
+    # 占用量（行占比）没有跨项目一致语义，落到某个阈值就是拍脑袋。
 
 退出码：0=全过，1=存在 VACUUM，2=环境/取数失败或**存在无从裁定的场景**（不得读成通过）。
+  --boundaries 模式：0=观测完成（读数不改变退出码），2=无从观测。
 """
 import argparse
 import re
@@ -79,6 +84,27 @@ def composition_duration(html: str):
     return total if total > 0 else None
 
 
+def scene_starts(html: str):
+    """T 块场起点的**唯一解析点** → (ordered_ids, {id: start})。
+
+    两条腿共用：`parse_scenes`（两点采样空窗判据）与 `--boundaries`（场边界采样）。
+    各写一份正则＝同一份 T 块有两套读法，改一处口径另一处静默不动。
+    顺序：先按场景 div 的 data-scene-id 出现次序取 T 块里有的键，再把 T 块独有的键
+    按起点秒数补进来（与旧实现逐字同序，供 parse_scenes 沿用）。
+    """
+    m = re.search(r"var\s+T\s*=\s*\{([^}]*)\}", html)
+    if not m:
+        raise RuntimeError("HTML 中未找到 `var T = {...}` 时间块，无法推导场景窗口")
+    starts = {k: float(v) for k, v in re.findall(r"(\w+)\s*:\s*([0-9.]+)", m.group(1))}
+    ids = re.findall(r'data-scene-id="([^"]+)"', html)
+    ordered = [i for i in ids if i in starts]
+    for extra in starts:
+        if extra not in ordered:
+            ordered.append(extra)
+    ordered.sort(key=lambda k: starts[k])
+    return ordered, starts
+
+
 def parse_scenes(html: str):
     """从 HTML 推导场景窗口 → (measured, not_applicable, untested)。
 
@@ -91,16 +117,7 @@ def parse_scenes(html: str):
       not_applicable  [(sid, reason)]      短场景豁免，与 visual_boundary_check 同名判据同向
       untested        [(sid, reason)]      窗口无从推导（缺 data-duration／窗口非正）
     """
-    m = re.search(r"var\s+T\s*=\s*\{([^}]*)\}", html)
-    if not m:
-        raise RuntimeError("HTML 中未找到 `var T = {...}` 时间块，无法推导场景窗口")
-    starts = {k: float(v) for k, v in re.findall(r"(\w+)\s*:\s*([0-9.]+)", m.group(1))}
-    ids = re.findall(r'data-scene-id="([^"]+)"', html)
-    ordered = [i for i in ids if i in starts]
-    for extra in starts:
-        if extra not in ordered:
-            ordered.append(extra)
-    ordered.sort(key=lambda k: starts[k])
+    ordered, starts = scene_starts(html)
     total = composition_duration(html)
     measured, not_applicable, untested = [], [], []
     for idx, sid in enumerate(ordered):
@@ -308,18 +325,151 @@ def summarize(measured, not_applicable, untested, total_scenes):
     return 0, lines
 
 
+# ── 场边界零渲染采样（--boundaries，观测面）───────────────────────────
+# 窗宽取自 2026-10-26 那轮的实测有效窗口：封面→S1 的纯平空帧落在 t=5.4–5.8s
+# （场起点 5.5s）——1fps 汇总看不见，10fps 才现形，故窗＝起点前 0.5s 到起点后 1.3s。
+# 判据只有一条，且是"恰为 0"：出现占用（visual_boundary_check 的正文区行占比口径）
+# 为 0 的纯平帧即点名该边界。不设门禁、不新增阈值——占用量没有跨项目一致语义，
+# 阈值落到某处即拍脑袋；本模式因此只出读数，退出码不随读数变化。
+BOUNDARY_PRE = 0.5
+BOUNDARY_POST = 1.3
+BOUNDARY_STEP = 0.1
+
+
+def format_boundary_window() -> str:
+    """取样窗与判据的唯一复述处：数值由常量插值，文案里不写死秒数。"""
+    return (f"窗＝场起点−{BOUNDARY_PRE}s ~ 起点+{BOUNDARY_POST}s，"
+            f"步长 {BOUNDARY_STEP}s（{round(1 / BOUNDARY_STEP)}fps）")
+
+
+def boundary_window(start: float, total=None):
+    """某场起点前后的采样时刻表（含两端；下界截到 0，上界不超过组合总时长）。"""
+    lo = max(0.0, round(start - BOUNDARY_PRE, 3))
+    hi = round(start + BOUNDARY_POST, 3)
+    if total is not None:
+        hi = min(hi, round(float(total), 3))
+    out, i = [], 0
+    while True:
+        t = round(lo + i * BOUNDARY_STEP, 3)
+        if t > hi + 1e-9:
+            break
+        out.append(t)
+        i += 1
+    return out
+
+
+def probe_boundary(chrome, probe, sid, start, work, total, verbose):
+    """一场起点的窗内逐帧占用读数 → 该边界行（纯平帧按**原始** cover 判 0，不取舍入值）。"""
+    frames = []
+    for t in boundary_window(start, total):
+        img = work / f"{sid}_b{int(round(t * 1000)):07d}.png"
+        shoot(chrome, probe, t, img)
+        raw = vbc.measure_content_coverage(img)
+        frames.append((round(t, 2), raw))
+        if verbose:
+            print(f"    t={t:6.2f}s cov={raw:.4f}")
+    blanks = [t for t, raw in frames if raw == 0.0]
+    row = {"sid": sid, "start": start, "frames": frames, "blanks": blanks}
+    if frames:
+        t_min, cov_min = min(frames, key=lambda f: f[1])
+        row["min_cov"], row["min_t"] = cov_min, t_min
+        print(f"  {sid:6s} T={start:6.2f}s  帧 {len(frames):2d}  "
+              f"min={cov_min:.4f}@{t_min:.2f}s  纯平帧 {len(blanks)}"
+              + ("".join(f" @{t:.2f}s" for t in blanks[:6]) if blanks else ""))
+    else:
+        row["min_cov"], row["min_t"] = None, None
+        print(f"  {sid:6s} T={start:6.2f}s  帧 0（窗长非正或已被总时长截空）")
+    return row
+
+
+def summarize_boundaries(rows):
+    """边界观测汇总裁定 → (exit_code, lines)。
+
+    观测面：退出码只回答"观测完成与否"（0/2），不回答"画面好不好"——有纯平帧与
+    没有纯平帧同为 0，读数只进结论行与点名清单。无一行采到帧即判 2：
+    "没有读数"不得读成"边界干净"。
+    """
+    if not rows or not any(r["frames"] for r in rows):
+        return 2, ["UNTESTED: 没有任何场起点进入窗内采样（无从观测，"
+                   "不得由「没有读数」读成「边界干净」）"]
+    named = [r for r in rows if r["blanks"]]
+    frames_n = sum(len(r["frames"]) for r in rows)
+    lines = []
+    if named:
+        lines.append(f"OBSERVED: {len(rows)} 个场起点 / {frames_n} 帧——{len(named)} 个边界"
+                     "出现占用恰为 0 的纯平帧 -> " + ", ".join(r["sid"] for r in named))
+        for r in named:
+            lines.append(f"  - {r['sid']} 起点 {r['start']:.2f}s：纯平 {len(r['blanks'])} 帧 @ "
+                         + ", ".join(f"{t:.2f}s" for t in r["blanks"]))
+    else:
+        lines.append(f"OBSERVED: {len(rows)} 个场起点 / {frames_n} 帧——全部帧占用 > 0，"
+                     "未观测到纯平帧")
+    empty = [r["sid"] for r in rows if not r["frames"]]
+    if empty:
+        lines.append(f"UNTESTED: {len(empty)} 个起点无采样帧（窗长非正或总时长截空）-> "
+                     + ", ".join(empty))
+    lines.append(f"口径：{format_boundary_window()}；判据＝占用恰为 0 即点名该边界。"
+                 "本模式是观测面、不设门禁——退出码不随读数变化（0=观测完成、2=无从观测）；"
+                 "占用量无跨项目一致语义，故不给 PASS/FAIL，也不新增阈值。")
+    return 0, lines
+
+
+def run_boundaries(html_src: Path, verbose: bool):
+    """--boundaries 入口：取 T 块场起点 → 逐边界采窗 → 观测结论。"""
+    try:
+        html_text = html_src.read_text(encoding="utf-8")
+        ordered, starts = scene_starts(html_text)
+    except RuntimeError as e:
+        print(f"UNTESTED: {e}", file=sys.stderr)
+        return 2
+    if not ordered:
+        print("UNTESTED: T 块未给出任何场起点，边界采样无对象", file=sys.stderr)
+        return 2
+    total = composition_duration(html_text)
+    work = BASE_DIR / f"bnd_{html_src.parent.name}"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        chrome = find_chrome()
+        probe, missing = make_probe(html_src, work)
+        print(f"场边界零渲染采样（观测面，不设门禁）: {html_src.parent.name}")
+        print(f"  {format_boundary_window()}")
+        if missing:
+            print(f"  ⚠ HTML 引用了但未能带入工作目录的资源 {len(missing)} 项 -> "
+                  + ", ".join(missing[:8])
+                  + ("…" if len(missing) > 8 else "")
+                  + "（该边界占用仍会偏低，属被测件引用问题）")
+        rows = [probe_boundary(chrome, probe, sid, starts[sid], work, total, verbose)
+                for sid in ordered]
+    except (RuntimeError, OSError) as e:
+        print(f"UNTESTED: {e}", file=sys.stderr)
+        return 2
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    code, lines = summarize_boundaries(rows)
+    for line in lines:
+        print(line)
+    return code
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("html", help="项目 index.html 路径")
     ap.add_argument("scenes", nargs="*",
                     help="sid:start:dur，省略则自动从 HTML 的 T 块推导全部场景")
     ap.add_argument("--quiet", action="store_true", help="不打印点亮行区段")
+    ap.add_argument("--boundaries", action="store_true",
+                    help="场边界零渲染采样（观测面，不设门禁；忽略场景清单参数）")
     args = ap.parse_args()
 
     html_src = Path(args.html).resolve()
     if not html_src.is_file():
         print(f"UNTESTED: 找不到 {html_src}", file=sys.stderr)
         return 2
+
+    if args.boundaries:
+        return run_boundaries(html_src, not args.quiet)
 
     if args.scenes:
         triples = []

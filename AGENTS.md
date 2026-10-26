@@ -134,7 +134,7 @@ preflight → tts → timeline → render
 
 ### 渲染纪律与错误恢复
 
-**预览驱动迭代**：修订任务修改 HTML 后，必须先跑 `instant_preview.py`（秒级出图）确认画面生效且无溢出，确认后才进入渲染；**禁止把全量渲染当预览用**。仅场景 div 内容变化时可用 `pipeline_runner.py --scene-patch` 走场景级增量渲染。
+**预览驱动迭代**：修订任务修改 HTML 后，必须先跑 `instant_preview.py`（秒级出图）确认画面生效且无溢出，确认后才进入渲染；**禁止把全量渲染当预览用**。场景级增量渲染由 render 步**自动尝试**（基线齐备即触发，不再需要开关）：仅场景 div 内容变化时走 PATCH，样式/脚本/时间轴/旁白有变则降级全量；显式退出用 `--no-scene-patch`（旧 `--scene-patch` 已降为兼容 no-op）。
 
 **错误恢复纪律**：
 1. 步骤失败后**先定点诊断，禁止直接 `--fresh`** 全量重置——优先 `--resume`（自动回退到最早失效步）或 `--quick-fix`；长视频（≥300s）或有渲染产物时，`--fresh` 必须显式追加 `--confirm-fresh` 并确认破坏清单

@@ -88,6 +88,11 @@ RENDER_CRITICAL_CHECKS = {
     # 判据本体住 pause_marks.plan_scene，预检与生效路径同一裁定源。
     "pause_declaration",
     "asset_signoff",      # check 14: 屏显/旁白与位点1 素材确认单分叉
+    # check 7e: 插入/删除/重排场景时三处独立书写的东西须一起改——隐藏声明、
+    # 进/退转场语句、z-index 层序。实证：插一场只改了 T 块与 div，新场缺 CSS 节
+    # （t=0 常驻）、旧场退场锚没前移（新场永不退场）、z-index 没重排（层序错位），
+    # 三处里只有"窗口重叠"会被既有检查抓到。
+    "scene_insert",
 }
 
 
@@ -1817,6 +1822,190 @@ def check_text_punctuation(html_path: Path, r: PreflightResult):
                  check_id="text_punct")
 
 
+def check_scene_insert(html_path: Path, r: PreflightResult):
+    """CRITICAL (结构级): 新增/删除/重排场景时，三处独立书写的东西必须一起改。
+
+    存在理由（2026-10-26 效率批 2②；一轮里四处真实踩点、其中三处此前无任何门禁）：
+    把新场插进现有序列时，改号只改了 T 块与 div，三处配套结构没跟上——
+
+      ① 新场没有隐藏声明（项目里其余场都有 `#sceneN{…opacity:0}`）→ 场景从 t=0 起
+         常驻画面并与其它场叠加；
+      ② 旧场的退场语句仍锚在**更后**的边界（原 `#scene8` 退场锚 `T.s10`）→ 插进来的
+         新场既没有自己的转场语句、也没有任何语句退出它，于是它永不退场；
+      ③ z-index 序号没随场序重排（原 `#scene10` 仍是 `z-index:9`）→ 层序与场序错位，
+         错位不报错，只会让整场被压在别的场下面。
+
+    三腿判据（零渲染、零像素、零阈值）：
+      L1 隐藏声明：非封面、且不是"封面遮挡位"（z-index 最低的非封面场——封面在位时它
+         本就不可见）的每个场景 div，须有隐藏声明：`#sceneN` CSS 节 / 该 div 内联 style /
+         它某个 class 规则，三者之一含 opacity:0、visibility:hidden 或 display:none。
+      L2a 转场锚（两条子腿）：① 悬垂——引用 `#sceneN` 的语句锚 `T.sM` 而 T 块里没有 sM
+         （改号/删场的残留）；② 晚锚且正位退场缺位——该场的语句锚在更后的边界 M > N+1、
+         却没有任何语句锚在紧跟的 N+1。只判这两条：晚锚本身是合法补刀形态（存量实证
+         `#scene9` 在 `T.s11` 再压一次 opacity:0，正位退场 `T.s10` 同时在场）。
+      L2b 孤立场：非封面、非末场场景若**一条转场语句都没有**，而邻场有 → 新场没写进/退。
+      L3 层序：声明了 z-index 的非封面场景，其值须等于场序号（`#scene10` → 10）。
+
+    取数纪律：
+      · 脚本面先剥 `/* */` 与行首 `//` 注释再按 `;`/换行切语句——注释里的 `#sceneN`
+        不得凭空造出一条转场语句（cue 声明与 chapter_bar 两处都踩过该形态）；
+      · T 块取不到 → 只把 L2 两腿判不适用并计数（遗留项目用数值锚，全仓 24 份 index.html
+        即此形态），L1/L3 不依赖 T 块照常裁定；
+      · 无 `id="sceneN"` 场景 div → 整体不适用（不同标记形态的项目不在本判据射程内）。
+
+    存量探针（2026-10-26，全仓 72 份 index.html）：L2a/L2b/L3 零命中；L1 命中 1 份
+    （某未发布草稿的 `#scene2` 在 z-index:2 上无隐藏声明、其 `.sc` 带不透底渐变 →
+    封面退场后压在 `#scene1` 之上）。该件是未发布草稿，属判据抓到的真实缺陷，本批不改它。
+
+    check_id: scene_insert（render 模式阻断；audit 模式降 warning）。
+    """
+    print("\n[7e/12] Scene Insert (hidden declaration, transition anchors, z-index order)")
+
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id="scene_insert")
+        return
+
+    content = html_path.read_text(encoding='utf-8')
+
+    # ── 1. 场景 div：class 与内联 style ──
+    divs = {}
+    for m in re.finditer(r'<div\b([^>]*?)>', content):
+        attrs = m.group(1)
+        sid_m = re.search(r'id="scene(\d+)"', attrs)
+        if not sid_m:
+            continue
+        cls = re.search(r'class="([^"]*)"', attrs)
+        sty = re.search(r'style="([^"]*)"', attrs)
+        divs[int(sid_m.group(1))] = (set((cls.group(1) if cls else "").split()),
+                                     sty.group(1) if sty else "")
+    if not divs:
+        r.counts["scene_insert"] = {"scenes": 0, "l1": 0, "l2a": 0, "l2b": 0, "l3": 0}
+        r.ok("无 `id=\"sceneN\"` 场景 div（不同标记形态的项目不在本判据射程内）",
+             check_id="scene_insert")
+        return
+
+    # ── 2. CSS 面：`#sceneN` 节与 class 规则（注释先剥，`{ }` 在注释里会切错规则）──
+    styles = "".join(re.findall(r'<style[^>]*>(.*?)</style>', content, re.DOTALL))
+    styles = re.sub(r'/\*.*?\*/', '', styles, flags=re.DOTALL)
+    id_rule, class_rule = {}, {}
+    for sel_list, body in re.findall(r'([^{}]+)\{([^{}]*)\}', styles):
+        for one in (s.strip() for s in sel_list.split(',')):
+            m = re.fullmatch(r'#scene(\d+)', one)
+            if m:
+                k = int(m.group(1))
+                id_rule[k] = id_rule.get(k, "") + ";" + body
+                continue
+            m = re.fullmatch(r'\.([A-Za-z_][\w-]*)', one)
+            if m:
+                class_rule[m.group(1)] = class_rule.get(m.group(1), "") + ";" + body
+
+    HIDE = re.compile(r'opacity\s*:\s*0(?![.\d])|visibility\s*:\s*hidden'
+                      r'|display\s*:\s*none')
+
+    def _hidden(n):
+        cls, sty = divs[n]
+        if HIDE.search(id_rule.get(n, "")) or HIDE.search(sty):
+            return True
+        return any(HIDE.search(class_rule.get(c, "")) for c in cls)
+
+    def _z(n):
+        m = re.search(r'z-index\s*:\s*(-?\d+)', id_rule.get(n, "") + ";" + divs[n][1])
+        return int(m.group(1)) if m else None
+
+    cover = min(divs)
+    others = sorted(n for n in divs if n != cover)
+    zs = {n: _z(n) for n in divs}
+
+    # 封面遮挡位：z-index 最低的非封面场。封面在其上且不透底，故它 t=0 时本就不可见。
+    shadowed = None
+    if others and zs[cover] is not None:
+        cand = [n for n in others if zs[n] is not None]
+        if cand:
+            low = min(cand, key=lambda n: zs[n])
+            if zs[cover] > zs[low]:
+                shadowed = low
+
+    # ── L1 隐藏声明 ──
+    l1 = [n for n in others if n != shadowed and not _hidden(n)]
+    for n in l1:
+        r.error(
+            f"#scene{n} 没有任何隐藏声明（`#scene{n}` CSS 节 / 该 div 内联 style / "
+            f"class 规则三处都没有 opacity:0 或 visibility:hidden）——该场从 t=0 起常驻画面、"
+            f"与其它场叠加。插入新场时最容易漏掉这一节",
+            check_id="scene_insert")
+
+    # ── 3. 脚本面：剥注释后按语句切 ──
+    scripts = "".join(re.findall(r'<script[^>]*>(.*?)</script>', content, re.DOTALL))
+    t_map = _parse_t_block(scripts)
+    scripts = re.sub(r'/\*.*?\*/', '', scripts, flags=re.DOTALL)
+    scripts = re.sub(r'^\s*//.*$', '', scripts, flags=re.M)
+    stmts = [s for s in re.split(r'[;\n]', scripts) if s.strip()]
+
+    def _refs(n):
+        pat = re.compile(r'["\']#scene%d(?!\d)' % n)
+        return [s for s in stmts if pat.search(s)]
+
+    scene_keys = sorted(set(divs) | set(t_map))
+
+    # ── L2a 转场锚（悬垂 / 晚锚且正位退场缺位）──
+    # 晚锚本身不判错：存量两种写法并存——合法补刀（正位退场也在，再在更后边界压一次
+    # opacity:0）与真实缺陷（旧场退场仍锚更后边界，新场插进序列后无人退出它）。
+    l2a = []
+    if t_map:
+        for n in scene_keys:
+            anchors = set()
+            for s in _refs(n):
+                anchors.update(int(x) for x in re.findall(r'T\.s(\d+)', s))
+            for j in sorted(anchors):
+                if j == 0:
+                    continue          # T.s0＝封面边界（初始化位点），存量里常不声明该键
+                if j not in t_map:
+                    l2a.append((n, j, "悬垂：T 块里没有这一键（改号或删场的残留）"))
+            late = sorted(j for j in anchors if j > n + 1 and j in t_map)
+            if late and (n + 1) not in anchors:
+                l2a.append((n, late[-1],
+                            f"非紧邻边界且正位退场缺位（没锚在 T.s{n + 1}）"))
+        for n, j, why in l2a:
+            r.error(
+                f"引用 #scene{n} 的转场语句锚在 T.s{j}——{why}。"
+                f"该场边界应为 T.s{n}（进场）或 T.s{n + 1}（退场）",
+                check_id="scene_insert")
+
+    # ── L2b 孤立场 ──
+    l2b = []
+    if t_map:
+        order = sorted(t_map)
+        for n in order[1:-1]:
+            if _refs(n):
+                continue
+            nb = [k for k in (n - 1, n + 1) if _refs(k)]
+            if nb:
+                l2b.append((n, nb))
+        for n, nb in l2b:
+            r.error(
+                f"#scene{n} 没有任何转场语句（进/退两条都没有），而邻场 {nb} 有——"
+                f"新场插进序列后没接上转场范式，它会从插入的那一刻起一直留在画面上",
+                check_id="scene_insert")
+
+    # ── L3 层序 ──
+    l3 = [(n, zs[n]) for n in others if zs[n] is not None and zs[n] != n]
+    for n, z in l3:
+        r.error(
+            f"#scene{n} 的 z-index 是 {z}，与场序 {n} 不一致——重排场景后层序没跟着改；"
+            f"层序错位不报错，只会让整场被压在其它场下面",
+            check_id="scene_insert")
+
+    r.counts["scene_insert"] = {"scenes": len(divs), "l1": len(l1), "l2a": len(l2a),
+                                "l2b": len(l2b), "l3": len(l3)}
+    if not t_map:
+        r.info("T 块取不到（`var T = {...}`）→ L2 两腿不适用：本件用数值锚或其它写法，"
+               "转场锚无可核对；L1/L3 已照常裁定", check_id="scene_insert")
+    if not (l1 or l2a or l2b or l3):
+        r.ok(f"{len(divs)} 个场景三腿一致（隐藏声明 {len(others) - len(l1)}/"
+             f"{len(others)}、转场锚{len(l2a)}处异常、孤立场{len(l2b)}处、层序{len(l3)}处）",
+             check_id="scene_insert")
+
+
 def check_design_rules(html_path: Path, r: PreflightResult):
     """Check for known design anti-patterns that cause visual quality issues."""
     print("\n[8/12] Design Rules")
@@ -2712,6 +2901,7 @@ def main():
     check_element_reveal(html_path, r)
     check_chapter_bar(html_path, r)
     check_text_punctuation(html_path, r)
+    check_scene_insert(html_path, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)
     check_placeholder_images(html_path, r)

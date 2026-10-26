@@ -4,20 +4,23 @@
 项目清理工具 — 事务式过程产物管理
 
 清理维度:
-  1. 渲染缓存    — work-* 目录、tts_44k、scene_N.mp3、bgm.wav
-  2. 中间视频    — render_new.mp4、final_output.mp4（render_raw.mp4 见下）
-  3. 备份文件    — .noaudio.mp4（渲染成功后不再需要）
-  4. 过期缓存    — 过程产物/缓存/ 中超过指定天数的文件
-  5. 空目录      — 过程产物下的空子目录
-  6. 增量基线    — render_raw.mp4 + scene_fingerprints.json 为 --scene-patch
+  1. 渲染可再生缓存(render-scratch) — work-* 目录、中间视频、调试截帧、.noaudio 备份
+  2. TTS 缓存(tts-cache)      — tts_44k、scene_*.mp3、scene_*_hq.wav
+                                **扣费面**：删掉后重跑要重新向 TTS 服务合成，故须
+                                `--confirm-tts-cache` 显式确认（2026-10-26 拆类）
+  3. 过期缓存    — 过程产物/缓存/ 中超过指定天数的文件
+  4. 空目录      — 过程产物下的空子目录
+  5. 增量基线    — render_raw.mp4 + scene_fingerprints.json 为 --scene-patch
                   增量渲染基线，保留最近一次，仅超过 stale-days 才列入清理
-  7. 散落取证产物 — 临时产物根目录的取证/调试文件 + _取证/YYYYMMDD 日期子目录，
+  6. 散落取证产物 — 临时产物根目录的取证/调试文件 + _取证/YYYYMMDD 日期子目录，
                   按目录归属归类、按 forensic_artifact_rules.json 的 retention_days
                   裁定可清理/保留期未到；受保护名与 .md 文档不在扫描面
 
 安全机制:
   - 默认预览模式（dry-run），不删除任何文件
   - --execute 执行实际删除
+  - **类别按「重新生成是否扣费」分**：`render-scratch` 只付时间，`tts-cache` 要重新
+    扣费合成；后者不给确认就不删（单类请求直接拒绝、全量清理时跳过并点名）
   - 永不触碰 成果文件/ 中的正式交付物
   - 删除前生成完整清单供确认
   - 删除后运行 project_audit 验证
@@ -26,8 +29,9 @@
 
 用法:
   python project_cleanup.py                    # 预览所有可清理项
-  python project_cleanup.py --execute          # 执行全部清理
-  python project_cleanup.py --category render  # 仅预览渲染缓存
+  python project_cleanup.py --execute          # 执行（TTS 缓存类默认跳过）
+  python project_cleanup.py --category render-scratch --execute  # 仅删可再生缓存
+  python project_cleanup.py --category tts-cache --execute --confirm-tts-cache  # 扣费面
   python project_cleanup.py --stale-days 7     # 将过期阈值调为7天
 """
 
@@ -72,6 +76,7 @@ class CleanupReport:
     deleted: List[CleanupItem] = field(default_factory=list)
     failed: List[CleanupItem] = field(default_factory=list)
     retained: List[CleanupItem] = field(default_factory=list)  # 保留的增量基线（仅展示占用）
+    skipped_tts: List[CleanupItem] = field(default_factory=list)  # 未确认而跳过的扣费面
     freed_bytes: int = 0
 
     def add(self, item: CleanupItem):
@@ -91,26 +96,31 @@ class CleanupReport:
 #  清理规则定义
 # ─────────────────────────────────────────────────────────
 
-# 渲染缓存：可安全删除，重新渲染可恢复
-RENDER_CACHE_PATTERNS = {
-    "dirs": [
-        "work-*",       # HyperFrames 渲染工作目录
-        "tts_44k",      # TTS 采样转换缓存
-    ],
-    "files": [
-        "scene_*.mp3",  # 场景 TTS 原始文件
-        "scene_*_hq.wav",
-        "bgm.wav",      # 合成 BGM（可重新生成）
-        "render_new.mp4",
-        "final_output.mp4",
-        "final_with_subs.mp4",
-        "frame_*.png",  # 调试截帧
-        "scene*_*.png", # 场景调试截帧
-        "verify_*.png",
-        "video-only.mp4",   # HyperFrames 无音频中间产物
-        "*noaudio*",        # 无音频备份文件（render_noaudio_backup.mp4 等）
-    ],
-}
+# 渲染缓存按「重新生成是否扣费」拆两档（2026-10-26 批 2③）：
+#   旧实现把两类混在同一个 `render` 类别里，`--category render --execute` 一次就把
+#   TTS 缓存一起删掉；本项目为此在一轮里付过 11 次重新合成。拆类后唯一的区分轴是
+#   「重跑要不要再向 TTS 服务付费」，不是目录形态。
+RENDER_SCRATCH_DIRS = [
+    "work-*",       # HyperFrames 渲染工作目录
+]
+TTS_CACHE_DIRS = [
+    "tts_44k",      # TTS 采样转换缓存
+]
+RENDER_SCRATCH_FILES = [
+    "bgm.wav",          # 合成 BGM（本地 ffmpeg 重新生成，不扣费）
+    "render_new.mp4",
+    "final_output.mp4",
+    "final_with_subs.mp4",
+    "frame_*.png",      # 调试截帧
+    "scene*_*.png",     # 场景调试截帧
+    "verify_*.png",
+    "video-only.mp4",   # HyperFrames 无音频中间产物
+    "*noaudio*",        # 无音频备份文件（render_noaudio_backup.mp4 等）
+]
+TTS_CACHE_FILES = [
+    "scene_*.mp3",      # 场景 TTS 原始文件（重新合成扣费）
+    "scene_*_hq.wav",   # 重采样成品（由 mp3 派生，源件删了同样要重合成）
+]
 
 # 增量渲染基线（scene-patch）：不再立即清理。render_raw.mp4 与同目录的
 # scene_fingerprints.json 是 --scene-patch 段渲染的拼接基线，删掉就只能全量
@@ -127,37 +137,45 @@ PATCH_BASELINE_NAMES = ["render_raw.mp4", "scene_fingerprints.json"]
 
 
 def scan_render_cache(cm: ConfigManager, report: CleanupReport):
-    """扫描渲染缓存（递归查找，支持嵌套在音频子目录下的 work-* 目录）"""
+    """扫描渲染缓存（递归查找，支持嵌套在音频子目录下的 work-* 目录）。
+
+    两档分开登记：`render-scratch`（重新生成只付时间）与 `tts-cache`（重新合成扣费）。
+    类别由**命中的模式组**决定，不按目录形态猜——`tts_44k` 与 `work-*` 都在 temp 下、
+    都是目录，唯一区别是重跑要不要再付费。
+    """
     temp_dir = cm.paths.process_temp
     if not temp_dir.exists():
         return
 
-    # 递归查找所有 work-* 目录（可能嵌套在 crm_audio/、pw_audio/ 等子目录下）
     cache_dirs = []
-    for d in _rglob_no_reparse(temp_dir, "work-*"):
-        if d.is_dir():
-            cache_dirs.append(d)
-            size = _dir_size(d)
-            report.add(CleanupItem(d, "render", "HyperFrames 渲染工作目录", size))
-
-    # 递归查找所有 tts_44k 目录
-    for d in _rglob_no_reparse(temp_dir, "tts_44k"):
-        if d.is_dir():
-            cache_dirs.append(d)
-            size = _dir_size(d)
-            report.add(CleanupItem(d, "render", "TTS 采样缓存", size))
+    for pattern in RENDER_SCRATCH_DIRS:
+        for d in _rglob_no_reparse(temp_dir, pattern):
+            if d.is_dir():
+                cache_dirs.append(d)
+                report.add(CleanupItem(d, "render-scratch",
+                                       "HyperFrames 渲染工作目录（可再生）", _dir_size(d)))
+    for pattern in TTS_CACHE_DIRS:
+        for d in _rglob_no_reparse(temp_dir, pattern):
+            if d.is_dir():
+                cache_dirs.append(d)
+                report.add(CleanupItem(d, "tts-cache",
+                                       "TTS 采样缓存（重新合成扣费）", _dir_size(d)))
 
     # 递归查找渲染中间文件（跳过已位于缓存目录内的文件，避免重复计数）
-    for pattern in RENDER_CACHE_PATTERNS["files"]:
-        for f in _rglob_no_reparse(temp_dir, pattern):
-            if f.is_file():
-                if any(f.is_relative_to(d) for d in cache_dirs):
-                    continue
-                report.add(CleanupItem(
-                    f, "render",
-                    f"渲染中间文件 ({pattern})",
-                    f.stat().st_size
-                ))
+    for category, patterns in (("render-scratch", RENDER_SCRATCH_FILES),
+                               ("tts-cache", TTS_CACHE_FILES)):
+        for pattern in patterns:
+            for f in _rglob_no_reparse(temp_dir, pattern):
+                if f.is_file():
+                    if any(f.is_relative_to(d) for d in cache_dirs):
+                        continue
+                    why = ("TTS 产物（重新合成扣费）" if category == "tts-cache"
+                           else "渲染中间文件")
+                    report.add(CleanupItem(
+                        f, category,
+                        f"{why} ({pattern})",
+                        f.stat().st_size
+                    ))
 
 
 def scan_patch_baseline(cm: ConfigManager, report: CleanupReport, stale_days: int):
@@ -183,13 +201,13 @@ def scan_patch_baseline(cm: ConfigManager, report: CleanupReport, stale_days: in
             age = (datetime.now() - mtime).days
             if mtime < threshold:
                 report.add(CleanupItem(
-                    f, "render",
+                    f, "render-scratch",
                     f"过期增量渲染基线 ({age}天未更新, 阈值{stale_days}天)",
                     size
                 ))
             else:
                 report.retained.append(CleanupItem(
-                    f, "render",
+                    f, "render-scratch",
                     f"增量渲染基线（保留 {age}/{stale_days} 天, 供 --scene-patch 拼接）",
                     size
                 ))
@@ -368,7 +386,8 @@ def scan_cdrive_residuals(report: CleanupReport):
 # ─────────────────────────────────────────────────────────
 
 CATEGORY_NAMES = {
-    "render": "渲染缓存",
+    "render-scratch": "渲染可再生缓存（重跑只付时间）",
+    "tts-cache": "TTS 缓存（重新合成扣费，须显式确认）",
     "stale": "过期缓存",
     "backup": "备份文件",
     "scattered": "散落取证产物",
@@ -416,6 +435,12 @@ def print_preview(report: CleanupReport, category_filter: str = None):
     print(f"合计: {total_count} 项, {report.total_size_mb():.1f} MB")
     print(f"{'─' * 60}")
     _print_retained(report)
+    tts = [i for i in report.items if i.category == "tts-cache"]
+    if tts:
+        mb = sum(i.size_bytes for i in tts) / 1024 / 1024
+        print(f"\n⚠ 其中 TTS 缓存 {len(tts)} 项 / {mb:.1f} MB 属**扣费面**：删掉后重跑要"
+              f"重新向 TTS 服务合成。`--execute` 默认跳过；确要删须显式加 "
+              f"`--category tts-cache --confirm-tts-cache`")
     print(f"\n确认无误后运行: python project_cleanup.py --execute")
 
 
@@ -432,14 +457,39 @@ def _print_retained(report: CleanupReport):
         print(f"    {item.reason}")
 
 
-def execute_cleanup(report: CleanupReport, category_filter: str = None) -> CleanupReport:
-    """执行清理"""
+def execute_cleanup(report: CleanupReport, category_filter: str = None,
+                    confirm_tts_cache: bool = False) -> CleanupReport:
+    """执行清理。
+
+    `tts-cache` 是**扣费面**：删掉后重跑要重新向 TTS 服务合成（本项目为此付过 11 次
+    重新合成）。故三档：
+      · `--category tts-cache` 未带确认 → **一件不删**（连同类以外的也不删：那本来
+        就不在请求面内），记入 skipped_tts，由 main 判退出码 2；
+      · 不限类别（全量清理）未带确认 → 跳过该类并点名跳过了什么，其余照删；
+      · 带确认 → 与其它类同样删。
+    """
     print("\n" + "=" * 60)
     print("执行清理")
     print("=" * 60)
 
+    tts_sel = [i for i in report.items
+               if i.category == "tts-cache"
+               and (category_filter is None or category_filter == "tts-cache")]
+    if tts_sel and not confirm_tts_cache:
+        report.skipped_tts = list(tts_sel)
+        mb = sum(i.size_bytes for i in tts_sel) / 1024 / 1024
+        if category_filter == "tts-cache":
+            print(f"[REFUSED] 请求的 tts-cache 属扣费面（{len(tts_sel)} 项 / {mb:.1f} MB）："
+                  f"删除后重跑要重新向 TTS 服务合成。")
+            print("  确认要删就再加 --confirm-tts-cache；本次一件未删。")
+            return report
+        print(f"[SKIP] tts-cache {len(tts_sel)} 项 / {mb:.1f} MB 未删（扣费面，需 "
+              f"--confirm-tts-cache）；其余类别照常清理。")
+
     for item in report.items:
         if category_filter and item.category != category_filter:
+            continue
+        if item.category == "tts-cache" and not confirm_tts_cache:
             continue
 
         try:
@@ -459,6 +509,9 @@ def execute_cleanup(report: CleanupReport, category_filter: str = None) -> Clean
     print(f"释放空间: {report.freed_bytes / 1024 / 1024:.1f} MB")
     if report.failed:
         print(f"失败: {len(report.failed)} 项")
+    if report.skipped_tts:
+        mb = sum(i.size_bytes for i in report.skipped_tts) / 1024 / 1024
+        print(f"跳过 TTS 缓存: {len(report.skipped_tts)} 项 / {mb:.1f} MB（扣费面，未确认）")
     print(f"{'─' * 60}")
 
     return report
@@ -476,6 +529,8 @@ def main():
                         help="仅处理指定类别")
     parser.add_argument("--stale-days", type=int, default=STALE_DAYS,
                         help=f"过期缓存天数阈值 (默认 {STALE_DAYS})")
+    parser.add_argument("--confirm-tts-cache", action="store_true",
+                        help="显式确认删除 TTS 缓存（扣费面：删后重跑要重新合成）")
     parser.add_argument("--no-verify", action="store_true",
                         help="清理后不运行审计验证")
     args = parser.parse_args()
@@ -493,7 +548,7 @@ def main():
     scan_cdrive_residuals(report)
 
     if args.execute:
-        result = execute_cleanup(report, args.category)
+        result = execute_cleanup(report, args.category, args.confirm_tts_cache)
 
         # 清理后运行审计验证（使用子进程，避免 sys.stdout 包装冲突）
         if not args.no_verify and result.deleted:
@@ -508,6 +563,10 @@ def main():
                 )
             else:
                 print("  (project_audit 不可用，跳过验证)")
+
+        # 单类请求被扣费面挡下 → 退 2：让"一件没删"与"删完了"在退出码上可区分
+        if args.category == "tts-cache" and result.skipped_tts:
+            sys.exit(2)
     else:
         print_preview(report, args.category)
 

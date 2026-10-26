@@ -20168,6 +20168,755 @@ def test_single_source_and_repo_hygiene() -> RegressionTestCase:
     return tc
 
 
+def test_boundaries_probe_names_flat_frames() -> RegressionTestCase:
+    """用例117：场边界零渲染采样（`--boundaries`）只点名"占用恰为 0"的纯平帧。
+
+    存在理由（2026-10-26 效率批 2①）：一支已交付片抽帧才量出封面→S1 有 0.45s 纯平空帧
+    （t=5.4–5.8s，主体区占用 0.0000），代价是一次全量重渲（24 分钟）＋修订号递增＋
+    交付说明重建＋审计重跑。渲前两点采样（early/late）看不见场边界，1fps 汇总也看不见
+    0.4s 级空帧，故本腿按场起点取窗（起点−0.5s ~ +1.3s，10fps）。
+
+    本用例锁：
+      A 窗口径：10fps 步长、含两端、下界截 0、上界不超组合总时长；
+      B T 块单源：边界腿与两点采样共用 `scene_starts`，且**不继承短场豁免**
+        （短场在两点采样里是 NOT_APPLICABLE，在边界腿里照样要采）；
+      C 判据："恰为 0"才点名（0.0001 不得被四舍五入成纯平帧），min 读数同源；
+      D 不设门禁：有/无纯平帧退出码同为 0，一帧未采到才判 2；
+      E 反面对照：同一夹具摘掉"恰为 0"判据后该形态不可观察（本段不是空跑）；
+      F 端到端接线：`run_boundaries` 按 T 块全部起点逐场采窗、退出码 0、
+        工作目录收尾即清（受管临时区不留测试项目）。
+    """
+    tc = RegressionTestCase(
+        "boundaries_probe_names_flat_frames",
+        "验证 --boundaries 窗口径/判据/不设门禁/接线，且摘掉判据后纯平帧形态不可观察"
+    )
+    try:
+        import content_vacuum_precheck as cv
+
+        # ── A. 窗口径 ──
+        w = cv.boundary_window(5.5)
+        tc.assert_equal([w[0], w[-1], len(w)], [5.0, 6.8, 19],
+                        "A1 窗须覆盖起点−0.5s ~ +1.3s 且按 0.1s 步长含两端（19 帧）")
+        tc.assert_equal(cv.boundary_window(0.2)[0], 0.0,
+                        "A2 下界须截到 0（负时刻无从 seek）")
+        tc.assert_equal(cv.boundary_window(299.5, 300)[-1], 300.0,
+                        "A3 上界不得超过组合总时长（data-duration 是末场的权威终点）")
+
+        # ── B. T 块单源 + 短场不豁免边界采样 ──
+        html = ('<div id="scene0" data-scene-id="s0"></div>'
+                '<div id="scene1" data-scene-id="s1"></div>'
+                '<div id="scene2" data-scene-id="s2"></div>'
+                '<div id="scene3" data-scene-id="s3"></div>'
+                '<div id="root" data-duration="40"></div>'
+                '<script>var T = { s0: 0.0, s1: 2.0, s2: 10.0, s3: 20.0 };</script>')
+        ordered, _starts = cv.scene_starts(html)
+        tc.assert_equal(ordered, ["s0", "s1", "s2", "s3"],
+                        "B1 场起点须按 T 块取全（含被两点采样豁免的短场）")
+        measured, na, _unt = cv.parse_scenes(html)
+        tc.assert_equal([sid for sid, _r in na], ["s0"],
+                        "B2 两点采样仍按既有规则豁免短场（dur 2s < 6s）")
+        tc.assert_equal([sid for sid, _s, _d in measured], ["s1", "s2", "s3"],
+                        "B3 同一份 T 块在两腿上的分态各自成立（单源，不各写一份解析）")
+
+        # ── C. 判据：恰为 0 ──
+        # 窗公式已在 A 段单独裁定，本段把它钉成固定帧表：判据腿与窗公式腿各由各的
+        # 变异打（117-M2 只该打 A 段，不该连带 C 段——夹具未隔离会让归因失真）。
+        pinned = [round(5.0 + i * 0.1, 1) for i in range(19)]
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            vals = {t: 0.25 for t in pinned}
+            vals[5.4] = 0.0        # 纯平帧
+            vals[5.6] = 0.0001     # 4 位舍入会显示成 0.0000，原始值非 0
+            calls = []
+
+            def fake_shoot(chrome, probe, t, out):
+                calls.append(t)
+                out.write_bytes(b"PNG")
+
+            def fake_cov(path, subtitle_lines=2):
+                ms = int(path.stem.split("_b")[1])
+                return vals[round(ms / 1000, 1)]
+
+            old_triple = (cv.shoot, cv.vbc.measure_content_coverage, cv.boundary_window)
+            cv.shoot, cv.vbc.measure_content_coverage = fake_shoot, fake_cov
+            cv.boundary_window = lambda start, total=None: list(pinned)
+            try:
+                row = cv.probe_boundary(object(), work / "probe.html", "s3", 5.5,
+                                        work, None, False)
+            finally:
+                cv.shoot, cv.vbc.measure_content_coverage, cv.boundary_window = old_triple
+            tc.assert_equal(len(calls), len(pinned),
+                            "C1 逐帧采样次数须等于窗内帧数（不跳帧、不重复）")
+            tc.assert_equal(row["blanks"], [5.4],
+                            "C2 只有占用恰为 0 的帧被点名（0.0001 不得被四舍五入成纯平帧）")
+            tc.assert_equal(row["min_cov"], 0.0,
+                            "C3 min 读数与点名同源（同一份原始 cover，不另算一遍）")
+            # E 反面对照：摘掉"恰为 0"判据后同一夹具不再产出点名
+            removed = [t for t, raw in row["frames"] if raw <= -1.0]
+            tc.assert_equal(removed, [],
+                            "E1 判据摘成恒假后该形态不可观察——C2 的点名来自判据本体而非夹具")
+
+        # ── D. 不设门禁 ──
+        named_rows = [{"sid": "s3", "start": 5.5,
+                       "frames": [(5.0, 0.3), (5.4, 0.0)], "blanks": [5.4]}]
+        clean_rows = [{"sid": "s3", "start": 5.5, "frames": [(5.0, 0.3)], "blanks": []}]
+        code_hit, lines_hit = cv.summarize_boundaries(named_rows)
+        code_clean, _lines = cv.summarize_boundaries(clean_rows)
+        tc.assert_equal([code_hit, code_clean], [0, 0],
+                        "D1 有/无纯平帧退出码同为 0（观测面，不设门禁）")
+        tc.assert_true(any("不设门禁" in x for x in lines_hit),
+                       "D2 结论行须自报观测面口径（不设门禁、不给 PASS/FAIL）")
+        tc.assert_equal(cv.summarize_boundaries([])[0], 2,
+                        "D3 一帧未采到即判 2（没有读数不得读成边界干净）")
+
+        # ── F. 端到端接线：按 T 块全部起点采窗 + 收尾清场 ──
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "_t117_fixture"
+            proj.mkdir()
+            (proj / "index.html").write_text(html, encoding="utf-8")
+            seen = []
+            old = (cv.find_chrome, cv.make_probe, cv.probe_boundary)
+            cv.find_chrome = lambda: "fake-chrome"
+            cv.make_probe = lambda src, work: (work / "probe.html", [])
+
+            def fake_boundary(chrome, probe, sid, start, work, total, verbose):
+                seen.append((sid, start))
+                return {"sid": sid, "start": start, "frames": [(start, 0.2)],
+                        "blanks": [round(start, 2)] if sid == "s2" else []}
+
+            cv.probe_boundary = fake_boundary
+            try:
+                code = cv.run_boundaries(proj / "index.html", False)
+            finally:
+                cv.find_chrome, cv.make_probe, cv.probe_boundary = old
+            tc.assert_equal([s for s, _t in seen], ["s0", "s1", "s2", "s3"],
+                            "F1 边界腿须按 T 块全部起点采窗（短场一并采，不继承豁免）")
+            tc.assert_equal(seen[1][1], 2.0, "F2 采窗起点取 T 块声明值")
+            tc.assert_equal(code, 0, "F3 观测到纯平帧仍返回 0（不设门禁）")
+            tc.assert_true(not (cv.BASE_DIR / "bnd__t117_fixture").exists(),
+                           "F4 收尾须删掉本次工作目录（受管临时区不留测试项目）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("boundaries_probe_names_flat_frames error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_scene_insert_three_legs() -> RegressionTestCase:
+    """用例118：`preflight_check.check_scene_insert`（check 7e）三腿配对 + 存量误杀防线。
+
+    存在理由（2026-10-26 效率批 2②）：一轮里四处真实踩点、其中三处此前无任何门禁——
+    把新场插进序列时，只有"窗口重叠"会被既有检查抓到，另外三件全靠人眼：
+      ① 新场缺隐藏声明（项目里其余场都有 `#sceneN{…opacity:0}`）→ t=0 起常驻并叠场；
+      ② 旧场退场语句仍锚更后的边界 → 新场既无转场语句、也无人退出它，永不退场；
+      ③ z-index 序号没随场序重排 → 层序错位（不报错，只把整场压在别的场下面）。
+
+    本用例锁：
+      A 缺陷夹具：三腿各自点名（L1 隐藏声明 / L2a 悬垂与晚锚缺位 / L2b 孤立场 / L3 层序），
+        且计数自报与点名同源；
+      B 存量误杀防线：封面（z-index 最高、无隐藏声明）与封面遮挡位（z-index 最低的非封面
+        场，封面在位时本就不可见）都不得点名；"晚锚补刀＋正位退场在场"不得点名；
+      C 取数纪律：无 T 块的项目 L2 两腿判不适用（L1/L3 照常裁定）并留 INFO，不得误杀；
+      D 挡位接线：scene_insert 在 RENDER_CRITICAL_CHECKS 内，audit 模式降为 warning。
+    """
+    tc = RegressionTestCase(
+        "scene_insert_three_legs",
+        "验证 scene_insert 三腿各自点名、存量合法形态不误杀、无 T 块判不适用、audit 降级"
+    )
+    try:
+        import contextlib
+        import io
+        import tempfile
+        import preflight_check as pfc
+
+        DEFECT = (
+            "<html><head><style>"
+            "#scene0{ z-index:999; background:#f4f6fa; }"
+            "#scene1{ z-index:1; background:#f4f6fa; opacity:0; }"
+            "#scene2{ z-index:2; background:#f4f6fa; opacity:0; }"
+            "#scene3{ z-index:3; background:#f4f6fa; opacity:0; }"
+            "#scene4{ z-index:4; background:#f4f6fa; opacity:0; }"
+            "#scene5{ z-index:5; background:#f4f6fa; opacity:0; }"
+            "#scene6{ z-index:6; background:#f4f6fa; opacity:0; }"
+            "#scene7{ z-index:7; background:#f4f6fa; opacity:0; }"
+            "#scene8{ z-index:8; background:#f4f6fa; opacity:0; }"
+            "#scene10{ z-index:9; background:#f4f6fa; opacity:0; }"
+            "</style></head><body>"
+            + "".join('<div id="scene%d" class="scene"></div>' % n
+                      for n in range(11))
+            + "<script>var T = { s1:5.5, s2:32.1, s3:67.8, s4:93.8, s5:121.4, "
+              "s6:153.8, s7:173.8, s8:208.0, s9:232.8, s10:256.1 };"
+              'tl.to("#scene0",{x:-1920},T.s1);'
+              'tl.fromTo("#scene1",{x:1920},{x:0},T.s1);'
+              'tl.to("#scene1",{x:-1920},T.s2);tl.fromTo("#scene2",{x:1920},{x:0},T.s2);'
+              'tl.to("#scene2",{x:-1920},T.s3);tl.fromTo("#scene3",{x:1920},{x:0},T.s3);'
+              'tl.to("#scene3",{x:-1920},T.s4);tl.fromTo("#scene4",{x:1920},{x:0},T.s4);'
+              'tl.to("#scene4",{x:-1920},T.s5);tl.fromTo("#scene5",{x:1920},{x:0},T.s5);'
+              'tl.to("#scene5",{x:-1920},T.s6);tl.fromTo("#scene6",{x:1920},{x:0},T.s6);'
+              'tl.to("#scene6",{x:-1920},T.s7);tl.fromTo("#scene7",{x:1920},{x:0},T.s7);'
+              'tl.to("#scene7",{x:-1920},T.s8);tl.fromTo("#scene8",{x:1920},{x:0},T.s8);'
+              # 真实缺陷形态：旧场退场仍锚更后边界，新场 #scene9 无 CSS 节也无任何转场语句
+              'tl.to("#scene8",{x:-1920},T.s10);tl.fromTo("#scene10",{x:1920},{x:0},T.s10);'
+              # 改号残留：T.s12 在 T 块里不存在
+              'tl.to("#scene3",{opacity:0},T.s12);'
+              "</script></body></html>")
+
+        CLEAN = (
+            "<html><head><style>"
+            "#scene0{ z-index:999; background:#f4f6fa; }"
+            "#scene1{ z-index:1; background:#f4f6fa; }"          # 封面遮挡位：不带隐藏声明
+            "#scene2{ z-index:2; background:#f4f6fa; opacity:0; }"
+            "#scene3{ z-index:3; background:#f4f6fa; opacity:0; }"
+            "#scene4{ z-index:4; background:#f4f6fa; opacity:0; }"
+            "#scene5{ z-index:5; background:#f4f6fa; opacity:0; }"
+            "</style></head><body>"
+            + "".join('<div id="scene%d" class="scene"></div>' % n
+                      for n in range(6))
+            + "<script>var T = { s1:3.0, s2:14.0, s3:26.0, s4:40.0, s5:52.0 };"
+              'tl.to("#scene0",{opacity:0},T.s1);tl.to("#scene1",{opacity:1},T.s1);'
+              'tl.to("#scene1",{opacity:0},T.s2);tl.to("#scene2",{opacity:1},T.s2);'
+              'tl.to("#scene2",{opacity:0},T.s3);tl.to("#scene3",{opacity:1},T.s3);'
+              # 晚锚补刀：正位退场 T.s4 也在场（存量 repo-mesh/vertical-style 同形）
+              'tl.to("#scene3",{opacity:0},T.s4);tl.to("#scene3",{opacity:0,duration:0.01},T.s5);'
+              'tl.to("#scene4",{opacity:1},T.s4);tl.to("#scene4",{opacity:0},T.s5);'
+              'tl.to("#scene5",{opacity:1},T.s5);'
+              "</script></body></html>")
+
+        NO_T = (
+            "<html><head><style>"
+            "#scene0{ z-index:999; }"
+            "#scene1{ z-index:1; }"
+            "#scene2{ z-index:2; opacity:0; }"
+            "</style></head><body>"
+            '<div id="scene0" class="scene"></div>'
+            '<div id="scene1" class="scene"></div>'
+            '<div id="scene2" class="scene"></div>'
+            "</body></html>")
+
+        def run(html, mode="render", name="f.html"):
+            with tempfile.TemporaryDirectory(prefix="si118_") as td:
+                p = Path(td) / name
+                p.write_text(html, encoding="utf-8")
+                r = pfc.PreflightResult(mode=mode)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pfc.check_scene_insert(p, r)
+            return r
+
+        # ── A. 缺陷夹具：三腿各自点名 ──
+        r = run(DEFECT)
+        errs = list(r.errors)
+        cnt = r.counts.get("scene_insert") or {}
+
+        def hits(*keys):
+            return [e for e in errs if all(k in e for k in keys)]
+
+        tc.assert_equal(len(hits("#scene9", "没有任何隐藏声明")), 1,
+                        "A1 L1 须点名缺隐藏声明的新场 #scene9")
+        tc.assert_equal(cnt.get("l1"), 1, "A1b 计数自报 l1 与点名同源（1）")
+        tc.assert_equal(len(hits("#scene3", "T.s12")), 1,
+                        "A2 L2a 须点名悬垂锚（T.s12 在 T 块里不存在）")
+        tc.assert_equal(len(hits("#scene8", "正位退场缺位")), 1,
+                        "A3 L2a 须点名晚锚且正位退场缺位（#scene8 退场仍锚 T.s10）")
+        tc.assert_equal(len(hits("#scene9", "没有任何转场语句")), 1,
+                        "A4 L2b 须点名孤立场 #scene9")
+        tc.assert_equal(cnt.get("l2b"), 1, "A4b 计数自报 l2b 与点名同源（1）")
+        tc.assert_equal(len(hits("#scene10", "z-index 是 9")), 1,
+                        "A5 L3 须点名层序错位（#scene10 仍是 z-index:9）")
+        tc.assert_equal(cnt.get("l3"), 1, "A5b 计数自报 l3 与点名同源（1）")
+        tc.assert_equal(cnt.get("scenes"), 11, "A6 场景计数取 div 实数（11）")
+
+        # ── B. 存量误杀防线 ──
+        rb = run(CLEAN)
+        tc.assert_equal(rb.errors, [],
+                        "B1 封面／封面遮挡位／晚锚补刀三种存量形态都不得点名")
+        tc.assert_true(not any("#scene0" in w for w in rb.warnings), "B2 封面不得进告警面")
+        tc.assert_true(not any("#scene3" in w for w in rb.warnings),
+                       "B3 晚锚补刀（正位退场在场）不得点名")
+
+        # ── C. 无 T 块：L2 判不适用，L1/L3 照常 ──
+        rc = run(NO_T)
+        tc.assert_equal(rc.errors, [],
+                        "C1 无 T 块的项目 L2 两腿不适用，不得因取数断链判红")
+        tc.assert_true(any("L2 两腿不适用" in e.get("message", "")
+                           for e in rc._log_entries),
+                       "C2 不适用须留 INFO 点名（不得静默跳过）")
+        tc.assert_equal((rc.counts["scene_insert"]["l2a"],
+                         rc.counts["scene_insert"]["l2b"]), (0, 0),
+                        "C3 不适用腿计数为 0（不是「测过且干净」）")
+
+        # ── D. 挡位接线 ──
+        tc.assert_true("scene_insert" in pfc.RENDER_CRITICAL_CHECKS,
+                       "D1 scene_insert 须在 RENDER_CRITICAL_CHECKS 内（render 模式阻断）")
+        ra = run(DEFECT, mode="audit")
+        tc.assert_equal(ra.errors, [], "D2 audit 模式不得硬阻断")
+        tc.assert_true(len(ra.warnings) >= 4,
+                       "D3 audit 模式须把三腿缺陷降为 warning 并保留条数")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_insert_three_legs error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_cleanup_splits_paid_tts_cache() -> RegressionTestCase:
+    """用例119：`project_cleanup` 把 render 拆成 render-scratch / tts-cache，后者须显式确认。
+
+    存在理由（2026-10-26 效率批 2③）：旧实现把可再生的 `work-*`（实测 2,357 MB）与
+    **扣费级 TTS 缓存**（`tts_44k` 45.9 MB＋`scene_*.mp3` ≈26 MB）混在同一个 `render`
+    类别里，`--category render --execute` 一次全删；上一轮按纪律执行后，下一轮为此付了
+    11 次重新合成。拆类的唯一区分轴是「重跑要不要再向 TTS 服务付费」，不是目录形态。
+
+    本用例锁：
+      A 归类：work-*/中间视频/调试帧/bgm → render-scratch；tts_44k/scene_*.mp3/
+        scene_*_hq.wav → tts-cache；旧的混类 `render` 不再存在；增量基线归可再生档；
+      B 扣费面闸门：单类请求 tts-cache 未确认 → 一件不删、记 skipped、CLI 退出码 2；
+      C 全量清理：可再生档照删、TTS 缓存按类跳过并点名（skipped 记账）；
+      D 反面/正面对照：同一个夹具带确认后，删掉的恰是 C 跳过的那批（证明 C 的存活来自
+        闸门而非"本来就不在扫描面"）。
+    """
+    tc = RegressionTestCase(
+        "cleanup_splits_paid_tts_cache",
+        "验证 render 拆成 render-scratch/tts-cache、扣费面须显式确认、其余照常清理"
+    )
+    try:
+        import contextlib
+        import io
+        import tempfile
+        import types
+        import project_cleanup as pc
+
+        def build_tree(temp: Path):
+            audio = temp / "proj_audio"
+            (audio / "work-render").mkdir(parents=True)
+            (audio / "work-render" / "frame.png").write_bytes(b"x" * 10)
+            (audio / "tts_44k").mkdir()
+            (audio / "tts_44k" / "a.wav").write_bytes(b"y" * 10)
+            for name in ("scene_1.mp3", "scene_1_hq.wav", "bgm.wav",
+                         "render_new.mp4", "frame_001.png", "render_raw.mp4"):
+                (audio / name).write_bytes(b"z" * 10)
+            return audio
+
+        def cm_for(temp: Path):
+            return types.SimpleNamespace(paths=types.SimpleNamespace(
+                process_temp=temp, process_cache=temp / "no_cache",
+                output_video=temp / "no_video", root=temp))
+
+        def scan(temp: Path):
+            rep = pc.CleanupReport()
+            pc.scan_render_cache(cm_for(temp), rep)
+            pc.scan_patch_baseline(cm_for(temp), rep, pc.STALE_DAYS)
+            return rep
+
+        # ── A. 归类 ──
+        with tempfile.TemporaryDirectory(prefix="pc119a_") as td:
+            temp = Path(td)
+            build_tree(temp)
+            rep = scan(temp)
+            cat = {}
+            for it in rep.items:
+                cat.setdefault(it.path.name, it.category)
+            tc.assert_equal(cat.get("work-render"), "render-scratch",
+                            "A1 work-* 属可再生档（重跑只付时间）")
+            tc.assert_equal(cat.get("tts_44k"), "tts-cache",
+                            "A2 tts_44k 属扣费档")
+            tc.assert_equal([cat.get("scene_1.mp3"), cat.get("scene_1_hq.wav")],
+                            ["tts-cache", "tts-cache"],
+                            "A3 场景 TTS 产物（mp3 与 hq.wav）属扣费档")
+            tc.assert_equal([cat.get("bgm.wav"), cat.get("render_new.mp4"),
+                             cat.get("frame_001.png")],
+                            ["render-scratch"] * 3,
+                            "A4 bgm/中间视频/调试帧属可再生档（本地重建，不扣费）")
+            tc.assert_true("render" not in pc.CATEGORY_NAMES,
+                           "A5 旧的混类 `render` 不再存在（拆类不是新增别名）")
+            tc.assert_equal([i.category for i in rep.retained],
+                            ["render-scratch"],
+                            "A6 增量渲染基线（保留期内）归可再生档")
+            tts_items = [i for i in rep.items if i.category == "tts-cache"]
+            tc.assert_equal(len(tts_items), 3,
+                            "A7 扣费档实取 3 项（tts_44k＋mp3＋hq.wav，取数面非空）")
+
+        # ── B/C. 闸门与全量清理 ──
+        with tempfile.TemporaryDirectory(prefix="pc119b_") as td:
+            temp = Path(td)
+            audio = build_tree(temp)
+
+            rep_b = scan(temp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                pc.execute_cleanup(rep_b, "tts-cache", False)
+            tc.assert_equal(rep_b.deleted, [],
+                            "B1 单类 tts-cache 未确认 → 一件都不删")
+            tc.assert_true((audio / "tts_44k").is_dir() and (audio / "scene_1.mp3").is_file(),
+                           "B1b TTS 缓存在盘未动")
+            tc.assert_equal(len(rep_b.skipped_tts), 3,
+                            "B2 拒绝须记账（skipped_tts 3 项），不得静默")
+
+            # CLI 路径：退出码 2 让"一件没删"与"删完了"可区分（ConfigManager 打桩）
+            old_cm, old_argv = pc.ConfigManager, sys.argv
+            pc.ConfigManager = lambda: cm_for(temp)
+            sys.argv = ["project_cleanup.py", "--category", "tts-cache",
+                        "--execute", "--no-verify"]
+            code = 0
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pc.main()
+            except SystemExit as e:
+                code = e.code
+            finally:
+                pc.ConfigManager, sys.argv = old_cm, old_argv
+            tc.assert_equal(code, 2,
+                            "B3 单类 tts-cache 未确认 → 退出码 2")
+            tc.assert_true((audio / "tts_44k").is_dir(),
+                           "B3b CLI 拒绝后 TTS 缓存仍在盘")
+
+            rep_c = scan(temp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                pc.execute_cleanup(rep_c, None, False)
+            tc.assert_true(not (audio / "work-render").exists(),
+                           "C1 全量清理：可再生档照删")
+            tc.assert_true((audio / "scene_1.mp3").is_file() and (audio / "tts_44k").is_dir(),
+                           "C2 全量清理：扣费档按类跳过（文件与目录都在盘）")
+            tc.assert_equal(len(rep_c.skipped_tts), 3,
+                            "C3 全量清理须点名跳过了什么（skipped_tts 3 项）")
+            # D2 的期望值取**扫描面**而非 skipped_tts：后者由同一颗闸门记账，
+            # 用它当期望＝判据自己给自己出题（摘闸门后两边同空，D2 变成恒真）。
+            skipped_names = sorted(i.path.name for i in rep_c.items
+                                   if i.category == "tts-cache")
+
+        # ── D. 带确认的对照 ──
+        with tempfile.TemporaryDirectory(prefix="pc119d_") as td:
+            temp = Path(td)
+            audio = build_tree(temp)
+            rep_d = scan(temp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                pc.execute_cleanup(rep_d, None, True)
+            tc.assert_true(not (audio / "tts_44k").exists(),
+                           "D1 带 --confirm-tts-cache 才删扣费档")
+            deleted_tts = sorted(i.path.name for i in rep_d.deleted
+                                 if i.category == "tts-cache")
+            tc.assert_equal(deleted_tts, skipped_names,
+                            "D2 带确认后删掉的恰是 C 跳过的那批（C 的存活来自闸门，"
+                            "不是不在扫描面）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("cleanup_splits_paid_tts_cache error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_scene_patch_script_attribution() -> RegressionTestCase:
+    """用例120：script 变更按「目标选择器归属哪些场景」裁定（2026-10-26 效率批 3）
+
+    背景：白名单要求"脚本/时间轴/旁白全等"，而卡片点亮时刻按定义住在 <script> 里 ⇒
+    每一轮节奏/观感修订都判 FULL（一支已交付项目实测 render_metrics
+    scene_patch_attempts 5 / hits 0，原因逐字 html-outside-scenes-changed；而 PATCH
+    命中的实测对照是 47.9s vs 142.3s）。本批把"变了哪些场景"从"script 字节变没变"
+    改为"改动语句瞄准哪些场景的元素"，逐语句裁定。
+
+    锁定（**任何一条都不为命中率放宽**）：
+      A 语句切分：注释里/字符串里的 `;` 不切句；IIFE 与函数体是一个整体（其内部的
+        for/分号不各自成句）——归属判定必须在整句面上做
+      B 选择器归属：`#id`/`.cls` 解析到**场景内**元素；多场共有类取并、复合选择器取
+        交集；场景外元素（#chapter）与解析不到的记号各自点名；hex 颜色不入选择器；
+        无时间位、锚落在目标场景之外、变量目标无静态选择器三种形态一律点名退回全量
+      C classify 面：纯节奏改（只动秒数）→ PATCH 且 changed 恰为被改语句的场；
+        div 改＋脚本改取并集；常驻元素/跨窗口转场/缺时间位/共享 helper/旧 sidecar/
+        仅注释改动/超 50% 五类各自 FULL 并点名；脚本未变仍 REUSE（既有行为零变化）
+      D 接线：patch() 把 classify 的 changed 原样交给 _patch_execute；sidecar 指纹面
+        新增 script_attribution（键＝归一化语句哈希），SIDECAR_VERSION 不 bump ——
+        旧 sidecar 缺该键时脚本一变即判 FULL（＝修复前行为），存量项目零额外重渲
+
+    变异（见 mutation_matrices.json → scene_patch_script_attribution）：摘场景外检查 /
+    摘锚归属检查 / 摘时间位检查 / 放行无静态目标 / 旧 sidecar 默认空表 / 空差分不点名 /
+    并集只取脚本腿 / 超半场只数 div —— 逐枚须落到对位断言。
+    """
+    tc = RegressionTestCase(
+        "scene_patch_script_attribution",
+        "验证脚本变更按选择器归属场景裁定：纯节奏改判 PATCH，常驻元素/跨窗口转场/"
+        "共享 helper/旧 sidecar 一律点名退回全量"
+    )
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        sp = _safe_import_rebinding_module("scene_patch_render")
+
+        FPS, DUR = 25, 15.0
+        STARTS = {"s1": 0.0, "s2": 3.0, "s3": 6.0, "s4": 9.0, "s5": 12.0}
+        ORDER = ["s1", "s2", "s3", "s4", "s5"]
+
+        def script_for(deltas=None, comment="", extra=""):
+            """deltas={sid: 秒数增量}；其余语句逐字固定。"""
+            deltas = deltas or {}
+            t_items = ", ".join(f"{sid}: {STARTS[sid]}" for sid in ORDER)
+            lines = [f"var T = {{ {t_items} }};",
+                     "var tl = gsap.timeline({ paused: true });"]
+            if comment:
+                lines.append(comment)
+            for sid in ORDER:
+                d = deltas.get(sid, 0.0)
+                lines.append(f'tl.to("#{sid}-a", {{ opacity:1, duration:0.4 }}, '
+                             f'T.{sid} + {0.2 + d:.2f});')
+            lines += ['tl.to("#scene1", { x:-1920, duration:0.9 }, T.s2 + 0.1);',
+                      'tl.set("#chapter", { opacity:1 }, T.s1);',
+                      'window.__timelines = { main: tl };']
+            if extra:
+                lines.append(extra)
+            return "\n".join(lines)
+
+        def build_html(bodies=None, script="", extra_div=""):
+            bodies = bodies or {sid: f'<p id="{sid}-a">内容{sid}</p>' for sid in ORDER}
+            scenes = "\n".join(
+                f'    <div id="scene{int(sid[1:])}" data-scene-id="{sid}" '
+                f'data-scene-entry="gsap" data-scene-subtitle-safe="true">'
+                f'{bodies[sid]}</div>' for sid in ORDER)
+            return ('<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+                    '<style>.card{color:#fff}</style></head>\n<body>\n'
+                    f'  <div data-composition-id="main" data-duration="{DUR}" '
+                    'data-width="1920" data-height="1080">\n'
+                    f'    <div id="chapter">章级常驻标识</div>\n{scenes}{extra_div}\n'
+                    '  </div>\n  <script src="gsap.min.js"></script>\n  <script>\n'
+                    f'{script}\n  </script>\n</body></html>\n')
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            saved_bases = (sp.HTML_BASE, sp.TEMP_BASE)
+            sp.HTML_BASE = td / "hyperframes"
+            sp.TEMP_BASE = td / "临时产物"
+            try:
+                proj = "sp120-fixture"
+                src_dir = sp.HTML_BASE / proj
+                tmp_dir = sp.TEMP_BASE / f"{proj}_audio"
+                src_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                cfg_path = td / f"{proj}.json"
+                cfg_path.write_text(json.dumps({
+                    "fps": FPS, "video_duration": DUR, "resolution": "1920x1080",
+                    "paths": {"html_project": proj, "temp_subdir": f"{proj}_audio"},
+                }, ensure_ascii=False), encoding="utf-8")
+                pr = sp.PatchRenderer(cfg_path)
+                pr.render_raw.write_bytes(b"\x00" * 64)
+
+                html0 = build_html(script=script_for())
+                pr.html_path.write_text(html0, encoding="utf-8")
+                blocks = sp.extract_scene_blocks(html0)
+                outside = sp.outside_elements_text(html0)
+
+                # ── A 语句切分与注释剥离 ──
+                src = ("var T = { s1: 0.0 };\n"
+                       "// 注释里带分号 ; 不应切句\n"
+                       'var s = "a;b";\n'
+                       'tl.to("#s1-a", { opacity:1 }, T.s1 + 0.2);\n'
+                       "(function(){\n"
+                       '  var els = document.querySelectorAll(".s1-x");\n'
+                       "  for (var i = 0; i < 2; i++) { tl.to(els, { opacity:1 }, T.s1 + i); }\n"
+                       "})();\n"
+                       "window.__timelines = { main: tl };\n")
+                stmts = sp.split_js_statements(sp.strip_js_comments(src))
+                tc.assert_equal(len(stmts), 5,
+                                f"A1 注释/字符串内的分号不切句（实得 {len(stmts)} 条）")
+                tc.assert_true('var s = "a;b"' in stmts,
+                               "A2 字符串里的分号保留在语句内，未被切走")
+                tc.assert_true(any(s.startswith("(function(){") and "for (var i = 0"
+                                  in s for s in stmts),
+                               "A3 IIFE 连内部 for 与分号仍是**一条**语句")
+                tc.assert_equal(sp.split_js_statements(sp.strip_js_comments(
+                    "var a = 1; // x ; y\nvar b = 2;")),
+                                ["var a = 1", "var b = 2"],
+                                "A4 行注释整体剥离后只剩两条语句")
+
+                # ── B 选择器归属 ──
+                bodies_b = {"s1": '<p id="s1-a">一</p>',
+                            "s2": '<p id="s2-a" class="card">二</p>',
+                            "s3": '<p id="s3-a" class="card"><span class="t">三</span></p>',
+                            "s4": '<p id="s4-a">四</p>',
+                            "s5": '<p id="s5-a">五</p>'}
+                hb = build_html(bodies=bodies_b, script=script_for())
+                bb = sp.extract_scene_blocks(hb)
+                ob = sp.outside_elements_text(hb)
+                tc.assert_equal(sp.resolve_selector("#s3-a", bb, ob)[0], {"s3"},
+                                "B1 #id 归属到它所在的场景")
+                tc.assert_equal(sp.resolve_selector(".card", bb, ob)[0], {"s2", "s3"},
+                                "B2 多场共有类取并集")
+                tc.assert_equal(sp.resolve_selector(".card .t", bb, ob)[0], {"s3"},
+                                "B3 复合选择器取交集")
+                tc.assert_equal(sp.resolve_selector("#s2-a, #s3-a", bb, ob)[0],
+                                {"s2", "s3"}, "B4 逗号分隔取并集")
+                c_out = sp.resolve_selector("#chapter", bb, ob)[1]
+                tc.assert_true(c_out and c_out.startswith("selector-outside-scenes("),
+                               f"B5 场景外常驻元素 → 点名（{c_out}）")
+                c_unres = sp.resolve_selector("#nope", bb, ob)[1]
+                tc.assert_true(c_unres and c_unres.startswith("selector-unresolved("),
+                               f"B6 解析不到的记号 → 点名（{c_unres}）")
+
+                stmt_color = ('tl.to("#s3-a", { color:"#7c3aed", duration:0.4 }, '
+                              'T.s3 + 0.6)')
+                tc.assert_equal(sp.attribute_statement(stmt_color, bb, ob), ({"s3"}, None),
+                                "B7 hex 颜色不当作选择器（#7c3aed 不触发 unresolved）")
+                stmt_nopos = 'tl.to("#s3-a", { opacity:1 })'
+                c_pos = sp.attribute_statement(stmt_nopos, bb, ob)[1]
+                tc.assert_true(c_pos and c_pos.startswith("append-position("),
+                               f"B8 缺时间位（GSAP 默认追加到时间轴末尾）→ 点名（{c_pos}）")
+                stmt_cross = 'tl.to("#scene1", { x:-1920 }, T.s2 + 0.1)'
+                c_cross = sp.attribute_statement(stmt_cross, bb, ob)[1]
+                tc.assert_true(c_cross and c_cross.startswith("anchor-outside-target("),
+                               f"B9 锚落在目标场景之外（元素属 s1、帧在 s2 窗口）→ 点名"
+                               f"（{c_cross}）")
+                stmt_iife = ('(function(){ var els = document.querySelectorAll(".card"); '
+                             'els.forEach(function(el, i){ tl.to(el, { opacity:1 }, '
+                             'T.s2 + i); }); })()')
+                tc.assert_equal(sp.attribute_statement(stmt_iife, bb, ob),
+                                ({"s2", "s3"}, None),
+                                "B10 变量目标＋同句静态选择器 → 可归属（IIFE 形态）")
+                stmt_helper = ('function reveal(el, at) { tl.fromTo(el, { opacity:0 }, '
+                               '{ opacity:1 }, at); }')
+                c_help = sp.attribute_statement(stmt_helper, bb, ob)[1]
+                tc.assert_true(c_help and c_help.startswith("no-static-target("),
+                               f"B11 共享 helper 函数体（只有变量目标）→ 点名（{c_help}）")
+
+                # ── C classify 面（真 classify） ──
+                def write_sidecar(html, **over):
+                    fp = sp.extract_fingerprints(html, pr.config,
+                                                 pr.source_dir / "narration.json")
+                    times, err = sp.extract_scene_times(html, pr.config)
+                    side = {"version": sp.SIDECAR_VERSION, "fps": FPS,
+                            "width": 1920, "height": 1080,
+                            "total_frames": int(round(DUR * FPS)), "has_audio": False,
+                            "scene_times": times, "scene_times_error": err,
+                            "scene_times_witness":
+                                sp.scene_time_witness(html) if times else None}
+                    side.update(fp)
+                    side.update(over)
+                    pr.sidecar_path.write_text(
+                        json.dumps(side, ensure_ascii=False), encoding="utf-8")
+                    return side
+
+                write_sidecar(html0)
+
+                def classify_with(html):
+                    pr.html_path.write_text(html, encoding="utf-8")
+                    return pr.classify()
+
+                v, ch, r, ctx = classify_with(build_html(script=script_for({"s2": 0.15})))
+                tc.assert_equal((v, ch, r), ("PATCH", ["s2"], ""),
+                                f"C1 纯节奏改（只动 s2 语句的秒数）→ PATCH 该场"
+                                f"（verdict={v}, changed={ch}, reason={r}）")
+                tc.assert_equal(ctx.get("script_scenes"), ["s2"],
+                                "C1b ctx 记录脚本归属场景，供留痕复核")
+                tc.assert_equal(sp.extract_fingerprints(
+                    pr.html_path.read_text(encoding="utf-8"), pr.config,
+                    pr.source_dir / "narration.json")["scene_hashes"]["s2"],
+                    sp.extract_fingerprints(html0, pr.config,
+                                            pr.source_dir / "narration.json"
+                                            )["scene_hashes"]["s2"],
+                    "C1c 反断言：该轮场景 div 内容逐字未变（PATCH 完全由脚本归属成立）")
+
+                bodies2 = {sid: f'<p id="{sid}-a">内容{sid}</p>' for sid in ORDER}
+                bodies2["s2"] = '<p id="s2-a">内容s2（改）</p>'
+                v, ch, r, ctx = classify_with(
+                    build_html(bodies=bodies2, script=script_for({"s3": 0.15})))
+                tc.assert_equal((v, ch), ("PATCH", ["s2", "s3"]),
+                                f"C2 div 改一场＋脚本改另一场 → 两场并入 PATCH"
+                                f"（changed={ch}, reason={r}）")
+
+                def full_reason(html, label, prefix):
+                    v, ch, r, _ = classify_with(html)
+                    tc.assert_true(v == "FULL" and r.startswith(prefix),
+                                   f"{label} → FULL 并点名（verdict={v}, reason={r}）")
+                    return r
+
+                full_reason(build_html(script=script_for().replace(
+                    'tl.set("#chapter", { opacity:1 }, T.s1)',
+                    'tl.set("#chapter", { opacity:0.9 }, T.s1)')),
+                    "C3 常驻元素 #chapter 被改",
+                    "script-added-unattributable(selector-outside-scenes(#chapter)")
+                full_reason(build_html(script=script_for().replace(
+                    'T.s2 + 0.1', 'T.s2 + 0.2')),
+                    "C4 跨窗口转场语句（#scene1 的帧在 s2 窗口）",
+                    "script-added-unattributable(anchor-outside-target(")
+                full_reason(build_html(script=script_for().replace(
+                    'tl.to("#s4-a", { opacity:1, duration:0.4 }, T.s4 + 0.20)',
+                    'tl.to("#s4-a", { opacity:1, duration:0.4 })')),
+                    "C5 去掉时间位（改为追加到时间轴末尾）",
+                    "script-added-unattributable(append-position(")
+                full_reason(build_html(script=script_for(
+                    extra="function reveal(el, at) { tl.fromTo(el, { opacity:0 }, "
+                          "{ opacity:1 }, at); }")),
+                    "C6 新增共享 helper（只有变量目标）",
+                    "script-added-unattributable(no-static-target(")
+
+                old = write_sidecar(html0)
+                old.pop("script_attribution", None)
+                pr.sidecar_path.write_text(json.dumps(old, ensure_ascii=False),
+                                           encoding="utf-8")
+                full_reason(build_html(script=script_for({"s2": 0.15})),
+                            "C7 旧 sidecar 缺归属表（脚本一变即退回全量）",
+                            "sidecar-no-script-attribution")
+
+                write_sidecar(html0)
+                full_reason(build_html(script=script_for(comment="// 只加一行注释")),
+                            "C8 只改注释（语句键集不变）",
+                            "script-format-or-order-changed")
+                # 场景外残余面：结构与 script src 仍须整份否决（脚本正文被摘出，
+                # 但不等于"场景外什么都没有面"）
+                full_reason(html0.replace('data-height="1080"', 'data-height="1080" data-note="x"'),
+                            "C11 场景外结构改动（root 属性）",
+                            "html-outside-scenes-changed")
+                full_reason(html0.replace('<script src="gsap.min.js">',
+                                          '<script src="gsap2.min.js">'),
+                            "C12 script src 被改（换库）",
+                            "html-outside-scenes-changed")
+                full_reason(build_html(script=script_for(
+                    {"s1": 0.1, "s2": 0.1, "s3": 0.1, "s4": 0.1})),
+                    "C9 归属并集超半场",
+                    "too-many-scenes-changed(4/5)")
+
+                pr.html_path.write_text(html0, encoding="utf-8")
+                tc.assert_equal(pr.classify()[:3],
+                                ("REUSE", [], "no-scene-content-change"),
+                                "C10 脚本与场景全等 → 仍 REUSE（既有行为零变化）")
+
+                # ── D 接线与指纹面 ──
+                pr.html_path.write_text(build_html(script=script_for({"s2": 0.15})),
+                                        encoding="utf-8")
+                captured = {}
+                pr._patch_execute = lambda ctx, changed, times: (
+                    captured.update({"changed": changed}) or (0, "applied"))
+                pr.patch()
+                tc.assert_equal(captured.get("changed"), ["s2"],
+                                "D1 patch() 把 classify 的归属结果原样交给 _patch_execute")
+
+                fp = sp.extract_fingerprints(
+                    build_html(script=script_for()), pr.config,
+                    pr.source_dir / "narration.json")
+                attrib = fp.get("script_attribution") or {}
+                tc.assert_true(isinstance(fp.get("script_attribution"), dict)
+                               and bool(fp.get("script_attribution")),
+                               "D2 指纹面携带 script_attribution（sidecar 由 **fp 落盘）")
+                tc.assert_equal(sorted(attrib),
+                                sorted({sp._sha256(s)[:16] for s in sp.split_js_statements(
+                                    sp.strip_js_comments(script_for()))}),
+                                "D2b 归属表的键恰是归一化语句哈希集（不重不漏）")
+                tc.assert_equal(sp.SIDECAR_VERSION, 1,
+                                "D3 SIDECAR_VERSION 不 bump：旧 sidecar 缺键即判 FULL，"
+                                "存量项目不因本批失去基线")
+                tc.assert_true(any("err" in x for x in attrib.values())
+                               and any("scenes" in x for x in attrib.values()),
+                               "D4 夹具同时含可归属与不可归属语句（两腿都在场，"
+                               "否则 C 段是空跑）")
+
+                tc.mark_passed()
+            finally:
+                sp.HTML_BASE, sp.TEMP_BASE = saved_bases
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_patch_script_attribution error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
+
 class RegressionTestRunner:
 
     """回归测试运行器"""    
@@ -20289,6 +21038,10 @@ class RegressionTestRunner:
             test_cue_consumption_warn_only,
             test_delivery_object_single_source_and_artifact_identity,
             test_registry_reconciliation_and_revision_naming,
+            test_boundaries_probe_names_flat_frames,
+            test_scene_insert_three_legs,
+            test_cleanup_splits_paid_tts_cache,
+            test_scene_patch_script_attribution,
         ]
         self.results = []
     
