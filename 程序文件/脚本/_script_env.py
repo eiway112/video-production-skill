@@ -285,6 +285,8 @@ def revision_base_stem(stem: str) -> str:
 
     修订轮的交付惯例：视频必须带修订后缀；字幕与交付说明允许沿用基础名
     （已有 2 支修订交付如此）。审计与写入共用本函数，避免各写一套正则。
+    **边界**：交付说明的"沿用基础名"只是**读取侧**宽容——审计据此判"这一版有没有
+    留痕"；写入侧不把本版实测写进基础名文档（见 pipeline_runner._format_notes_base_refusal）。
     """
     import re as _re
     m = _re.search(r"_修订\d+$", str(stem or ""))
@@ -292,7 +294,11 @@ def revision_base_stem(stem: str) -> str:
 
 
 def delivery_notes_candidates(video_path):
-    """交付说明候选链：修订名优先，基础名回退（审计与流水线写入共用）。"""
+    """交付说明候选链：修订名优先，基础名回退。
+
+    消费者是**读取侧**（审计第 6 维 resolve_delivery_notes）；流水线写入侧只用它
+    识别"同层仅有基础名说明"这一状态并拒绝改写，不把它当写入目标。
+    """
     p = Path(video_path)
     exact = p.parents[1] / f"交付说明_{p.stem}.md"
     base = revision_base_stem(p.stem)

@@ -157,6 +157,19 @@ def _next_revision_name(stem):
     return f"{stem}_修订01"
 
 
+def _format_notes_base_refusal(notes, base_notes):
+    """修订轮「同层只有基础名说明」时的写入侧拒绝文案（唯一生成点）。
+
+    读取侧（审计第 6 维）接受基础名候选——它答的是"这一版有没有留痕"；写入侧必须
+    精确，因为把本版实测写进另一版文档是不可逆的事实污染，且改完看不出发生过
+    （2026-10-26 实证：修订06 的 asr_forced 12/12 落进了描述初版 10 场的说明里）。
+    两条合法路径都点名，不代创建、不改名。
+    """
+    return (f"同层仅有基础名 {Path(base_notes).name}，本版说明须为 {Path(notes).name}；"
+            "未写入任何文件。创建或改名成本版说明后单跑 "
+            "pipeline_runner.py --step completion_report 即可补写该节（零重渲）")
+
+
 def _coerce_bool(value, default=True):
     """配置布尔的安全解析：JSON 布尔直接用；字符串 "false"/"0"/"no" 视为 False。
 
@@ -3065,8 +3078,9 @@ class PipelineRunner:
         为什么由流水线写：该节数字的唯一来源是终检 media_facts，而 temp/ 与日志不入
         git——靠提示让人粘贴，交付后"这一版走主路径还是降级链"又回到无从追溯。
         md 不存在时**不创建**：本节是交付说明的一节，不是交付说明本身，创建属人工
-        收尾（模板 templates_07 照常提示）。返回一句状态供调用点打印，幂等由
-        splice 的"无变化不落盘"保证。
+        收尾（模板 templates_07 照常提示）。同层只有基础名说明时**不改写**它（写入
+        侧精确、读取侧宽容，见 _format_notes_base_refusal）。返回一句状态供调用点
+        打印，幂等由 splice 的"无变化不落盘"保证。
         """
         from media_qa_gate import (delivery_notes_path,
                                    format_subtitle_source_section,
@@ -3075,19 +3089,29 @@ class PipelineRunner:
 
         line = self._subtitle_source_note_line()
         notes = delivery_notes_path(self.output_file)
-        notes_note = ""
         if not line:
             return f"跳过（终检未记录来源分布）: {notes.name}"
         if not notes.exists():
-            # 修订轮惯例：说明允许沿用基础名（已有 2 支修订交付如此）。候选链
-            # 与审计第 6 维共用 media_qa_gate.delivery_notes_candidates，避免
-            # 写读两端各推一条路径。精确名优先，基础名回退。
+            # 同层候选链与审计第 6 维共用，避免写读两端各推一条路径。但**候选链
+            # 不是写入目标**：基础名说明属上一版/首版的文档，把本版实测写进去等于
+            # 在别人的文档上改数字——故命中基础名时只做两件事：内容已一致就道明
+            # "它就是本节"（幂等，不写盘），不一致就拒绝并点名两条合法路径
+            # （2026-10-26 生产实证，见 _format_notes_base_refusal）。
             existing = [c for c in delivery_notes_candidates(self.output_file)
                         if c.exists()]
             if existing:
-                notes = existing[0]
-                notes_note = "（修订沿用基础说明）"
-        if not notes.exists():
+                base = existing[0]
+                try:
+                    _, would_change = splice_subtitle_source_section(
+                        base.read_text(encoding='utf-8'),
+                        format_subtitle_source_section(line))
+                except OSError:
+                    # 读不回不得猜成"已最新"：按可能不一致处理，走拒绝分支
+                    would_change = True
+                if not would_change:
+                    return f"已是最新: {base.name}（基础名说明，未写入）"
+                return ("跳过（本版说明未建，基础名说明不改写）: "
+                        f"{_format_notes_base_refusal(notes, base)}")
             # 归因分岔：同层若有其它 交付说明_*.md，那是**名字不对**而非**没建**——
             # 旧文案一律报"尚未创建"，人据此会去补建或重跑全链，真实修法只是改名。
             from media_qa_gate import (find_mismatched_delivery_notes,
@@ -3099,9 +3123,9 @@ class PipelineRunner:
         new_text, changed = splice_subtitle_source_section(
             notes.read_text(encoding='utf-8'), format_subtitle_source_section(line))
         if not changed:
-            return f"已是最新: {notes.name}{notes_note}"
+            return f"已是最新: {notes.name}"
         atomic_write_text(notes, new_text)
-        return f"已写入: {notes}{notes_note}"
+        return f"已写入: {notes}"
 
     def step_postprocess(self):
         if self._can_skip("postprocess"):

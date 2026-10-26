@@ -8578,6 +8578,57 @@ def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
                            "终检无事实时不写（不得凭空造节）")
             notes.write_text(md_old, encoding='utf-8')
 
+            # ── 4b. 修订轮：同层仅有基础名说明时**拒绝改写**它 ──
+            #   读取侧宽容（审计第 6 维按候选链接受基础名，见用例116 D），写入侧
+            #   必须精确：把本版实测写进上一版/首版文档是不可逆的事实污染，且改完
+            #   看不出发生过。2026-10-26 生产实证——修订06 的 asr_forced 12/12 落进
+            #   了描述初版 13 场的说明里，靠人发现才还原。
+            video_rev = out_dir / "视频" / "案例成片_修订06.mp4"
+            video_rev.write_bytes(b"fake-video-rev")
+            notes_rev = mq.delivery_notes_path(video_rev)
+            base_notes = out_dir / "交付说明_案例成片.md"
+            tc.assert_equal(notes_rev.name, "交付说明_案例成片_修订06.md",
+                            "4b0 本版说明名仍由成片基名派生")
+            tc.assert_true(base_notes.exists(), "4b0b 夹具须让基础名说明在位（否则测不到该分支）")
+            base_bytes = base_notes.read_bytes()
+            fake_rev = SimpleNamespace(output_file=video_rev,
+                                       _subtitle_source_note_line=lambda: line)
+            msg_base = pr.PipelineRunner._sync_subtitle_source_section(fake_rev)
+            tc.assert_true("基础名" in msg_base and "未写入任何文件" in msg_base,
+                           "4b1 命中基础名时必须明说拒绝写入，不得静默沿用")
+            tc.assert_true(notes_rev.name in msg_base and base_notes.name in msg_base,
+                           "4b2 两个文件名都点名（只说一个，人不知道该建哪个）")
+            tc.assert_true("--step completion_report" in msg_base,
+                           "4b3 给出可执行的补写路径（零重渲）")
+            tc.assert_equal(base_notes.read_bytes(), base_bytes,
+                            "4b4 基础名说明字节不变（旧实现在此处写入本版实测）")
+            tc.assert_true(not notes_rev.exists(),
+                           "4b5 拒绝路径不代创建本版说明（创建属人工收尾）")
+
+            # ── 4c. 基础名说明**已含本节且一致** → 认作最新、不写盘 ──
+            #   这一段专防"一刀切拒绝"带来的假警报：已有 2 支修订交付的说明本就
+            #   落在基础名上且内容正确，若一律报"本版说明未建"，归因方向与事实
+            #   相反（信息其实记录着）——本仓反复治的正是这类错归因。
+            base_notes.write_text(md_old + "\n" + section, encoding='utf-8')
+            mtime_same = base_notes.stat().st_mtime_ns
+            msg_same = pr.PipelineRunner._sync_subtitle_source_section(fake_rev)
+            tc.assert_true("已是最新" in msg_same and base_notes.name in msg_same,
+                           "4c1 基础名说明已含本节且一致 → 认作最新，不报未建")
+            tc.assert_equal(base_notes.stat().st_mtime_ns, mtime_same,
+                            "4c2 幂等态不写盘（写会刷新另一版文档的 mtime）")
+            other_section = mq.format_subtitle_source_section(
+                mq.format_subtitle_source_line(dict(facts, scenes_total=13,
+                                                    asr_forced=13,
+                                                    asr_forced_ratio=1.0)))
+            base_notes.write_text(md_old + "\n" + other_section, encoding='utf-8')
+            msg_diff = pr.PipelineRunner._sync_subtitle_source_section(fake_rev)
+            tc.assert_true("不改写" in msg_diff,
+                           "4c3 基础名说明的分布与本版不同（另一版文档）→ 拒绝改写")
+            tc.assert_true(other_section in base_notes.read_text(encoding='utf-8'),
+                           "4c4 另一版的分布原样保留（旧实现会被替换成本版）")
+            # 复位夹具：本节若被写入（变异形态）会污染后续小节的取数前提
+            base_notes.write_text(md_old, encoding='utf-8')
+
             # ── 5. md 写盘必须是原子替换（原地截断写会留下半截交付说明）──
             import script_interface as si
             from unittest import mock
@@ -22613,6 +22664,18 @@ def test_delivery_object_single_source_and_artifact_identity() -> RegressionTest
                          for n in ast.walk(f_notes))
         tc.assert_true(uses_chain,
                        "I2 pipeline notes writer must share the candidate chain")
+        # 候选链是**读取面**，不是写入目标：把 notes 重新绑定到某个候选（旧实现的
+        # `notes = existing[0]`）＝把本版实测写进另一版文档。唯一合法的 notes 绑定
+        # 是 delivery_notes_path(...) 推导出的精确名。
+        retarget = [n for n in ast.walk(f_notes)
+                    if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "notes"
+                            for t in n.targets)
+                    and not (isinstance(n.value, ast.Call)
+                             and isinstance(n.value.func, ast.Name)
+                             and n.value.func.id == "delivery_notes_path")]
+        tc.assert_true(not retarget,
+                       "I2b notes write target must never be retargeted off the exact name")
 
         pfc_tree = ast.parse(Path(pfc.__file__).read_text(encoding="utf-8"))
         pfc_main = None
