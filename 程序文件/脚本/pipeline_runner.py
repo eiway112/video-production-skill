@@ -1769,10 +1769,61 @@ class PipelineRunner:
             # 时长预算门禁（wp 批次复盘 P0）：渲染前的最后拦截点
             if not self._budget_gate_ok():
                 return False
+            # 句内停顿审计（描述面）：渲染前的最后一个零成本读数位点
+            self._pause_audit_face()
             self.state.mark_completed("timeline", self._fingerprint("timeline"))
             return True
         self._fail("timeline", "Timeline adjustment failed", SUBPROCESS_FAILED)
         return False
+
+    def _pause_audit_face(self):
+        """渲染前的句内停顿审计（描述面，不裁定、不阻断、不进退出码）。
+
+        存在理由（2026-10-28 复盘实测）：停顿类反馈两轮重复出现的根因不是判据不够，
+        而是**唯一的机判件 narration_pause_precheck 从未在交付链上跑过**——用户点名的
+        两处位点在修前波形上实测 0.16s／0.00s，现行 0.2s 绝对阈本来抓得到，只是没人跑。
+        发现位点因此落在成片之后，每轮代价＝一次全量渲染（本项目实测 1512.8s）。
+        本方法把它前移到 timeline 步末：此时 `_timeline_manifest.json` 的逐字时间戳刚实测
+        落盘、且 render 尚未起跑，改一处停顿只付该场 TTS 重合成。
+
+        三条边界：①只报不拦——与 frame_occupancy／narration_pause_precheck 同判据
+        （为观感新增门禁只会多一次"全绿但难看"）；②取数断链一律点名断在哪条腿，
+        不得由"没报问题"读成"没有问题"；③刻意不把该脚本登记进任何步骤指纹面
+        （见回归用例94 F 段），改它不使存量项目重跑。
+        """
+        try:
+            import narration_pause_precheck as npp
+            audit = npp.run_project_audit(self.html_project)
+        except Exception as e:
+            print(f"  [PAUSE-AUDIT] 无从审计：{e}")
+            print("    这不等于「停顿已核过」——需该项目先跑过 TTS 对齐（timeline 步之前完成）")
+            self.state.data["pause_audit"] = {"at": datetime.now().isoformat(),
+                                              "adjudicated": False, "reason": str(e)[:200]}
+            return
+        s = audit["summary"]
+        try:
+            with open(self.temp_dir / "_pause_audit.json", "w", encoding="utf-8") as f:
+                json.dump({"at": datetime.now().isoformat(), **audit}, f,
+                          ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"  [PAUSE-AUDIT] 读数落盘失败（照常打印）：{e}")
+        self.state.data["pause_audit"] = {"at": datetime.now().isoformat(),
+                                          "adjudicated": True, **s}
+        print(f"  [PAUSE-AUDIT] 描述面（不裁定）：标点位点 {s['punct_points_measured']} 个"
+              f"｜连读桶 <{s['absolute_floor_seconds']:g}s 共 {s['absolute_hits']} 条"
+              f"｜急促桶 <{s['relative_ratio']:g}×同场同类中位 且 <{s['relative_ceiling_seconds']:g}s"
+              f" 共 {s['relative_hits']} 条"
+              f"｜cohort 样本<2 未裁定 {s['relative_unmeasurable'] if s['relative_unmeasurable'] is not None else '无从计数'} 个")
+        for r in audit["rushed"][:5]:
+            print(f"    · {r['note']}")
+        if len(audit["rushed"]) > 5:
+            print(f"    · …其余 {len(audit['rushed']) - 5} 条见 _pause_audit.json")
+        if audit["skipped"]:
+            print(f"    音频面未量（逐场点名）：{'、'.join(audit['skipped'])}")
+        if audit["rushed"]:
+            print("    渲染前改此处只付该场 TTS 重合成；渲完再改要付一次全量渲染。")
+            print("    取候选声明：python narration_pause_precheck.py --project "
+                  f"{self.html_project} --emit-declarations")
 
     def _record_timeline_run(self, new_dur):
         """时间轴运行历史登记 + 非收敛漂移告警（P1 整改，prefab 复盘根因3）。

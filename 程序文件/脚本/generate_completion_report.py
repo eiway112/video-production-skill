@@ -960,7 +960,12 @@ def generate_report(
                                      # 当时是否落后"须与成片同批入 git——消费者侧的版本读数此前
                                      # 无处可查，开发仓侧也无从复核对方报来的问题出在哪一版。
                                      # 同 render_env_check 口径——只透传不裁定。
-                                     ("skill_version", "skill_version")):
+                                     ("skill_version", "skill_version"),
+                                     # 句内停顿审计（2026-10-28 复盘批）：temp/日志均不入 git，
+                                     # "这轮渲染前量过多少标点处该停未停"须进 git 可追溯面，
+                                     # 否则下一轮又只能靠人耳重新发现。同 frame_occupancy 口径
+                                     # ——描述面，只透传不裁定。
+                                     ("pause_audit", "pause_audit")):
                     _val = pipeline_state.get(_skey)
                     if isinstance(_val, dict):
                         report["data_sources"][_dkey] = _val

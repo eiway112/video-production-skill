@@ -16288,7 +16288,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
                               "norm": "甲乙丙丁戊己庚辛", "chars": chars_d1,
                               "sentences": [{"text": "甲乙丙。", "rel_start": 0.0, "rel_end": 3.0},
                                             {"text": "丁戊己、庚辛", "rel_start": 3.4, "rel_end": 8.4}]}]}
-        silent, summ, skipped = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d1, rules)
+        silent, rushed, summ, skipped = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d1, rules)
         tc.assert_true(len(silent) == 1 and "、" in silent[0] and "。" not in silent[0],
                        f"D1 被点名的必须是顿号那条（归属错一位会点成句号或全零）：{silent}")
         tc.assert_true(summ["punct_median"].get("。") == 0.4,
@@ -16299,7 +16299,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         man_d2 = {"scenes": [{"scene_id": 1, "method": "asr_forced",
                               "norm": "有171个版本", "chars": chars_d2,
                               "sentences": [{"text": "有 171 个版本。", "rel_start": 0.0, "rel_end": 7.0}]}]}
-        silent2, _, skipped2 = npp.audio_face([{"scene_id": 1, "narration": text_d2}], man_d2, rules)
+        silent2, _, _, skipped2 = npp.audio_face([{"scene_id": 1, "narration": text_d2}], man_d2, rules)
         tc.assert_true(silent2 == [] and skipped2 == [],
                        f"D2 数字与量词之间的空白不构成停顿请求：{silent2}")
 
@@ -16313,7 +16313,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         ):
             man = {"scenes": [entry]}
             nar = [{"scene_id": 1, "narration": "甲乙丙。丁戊己、庚辛"}]
-            _, _, sk = npp.audio_face(nar, man, rules)
+            _, _, _, sk = npp.audio_face(nar, man, rules)
             tc.assert_true(len(sk) == 1 and needle in sk[0],
                            f"{label} 须逐场点名跳过（不得按 0 计、也不得读成干净）：{sk}")
 
@@ -16322,9 +16322,125 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
                               "sentences": [{"text": "甲乙丙。", "rel_start": 0.0, "rel_end": 3.0},
                                             {"text": "丁戊己、庚辛",
                                              "rel_start": 3.0 + 0.4 - 1e-9, "rel_end": 8.4}]}]}
-        _, summ6, _ = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d6, rules)
+        _, _, summ6, _ = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d6, rules)
         tc.assert_equal(summ6["segment_pause_below_enforced"], 0,
                         "D6 恰好达标的浮点读数不得计入'低于强制下限'（无容差的比较会数成 1）")
+
+        # ── D7~D10：相对（急促）桶 —— 2026-10-28 修前真值标定批新增 ──────────────
+        # 存在理由：用户点名的形态是"这里该停一下"，实测修前值 0.16s／0.00s，
+        # 而同场同类中位差到 逗号 0.30／冒号 0.48——单一绝对线在两档上语义不同。
+        # 正样本必须**绝对桶抓不到、相对桶抓得到**，否则这条腿等于没测。
+        text_d7 = "甲乙，丙丁，戊己，庚"          # 三个逗号位点：0.70 / 0.60 / 0.28
+        chars_d7 = [[0.0, 1.0, 1], [1.0, 2.0, 1],
+                    [2.7, 3.7, 1], [3.7, 4.7, 1],
+                    [5.3, 6.3, 1], [6.3, 7.3, 1], [7.58, 8.58, 1]]
+        man_d7 = {"scenes": [{"scene_id": 1, "method": "asr_forced",
+                              "norm": "甲乙丙丁戊己庚", "chars": chars_d7,
+                              "sentences": [{"text": "甲乙，丙丁，戊己，庚",
+                                             "rel_start": 0.0, "rel_end": 8.58}]}]}
+        silent7, rushed7, summ7, skipped7 = npp.audio_face(
+            [{"scene_id": 1, "narration": text_d7}], man_d7, rules)
+        tc.assert_equal(len(silent7), 0,
+                        f"D7 绝对桶须为 0（0.28 > 0.20 可听阈）——否则正样本被绝对桶抢走：{silent7}")
+        tc.assert_equal(len(rushed7), 1,
+                        f"D7 相对桶须恰 1 条（0.28 < 0.5×中位0.60 且 <0.30）：{rushed7}")
+        tc.assert_true(rushed7 and rushed7[0]["anchor"] == "戊己"
+                       and rushed7[0]["gap"] == 0.28,
+                       f"D7b 候选须带锚词与读数，且锚词不得跨上一个标点：{rushed7}")
+        tc.assert_equal(summ7["relative_hits"], 1, "D7c 摘要计数＝点名条数（不得各算一遍）")
+        tc.assert_equal(summ7["punct_points_measured"], 3,
+                        f"D7d 标点位点总数按标点计（本例 3 枚逗号）：{summ7['punct_points_measured']}")
+
+        # D8 cohort 样本 <2 → 无从取中位：不得入桶，也不得读成干净（D1 夹具每类各 1 枚）
+        tc.assert_equal(len(rushed), 0, "D8a 单样本 cohort 不入相对桶")
+        tc.assert_equal(summ.get("relative_unmeasurable"), 2,
+                        f"D8b 未裁定位点须计数点名（本例句号+顿号各 1）：{summ}")
+
+        # D9 候选声明产出：过 pause_marks 全部校验，超预算点名拒绝而非静默截断。
+        # 夹具自带（不从 D7 的读数派生）——否则"摘掉相对判据腿"会让 D9 连带变红，
+        # 变异落位就归不到对位断言。
+        cand = [{"scene_id": 1, "punct": "，", "gap": 0.28, "cohort_median": 0.6,
+                 "ratio": 0.47, "anchor": "戊己", "ctx": "丁戊己，庚辛", "note": "x"}]
+        decls = npp.emit_declarations([{"scene_id": 1, "narration": text_d7}], cand)
+        joined = "\n".join(decls)
+        tc.assert_true("戊己" in joined and "500" in joined,
+                       f"D9a 建议片段须含锚词与 auto_ms 取值：{joined}")
+        import pause_marks as _pm9
+        _pm_rules = _pm9.load_rules()
+        _plan = _pm9.plan_scene(text_d7, [{"after": "戊己", "ms": int(_pm_rules["auto_ms"])}],
+                               _pm_rules, engine="qwen", enabled=False)
+        tc.assert_equal(_plan["applied"], 1,
+                        f"D9b 建议片段必须可直接落进 TTS（plan_scene 认它）：{_plan}")
+        # 每场上限＝2：给一场塞 4 条急促候选，须只收 2 条并逐条点名拒绝
+        fake = [dict(cand[0], gap=0.05 + k * 0.01, anchor=a)
+                for k, a in enumerate(["甲乙", "丙丁", "戊己", "己庚"])]
+        over = "\n".join(npp.emit_declarations([{"scene_id": 1, "narration": text_d7}], fake))
+        tc.assert_true("超每场上限" in over,
+                       f"D9c 超上限须点名拒绝（静默截断＝给了不可执行的清单）：{over[:200]}")
+        # D9d/D9e 画面联动：只对被接受的候选报，且拼接式引用须单独点名（静态取不到词名）。
+        # 存在理由＝2026-10-28 生产实证：本项目 S6 字段值 `C["s6:结论固定"] + 0.30` 是因
+        # 插入停顿手工抬到 +0.90 的——清单若不点名这类偏移，等于给出会让音画更错位的清单。
+        html_d9 = ('<div data-scene-id="s1"></div>\n'
+                   '<script>\n'
+                   'tl.to("#a", {opacity:1}, T.s1 + C["s1:戊己"] + 0.30);\n'
+                   'tl.to("#b", {opacity:1}, T.s1 + C["s1:" + words[i]]);\n'
+                   'tl.set("#c", {x:0}, T.s1 + C["s1:甲乙"]);\n'
+                   '</script>')
+        link = "\n".join(npp.emit_declarations([{"scene_id": 1, "narration": text_d7}],
+                                               cand, html_d9))
+        tc.assert_true("画面联动" in link and "0.3" in link,
+                       f"D9d 命中的手调偏移须点名（本例 +0.30 挂在同一锚词上）：{link[:260]}")
+        tc.assert_true("拼接式" in link,
+                       f"D9e 拼接式引用静态取不到词名，须单独点名而非读成无联动：{link[:260]}")
+        # D9f 无 HTML 时建议照常产出（联动面缺失不得把整条腿判死）
+        tc.assert_true("戊己" in "\n".join(
+            npp.emit_declarations([{"scene_id": 1, "narration": text_d7}], cand)),
+            "D9f 未取到 HTML 只影响联动提示，候选本身照常给出")
+
+        # D9g–D9i 去重与歧义两条拒绝腿：判据必须取**标点位点**，不是锚词字面重叠。
+        # 存在理由＝2026-10-28 真实项目读数：s6 候选『名称』（"…现场实测。名称，只能触发…"）
+        # 与既有声明「只有名称」互为子串、分处两句，旧字面判据把它报成"该位点已有声明"并当场
+        # 丢弃——归因把"锚词不唯一、须加长"说成"这里已经停过了"，作者据此会认为无需处理。
+        # 这两条腿此前**零断言**（grep 「已有声明/锚点命中」在回归面命中 0）。
+        text_d9g = ("欠定输入，混合体系，只有名称。跨专业边界，"
+                    "检测报告与现场实测。名称，只能触发必问字段。")
+        nar_d9g = [{"scene_id": 6, "narration": text_d9g,
+                    "pause_marks": [{"after": "只有名称", "ms": 400}]}]
+        cand_d9g = [{"scene_id": 6, "punct": "，", "gap": 0.0, "cohort_median": 0.3,
+                     "ratio": 0.0, "anchor": "名称",
+                     "ctx": "现场实测。名称，只能触发", "note": "x"}]
+        g_out = "\n".join(npp.emit_declarations(nar_d9g, cand_d9g))
+        tc.assert_true("已有声明" not in g_out,
+                       f"D9g 锚词字面重叠不得读成「已有声明」（本例二者分处两句）：{g_out[:260]}")
+        tc.assert_true("锚点命中 2 次" in g_out and "加长锚词" in g_out,
+                       f"D9h 歧义锚词须点名命中次数并给出修法：{g_out[:260]}")
+        # D9i 同一标点位（锚词是既有声明锚词的后缀、末字符同一点）→ 仍须判"已有声明"，
+        # 不得因位点判据放宽成重复声明（同位点插两次＝停顿叠加，超预算且听感上是结巴）。
+        cand_d9i = [dict(cand_d9g[0], anchor="有名称", ctx="混合体系，只有名称。跨专业")]
+        i_out = "\n".join(npp.emit_declarations(nar_d9g, cand_d9i))
+        tc.assert_true("已有声明" in i_out,
+                       f"D9i 同位点重复声明须点名而非再插一条：{i_out[:260]}")
+        tc.assert_true('"after": "有名称"' not in i_out,
+                       f"D9i2 被拒候选不得混进建议片段（清单必须可执行）：{i_out[:260]}")
+
+        # D10 相对阈两键 fail-closed：缺键不得静默退化成"只有绝对桶"
+        for _miss in ("relative_ratio", "relative_ceiling_seconds"):
+            _r = _json.loads(_json.dumps(rules))
+            _r["pause_measurement"].pop(_miss)
+            _rp = Path(tmpdir) / f"prosody_missing_{_miss}.json"
+            _rp.write_text(_json.dumps(_r, ensure_ascii=False), encoding="utf-8")
+            _old_rf = npp.RULES_FILE
+            npp.RULES_FILE = _rp
+            try:
+                with _io.StringIO() as _buf:
+                    try:
+                        npp.load_rules()
+                        tc.assert_true(False, f"D10 缺 {_miss} 键必须抛 Broken，不得按 0 条继续")
+                    except npp.Broken as _e:
+                        tc.assert_true(_miss in str(_e),
+                                       f"D10 断链须点名缺哪个键：{_e}")
+            finally:
+                npp.RULES_FILE = _old_rf
 
         # ═════════════════════════════════════════════════════════
         # E. 不裁定：命中再多退出码仍 0；只有断链才非零
@@ -16341,6 +16457,18 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         tc.assert_true("描述面（不裁定）" in out, f"E2 汇总行自陈不裁定：{out.strip()[-80:]}")
         tc.assert_true("连读风险 1" in out and "枚举挤段 1" in out,
                        f"E3 计数住判据自身并打印：{out.strip()[-80:]}")
+        # E3b/E5：音频面没跑必须在汇总行显形。2026-10-28 实测病灶——CLI 传了写错的相对
+        # 路径时旧形态静默跳过音频面，汇总行照印"低于可听阈 0"，把"没量"读成"没问题"，
+        # 而同一份数据直调模块拿到的是 31 条。
+        tc.assert_true("音频面未跑 1" in out,
+                       f"E3b 未提供 manifest 时汇总行须点名「音频面未跑」：{out.strip()[-90:]}")
+        buf5 = _io.StringIO()
+        with contextlib.redirect_stdout(buf5):
+            rc5 = npp.main(["--narration", str(nar_path),
+                            "--manifest", str(Path(tmpdir) / "no_such_manifest.json")])
+        out5 = buf5.getvalue()
+        tc.assert_true(rc5 == 0 and "音频面取数断链" in out5 and "音频面未跑 1" in out5,
+                       f"E5 manifest 路径不在位＝点名断链（不得静默按 0 计）：rc={rc5} {out5.strip()[:150]}")
 
         old = with_rules(b"{ broken", tmpdir, "broken_for_cli.json")
         try:
@@ -16356,8 +16484,26 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         # F. 零冲击登记面（接进生效路径时必须同步改这两条）
         # ═════════════════════════════════════════════════════════
         pr = (Path(_script_env.SCRIPT_DIR) / "pipeline_runner.py").read_text(encoding="utf-8")
-        tc.assert_true("narration_pause_precheck" not in pr,
-                       "F1 本脚本不在任何步骤指纹登记面（改它不使存量项目重跑）")
+        # F1 判据方向于 2026-10-28 翻转（翻转条件正是本段注释当初写下的那条：
+        #   "接进生效路径时必须同步改这两条"）。旧断言"pipeline_runner.py 里不得出现本脚本名"
+        #   把**意图**（不登记进指纹面＝改它不使存量项目重跑）写成了**字面**（不许被调用），
+        #   于是把"消费但不登记"这条正确形态一并判成回归坏了。现拆两腿：
+        #   F1a 消费必须在位（否则停顿审计又退回"靠人耳在成片后发现"）；
+        #   F1b 登记面必须缺席（否则每改一次判据文案就让全仓项目重跑 preflight/tts）。
+        import re
+        _m = re.search(r"def _step_inputs\(.*?(?=\n    def )", pr, re.S)
+        tc.assert_true(_m is not None, "F1c _step_inputs 取不回＝登记面无从核对（不得按缺席判绿）")
+        if _m:
+            tc.assert_true("narration_pause_precheck" not in _m.group(0),
+                           "F1b 本脚本不得进任何步骤指纹登记面（改判据文案不得使存量项目重跑）")
+        tc.assert_true("run_project_audit" in pr and "_pause_audit_face" in pr,
+                       "F1a pipeline 必须消费本审计件（只报不拦），否则它仍是手动入口")
+        _tl = re.search(r"def step_timeline\(.*?(?=\n    def )", pr, re.S)
+        tc.assert_true(_tl is not None and "self._pause_audit_face()" in _tl.group(0),
+                       "F1d 审计位点须落在 timeline 步内（render 之前，改停顿才只付该场 TTS）")
+        _rep = (Path(_script_env.SCRIPT_DIR) / "generate_completion_report.py").read_text(encoding="utf-8")
+        tc.assert_true('("pause_audit", "pause_audit")' in _rep,
+                       "F1e 读数须透出到完工报告 data_sources（temp/日志不入 git，否则交付后不可追溯）")
         # F2 的判据方向已于 2026-10-14 翻转，翻转条件正是本段注释写下的那条：
         #   停顿声明生效面（pause_marks.load_rules）**引用**了同一份
         #   narration_prosody_rules.json 的 segment_overload 形状阈值（不抄值），

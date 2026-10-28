@@ -28,6 +28,24 @@
 - **TTS 语音**: {voice}
 - **渲染日期**: {YYYY-MM-DD}
 
+## 零渲染前置复核
+
+各门禁的当轮读数由执行者从流水线输出抄录；**本表是这些读数唯一的版本化留痕面**——
+`temp/`、`_pause_audit.json`、`completion_report.json` 与流水线日志全在 `.gitignore` 的
+`过程产物/` 之下，交付后不可追溯。留空即等于"没跑"，不得事后凭印象补填。
+
+| 判据 | 读数 |
+|---|---|
+| 预检 `preflight_check --mode render` | {PASS/FAIL，error/warning 计数与良性项说明} |
+| 词级 cue 声明契约 | {声明条数／是否全部可定位} |
+| 停顿声明（`pause_marks`） | {条数／覆盖场数／是否可执行} |
+| 停顿审计两桶（渲染前实测） | {连读桶 N 条／急促桶 M 条／未裁定位点数；来源 `[PAUSE-AUDIT]` 行，temp 读数不入 git} |
+| 场景插入三腿（`check_scene_insert`） | {仅在增删/重排场景时填} |
+| 章级条（`check_chapter_bar`） | {章名格／刻度格配对} |
+| 预览 `instant_preview` | {安全区／文字塌陷／柱状溢出／动画密度四判据} |
+| 空窗预判（渲染前置） | {实测 N/M 场过；曾用 --force 须写明} |
+| 交付审计 `--audit` | {六维逐项 PASS 与关键读数} |
+
 ## 字幕时间戳来源（必填，主路径命中率）
 
 Subtitle timestamp source: asr_forced {n}/{N} ({xx%}) | punct_gap {n} | char_prop {n} — 阈值 ≥{th%}
