@@ -37,10 +37,13 @@
 `config/quality/narration_prosody_rules.json`
 - merge_risk：量词 × 高危后缀字的封闭表，增字必须附真实口播样本；
 - segment_overload：分段结果里"长段 + 多顿号"的形状（用生产分段函数取数，不写第二套切分口径）；
-- pause_measurement：音频面**两桶**——连读桶（绝对阈 `audible_floor_seconds`）与
-  急促桶（`relative_ratio` × 同场同类标点中位、且 < `relative_ceiling_seconds`）。
-  两桶并列不合并的依据是 2026-10-28 的修前真值标定，读数与推理过程住该文件
-  `pause_measurement._标定依据`，此处不复述。
+- pause_measurement：音频面**三桶**——连读桶（绝对阈 `audible_floor_seconds`）、
+  急促桶（`relative_ratio` × 同场同类标点中位、且 < `relative_ceiling_seconds`）与
+  **第三桶**（2026-11-05 用户口播反馈批：无标点处**出现了**可听停顿，前两桶的镜像形态）。
+  三桶并列不合并的依据是 2026-10-28 的修前真值标定，读数与推理过程住该文件
+  `pause_measurement._标定依据`，此处不复述。第三桶的阈值权威源**不在此文件**，
+  住 `audio_sync_rules.json → intra_pause_trim`，判据实现住 `intra_pause.py`
+  （修剪面与点名面共用同一入口，两处各算即两份真相）。
 
 刻意**不做成门禁**
 ------------------
@@ -194,12 +197,20 @@ def spoken_and_after(text: str):
     return spoken, after
 
 
-def audio_face(narration: list, manifest: dict, rules: dict):
+def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
     """返回 (连读桶点名, 急促桶点名, 读数摘要, 逐场状态)。
 
     两桶**并列不合并**：连读＝绝对阈（该处几乎没停，听感是词被吞）；急促＝相对该场
     该类标点中位明显偏短（听感是用户口播点名的"这里该停一下"）。判据依据与标定读数
     住 narration_prosody_rules.json → pause_measurement._标定依据，此处不复述。
+
+    2026-11-05 增第三桶（`summary["intra"]`）：无标点处**出现了**可听停顿——它是前两桶的
+    镜像（前两桶量"标了标点却没停"，本桶量"没标标点却停了"），既有两桶的取样条件
+    `if not punct: continue` 结构上抓不到它。判据、阈值与波形修剪面**同源**
+    （`intra_pause.classify_points` + `audio_sync_rules.json → intra_pause_trim`）：
+    点名侧与修剪侧各算一遍即两份真相，会出现"报告里绿、成片里响"。
+    `wav_dir` 给出时（= 该项目 temp/tts_44k）能量腿照常跑；不给则位点以
+    `energy=None` 列出并计入 `unconfirmed`，**不得**并进 `hits`。
     """
     pm = rules["pause_measurement"]
     floor = float(pm["audible_floor_seconds"])
@@ -211,6 +222,10 @@ def audio_face(narration: list, manifest: dict, rules: dict):
     silent_punct: list = []
     seg_pause = []
     skipped = []
+    intra_rows: list = []
+    intra_unmeasurable = 0
+    intra_no_energy = 0
+    intra_broken: list = []
     for entry in manifest.get("scenes", []):
         sid = str(entry.get("scene_id"))
         if entry.get("method") != "asr_forced" or not entry.get("chars"):
@@ -252,6 +267,14 @@ def audio_face(narration: list, manifest: dict, rules: dict):
             if g < floor:
                 silent_punct.append(
                     f"s{sid} 标点处实测 {g:.2f}s（<{floor:g}s 可听阈）『…{ctx}…』")
+        # 第三桶：无标点处出现的可听停顿（判据与修剪面同源，见 _intra_bucket_rows）
+        res, err = _intra_bucket_rows(sid, spoken, after, chars, entry, wav_dir)
+        if err:
+            intra_broken.append(f"s{sid}：{err}")
+        elif res:
+            intra_rows += res["rows"]
+            intra_unmeasurable += res["unmeasurable"]
+            intra_no_energy += res["no_energy"]
         sents = entry.get("sentences") or []
         for a, b in zip(sents, sents[1:]):
             seg_pause.append(float(b["rel_start"]) - float(a["rel_end"]))
@@ -300,8 +323,68 @@ def audio_face(narration: list, manifest: dict, rules: dict):
         "relative_hits": len(rushed),
         # 同场同类样本 <2 的位点＝**未被裁定**，不得由"急促桶 0 条"读成干净
         "relative_unmeasurable": unmeasurable if rows else None,
+        # ---- 第三桶（2026-11-05）：无标点处出现了可听停顿 ----
+        "intra": {
+            "threshold_seconds": _trim_threshold_or_none(),
+            "hits": sum(1 for r in intra_rows if r["energy"] is True),
+            # energy=None＝能量腿没跑（未给 wav_dir 或该区间取不到样本）：照常点名，
+            # 但**不入 hits**——把"没量过"数成"确认是谷"即虚报，反之数成"没问题"即漏判。
+            "unconfirmed": sum(1 for r in intra_rows if r["energy"] is None),
+            "not_valley": sum(1 for r in intra_rows if r["energy"] is False),
+            "points": intra_rows,
+            "unmeasurable": intra_unmeasurable,
+            "no_energy": intra_no_energy,
+            "broken": intra_broken,
+        },
     }
     return silent_punct, rushed, summary, skipped
+
+
+_TRIM_RULES_MEMO: dict = {}
+
+
+def load_trim_rules():
+    """`audio_sync_rules.json → intra_pause_trim`（修剪面与第三桶共用的阈值权威源）。
+
+    读不回即返回 None 并让调用方点名——**不得**回退到脚本内字面量：那会把权威源
+    悄悄换成第二份真相（与 `enforced_floor()` 读不回返回哨兵 -1 同一族设计）。
+    """
+    try:
+        d = json.loads(SYNC_RULES_FILE.read_text(encoding="utf-8"))
+        sec = d["intra_pause_trim"]
+        return sec if isinstance(sec, dict) else None
+    except Exception:
+        return None
+
+
+def _trim_threshold_or_none():
+    """第三桶的绝对阈（供报告透出）；读不回即 None 并照常点名，不得回退成脚本内字面量。"""
+    r = load_trim_rules()
+    try:
+        return float(r["min_seconds"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def _intra_bucket_rows(sid, spoken, after, chars, entry, wav_dir):
+    """第三桶逐场取数：判据走 intra_pause.classify_points（单源，见其 docstring）。"""
+    import intra_pause as _ip
+    if "rules" not in _TRIM_RULES_MEMO:      # 只缓存一次；读不回也要缓存（None 是结论不是缺键）
+        _TRIM_RULES_MEMO["rules"] = load_trim_rules()
+    rules = _TRIM_RULES_MEMO["rules"]
+    if rules is None:
+        return None, "修剪面判据断链（audio_sync_rules → intra_pause_trim 读不回）"
+    audio = sr = None
+    if wav_dir:
+        cand = Path(wav_dir) / str(entry.get("tts_file") or "")
+        audio, sr = _ip.mono_from_wav(cand) if entry.get("tts_file") else (None, None)
+    verdict = _ip.classify_points(spoken, after, chars, rules, audio=audio, sr=sr)
+    if verdict["length_mismatch"]:
+        return None, f"原文 {len(spoken)} 字 ≠ 对齐 {len(chars)} 字，该场未量"
+    rows = [{"scene_id": sid, "gap": p["gap"], "ctx": p["ctx"], "energy": p["energy"]}
+            for p in verdict["points"]]
+    return {"rows": rows, "unmeasurable": verdict["unmeasurable"],
+            "no_energy": verdict["no_energy"]}, None
 
 
 def enforced_floor() -> float:
@@ -353,7 +436,9 @@ def run_project_audit(project: str) -> dict:
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     except Exception as e:
         raise Broken(f"音频面取数断链：_timeline_manifest.json 不可解析（{e}）")
-    absolute, rushed, summary, skipped = audio_face(narration, manifest, rules)
+    absolute, rushed, summary, skipped = audio_face(
+        narration, manifest, rules,
+        wav_dir=Path(manifest_path).parent / "tts_44k")
     html = Path(narration_path).parent / "index.html"
     html_text = ""
     if html.exists():
@@ -503,7 +588,8 @@ def main(argv=None) -> int:
         return 2
 
     grand = {"merge_risk": 0, "segment_overload": 0, "silent_punct": 0,
-             "rushed_punct": 0, "projects": 0, "audio_unaudited": 0}
+             "rushed_punct": 0, "projects": 0, "audio_unaudited": 0,
+             "intra_hits": 0, "intra_unconfirmed": 0}
     for path, manifest_path in targets:
         name = path.parent.name
         try:
@@ -527,10 +613,15 @@ def main(argv=None) -> int:
             else:
                 try:
                     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-                    silent, rushed, summary, skipped = audio_face(narration, manifest, rules)
+                    silent, rushed, summary, skipped = audio_face(
+                        narration, manifest, rules,
+                        wav_dir=Path(manifest_path).parent / "tts_44k")
                     audio_ran = True
                     grand["silent_punct"] += len(silent)
                     grand["rushed_punct"] += len(rushed)
+                    _intra = summary.get("intra") or {}
+                    grand["intra_hits"] += int(_intra.get("hits") or 0)
+                    grand["intra_unconfirmed"] += int(_intra.get("unconfirmed") or 0)
                 except Exception as e:
                     print(f"[PROSODY] {name} 音频面取数失败（文本面照常）：{e}")
                     grand["audio_unaudited"] += 1
@@ -559,9 +650,25 @@ def main(argv=None) -> int:
                       f"｜急促桶（<{summary['relative_ratio']:g}×同场同类中位 且 "
                       f"<{summary['relative_ceiling_seconds']:g}s）{summary['relative_hits']} 条"
                       f"｜cohort 样本<2 未裁定 {summary['relative_unmeasurable'] if summary['relative_unmeasurable'] is not None else '无从计数'} 个")
+            _intra = summary.get("intra") or {}
+            if _intra:
+                for r in _intra.get("points") or []:
+                    tag = {True: "真静音谷", False: "非谷（ASR 词尾早收）",
+                           None: "未经能量确认"}[r["energy"]]
+                    print(f"  · s{r['scene_id']} 无标点位点实测 {r['gap']:.2f}s"
+                          f"（≥{_intra['threshold_seconds'] if _intra['threshold_seconds'] is not None else '?'}s）"
+                          f"『…{r['ctx']}…』〔{tag}〕")
+                for b in _intra.get("broken") or []:
+                    print(f"  · 第三桶取数断链：{b}")
+                print(f"  第三桶｜无标点且 ≥{_intra['threshold_seconds']}s 位点 {len(_intra.get('points') or [])} 处"
+                      f"＝确认谷 {_intra['hits']}＋未经能量确认 {_intra['unconfirmed']}"
+                      f"＋非谷 {_intra['not_valley']}"
+                      f"｜插值/样本<2 未裁定 {_intra['unmeasurable']} 个"
+                      f"｜区间取不到 {_intra['no_energy']} 个"
+                      "（修剪面只动「确认谷」，本面只点名不剪）")
             if skipped:
                 print(f"  音频面未量（逐场点名）：{'、'.join(skipped)}")
-            if not hits and not silent and not rushed:
+            if not hits and not silent and not rushed and not (_intra.get("points") or []):
                 print("  文本面与音频面均无点名对象"
                       + ("（音频面未跑，此句不代表停顿已核）" if not audio_ran else ""))
         if a.emit_declarations and rushed:
@@ -580,6 +687,9 @@ def main(argv=None) -> int:
         f"｜枚举挤段 {grand['segment_overload']}"
         f"｜标点处实测低于可听阈 {grand['silent_punct']}"
         f"｜急促（相对同场同类中位）{grand['rushed_punct']}"
+        f"｜无标点处可听停顿 {grand['intra_hits']}"
+        + (f"（另有 {grand['intra_unconfirmed']} 处未经能量确认）"
+           if grand["intra_unconfirmed"] else "")
         + (f"｜音频面未跑 {grand['audio_unaudited']} 个（该计数>0 时上列两项读数不完整）"
            if grand["audio_unaudited"] else ""))
     return 0

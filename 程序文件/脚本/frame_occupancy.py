@@ -98,6 +98,14 @@ def measure(video_path, scene_windows=None):
         # 口径且等于声明口径"，把随项目画布高而变的推导值塞进去会让那条断言失去意义。
         out["body_ratio"] = [BODY_TOP, round(body_ratio, 4)]
         out["body_ratio_source"] = ratio_src
+        # 活跃度子面与占用面正交（时间维 vs 空间维），各自独立取数、独立归因：
+        # 占用取到数而活跃度取不到时，只点名后者，**不得把整面洗成 untested**；
+        # 反向亦然。内层 try 是这条隔离的实现腿，摘掉它即让子面异常冒到外层
+        # ——外层 catch 会把"有占用的好读数"一起吞成一句 untested（用例93 B6 锁此）。
+        try:
+            out["motion"] = measure_motion(video_path)
+        except Exception as e:                          # noqa: BLE001
+            out["motion"] = {"untested": f"活跃度子面异常（{type(e).__name__}）"}
         if scene_windows:
             per = []
             for sid, a, b in scene_windows:
@@ -170,6 +178,69 @@ def _extract(video_path, W):
     return r.stdout if r.returncode == 0 and r.stdout else None
 
 
+# ── 画面活跃度子面（2026-11-05 外部参考片实测批）───────────────────────────
+MOTION_FPS = 10             # 采样密度：0.1s 一帧，够抓 3s 级静止，不被转场帧稀释
+MOTION_W = 320
+MOTION_H = 180
+MOTION_EVENT_MIN = 0.1      # 逐帧 mean|Δ|（0-255 灰度标度）超过此值记为"该 0.1s 在动"
+
+MOTION_CALIBER = {"fps": MOTION_FPS, "w": MOTION_W, "h": MOTION_H,
+                  "event_min": MOTION_EVENT_MIN}
+
+
+def _extract_motion(video_path):
+    import subprocess
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
+                        "-vf", f"fps={MOTION_FPS},scale={MOTION_W}:{MOTION_H},format=gray",
+                        "-f", "rawvideo", "pipe:1"], capture_output=True)
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
+def measure_motion(video_path):
+    """画面活跃度（描述面，**不裁定**）：逐 0.1s 帧间差分的分布、在动占比、最长连续静止秒数。
+
+    存在理由（实测而非推演）：本仓「最大静止时间：任何场景内连续静止不超过 3 秒」
+    （踩坑清单 §八 场景时间设计规范 第 3 条）自设立起**从未被机算验证过**。2026-11-05 首次
+    复算：两支用户验收通过的横屏成片静止占比 69.3%／74.5%，同期一支外部参考片同法 0.8%。
+    而画面占用那条量上三支不可分（外部 0.191 居中，被点名的留白病灶件反而最好）——
+    **占用是空间维、活跃度是时间维，两者正交，不得互替**：一张图可以铺得很满却一动不动。
+    这正是"条文在位、产出未兑现"的形态：条款要求持续动效，代码里也确实有 42 块 repeat/yoyo，
+    但 34 块挂在背景光斑的 `scale` 上，落在逐帧差分上不足 0.05 灰阶。
+
+    刻意不设阈、不给 PASS/FAIL、不进任何退出码路径——与占用面同一取舍
+    （2026-10-10 常设裁定：不为观感问题新增代码门禁）。翻转前置同占用面：
+    须同时给出四态给法、会错杀哪些既有交付、且同画布向已验收样本 ≥3 支。
+
+    永不抛异常：取不到就点名为什么取不到（描述面不得把"崩了"读成"没有这一节"）。
+    """
+    try:
+        import numpy as np
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"numpy 不可用（{type(e).__name__}）——本项按缺依赖处理，"
+                            "不得读成成片有缺陷"}
+    try:
+        raw = _extract_motion(video_path)
+        if raw is None:
+            return {"untested": "ffmpeg 抽帧失败（活跃度子面）"}
+        fb = MOTION_W * MOTION_H
+        n = len(raw) // fb
+        if n < 3:
+            return {"untested": f"抽到 {n} 帧（<3），无从给逐帧差分"}
+        arr = np.frombuffer(raw[:n * fb], dtype=np.uint8)
+        arr = arr.reshape(n, MOTION_H, MOTION_W).astype(np.int16)
+        d = np.abs(arr[1:] - arr[:-1]).mean(axis=(1, 2))
+        moving = d > MOTION_EVENT_MIN
+        return {"caliber": dict(MOTION_CALIBER), "frames": int(n),
+                "seconds": round(n / float(MOTION_FPS), 1),
+                "diff_median": round(float(np.median(d)), 3),
+                "diff_p90": round(float(np.percentile(d, 90)), 3),
+                "moving_share": round(float(moving.mean()), 3),
+                "static_share": round(float((~moving).mean()), 3),
+                "max_static_seconds": round(_longest_run(~moving) / float(MOTION_FPS), 1)}
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"活跃度度量异常（{type(e).__name__}: {str(e)[:80]}）"}
+
+
 def format_line(m):
     """人类可读那一行的**唯一生成点**（文案住这里，报告侧不得另抄一句描述）。
 
@@ -179,9 +250,23 @@ def format_line(m):
     # 否则会掉进下面的取数分支并 KeyError——这条由用例93 B3 抓到并当场修。
     if not m or "untested" in m:
         return f"[FRAME-OCCUPANCY] UNTESTED — {m.get('untested') or '未附归因（取数面未点名原因）'}"
+    # 活跃度子面缺席必须**可见**：把"没接这个子面"和"接了但取不到数"都写成静默省略，
+    # 就等于让"摘掉子面"这种改动不留任何读数差（用例93 B5）。
+    mo = m.get("motion")
+    if mo is None:
+        motion_txt = "｜活跃度 未取数（子面未接入，非「取不到」）"
+    elif "untested" in mo:
+        motion_txt = f"｜活跃度 UNTESTED — {mo.get('untested') or '未附归因'}"
+    else:
+        motion_txt = (f"｜在动占比 {mo['moving_share']} 静止占比 {mo['static_share']} "
+                      f"最长连续静止 {mo['max_static_seconds']}s"
+                      f"（逐帧差分中位 {mo['diff_median']}，"
+                      f"{mo['caliber']['fps']}fps×{mo['caliber']['w']}）")
     return (f"[FRAME-OCCUPANCY] 描述面（不裁定）：主体区占用 中位 {m['median']} "
             f"p10 {m['p10']} 最低 {m['min']}｜低占用(<{LOW_SHARE_OF_BLANK}) "
             f"{m['low_blank_seconds']}s／{m['frames']}s｜最长连续低占用 "
-            f"{m['max_low_blank_run_seconds']}s｜口径 {m['caliber']['tile']}×"
+            f"{m['max_low_blank_run_seconds']}s"
+            + motion_txt +
+            f"｜口径 {m['caliber']['tile']}×"
             f"{m['caliber']['tile']} 块 std>{m['caliber']['std_min']}，"
             f"主体区纵向比例 {m['caliber']['body_ratio']}")

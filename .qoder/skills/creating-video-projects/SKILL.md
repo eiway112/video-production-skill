@@ -5,6 +5,17 @@ description: 通过现有视频制作工作流（Doc2Video → AI导演 → Hype
 
 # 视频项目创建 — 端到端编排协议
 
+## 前置条件（先读这一节）
+
+**本 Skill 是编排协议，不是独立工具**：包内只有本文件，不含任何脚本。下文所有命令都住在视频制作工作流仓的 `程序文件/脚本/` 下——未取到该仓时，阶段0 的 `python config_manager.py` 即报 `FileNotFoundError`。**属环境未就绪，不得据此判本 Skill 失效，也不得据此改判据。**
+
+工作流仓为公开仓，GitHub 与 Gitee 双端点同名同内容：
+
+- `https://github.com/eiway112/video-production-skill`
+- `https://gitee.com/eiway112/video-production-skill`
+
+克隆后按该仓 `README.md` 的安装段配置环境（Python / FFmpeg / Node + hyperframes 渲染器 / Chrome / TTS 凭据）。**版本号与安装命令一律以该 README 为权威源，本文件不复制**——渲染器版本钉住过也升过，抄进这里即随源件过期。该仓同时携带下文「权威参照」表列出的 4 份文档。
+
 ## 适用范围（v1）
 
 - ✅ 主路径：文档(PPT/Word/MD) → AI导演模式 → HyperFrames 渲染（已被 21 支交付视频验证）

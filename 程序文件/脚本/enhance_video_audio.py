@@ -201,6 +201,11 @@ AUDIO_BITRATE = "256k"  # config "audio_bitrate"：成片 AAC 码率（现状默
 # 也会让"同一场同一文本"在一轮里因中途改规则而裂成两个读数。
 PAUSE_DECLARATIONS: dict = {}
 PAUSE_AUTO_ENABLED = False
+# INTRA_TRIM_ENABLED：三态（None＝未声明，按 audio_sync_rules → enabled_by_default 裁定；
+# True/False＝项目显式声明）。与 PAUSE_AUTO_ENABLED / BGM_ENABLED_DEFAULT 同判据：
+# 缺省关——开启＝替作者剪掉已合成波形里的静音并缩短片长（场景窗口由 TTS 时长驱动，
+# 级联时长预算与增量渲染基线），属全仓节奏基准变更，代码落地、缺省不翻。
+INTRA_TRIM_ENABLED = None
 _PAUSE_PLAN_MEMO: dict = {}
 
 
@@ -268,7 +273,7 @@ def _collect_pause_state(cfg, scenes_list):
     "不惰性赋值"同族），跨项目 in-process 调用时后一个项目会静默继承前一个
     项目的停顿声明——那等于把 A 项目的朗读节奏装进 B 项目的音频。
     """
-    global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED
+    global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED, INTRA_TRIM_ENABLED
     PAUSE_DECLARATIONS = {}
     PAUSE_AUTO_ENABLED = False
     _PAUSE_PLAN_MEMO.clear()
@@ -276,6 +281,28 @@ def _collect_pause_state(cfg, scenes_list):
     if raw is None and isinstance(cfg.get("audio"), dict):
         raw = cfg["audio"].get("pause_auto_enabled")
     PAUSE_AUTO_ENABLED = _coerce_bool(raw, default=False)
+    # 修剪面开关：**三态**（未声明=None → 由规则文件 enabled_by_default 裁定）。
+    # 与 BGM 那条同判据的守卫：声明了 intra_pause_trim 节却没声明 enabled 即退出码非零
+    # 并点名两键——不得静默摘掉作者的裁定，也不得"见了节就开"（后者会把一次误写
+    # 变成全项目剪波形）。
+    _trim_cfg = cfg.get("intra_pause_trim")
+    if _trim_cfg is None and isinstance(cfg.get("audio"), dict):
+        _trim_cfg = cfg["audio"].get("intra_pause_trim")
+    if isinstance(_trim_cfg, dict):
+        if "enabled" not in _trim_cfg:
+            print("[ERROR] 声明了 intra_pause_trim 节却未声明其 enabled 键——")
+            print("[ERROR]   要么显式写 intra_pause_trim.enabled: true/false，")
+            print("[ERROR]   要么整节删掉（交回 audio_sync_rules.json → enabled_by_default 裁定）。")
+            sys.exit(1)
+        INTRA_TRIM_ENABLED = _coerce_bool(_trim_cfg.get("enabled"), default=False)
+    elif isinstance(_trim_cfg, bool):
+        INTRA_TRIM_ENABLED = _trim_cfg
+    elif _trim_cfg is not None:
+        print(f"[ERROR] intra_pause_trim 必须是对象（含 enabled 键）或布尔，读到 "
+              f"{type(_trim_cfg).__name__}：{_trim_cfg!r}")
+        sys.exit(1)
+    else:
+        INTRA_TRIM_ENABLED = None
     for s in scenes_list or []:
         marks = s.get("pause_marks")
         if marks:
@@ -638,6 +665,186 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
     return True, sentences, total_inserted, chars
 
 
+def _time_map_factory(cuts):
+    """把一串"已删除区间"（原时间轴上的 (lo, hi)）合成一个单调时间映射。
+
+    落在被删区间内的时刻一律收到该区间起点，之后的时刻整体前移累计删除量。
+    修剪面与句级/字符级共用这一个映射——两处各算一遍就会分叉（A06 同族）。
+    """
+    ordered = sorted(cuts)
+
+    def f(t):
+        t = float(t)
+        shift = 0.0
+        for lo, hi in ordered:
+            if t >= hi:
+                shift += hi - lo
+            elif t > lo:
+                return round(lo - shift, 3)
+        return round(t - shift, 3)
+    return f
+
+
+def _trim_note(note, points=0, hits=0, unmeasurable=0, no_energy=0):
+    """修剪面一次的**结构化**读数（2026-11-05）。
+
+    存在理由：调用方要把"剪了几处 / 多少处因取数面未入桶 / 多少处能量腿无从裁定"
+    落进 manifest 与日志。若让它从文案串里 split 出数字，判据面与呈现面就分叉了
+    （文案改一个标点，读数即错）。`note` 只供人读，三个计数才是给机器的。
+    """
+    return {"note": note, "points": int(points), "hits": int(hits),
+            "unmeasurable": int(unmeasurable), "no_energy": int(no_energy)}
+
+
+def _shift_stream_for_removed_silence(stream, cuts):
+    """字符级流 / 句级流在删除静音后的时刻重映射（返回新列表，不改入参）。
+
+    与 `_shift_chars_for_inserted_silence` 互为逆运算，同一套纪律：
+      - **返回新值**而非原地热绑定——原地改会让调用方"忘了回写也恰好生效"，
+        回写这条腿就永远测不出是不是死代码（2026-10-12 定）。
+      - `chars` 形如 [[s, e, matched], ...]，`sentences` 形如 [{rel_start, rel_end}, ...]；
+        两者用同一个时间映射，故"句子说 12.0s、字符说 11.2s"的两份真相在结构上不可能出现。
+    """
+    f = _time_map_factory(cuts)
+    out = []
+    for item in stream:
+        if isinstance(item, dict):
+            d = dict(item)
+            d['rel_start'] = f(d.get('rel_start', 0.0))
+            d['rel_end'] = f(d.get('rel_end', 0.0))
+            out.append(d)
+        else:
+            out.append([f(item[0]), f(item[1]), item[2]])
+    return out
+
+
+def _trim_intrasentence_silence(hq_file, sentences, chars, text, rules):
+    """无标点处多余停顿的波形修剪（2026-11-05 用户口播反馈批；缺省关闭）。
+
+    存在理由与阈值标定住 `intra_pause.py` 与 `audio_sync_rules.json → intra_pause_trim`，
+    本函数只做**执行**：判据（位点是否入桶）一律经 intra_pause 取数，不在这里重算。
+
+    与 `_enforce_sentence_pauses` 的分工：那个面在字幕段边界**补**静音（作者要求停而引擎没停），
+    本面在无标点处**剪**静音（作者没要求停而引擎切进词里）。两者都改波形，因此共用
+    同一套"返回新时间戳 + 重测时长 + 重绑波形哈希"的收口，也都受 PAUSE_ENFORCE_VERSION 管。
+
+    不对称纪律（与声明面同判据）：任一取数腿断链即**不剪**并点名原因，绝不"猜着剪"——
+    在字上动刀是不可逆损伤，而"该剪没剪"最坏只是维持现状（复核第三桶照常点名它）。
+
+    Returns (modified, sentences, removed_seconds, chars, res)
+        `res` 是 `_trim_note` 的结构化读数（note / points / hits / unmeasurable / no_energy）：
+        三个计数分别回答"剪了几处""命中几处但没剪""因取数面未入桶几处"，
+        调用方**不得**从 note 文案里 parse 数字。
+    """
+    if chars is None or len(sentences) < 1 or not text:
+        return False, sentences, 0.0, chars, _trim_note(
+            "无字符级对齐数据，修剪面未运行（非『无需修剪』）")
+    import wave
+    import numpy as np
+    import intra_pause as _ip
+    from narration_pause_precheck import spoken_and_after
+
+    try:
+        with wave.open(str(hq_file), 'rb') as wf:
+            if wf.getsampwidth() != 2:
+                return False, sentences, 0.0, chars, _trim_note(
+                    f"非 s16 wav（sampwidth={wf.getsampwidth()}），不剪")
+            n_ch, sr = wf.getnchannels(), wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except (OSError, wave.Error) as e:
+        return False, sentences, 0.0, chars, _trim_note(
+            f"波形读不回（{type(e).__name__}），不剪")
+
+    audio = np.frombuffer(raw, dtype=np.int16).reshape(-1, n_ch)
+    mono = audio.mean(axis=1).astype(np.float64) / 32768.0
+
+    spoken, after = spoken_and_after(text.strip())
+    # 判据一律走 intra_pause.classify_points——点名侧与修剪侧共用同一入口，
+    # 两处各算一遍即两份真相（本仓 A06/单源收敛反复栽过的形态）。
+    verdict = _ip.classify_points(spoken, after, chars, rules, audio=mono, sr=sr)
+    if verdict["length_mismatch"]:
+        return False, sentences, 0.0, chars, _trim_note(
+            f"原文 {len(spoken)} 字 ≠ 对齐 {len(chars)} 字，该场不入修剪面（不得按 0 计）",
+            unmeasurable=verdict["unmeasurable"], no_energy=verdict["no_energy"])
+    # 只动能量腿**明确为谷**的位点：False＝ASR 词尾早收的时刻偏差（不是静音），
+    # None＝这一腿没跑成（区间过短/取不到样本）——把两者当"是谷"去剪即在字上动刀。
+    kept = _ip.audio_is_valley(verdict["points"])
+    unmeasurable, no_energy = verdict["unmeasurable"], verdict["no_energy"]
+
+    cap = int(rules.get('max_points_per_scene', 3))
+    if len(kept) > cap:
+        return False, sentences, 0.0, chars, _trim_note(
+            f"该场命中 {len(kept)} 处 > 上限 {cap}，整场退回人工（逐条见复核第三桶），未剪",
+            hits=len(kept), unmeasurable=unmeasurable, no_energy=no_energy)
+    if not kept:
+        return False, sentences, 0.0, chars, _trim_note("无入桶位点",
+                                                          unmeasurable=unmeasurable,
+                                                          no_energy=no_energy)
+
+    keep_s = float(rules['keep_seconds'])
+    fade = max(1, int(0.008 * sr))
+    buf = audio.copy()
+    cuts = []
+    for p in sorted(kept, key=lambda q: -q['t_lo']):     # 右→左：切点坐标恒在原时间轴上
+        i0 = int(round(p['t_lo'] * sr))
+        i1 = int(round(p['t_hi'] * sr))
+        rem = (i1 - i0) - int(round(keep_s * sr))
+        if rem < 2:
+            continue
+        env = np.abs(buf[i0:i1].astype(np.int32)).sum(axis=1).astype(np.float64)
+        win = max(1, int(0.015 * sr))
+        env = np.convolve(env, np.ones(win) / win, mode='same')
+        centre = i0 + int(np.argmin(env))
+        lo = min(max(centre - rem // 2, i0), i1 - rem)
+        hi = lo + rem
+        # 接缝两侧各做 8ms 淡入淡出：被剪区间本就在静音里，淡变在近零样本上是 no-op，
+        # 它防的是"ASR 时刻偏早、边缘仍带语音"这一形态——不淡变即是在波形上造一个台阶。
+        a = max(0, lo - fade)
+        buf[a:lo] = (buf[a:lo].astype(np.float64)
+                     * np.linspace(1.0, 0.0, lo - a)[:, None]).astype(np.int16)
+        b = min(len(buf), hi + fade)
+        buf[hi:b] = (buf[hi:b].astype(np.float64)
+                     * np.linspace(0.0, 1.0, b - hi)[:, None]).astype(np.int16)
+        buf = np.concatenate([buf[:lo], buf[hi:]])
+        cuts.append((lo / sr, hi / sr))
+
+    if not cuts:
+        return False, sentences, 0.0, chars, _trim_note(
+            "入桶位点均短于 keep_seconds，未剪", hits=len(kept))
+
+    new_chars = _shift_stream_for_removed_silence(chars, cuts)
+    new_sents = _shift_stream_for_removed_silence(sentences, cuts)
+    removed = sum(hi - lo for lo, hi in cuts)
+
+    # 验证闭环（与插入面同判据）：剪完这些位点的间隔必须落到 keep 档，
+    # 否则炸给调用方、不写残波形——"剪了但没剪够"写成成功即虚假放行。
+    # 复核用的是**重映射后的字符流**（下游真正消费的那份），不是重新量一遍波形。
+    for p in sorted(kept, key=lambda q: q['t_lo']):
+        i = p['i']
+        gap = float(new_chars[i + 1][0]) - float(new_chars[i][1])
+        if gap > keep_s + 0.06:
+            raise RuntimeError(
+                f"intra-pause trim 失败：{hq_file.name} 位点 {p['ctx']} 剪后间隔仍为 "
+                f"{gap:.3f}s > keep={keep_s}s，拒绝静默放行")
+
+    tmp = hq_file.with_name(hq_file.name + ".trim.tmp")
+    try:
+        with wave.open(str(tmp), 'wb') as wf:
+            wf.setnchannels(n_ch)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(np.ascontiguousarray(buf).tobytes())
+        os.replace(tmp, hq_file)      # 原子落盘：半截 wav 会让下一轮 silencedetect 读出错
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        return False, sentences, 0.0, chars, _trim_note(
+            f"修剪后波形写入失败（{type(e).__name__}），维持原波形", hits=len(kept))
+
+    return True, new_sents, round(removed, 3), new_chars, _trim_note(
+        f"剪 {len(cuts)} 处 / {removed:.2f}s", points=len(cuts), hits=len(kept),
+        unmeasurable=unmeasurable, no_energy=no_energy)
+
+
 def _wave_sha256(wav_path):
     """波形内容哈希（A08）：对齐缓存必须绑定实际音频字节而非文本派生键。
 
@@ -684,6 +891,33 @@ ALIGN_ALGO_VERSION = "v3"
 # 改动停顿强制的裁定逻辑（下刀点、插入量、fade 等）时必须 bump。
 PAUSE_ENFORCE_VERSION = "v2"
 _ENF_STAMP_RAW = "raw"
+# 修剪面上线后**已入桶位点处**的静音被物理删除，旧波形上没有"该剪未剪"的复检信号，
+# 故启用时戳记另加后缀：v2 → 与 v2+trim 不是同一份波形代次，必须从原始 TTS 重建后重走
+# 强制+修剪。未启用时后缀为空，存量项目零冲击（既有戳记逐字照旧命中）。
+PAUSE_TRIM_SUFFIX = "+trim"
+
+
+def _intra_trim_state():
+    """返回 (enabled, rules, stamp_expected, 归因)。
+
+    单一出口：波形侧（_build_timeline_manifest）与点名侧（narration_pause_precheck 第三桶）
+    都从这里取值，两处各读一遍配置即两份真相。
+    判据断链（规则文件缺失/残键）一律 enabled=False 并给出归因——"读不到判据"不得
+    退化成"按脚本内字面量剪波形"。
+    """
+    global INTRA_TRIM_ENABLED
+    import intra_pause as _ip
+    try:
+        rules = _ip.load_rules(
+            Path(__file__).resolve().parents[1] / "配置" / "config" / "quality"
+            / "audio_sync_rules.json")
+    except _ip.Untested as e:
+        return False, None, PAUSE_ENFORCE_VERSION, f"判据断链：{e}"
+    enabled = (bool(rules.get('enabled_by_default'))
+               if INTRA_TRIM_ENABLED is None else bool(INTRA_TRIM_ENABLED))
+    stamp = PAUSE_ENFORCE_VERSION + (PAUSE_TRIM_SUFFIX if enabled else "")
+    return enabled, rules, stamp, ("项目显式声明" if INTRA_TRIM_ENABLED is not None
+                                   else "按缺省 enabled_by_default")
 
 
 def _enf_stamp_path(hq_file):
@@ -708,8 +942,12 @@ def _write_enf_stamp(hq_file, value):
         print(f"  [WARN] 停顿强制戳记写入失败 {hq_file.name}: {e}")
 
 
-def _ensure_current_enforcement(hq_file, raw_file):
+def _ensure_current_enforcement(hq_file, raw_file, stamp_expected=None):
     """确保 hq wav 是**当前停顿强制版本**的产物；必要时从原始 TTS 重建。
+
+    `stamp_expected` 缺省＝`PAUSE_ENFORCE_VERSION`（未启用修剪面时的既有形态，逐字不变）。
+    启用修剪时调用方传 `v2+trim`：波形里已被剪掉的静音无法在旧波形上"再剪一次"补回来，
+    与下面那条重建理由同源——凡改的是**已不可逆地写进波形**的东西，判据就只能靠重建，不能靠复检。
 
     返回 True 表示发生了重建（重建后该波形尚未经停顿强制，须由调用方随后执行）。
 
@@ -720,11 +958,12 @@ def _ensure_current_enforcement(hq_file, raw_file):
     **零网络成本**——不碰 `tts_hash`，故不会击穿已付费的合成缓存。
     """
     stamp = _read_enf_stamp(hq_file)
-    if stamp == PAUSE_ENFORCE_VERSION:
+    stamp_expected = stamp_expected or PAUSE_ENFORCE_VERSION
+    if stamp == stamp_expected:
         return False
     if not raw_file.exists():
         print(f"  [WARN] {hq_file.name}: 停顿强制戳记={stamp or '缺失'}"
-              f"（当前版本 {PAUSE_ENFORCE_VERSION}），但原始 TTS {raw_file.name} 不在位，"
+              f"（当前版本 {stamp_expected}），但原始 TTS {raw_file.name} 不在位，"
               f"无法重建波形——本次沿用现有波形，该场停顿可能仍是旧逻辑切出来的")
         return False
     ok = run_ffmpeg([
@@ -732,7 +971,7 @@ def _ensure_current_enforcement(hq_file, raw_file):
         "-ar", str(SAMPLE_RATE), "-ac", "2",
         "-sample_fmt", "s16",
         str(hq_file)
-    ], f"rebuild hq from raw (enforce {PAUSE_ENFORCE_VERSION})")
+    ], f"rebuild hq from raw (enforce {stamp_expected})")
     if not ok:
         print(f"  [WARN] {hq_file.name}: 从原始 TTS 重建失败，本次沿用现有波形")
         return False
@@ -774,6 +1013,13 @@ def _build_timeline_manifest(temp_dir):
     aligned = 0
     pause_min = float((_load_audio_sync_rules().get('sentence_pause') or {}).get('min_seconds', 0.4))
     algo_ver = f"{ALIGN_ALGO_VERSION}|{_fa.MODEL_SIZE}|pause={pause_min:g}"
+    # 修剪面状态在循环外解析一次：逐场重读规则文件会造出"同一轮里有的场剪了、
+    # 有的场因读盘失败没剪"的分裂代次（stamp 也是同一轮的唯一判据）。
+    trim_on, trim_rules, stamp_expected, trim_归因 = _intra_trim_state()
+    if not trim_on and INTRA_TRIM_ENABLED is not None:
+        print(f"  [TRIM] 修剪面未启用（项目声明 enabled={INTRA_TRIM_ENABLED}）：{trim_归因}")
+    elif not trim_on and trim_rules is None:
+        print(f"  [TRIM] 修剪面未启用：{trim_归因}")
     for scene_id, start, end, text in SCENES:
         h = _tts_cache_key(text, scene_id=scene_id)
         hq_file = tts_dir / f"tts_{h}_hq.wav"
@@ -784,9 +1030,10 @@ def _build_timeline_manifest(temp_dir):
         # 位置在 wave_sha 计算之前——重建会改写字节，哈希必须取重建后的值，
         # 否则下面那道"波形字节实测未变"的缓存条件会拿旧哈希比新波形。
         prev_stamp = _read_enf_stamp(hq_file)
-        rebuilt = _ensure_current_enforcement(hq_file, temp_dir / f"scene_{scene_id}_{h}.mp3")
+        rebuilt = _ensure_current_enforcement(hq_file, temp_dir / f"scene_{scene_id}_{h}.mp3",
+                                              stamp_expected=stamp_expected)
         if rebuilt:
-            print(f"  Scene {scene_id}: 停顿强制版本 {prev_stamp or '缺失'} → {PAUSE_ENFORCE_VERSION}，"
+            print(f"  Scene {scene_id}: 停顿强制版本 {prev_stamp or '缺失'} → {stamp_expected}，"
                   f"hq 波形已从原始 TTS 重建（零网络成本）")
         tts_dur = get_duration(str(hq_file))
         wave_sha = _wave_sha256(hq_file)
@@ -874,12 +1121,38 @@ def _build_timeline_manifest(temp_dir):
                 entry['wave_sha256'] = _wave_sha256(hq_file)
                 print(f"  Scene {scene_id}: sentence-pause enforced "
                       f"(+{ins:.2f}s silence → {entry['tts_duration']:.2f}s)")
+            # 修剪面（缺省关闭）：跑在插入面**之后**，量的是插入完成后将要交付的那份波形。
+            # 顺序反过来就会在旧波形上剪、再被插入面把时刻挪一次——两腿共用同一条
+            # "返回新时间戳"的路径才只有一份真相。
+            if trim_on and entry.get('chars'):
+                t_mod, t_sents, removed, t_chars, res = _trim_intrasentence_silence(
+                    hq_file, entry['sentences'], entry.get('chars'), text, trim_rules)
+                entry['pause_trim'] = {k: res[k] for k in
+                                       ("points", "hits", "unmeasurable", "no_energy")}
+                if t_mod:
+                    entry['sentences'] = t_sents
+                    if t_chars is not None:
+                        entry['chars'] = t_chars
+                    entry['tts_duration'] = round(get_duration(str(hq_file)), 3)
+                    entry['pause_trimmed'] = removed
+                    entry['wave_sha256'] = _wave_sha256(hq_file)
+                    print(f"  Scene {scene_id}: intra-pause trimmed "
+                          f"({res['note']} → {entry['tts_duration']:.2f}s；"
+                          f"{res['unmeasurable']} 处未入桶·{res['no_energy']} 处无从裁定)")
+                else:
+                    # 未剪的场**照常落读数**（含 0）：只有"剪了才写"会把"跑了但没命中"
+                    # 与"没跑"压成同一个空位（A06/停顿强制三态留痕同族）。
+                    print(f"  Scene {scene_id}: [TRIM] {res['note']}"
+                          f"（命中 {res['hits']}·未入桶 {res['unmeasurable']}"
+                          f"·无从裁定 {res['no_energy']}）")
+            elif trim_on:
+                print(f"  Scene {scene_id}: [TRIM] 无字符级对齐数据，修剪面未运行（非「无需修剪」）")
         # 戳记收口：波形旁记下"这份波形已经是当前停顿强制逻辑的产物"。
         # 只在两种情形写当前版本——本轮刚从原始 TTS 重建（重建物必为干净波形），
         # 或进来时戳记本就是 raw/当前版本。重建失败（原始 TTS 不在位）时**不写**，
         # 保持旧戳记，下一轮重试重建；不得把"没能重建"记成"已是当前版本"。
-        if rebuilt or prev_stamp in (_ENF_STAMP_RAW, PAUSE_ENFORCE_VERSION):
-            _write_enf_stamp(hq_file, PAUSE_ENFORCE_VERSION)
+        if rebuilt or prev_stamp in (_ENF_STAMP_RAW, stamp_expected):
+            _write_enf_stamp(hq_file, stamp_expected)
         scenes_out.append(entry)
 
     data = {

@@ -1320,6 +1320,13 @@ class PipelineRunner:
                              # 不登记即"改了七层判据而 tts 步缓存照常命中、旧结论继续供数"，
                              # 与 2026-10-12 批 preview_capture.js 那条同族。
                              "tts_verify": SCRIPTS / "verify_tts_product.py",
+                             # 2026-11-05 用户口播反馈批补登：无标点处多余停顿的判据真身。
+                             # 修剪与重映射住在 _build_timeline_manifest（本 enhancer 件、
+                             # 即 **tts 步末尾**执行），它按名导入 intra_pause.classify_points；
+                             # timeline 那侧登记的是它写出的 manifest（内容变即失效），
+                             # 脚本本体不在 timeline 读取面上——登记到不读它的步骤＝制造
+                             # "缓存永不命中"的假安全（A06 反面），故记在 tts。
+                             "intra_pause_rules": SCRIPTS / "intra_pause.py",
                              "gsap_time_utils": gsap_utils,
                              "script": enhance_script},
             "timeline":     {"config": self.config_path, "html": self.html_path,
@@ -1422,6 +1429,10 @@ class PipelineRunner:
                              # 该节的判据真身与文案单源，同样必须登记。
                              "script": SCRIPTS / "generate_completion_report.py",
                              "occupancy_module": SCRIPTS / "frame_occupancy.py",
+                             # 2026-11-05 编排面同判据登记：data_sources.choreography 的判据真身
+                             # 与文案单源都在本件（generate_completion_report 只接线），
+                             # 不登记即"改了编排口径而该步缓存照常命中"——A06 同族第三犯。
+                             "choreography_module": SCRIPTS / "choreography_profile.py",
                              # 2026-10-16 审计批补登两条：本步的"产物-状态一致性"自适应容差
                              # 权威源是 delivery_gate_rules.json（generate_completion_report.py:48
                              # 直读），第 6 维"交付说明同源性"的取数与文案真身是 media_qa_gate.py
@@ -1818,6 +1829,40 @@ class PipelineRunner:
             print(f"    · {r['note']}")
         if len(audit["rushed"]) > 5:
             print(f"    · …其余 {len(audit['rushed']) - 5} 条见 _pause_audit.json")
+        # 第三桶（2026-11-05）：前两桶量"该停没停"，这一桶量"不该停却停了"。
+        # 处置方向与前者相反（加标点只会更糟），故必须单独成行、不能并进上面那条汇总。
+        _intra = s.get("intra") or {}
+        if _intra:
+            _th = _intra.get("threshold_seconds")
+            print(f"  [PAUSE-AUDIT] 第三桶｜无标点处出现可听停顿（阈 ≥{_th if _th is not None else '?'}s）："
+                  f"确认静音谷 {_intra['hits']} 处｜未经能量确认 {_intra['unconfirmed']} 处"
+                  f"｜非谷（ASR 词尾早收）{_intra['not_valley']} 处"
+                  f"｜插值/样本<2 未裁定 {_intra['unmeasurable']} 个")
+            for q in (_intra.get("points") or [])[:5]:
+                _tag = {True: "真静音谷", False: "非谷", None: "未经能量确认"}[q["energy"]]
+                print(f"    · s{q['scene_id']} 无标点处实测 {q['gap']:.2f}s"
+                      f"『…{q['ctx']}…』〔{_tag}〕")
+            for b in (_intra.get("broken") or [])[:3]:
+                print(f"    · 第三桶取数断链：{b}")
+            if _intra["hits"]:
+                # 开关状态取自 enhance 的单一解析出口，不在这里重读 config——
+                # 两处各自 `cfg.get(...)` 就会出现"报告说没开、执行侧却开着"的分叉。
+                _on, _stamp, _why = False, "", ""
+                try:
+                    import enhance_video_audio as _eva
+                    _on, _rules_i, _stamp, _why = _eva._intra_trim_state()
+                except Exception as e:
+                    print(f"    修剪面开关状态取不回（{type(e).__name__}）："
+                          "按未启用呈报，不得由『取不回』读成『已启用』")
+                if not _on:
+                    print("    修剪面未启用，以上位点**不会被自动处理**："
+                          "改写不可预期（韵律由整段上下文决定，理由与实测住 intra_pause.py"
+                          " docstring「为什么裁定权在波形层」），"
+                          "需要机器代处理须在 config 显式声明 intra_pause_trim.enabled: true")
+                else:
+                    print(f"    修剪面已启用（波形代次 {_stamp}·开关归因 {_why}）："
+                          "本审计读的是 manifest 里的对齐采样，修剪量逐场见同文件 "
+                          "scenes[].pause_trimmed 与渲染日志 [TRIM] 行")
         if audit["skipped"]:
             print(f"    音频面未量（逐场点名）：{'、'.join(audit['skipped'])}")
         if audit["rushed"]:

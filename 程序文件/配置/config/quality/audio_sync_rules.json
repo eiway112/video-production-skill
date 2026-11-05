@@ -69,5 +69,15 @@
     "fail_on_violation": true,
     "description": "字幕-语音对齐度门禁（media_qa_gate subtitle_audio_alignment）：silencedetect 提取成片音轨语音起口，与最近字幕条目起点比对，偏差 p95 超过 p95_max_seconds 则拒收。起口数 < min_onsets（如含 BGM 无静音段）降级为警告。",
     "$min_asr_forced_ratio": "主路径命中率门禁（media_qa_gate subtitle_timestamp_source，2026-09-19 普查裁定，方案 A）：asr_forced 场景数 / 有字幕场景总数 低于本值 → 判 UNTESTED（不是 FAIL——punct-gap 是设计内一级链路，成片并非不合格），默认阻断、--accept-media-untested 放行并留痕。取数面＝step5 逐场实际消费链（temp/_subtitle_timestamp_source.json），非 manifest 声明面。定值依据（7 份已交付成片实测分布，逐条终态表以 AI视频制作工作流模板/操作日志.md 的 [2026-09-19] docs 普查条目为唯一权威源，本字段不重抄派生副本）：5 份全场景 asr_forced（场景数 7-11 不等）、_修订01 9/10（1 场由对齐守卫按设计主动降级）、09-18 原版 0/10（HF 模型缓存未就位 → 整项目一级降级）。0.8 容忍个别场景守卫降级、拦住环境级失效；粒度随场景数变粗（3 场项目 1 场降级＝0.667 即触发），触发后可知情放行。"
+  },
+  "intra_pause_trim": {
+    "enabled_by_default": false,
+    "min_seconds": 0.25,
+    "relative_ratio": 0.6,
+    "keep_seconds": 0.08,
+    "valley_floor_db_max": -30.0,
+    "valley_side_sep_db_min": 12.0,
+    "max_points_per_scene": 3,
+    "description": "无标点处多余停顿的波形修剪面（2026-11-05 用户口播反馈批；判据单一持有者住 intra_pause.py，本文件只登记阈值）。存在理由：CosyVoice 整段合成时会在**旁白没有任何停顿请求**的位置切开完整语义单位（实测片 装配式装修标准体系_知识科普_修订05：评价|验收 0.32s、计量|计价 0.28s、强制|底线 0.30s、3|大支柱 0.30s），既有两桶只在有标点处取样，抓的是『标了标点却没停』，该形态是其镜像、无名字。跨 11 支已交付项目 8530 个无标点位点：中位 0.000s、p99 0.008s；过两腿（两侧 matched=1 ＋ 区间真静音谷）后 ≥0.25s 仅 20 处、分布在 9 支项目、单场最多 2 处——阈值取 0.25 而非 0.30 的理由即用户点名的四处里有一处实测 0.28s，取 0.30 即当场漏判；0.25 距 p99 仍有 30 倍，不会把 ASR 时间戳抖动读成缺陷。relative_ratio=0.6 为第二腿：位点间隔还须达到同场标点停顿中位的 0.6 倍，语义是『该静音已与真正的项间停顿同档』，分组歧义才成立；同场标点样本 <2 时该位点**不入桶**并计入 unmeasurable 点名，不得由『无从取中位』读成『不显著』。能量腿两条数（谷底 ≤-30 dBFS、与两侧语音落差 ≥12 dB）取自本轮 20 处的实测分布：35 个两侧实测的位点里只有 18 个是真静音谷，其余 17 个谷底 -15~-29 dBFS——那是 ASR 词尾早收造成的时刻偏差，不剪它就不会损伤语音，硬剪即在字上动刀。keep_seconds=0.08：修剪到 0 等于把两字硬接，正是连读桶点名的缺陷形态；留 80ms 气口。max_points_per_scene=3 是止损上限：超过即说明该场节奏整体异常（更可能是整场语速/文本问题而非零星误切），逐条点名退回人工，不做批量剪切。缺省 enabled_by_default=false 的理由与 pause_declaration、shrink.basis 同判据：开启＝自动改写已合成波形并缩短片长，场景窗口由 TTS 时长驱动、级联到时长预算与增量渲染基线，属全仓节奏基准变更——代码落地、缺省不翻、挂在本来就要重跑的那批上。项目 config 声明 intra_pause_trim.enabled 即显式启用；声明了该节而未声明 enabled 一律退出码非零并点名两键（与 BGM『声明指针而未声明开关』同判据：不得把裁定藏进缺省值）。"
   }
 }

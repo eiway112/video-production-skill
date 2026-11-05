@@ -482,6 +482,38 @@ def _fo_format(m):
     return _fo.format_line(m)
 
 
+def _choreography_face(project_name):
+    """编排面（描述面）的**取数接线**：判据真身与文案都不在本文件里（单源住 choreography_profile）。
+
+    与 frame_occupancy 的分工：那面量产出（成片像素），本面量声明（HTML 动效时间并集），
+    且本面**不需要成片**——所以它在"成片不在位"的外层分支**之外**调用，
+    否则纯 BGM／无视频产物那一轮会把一个只依赖 HTML 的面一起吞掉（那是取数断链，不是无缺陷）。
+    HTML 落点由 `--project-name`（＝流水线传入的 paths.html_project）单点推导；
+    项目名缺位或 HTML 不在位一律由 measure 自己返回 untested 并点名，不影响 status/verdict。
+    """
+    try:
+        import choreography_profile as _ch
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"choreography_profile 模块取不回（{type(e).__name__}）"}
+    if not project_name:
+        return {"untested": "未传 --project-name，无从定位 HTML 项目目录（paths.html_project）"}
+    try:
+        from _script_env import HTML_BASE
+        html = Path(HTML_BASE) / str(project_name) / "index.html"
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"HTML_BASE 取不回（{type(e).__name__}）"}
+    return _ch.measure(str(html))
+
+
+def _ch_format(m):
+    try:
+        import choreography_profile as _ch
+    except Exception:                                   # noqa: BLE001
+        # 同 _fo_format：接线断了与跑过但取不到数是两件事，不得共用同一前缀字面量。
+        return "[CHOREOGRAPHY-DISCONNECTED] 文案生成点取不回（choreography_profile 不可导入）"
+    return _ch.format_line(m)
+
+
 def ffprobe_get_metadata(video_path: str) -> Dict[str, Any]:
     """使用 ffprobe 获取视频元数据"""
     try:
@@ -719,7 +751,14 @@ def generate_report(
         # 取数断链按点名处理（不得由"没有这一节"反推"没跑成"还是"跑过且干净"）。
         report["data_sources"]["frame_occupancy"] = _frame_occupancy_face(video_path)
         print("  " + _fo_format(report["data_sources"]["frame_occupancy"]))
-    
+
+    # 动画编排（描述面，2026-11-05 第二支外部参考片实测批）：只出数、不裁定、不进 issues、不进退出码。
+    # 与上一面的分工写进 choreography_profile 模块 docstring，本处不复制第二份判据；
+    # 刻意放在"成片不在位"分支**之外**——本面只依赖 HTML，无视频产物那一轮照样该有数
+    # （放里面＝把只依赖 HTML 的面挂到视频在位性上，属取数断链）。
+    report["data_sources"]["choreography"] = _choreography_face(project_name)
+    print("  " + _ch_format(report["data_sources"]["choreography"]))
+
     # 数据源2：字幕文件
     if subtitle_file:
         subtitle_path = Path(subtitle_file)

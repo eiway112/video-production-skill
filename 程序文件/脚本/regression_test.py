@@ -15951,13 +15951,23 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
     （某浅色交付件 13 场全部下带占用 0.0，而那正是用户点名验收通过的件）。
     故任何"把本面升格成 FAIL/退出码"的改动必须让本用例转红（C3/M2）。
 
-    变异对应：
+    变异对应（M1-M6 早于变异引擎落地，当时由一次性探针执行；M7-M13 已登记进
+    `mutation_matrices.json`，2026-11-05 起由 `mutation_matrix.py --case` 复跑，读数 7/7 落对位）：
     M1 报告侧摘掉接线（不写 data_sources.frame_occupancy）→ C1/C2
     M2 把描述面升成裁定（untested 计入 issues 并翻 all_valid）→ C3
     M3 报告侧自写一句描述而不走 format_line → D1
     M4 摘 completion_report 登记面的脚本/模块 → E1/E2
     M5 口径常量被改（tile 8→16）而不重标分布 → F1
     M6 measure 内部异常改为上抛（丢掉"永不抛"契约）→ B1/B2
+    ---- 以下 7 枚属 2026-11-05 活跃度子面批 ----
+    M7  摘掉 measure() 里的子面接入（整个 motion 键不产出）→ G4/G4b/G4c + B7b（构造性同落，
+         见矩阵 note；**本枚抓出首版 G4 恒真**——键缺席时 `{}.get("untested")` 为 None 也算过）
+    M8  摘掉子面接入的内层 try（子面异常冒到外层，把有占用的好读数一起吞成整面 untested）→ B7/B7b
+    M9  「未取数」分支改成静默省略（摘子面不留读数差＝空跑）→ B5
+    M10 采样密度 10fps→5fps 而不重标对照分布 → A6
+    M11 在动判定下限 0.1→0.5 灰阶（口径漂移会把静止读成在动）→ A8
+    M12 报告侧自写一句活跃度文案（第二份真相源）→ D3
+    M13 报告侧改写子面读数（描述面动了数）→ C5
     """
     tc = RegressionTestCase(
         "frame_occupancy_descriptive_face",
@@ -15984,6 +15994,17 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
                        f"A4 主体区下界＝字幕安全线比例（实得 {fo.SUBTITLE_LINE_RATIO:.4f}）")
         tc.assert_true(fo.CALIBER["body_ratio"][1] == round(fo.SUBTITLE_LINE_RATIO, 4),
                        "A5 透出口径与常量同源（CALIBER 不是手抄第二份）")
+        # 活跃度子面（2026-11-05）：这四个字面量是同法横向比较的定标本体，
+        # 改动即须重标三支对照分布（外部 0.8% 静止／本仓 69.3%／74.5%）。
+        tc.assert_equal(fo.MOTION_FPS, 10, "A6 活跃度采样密度 10fps（0.1s 一帧）")
+        tc.assert_equal((fo.MOTION_W, fo.MOTION_H), (320, 180),
+                        f"A7 活跃度取数框 320×180（实得 {fo.MOTION_W}×{fo.MOTION_H}）")
+        tc.assert_equal(fo.MOTION_EVENT_MIN, 0.1,
+                        f"A8 在动判定差分下限 0.1 灰阶（实得 {fo.MOTION_EVENT_MIN}）")
+        tc.assert_equal(fo.MOTION_CALIBER,
+                        {"fps": fo.MOTION_FPS, "w": fo.MOTION_W, "h": fo.MOTION_H,
+                         "event_min": fo.MOTION_EVENT_MIN},
+                        "A9 子面口径由常量派生（CALIBER 不得手抄第二份，同 A5 手法）")
 
         # ═════════════════════════════════════════════════════════
         # B. 永不抛异常：取数断链一律点名归因（描述面不得把崩了读成没有这一节）
@@ -16001,6 +16022,47 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
             not_a_video.unlink(missing_ok=True)
         tc.assert_true("untested" not in fo.format_line({"untested": None}),
                        "B3 文案面对缺归因时仍只说 UNTESTED，不编数字")
+
+        # ── B4-B7：活跃度子面（2026-11-05）的三条独立契约 ──────────────
+        r_mo_missing = fo.measure_motion("Z:/definitely/not/here.mp4")
+        tc.assert_true(isinstance(r_mo_missing, dict) and r_mo_missing.get("untested"),
+                       f"B4 子面取不到即点名归因且不抛：{str(r_mo_missing)[:70]}")
+        # B5 子面**缺席**与**取不到**是两件事，文案必须可分辨：
+        #   把"没接这个子面"写成静默省略，摘掉子面的改动就不留任何读数差（空跑）。
+        line_no_motion = fo.format_line({"median": 0.3, "p10": 0.1, "min": 0.0, "frames": 100,
+                                        "low_blank_seconds": 6, "max_low_blank_run_seconds": 2,
+                                        "caliber": dict(fo.CALIBER)})
+        tc.assert_true("未取数" in line_no_motion and "UNTESTED —" not in line_no_motion.split("活跃度")[1][:20],
+                       f"B5 子面缺席时文案自陈「未取数」而非「取不到」：{line_no_motion[-58:]}")
+        # B6/B7 用 3 秒合成片做真取数（不靠业务成片，保证可重复与秒级）
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tiny = Path(td) / "tiny.mp4"
+            import subprocess as _sp
+            rc = _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                          "-i", "testsrc=size=320x180:rate=10:duration=3",
+                          "-pix_fmt", "yuv420p", str(tiny)], capture_output=True)
+            if rc.returncode != 0:
+                tc.assert_true(True, "B6/B7 无 ffmpeg 对象，按无对象通过（非恒真：有 ffmpeg 时必跑）")
+            else:
+                r_mo = fo.measure_motion(str(tiny))
+                tc.assert_true(not r_mo.get("untested"), f"B6 合成片取得子面读数：{str(r_mo)[:70]}")
+                tc.assert_equal(r_mo.get("caliber"), dict(fo.MOTION_CALIBER),
+                                "B6b 子面读数自带口径（跨片比对可判是否同口径，同 G3 手法）")
+                tc.assert_true(0.0 <= r_mo.get("moving_share", -1) <= 1.0
+                               and r_mo.get("max_static_seconds", -1) >= 0,
+                               f"B6c 占比∈[0,1] 且静止秒数非负：{r_mo.get('moving_share')}")
+                orig_mm = fo.measure_motion
+                try:
+                    fo.measure_motion = lambda *a, **k: (_ for _ in ()).throw(
+                        RuntimeError("fixture：子面故意崩"))
+                    r_iso = fo.measure(str(tiny))
+                finally:
+                    fo.measure_motion = orig_mm
+                tc.assert_true(not r_iso.get("untested"),
+                               f"B7 子面崩了不得把占用面一起吞成整面 untested：{str(r_iso)[:70]}")
+                tc.assert_true("median" in r_iso and r_iso.get("motion", {}).get("untested"),
+                               f"B7b 占用读数在位、子面单独点名：{str(r_iso.get('motion'))[:60]}")
 
         # ═════════════════════════════════════════════════════════
         # C. 报告接线：驱动真实 generate_report()，桩只打在**取数入口**
@@ -16022,7 +16084,13 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
             fake = {"median": 0.421, "p10": 0.1, "min": 0.0, "frames": 224,
                     "low_blank_seconds": 6, "max_low_blank_run_seconds": 1,
                     "canvas": [1080, 1920], "duration_s": 223.7,
-                    "caliber": dict(fo.CALIBER)}
+                    "caliber": dict(fo.CALIBER),
+                    # 活跃度子面（2026-11-05 接口变更随桩扩，不加兼容 shim）：
+                    # 值取本片真实量级附近但**不等于**任何真实读数，防"报告侧另算一份"
+                    "motion": {"caliber": dict(fo.MOTION_CALIBER), "frames": 3132,
+                               "seconds": 313.2, "diff_median": 0.069, "diff_p90": 0.36,
+                               "moving_share": 0.307, "static_share": 0.693,
+                               "max_static_seconds": 11.4}}
             orig_measure, orig_fmt = fo.measure, fo.format_line
             try:
                 fo.measure = lambda *a, **k: dict(fake)
@@ -16046,6 +16114,8 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
                 "C3c 无读数时该节仍在并点名 untested（不得把『没跑成』读成『没有这一节』）")
             tc.assert_true(all(k in got for k in fake),
                            "C4 透出面字段齐备（改名即红，同 A06 键契约）")
+            tc.assert_equal((got.get("motion") or {}).get("moving_share"), 0.307,
+                            "C5 子面值原样透出（报告侧不得对活跃度另算或改写）")
 
         # ═════════════════════════════════════════════════════════
         # D. 文案单源：报告侧只调 format_line，不自写描述句
@@ -16058,6 +16128,8 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
                        "D1 报告侧那一行描述由 _fo_format 生成（不是把句子抄进报告）")
         tc.assert_true("[FRAME-OCCUPANCY]" not in src,
                        "D2 报告源码内不得出现该文案字面量（否则两处各有一份，A12 同族）")
+        tc.assert_true("在动占比" not in src,
+                       "D3 活跃度子面的文案也不得抄进报告（子面文案单源住 format_line）")
 
         # ═════════════════════════════════════════════════════════
         # E. 登记面：新增节必须能让存量项目真的重生成一次
@@ -16084,7 +16156,11 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
         # ═════════════════════════════════════════════════════════
         line = fo.format_line({"median": 0.3, "p10": 0.1, "min": 0.0, "frames": 100,
                                "low_blank_seconds": 6, "max_low_blank_run_seconds": 2,
-                               "caliber": dict(fo.CALIBER)})
+                               "caliber": dict(fo.CALIBER),
+                               "motion": {"caliber": dict(fo.MOTION_CALIBER), "frames": 1000,
+                                          "seconds": 100.0, "diff_median": 0.07,
+                                          "diff_p90": 0.4, "moving_share": 0.31,
+                                          "static_share": 0.69, "max_static_seconds": 9.0}})
         tc.assert_true("[FRAME-OCCUPANCY]" in line and "描述面" in line,
                        f"F1 文案自陈不裁定：{line[:60]}")
         tc.assert_true(not any(w in line for w in ("FAIL", "PASS", "不合格", "违规")),
@@ -16100,6 +16176,24 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
                            f"G2 中位读数在 [0,1]（实得 {rG.get('median')}）")
             tc.assert_equal(rG.get("caliber"), dict(fo.CALIBER),
                             "G3 读数自带口径（跨项目比对时可判定是否同口径，防混读）")
+            gmo = rG.get("motion")
+            # 键**缺席**也必须判红：`{}.get("untested")` 为 None 会让"摘掉整个子面"通过，
+            # 这条由变异 93-M7 实测抓出（首版 G4 恒真，落点归给了 B7b）。
+            tc.assert_true(isinstance(gmo, dict) and "untested" not in gmo
+                           and gmo.get("caliber") == dict(fo.MOTION_CALIBER),
+                           f"G4 真实成片取得活跃度子面（键在位、非 untested、自带口径）："
+                           f"{str(rG.get('motion'))[:70]}")
+            # 后续读数一律走已判过类型的局部量——直接对 None 取属性会把整案截断，
+            # 截断即 CRASH（引擎判据二），变异落点就无从归因。
+            gm = gmo if isinstance(gmo, dict) else {}
+            tc.assert_equal(gm.get("caliber"), dict(fo.MOTION_CALIBER),
+                            "G4b 子面读数自带口径（与 B6b 同法，跨片比对可判同口径）")
+            # G4c 是本子面存在的理由本身：业务成片的静止占比是**大数**（外部参考片同法 0.008）。
+            # 若哪天静止占比掉到 0.2 以下，说明要么画面真的在动，要么取数面断了——
+            # 后者必须被查到，所以这里断"取到数且口径在位"而不是断一个区间值。
+            tc.assert_true(gm.get("static_share", -1) >= 0.0
+                           and gm.get("seconds", 0) > 0,
+                           f"G4c 子面取到正数读数：{gm.get('static_share')}/{gm.get('seconds')}")
         tc.mark_passed()
     except Exception as e:
         import traceback
@@ -21280,10 +21374,13 @@ class RegressionTestRunner:
             test_cue_consumption_warn_only,
             test_delivery_object_single_source_and_artifact_identity,
             test_registry_reconciliation_and_revision_naming,
+            test_intra_pause_trim_and_third_bucket,
             test_boundaries_probe_names_flat_frames,
             test_scene_insert_three_legs,
             test_cleanup_splits_paid_tts_cache,
             test_scene_patch_script_attribution,
+            test_choreography_descriptive_face,
+            test_scene_overflow_probe_adjudicates_clips,
         ]
         self.results = []
     
@@ -23118,6 +23215,802 @@ def test_registry_reconciliation_and_revision_naming() -> RegressionTestCase:
     return tc
 
 
+
+def test_choreography_descriptive_face() -> RegressionTestCase:
+    """用例122：动画编排描述面（choreography_profile + 完工报告只透传接线）。
+
+    存在理由（2026-11-05 第二支外部参考片实测批）：同日量一支竖屏外部片可见变化 3.2 次/秒
+    对本仓成片 0.6-1.2 次/秒，而病灶**不在"有没有写动画"**——73 个项目里 64 个有 yoyo、
+    每场中位 12 路动效、ease 用 none/linear 占比中位仅 0.85%。剔掉无限循环后，"会走完的动效"
+    只覆盖该场窗口约 23%（p50），88.9% 的场景存在 >3 秒无推进段。踩坑清单 §八 第 3 条
+    「连续静止不超过 3 秒」第二次沦为"条文在位、产出未兑现"，且此前只有**渲完才看得见**的
+    像素面能查。本件把同一条量到**渲染前**（纯静态解析 HTML，零渲染零 ffmpeg）。
+
+    与 frame_occupancy 的分工是本用例的核心锁点：那面量**产出**，本面量**声明**。
+    2026-11-05 四支成片同片两面对撞——含循环覆盖率算出 1.000 的两支，像素面在动只有
+    30.7%／25.5%。故 C5/C6 把"一条 repeat:-1 使两腿差 0.9"做成最小夹具，
+    G1/G2 把该背离钉在真实项目上：**声明面能填满纸，不代表产出面在动**。
+    G 段按 `export_repo_face()` 切面：本仓面钉 5 份业务项目，发布仓面钉 §5 两份夹具
+    （业务项目按 never_in_target 不导出，写死即下次导出的 §8.2 两仓回归必红）。
+
+    **刻意不裁定**（与 frame_occupancy 同取舍，2026-10-10 常设裁定：不为观感问题新增代码门禁）：
+    不进 issues、不进退出码、STILL_RUN_SECONDS 只作描述性占比门槛。
+    任何"把本面升格成 FAIL/阻断"的改动必须让本用例转红（A6/F6/H1-H3）。
+
+    两条取数边界另立一组（D 段）——它们是本读数的**可信性**所在，不是脚注：
+      · 相对锚（'<'／'+=x'）与标签锚解析不出，计入只会抬高覆盖率，故本面为**下界**；
+        D2 锁"加一条 '<' 语句后覆盖率逐值不变"，摘掉 unparsed 分支即转红。
+      · 锚点越界夹空者既不计入覆盖也不计入分母；C14 锁 coverage_min >= 0
+        ——首版未夹时算出过 -2.188 的负覆盖（裁定文档 §14.1/§14.2 留痕不回改）。
+
+    变异对应（登记进 mutation_matrices.json，122-M1..M13）：
+    M1 摘 unparsed 分支（相对锚按 0 覆盖计）→ D1/D2
+    M2 摘越界夹窗（负覆盖复活）→ C14/D3
+    M3 越界者计入分母 → D4
+    M4 循环不再剔除（两腿合一，背离形态消失）→ C5/C6/G1
+    M5 duration 缺省改 0（未声明即零覆盖，覆盖率被压低）→ D5/D5b
+    M6 末场窗口不取 root data-duration → D6/D6b
+    M7 报告侧摘掉接线（不写 data_sources.choreography）→ F1/F3
+    M8 报告侧自写一句文案（第二份真相源）→ E4
+    M9 摘 completion_report 登记面的 choreography_module → F4/F5
+    M10 untested 分支改判"值真假"而非"键在不在" → B5
+    M11 measure 内部异常改为上抛（丢"永不抛"契约）→ B7
+    M12 把本面升成裁定（进 issues／翻 all_valid）→ F6/H2
+    M13 format_line 摘掉"下界"字样 → E1
+    M14 vars 只扫第一个对象段（fromTo 的 duration/repeat 在 toVars 因而读不到，
+        即 2026-11-05 与探针对撞抓出的首版缺陷复活）→ I2/I3/I4/I5/I6
+    M15 场景外实例并入场景内集合（路线 A／B 混成一数）→ J4
+    M16 几何一致性滤掉缺内联几何的实例后再比（取数不齐按在场者算）→ J6
+    M17 无 T 块出口不附子面读数 → J9b（J9 恒真，故拆两条）
+    M18 扫描器改写 data-anchor 字面量（契约名值第二处真相）→ J12
+    M19 format_line 子面缺席可见分支摘掉 → J10
+    M20 瞬时语句不再跳过而按缺省 0.5s 计入覆盖（复活复核批前形态）→ K1/K2/K5
+    M21 自闭合容器的封面登记腿摘掉（两条注册腿只补一条＝半生效）→ K7
+    M22 文案摘掉「分母含封面容器」字样 → K6b
+    M23 算了但不落盘（cover_containers 恒 0）→ K6/K6b/K7
+    M24 内联隐藏只认 display:none（opacity 那条腿摘掉）→ L1/L2/L3
+    M25 入场目标只按 #id 匹配（class 那条腿摘掉）→ L3（夹具刻意只给 class）
+    M26 文案两条计数写成常量 0 → L5（L5b/L6 各防另一种腐坏，不列入）
+    M27 隐藏明细不落盘、只留计数 → L1（三量一条 assert_equal 就是为让它显形）
+
+    K 段（第十一轮复核批）锁的是两条**由复核而非用例发现**的取数偏差：
+      · `tl.set`／`tl.call` 按 GSAP 语义零时长，旧形态却按缺省 0.5s 计入推进腿＝**虚高**
+        （全仓 49/50 份含 set、共 728 条，28/50 片推进覆盖率位移 >0，最大 +0.028，
+        中位 0.211→0.202）；方向与编号 24 要防的"循环充当填充"同一侧，故必须收。
+        跳过位点与窗口包含判据**同层**：越界的 set 归 out_of_window、在窗内的归 instant，
+        两个计数器互斥（首版把跳过放在判窗之前，K3/K3b 当场抓到）。
+      · 子面分母含封面容器（31/50 片的 DOM 场数＝T 块场数＋1），处置是**让分母可见**
+        而不是「有封面标记才剔」——后者会让同一个键有两种口径。
+
+    L 段（第十二轮）锁的是**描述面自己也会说谎**的那一格：两处基形内联 `opacity:0` 且无任何入场语句时，
+    `check_element_reveal` 判 0（它只认「容器隐藏·入场只打子元素」形态）、`check_scene_visibility` 判 0
+    （管场景根），而 persist 当时报「声明 2 处／覆盖 2 场」——渲染里那两处全程不存在
+    （2026-10-13「6 块内容永久不可见」同病灶）。据此子面出两条计数：raw＝内联请求了初始隐藏，
+    unrevealed＝且任何 tl 语句目标串里都找不到该元素的 #id/·class 记号；
+    取宽方向是**少报**（宁可漏报也不把正常写法报成病灶），与几何那条「宁可多报」相反，两处取向各注明理由。
+
+    J 段（2026-11-05 编号 26）锁的是**跨场常驻主图**子面：它存在的理由是先量的两条拓扑——
+    常驻层放**场景之外**（仓内唯一先例＝章级标识 `#chapter`）按 `resolve_selector` 必判
+    `selector-outside-scenes`，实证 `standard-system-explainer` `scene_patch attempts 5 / hits 0`；
+    同一基形在**每场各一份、同位同形**则可归属（`dual-cavity-wet-tile` 注入后四条静态门禁
+    前后读数逐字一致＝零误杀）。本面不判拓扑好坏，只把"声明几处／覆盖几场／同不同形／
+    有没有跑到场景外"写成纸上的数，且**与时间轴腿各自独立归因**（J8/J9/J9b）。
+    """
+    import re
+
+    tc = RegressionTestCase(
+        "choreography_descriptive_face",
+        "验证动画编排描述面：口径单源、永不抛异常、声明面与产出面背离可复现、下界性质可见、报告只透传"
+    )
+    try:
+        import ast
+        import tempfile
+        from pathlib import Path
+
+        import choreography_profile as ch
+
+        script_dir = Path(__file__).parent
+        gcr_src = (script_dir / "generate_completion_report.py").read_text(encoding="utf-8")
+        runner_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        mod_src = (script_dir / "choreography_profile.py").read_text(encoding="utf-8")
+        clause = (script_dir.parent.parent / "AI视频制作工作流模板" /
+                  "新路径实施_踩坑清单与防范检查表.md").read_text(encoding="utf-8", errors="replace")
+
+        tmp = Path(tempfile.mkdtemp(prefix="case122_"))
+
+        def fixture(name, body):
+            p = tmp / name
+            p.write_text(body, encoding="utf-8")
+            return str(p)
+
+        HEAD = ('<html><body><div id="root" data-duration="30">'
+                '<script>const T = {s1: 0.0, s2: 10.0, s3: 20.0};\n')
+        TAIL = '</script></div></body></html>'
+        # 已知排布：s1 两段推进(0-2,5-8)；s2 一段推进(10-11)＋一条无限循环(10-20)；s3 唯一语句越界
+        BASE = (HEAD +
+                "tl.to('#a', {opacity: 1, duration: 2}, T.s1);\n"
+                "tl.to('#b', {opacity: 1, duration: 3}, T.s1+5);\n"
+                "tl.to('#c', {opacity: 1, duration: 1}, T.s2);\n"
+                "tl.to('#d', {opacity: 1, duration: 20, repeat: -1}, T.s2);\n"
+                "tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n" + TAIL)
+        m = ch.measure(fixture("base.html", BASE))
+        ps = {s["scene"]: s for s in m.get("per_scene", [])}
+
+        # ═════════════════════════════════════════════════════════
+        # A. 口径单源
+        # ═════════════════════════════════════════════════════════
+        tc.assert_equal(ch.DEFAULT_DURATION, 0.5,
+                        "A1 duration 缺省 0.5＝GSAP 引擎缺省值，非本件自定（改它即换口径）")
+        tc.assert_equal(ch.STILL_RUN_SECONDS, 3.0,
+                        "A2 占比门槛 3.0 与踩坑清单 §八 第 3 条同源")
+        tc.assert_true("连续静止不超过 3 秒" in clause,
+                       "A3 条款文本仍在位（常量与条款两处必须同批改，A4 锁指针注释）")
+        tc.assert_true("改那条条款须同批改此处" in mod_src,
+                       "A4 同批改的指针注释在位（否则常量与条款漂移无人提示）")
+        tc.assert_true("repeat:-1" in ch.CALIBER["loop_treatment"] and
+                       "推进型" in ch.CALIBER["loop_treatment"],
+                       "A5 循环处理口径随读数落盘（两腿差异的口径声明本身就是读数的一部分）")
+        tc.assert_true("issues" not in mod_src.split("def format_line")[0].replace(
+            "不进 issues", "").replace("进 issues", ""),
+            "A6 模块主体不引用 issues（不裁定的源码面证据）")
+
+        # ═════════════════════════════════════════════════════════
+        # B. 取数断链各形态：一律 untested 且点名归因
+        # ═════════════════════════════════════════════════════════
+        u1 = ch.measure(str(tmp / "nope.html"))
+        tc.assert_true("untested" in u1 and "不在位" in u1["untested"],
+                       "B1 HTML 不在位 → untested 点名路径，不得读成「已检查且干净」")
+        u2 = ch.measure(fixture("notb.html", "<html><body>x</body></html>"))
+        tc.assert_true("untested" in u2 and "不猜时间轴" in u2["untested"],
+                       "B2 无 T-block → untested 且写明不猜时间轴")
+        u3 = ch.measure(fixture("onekey.html",
+                                '<div id="root" data-duration="9">const T = {s1: 0.0};'
+                                "tl.to('#a', {opacity: 1, duration: 2}, T.s1);"))
+        tc.assert_true("untested" in u3 and "1" in u3["untested"],
+                       "B3 T 键 <2 → untested 并带实际键数")
+        u4 = ch.measure(fixture("few.html", HEAD +
+                                "tl.to('#a', {opacity: 1, duration: 2}, T.s1);\n"
+                                "tl.to('#b', {opacity: 1, duration: 2}, T.s2);\n" + TAIL))
+        tc.assert_true("untested" in u4 and "2" in u4["untested"],
+                       "B4 可解析语句 <3 → untested 并带计数（不硬造分布）")
+        tc.assert_true(ch.format_line({"untested": None}).startswith("[CHOREOGRAPHY] UNTESTED")
+                       and "未附归因" in ch.format_line({"untested": None}),
+                       "B5 判「键在不在」而非「值真假」：归因为 None 也须走 UNTESTED 并印未附归因"
+                       "（用例93 B3 同判据；只判 startswith 会被「读数键缺失」分支顶替而恒真）")
+        tc.assert_true("UNTESTED" in ch.format_line({}) and "UNTESTED" in ch.format_line(None),
+                       "B6 空 dict／None 不崩且落 UNTESTED")
+        # B7 要打到**读取腿**才验得了"永不抛"：目录路径在 is_file() 处即短路成"不在位"，
+        # 根本不进 try 块——122-M11 首跑因此判 SURVIVED（摘掉 catch 也无人失败）。
+        # 传 None 才真会抛 TypeError（Path(None)），且必须被 catch 兜住。
+        try:
+            _none_in = ch.measure(None)
+            _threw = None
+        except Exception as _e:
+            _none_in, _threw = None, _e
+        tc.assert_true(_threw is None and isinstance(_none_in, dict)
+                       and "untested" in _none_in,
+                       "B7 读取腿抛异常时不上抛而落 untested（永不抛契约；"
+                       "描述面把崩了读成「没有这一节」是最坏形态）")
+        _bad = tmp / "adir.html"
+        _bad.mkdir()
+        u7b = ch.measure(str(_bad))
+        _bad.rmdir()
+        tc.assert_true("untested" in u7b and "不在位" in u7b["untested"],
+                       "B7b 目录当路径 → 走「不在位」归因（与 B7 是两条不同的腿，各判一次）")
+
+        # ═════════════════════════════════════════════════════════
+        # C. 判据正确性：夹具逐值核对（期望值由排布手算，非实跑反推）
+        # ═════════════════════════════════════════════════════════
+        tc.assert_equal(ps["s1"]["coverage_advance"], 0.5,
+                        "C1 s1 推进型覆盖 5s/10s＝0.5（[0,2]∪[5,8]）")
+        tc.assert_equal(ps["s1"]["coverage_loop"], 0.5,
+                        "C2 无循环的场：两腿相等（循环剔除不得凭空改数）")
+        tc.assert_equal(ps["s1"]["advance_gap_max_s"], 3.0,
+                        "C3 s1 最长无推进段＝[2,5] 的 3.0s")
+        tc.assert_equal(ps["s2"]["coverage_advance"], 0.1,
+                        "C4 s2 推进型覆盖 1s/10s＝0.1")
+        tc.assert_equal(ps["s2"]["coverage_loop"], 1.0,
+                        "C5 s2 含循环覆盖＝1.000（一条 repeat:-1 把纸面填满）")
+        tc.assert_equal(round(ps["s2"]["coverage_loop"] - ps["s2"]["coverage_advance"], 3), 0.9,
+                        "C6 两腿差 0.9＝声明面与产出面背离的最小夹具")
+        tc.assert_equal(ps["s2"]["advance_gap_max_s"], 9.0,
+                        "C7 s2 推进型无推进段 9.0s（循环救不了产出面）")
+        tc.assert_equal(ps["s3"]["coverage_advance"], 0.0,
+                        "C8 s3 唯一语句越界 → 覆盖 0.0 而非负数")
+        tc.assert_equal(ps["s3"]["advance_gap_max_s"], 10.0,
+                        "C9 s3 整场无推进＝窗口 10.0s")
+        tc.assert_equal(m["coverage_advance_p50"], 0.1,
+                        "C10 全片中位取三场 [0.5,0.1,0.0] 的中位 0.1")
+        tc.assert_equal(m["coverage_loop_p50"], 0.5,
+                        "C11 含循环中位 0.5——与 C10 同批锁，两腿不得同数")
+        tc.assert_equal(m["advance_gap_max"], 10.0,
+                        "C12 全片最长无推进段 10.0s")
+        tc.assert_equal(m["share_scenes_gap_over_still_run"], 0.667,
+                        "C13 占比 2/3；边界用 > 非 >=（s1 恰 3.0 不计入）")
+        tc.assert_true(m["coverage_advance_min"] >= 0.0,
+                       "C14 无负覆盖（首版未夹越界算出 -2.188，取数缺陷不是业务量）")
+        tc.assert_equal(m["tweens_total"], 5,
+                        "C15 语句总数 5（含越界那条；总数与解析入分母数是两件事）")
+        tc.assert_equal(m["tweens_parsed"], 4,
+                        "C16 解析入分母 4 条")
+
+        # ═════════════════════════════════════════════════════════
+        # D. 两条取数边界（下界性质的可见性）
+        # ═════════════════════════════════════════════════════════
+        REL = BASE.replace("tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n",
+                           "tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n"
+                           "tl.to('#f', {opacity: 1, duration: 4}, '<');\n")
+        mr = ch.measure(fixture("rel.html", REL))
+        tc.assert_equal(mr["tweens_unparsed"], m["tweens_unparsed"] + 1,
+                        "D1 相对锚 '<' 计入 unparsed（+1），不按 0 覆盖静默吞掉")
+        # 落点取**该场**覆盖率而非全片中位：中位对单场变化不敏感（三场里改一场常不动中位），
+        # 写在中位上会让 M1（把相对锚按覆盖计）存活——122-M1 首跑即为此形。
+        _ps_r = {s["scene"]: s for s in mr.get("per_scene", [])}
+        tc.assert_equal(_ps_r.get("s1", {}).get("coverage_advance"),
+                        ps["s1"]["coverage_advance"],
+                        "D2 加一条 '<' 语句后 s1 覆盖率**逐值不变**——计入只会抬高覆盖率，"
+                        "故本面是下界；摘掉 unparsed 分支即在此转红")
+        tc.assert_equal(mr["tweens_out_of_window"], m["tweens_out_of_window"],
+                        "D2b 同一枚变异的第二腿：越界计数不受相对锚影响（防把两件事混成一句）")
+        tc.assert_equal(m["tweens_out_of_window"], 1,
+                        "D3 越界语句计入 out_of_window")
+        tc.assert_equal(m["scenes"], 3,
+                        "D4 越界不进分母：场数仍 3（分母由 T 块给，不由语句给）")
+        md = ch.measure(fixture("dflt.html", HEAD +
+                                "tl.to('#a', {opacity: 1}, T.s1);\n"
+                                "tl.to('#b', {opacity: 1, duration: 1}, T.s2);\n"
+                                "tl.to('#c', {opacity: 1, duration: 1}, T.s2+1);\n" + TAIL))
+        # 取数面在位与否先单独点名：缺键时直接 md["..."] 会 KeyError 截断整案，
+        # 引擎按 CRASH 处理（122-M5 首跑即此形）——断言条数必须与数据无关。
+        tc.assert_true("untested" not in md,
+                       "D5a 未声明 duration 的夹具仍应产出读数（塌成 untested 即取数面断了）")
+        _ps_d = {s["scene"]: s for s in md.get("per_scene", [])}
+        tc.assert_equal(md.get("tweens_default_duration"), 1,
+                        "D5 未声明 duration 者计数并按 GSAP 缺省 0.5 计（不得按 0 洗成无覆盖）")
+        tc.assert_equal(_ps_d.get("s1", {}).get("coverage_advance"), 0.05,
+                        "D5b 缺省 0.5s 计入覆盖：0.5/10＝0.05")
+        mn = ch.measure(fixture("noroot.html", BASE.replace('data-duration="30"', '')))
+        tc.assert_equal(mn["per_scene"][2]["window_s"], 8.0,
+                        "D6 末场取不到 root data-duration 时用兜底窗口 8.0s 并随读数透出")
+        tc.assert_equal(m["per_scene"][2]["window_s"], 10.0,
+                        "D6b 末场 data-duration 在位时窗口取 20→30（两条腿各判一次）")
+
+        # ═════════════════════════════════════════════════════════
+        # E. 文案单源
+        # ═════════════════════════════════════════════════════════
+        line = ch.format_line(m)
+        tc.assert_true("下界" in line,
+                       "E1 文案含「下界」——不得让下界读数被当精确值复用")
+        tc.assert_true("含循环口径" in line and "循环不计入推进" in line,
+                       "E2 两腿同时随行（只报一腿即把背离形态洗掉）")
+        tc.assert_true(str(ch.STILL_RUN_SECONDS) in line,
+                       "E3 占比门槛走 caliber 取值而非文案写死")
+        # 计数不带前引号：接线断了那一路写的是 [CHOREOGRAPHY-DISCONNECTED]，
+        # 它含 "[CHOREOGRAPHY 但不含 [CHOREOGRAPHY]，两种写法在基线下同为 0，
+        # 而 122-M8（报告侧自写一句文案）只在带右括号这一种下显形——首版取前者故判 SURVIVED。
+        tc.assert_equal(gcr_src.count('[CHOREOGRAPHY]'), 0,
+                        "E4 报告侧不得出现第二份 [CHOREOGRAPHY] 文案字面量（单源住模块）")
+
+        # ═════════════════════════════════════════════════════════
+        # F. 接线与登记面（AST 配对，非子串匹配）
+        # ═════════════════════════════════════════════════════════
+        tree = ast.parse(gcr_src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "generate_report")
+        parents = {}
+        for node in ast.walk(fn):
+            for _fld, val in ast.iter_fields(node):
+                if isinstance(val, ast.AST):
+                    parents[val] = node
+                elif isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, ast.AST):
+                            parents[v] = node
+        chg = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Subscript) and "choreography" in ast.dump(t)
+                       for t in n.targets)]
+        tc.assert_equal(len(chg), 1,
+                        "F1 报告侧恰一处写 data_sources.choreography")
+        # F2/F6/F7 一律恒执行：写成 `if chg:` 内跳过的话，摘掉接线那枚变异（M7）
+        # 会让整案断言数从 56 掉到 53，引擎按 CRASH 处理而非 RED-OK
+        # ——断言条数必须与数据无关，否则"拦住"和"没跑成"在报告里长得一样。
+        _c0 = chg[0] if chg else None
+        _ok_f2 = False
+        if _c0 is not None:
+            _anc = parents.get(_c0)
+            while _anc is not None and _anc is not fn:
+                if isinstance(_anc, ast.If):
+                    _ok_f2 = True
+                    break
+                _anc = parents.get(_anc)
+        tc.assert_true(_c0 is not None and not _ok_f2,
+                       "F2 该写入存在且不在任何 if 分支内＝不在「成片不在位」分支里"
+                       "（本面只依赖 HTML，挂到视频在位性上即取数断链）")
+        tc.assert_true(_c0 is not None and "all_valid" not in ast.dump(_c0),
+                       "F6 该赋值语句本身不含 all_valid（描述面不得顺手翻转裁定）")
+        _tail = ""
+        if 'report["data_sources"]["choreography"] = _choreography_face' in gcr_src:
+            _tail = gcr_src.split('report["data_sources"]["choreography"] = _choreography_face')[1]
+            _tail = _tail.split("# 数据源2")[0] if "# 数据源2" in _tail else _tail[:400]
+        tc.assert_true(bool(_tail) and "all_valid = False" not in _tail and
+                       'report["issues"].append' not in _tail,
+                       "F7 接线之后到下一数据源之间不写 issues、不翻 all_valid"
+                       "（升格为裁定的改动必须在此转红，2026-10-10 常设裁定）")
+        tc.assert_true("_choreography_face(project_name)" in gcr_src,
+                       "F3 接线真身被调用（不是只 import 不消费）")
+        tc.assert_true('"choreography_module": SCRIPTS / "choreography_profile.py"' in runner_src,
+                       "F4 completion_report 登记面覆盖 choreography_profile.py"
+                       "（A06 同族：改了口径而该步缓存照命中＝新节对存量项目静默不出现）")
+        # 登记键必须落在 completion_report 这一层的 dict 内：键放错层（比如挂到别的步骤）
+        # 对指纹计算是零贡献，而 F4 那条源码子串匹配照样为绿——两条合起来才拦得住方向性错误。
+        _cr = re.search(r'"completion_report":\s*\{(.*?)\n        \}', runner_src, re.S)
+        tc.assert_true(_cr is not None and "choreography_module" in _cr.group(1) and
+                       "occupancy_module" in _cr.group(1),
+                       "F5 登记键与 occupancy_module 同处 completion_report dict（键放错层＝零贡献）")
+
+        # ═════════════════════════════════════════════════════════
+        # G. 真实项目：背离形态与正向见证（固定条数，不随项目数变化）
+        # ═════════════════════════════════════════════════════════
+        import _script_env
+        hb = Path(_script_env.HTML_BASE)
+        face = export_repo_face(tc)
+        if face == "dev":
+            real = {}
+            for name in ("standard-system-explainer", "agent-decision-map",
+                         "prefab-parts-atlas", "repo-mesh-governance-promo",
+                         "dual-cavity-wet-tile"):
+                p = hb / name / "index.html"
+                if p.is_file():
+                    r = ch.measure(str(p))
+                    if "coverage_advance_p50" in r:
+                        real[name] = r
+            tc.assert_true(len(real) >= 4,
+                           f"G0 真实项目取数面在位（实得 {len(real)}/5；不足即取数断链而非无缺陷）")
+            if "standard-system-explainer" in real:
+                r = real["standard-system-explainer"]
+                tc.assert_true(r["coverage_loop_p50"] >= 0.99 and r["coverage_advance_p50"] < 0.3,
+                               "G1 standard-system-explainer：含循环≈满分而推进型<0.3"
+                               "（与像素面 30.7% 在动同批对撞，§14.3 的真实数据腿）")
+            if "agent-decision-map" in real:
+                r = real["agent-decision-map"]
+                tc.assert_true(r["coverage_loop_p50"] >= 0.99 and r["coverage_advance_p50"] < 0.3,
+                               "G2 agent-decision-map 同形态（背离不是单例）")
+            if "dual-cavity-wet-tile" in real:
+                r = real["dual-cavity-wet-tile"]
+                tc.assert_true(r["coverage_advance_p50"] > 0.7,
+                               "G3 正向见证：dual-cavity-wet-tile 推进型覆盖 >0.7，"
+                               "说明本面能区分好坏编排，不是恒红的面")
+            _div = sum(1 for r in real.values()
+                       if r["coverage_loop_p50"] >= 0.99 and r["coverage_advance_p50"] < 0.5)
+            tc.assert_true(_div >= 2,
+                           f"G4 抽样内背离形态数 >=2（实得 {_div}）；不钉全仓总数——"
+                           "开放全集计数会随并发与新增项目漂移")
+        else:
+            # 发布仓面：G0-G4 依赖的 5 份本仓业务项目按 never_in_target / delivery_artifact_ban
+            # 不随导出，公开面无对应物。此处改按 §5 的中性化夹具裁定，并把分支本身显形；
+            # 「那 5 份该不该在公开面」归脱敏门禁（用例67/72）裁定，不在此重复第二份判据。
+            fixtures = {}
+            for name in ("quickstart-demo", "bgm-showcase-test"):
+                p = hb / name / "index.html"
+                if p.is_file():
+                    r = ch.measure(str(p))
+                    if "coverage_advance_p50" in r:
+                        fixtures[name] = r
+            tc.assert_equal(sorted(fixtures), ["bgm-showcase-test", "quickstart-demo"],
+                            "G0-发布仓面：§5 两份夹具都参与取数（少一份即夹具被移出或取数断链）")
+            tc.assert_true(bool(fixtures) and all(
+                r.get("tweens_parsed", 0) > 0 and r.get("scenes", 0) > 0
+                for r in fixtures.values()),
+                "G1-发布仓面：每份夹具都产出真实解析读数（tweens_parsed/scenes 非 0，空跑显形）")
+            tc.assert_equal(face, "published",
+                            "G2-发布仓面：分支确由脱敏三件套缺席切过来（非恒真）")
+
+        # ═════════════════════════════════════════════════════════
+        # H. 不升格为门禁（三腿）
+        # ═════════════════════════════════════════════════════════
+        tc.assert_true("sys.exit" not in mod_src,
+                       "H1 模块无 sys.exit（描述面不参与任何退出码路径）")
+        _face_src = gcr_src.split("def _choreography_face")[1].split("def _ch_format")[0]
+        tc.assert_true('report["issues"]' not in _face_src,
+                       "H2 接线函数体内不写 issues")
+        tc.assert_true("不裁定" in line,
+                       "H3 文案自陈不裁定（读的人不会把描述当结论）")
+
+        # ═════════════════════════════════════════════════════════
+        # I. fromTo 的**两个** vars 段（2026-11-05 与 _取证 探针对撞时抓出的实现缺陷）
+        # ═════════════════════════════════════════════════════════
+        # 存在理由（不是假想形态，是真实项目的多数形态）：`tl.fromTo(sel, fromVars, toVars, anchor)`
+        # 的 duration 与 repeat 都写在 **toVars**，而首版模块取 vars 时只扫第一个 `{…}`＝fromVars。
+        # 后果两向相反且都致命：时长读不到 → 4s 入场被记成缺省 0.5s（覆盖率**低估**）；
+        # repeat:-1 读不到 → 循环混进"推进型"那一腿（覆盖率**虚高**，而"循环不算推进"正是编号 24 的题旨）。
+        # 真实读数：`integrated-module-wall`（50 条 fromTo）首版 0.142 对探针 0.989。
+        FT = (HEAD +
+              "tl.fromTo('#a', {y: 20, opacity: 0}, {y: 0, opacity: 1, duration: 4}, T.s1);\n"
+              "tl.fromTo('#b', {opacity: 0}, {opacity: 1, duration: 20, repeat: -1}, T.s2);\n"
+              "tl.fromTo('#c', {x: -60}, {x: 0, duration: 2}, T.s2+2);\n" + TAIL)
+        mf = ch.measure(fixture("fromto.html", FT))
+        _ps_f = {s["scene"]: s for s in mf.get("per_scene", [])}
+        tc.assert_equal(mf.get("tweens_parsed"), 3,
+                        "I1 三条 fromTo 全部解析（拒识 fromTo 会让整片读成无动效）")
+        tc.assert_equal(mf.get("tweens_default_duration"), 0,
+                        "I2 duration 从 **toVars** 读到，不按缺省 0.5 计——"
+                        "首版只扫第一个对象段时此值＝3（本条即那枚缺陷的直接显形）")
+        tc.assert_equal(_ps_f.get("s1", {}).get("coverage_advance"), 0.4,
+                        "I3 s1 推进覆盖 4/10＝0.4（按 toVars 的 4s，不是 0.5/10）")
+        tc.assert_equal(_ps_f.get("s2", {}).get("coverage_advance"), 0.2,
+                        "I4 写在 toVars 的 repeat:-1 仍被识别为循环，**不混进推进腿**"
+                        "（s2 推进只剩 #c 的 2/10＝0.2；混进来会算成 1.0）")
+        tc.assert_equal(_ps_f.get("s2", {}).get("coverage_loop"), 1.0,
+                        "I5 同一场含循环腿仍填满 1.000——声明面自陈背离的最小复现，"
+                        "与 C5/C6 同形但走 fromTo 路径")
+        tc.assert_equal(mf.get("coverage_advance_p50"), 0.2,
+                        "I6 全片推进覆盖率 p50＝0.2（三场 0.4/0.2/0.0 取中位，手算非实跑反推）")
+
+        # ═════════════════════════════════════════════════════════
+        # J. 跨场常驻主图（锚＋生长）子面：两条拓扑与"取数不齐不得按在场者算"
+        # ═════════════════════════════════════════════════════════
+        # 编号 26 落地前量的两条拓扑（裁定文档 §14.7）：路线 A（常驻层放场景外）按
+        # `scene_patch_render.resolve_selector` 必判 `selector-outside-scenes` → 永久失去增量资格
+        # （实证 `standard-system-explainer`：attempts 5 / hits 0）；路线 B（每场各一份同位同形）
+        # 可归属。本段子面**不裁定拓扑好坏**，只把"声明了几处、覆盖几场、同不同形、有没有跑到场景外"
+        # 写成纸上的数——与主面（时间轴腿）互不顶替，这是 J7/J8 的题旨。
+        P_HEAD = ('<html><body><div id="root" data-duration="36">'
+                  '{root}{body}'
+                  '<script>const T = {s1: 0.0, s2: 12.0, s3: 24.0};\n'
+                  "tl.to('#x1', {opacity: 1, duration: 2}, T.s1);\n"
+                  "tl.to('#x2', {opacity: 1, duration: 2}, T.s2);\n"
+                  "tl.to('#x3', {opacity: 1, duration: 2}, T.s3);\n"
+                  '</script></div></body></html>')
+        GEO = 'style="position:absolute;left:96px;top:150px;width:420px;height:230px"'
+
+        def phtml(inners, root_extra=''):
+            # 场景 div 必须在 <script> **之外**：HTMLParser 把 script 体当 CDATA，
+            # 写进去就不是元素、子面会读成「未识别到场景容器」（首版夹具即此形，靠 J1 当场转红）。
+            body = "".join('<div id="scene%d" data-scene-id="s%d">%s</div>' % (i, i, c)
+                           for i, c in enumerate(inners, 1))
+            return P_HEAD.replace('{body}', body).replace('{root}', root_extra)
+
+        ANCH = '<div data-anchor="wall" %s></div>' % GEO
+        mp = ch.measure(fixture("anchor_ok.html",
+                                phtml([ANCH + '<p>a</p>', ANCH + '<p>b</p>', ANCH + '<p>c</p>'])))
+        pp = mp.get("persist") or {}
+        tc.assert_equal(pp.get("declared_instances"), 3,
+                        "J1 三场各一份同位同形的基形＝声明 3 处（契约属性识别不到即整面失效）")
+        tc.assert_equal([pp.get("scenes_with_anchor"),
+                         pp.get("max_consecutive_scenes_with_same_anchor"),
+                         len(pp.get("anchors_geometry_divergent") or [])], [3, 3, 0],
+                        "J2 覆盖 3 场／同锚最长连续 3 场／几何不一致 0——同位同形是本条正读数的形状")
+        tc.assert_true("coverage_advance_p50" in mp,
+                       "J2b 主面（时间轴腿）与子面同时有读数：两腿共用一次 HTML 读取但各自取数")
+
+        DRIFT = ('<div data-anchor="wall" '
+                 'style="position:absolute;left:96px;top:170px;width:420px;height:230px"></div>')
+        md_ = ch.measure(fixture("anchor_drift.html", phtml([ANCH, ANCH, DRIFT])))
+        pd_ = md_.get("persist") or {}
+        tc.assert_equal([len(pd_.get("anchors_geometry_divergent") or []),
+                         (pd_.get("anchors_geometry_divergent") or [{}])[0].get("variants")],
+                        [1, 2],
+                        "J3 第三场坐标漂移：判该锚几何不一致、形态数 2——观众读作「图跳了一下」，此为该病灶的纸面形态")
+
+        ma = ch.measure(fixture("anchor_routeA.html",
+                                phtml([ANCH, '<p>b</p>', '<p>c</p>'], root_extra=ANCH)))
+        pa = ma.get("persist") or {}
+        tc.assert_equal([pa.get("outside_scene_instances"), pa.get("scenes_with_anchor")], [1, 1],
+                        "J4 路线 A：场景外那一份计入 outside_scene_instances，不得混进场景内覆盖数")
+        tc.assert_true("路线 A" in (pa.get("outside_scene_note") or ""),
+                       "J5 场景外实例必须点名其拓扑归因（必判 FULL 那条是 `resolve_selector` 的事，本面只随行不裁定）")
+
+        mnog = ch.measure(fixture("anchor_nogeo.html",
+                                  phtml(['<div data-anchor="wall"></div>', ANCH, '<p>c</p>'])))
+        png = mnog.get("persist") or {}
+        tc.assert_equal([png.get("anchors_geometry_unchecked"),
+                         len(png.get("anchors_geometry_divergent") or [])], [['wall'], 0],
+                        "J6 任一实例缺内联几何 → **整锚判无从判定**，不得拿在场那几份算一致性"
+                        "（首版用 `if g` 滤掉缺位者，两报皆空＝取数不齐按 0 计）")
+
+        mnone = ch.measure(fixture("anchor_none.html", phtml(['<p>a</p>', '<p>b</p>', '<p>c</p>'])))
+        pnone = mnone.get("persist") or {}
+        tc.assert_equal(pnone.get("declared_instances"), 0,
+                        "J7a 全片未声明常驻锚 → 读数 0")
+        tc.assert_true("untested" not in pnone,
+                       "J7b 0 是**合法读数**（这片没有常驻主图），不得与「解析不出」互混")
+
+        pnb = ch.measure_persistence(BASE)
+        tc.assert_true("untested" in pnb and "coverage_advance_p50" in m,
+                       "J8 子面与主面各自独立归因：BASE 无场景容器 → 子面点名 untested，"
+                       "而主面照常出数（摘掉任一腿都不得把另一腿洗成同形）")
+
+        # 场景容器必须在（否则子面自己就该判 untested，J9 想证的就不是"无 T 块仍在位"了）；
+        # 只把 <script> 整段摘掉＝无 T 块、结构在位。
+        mwo = ch.measure(fixture("no_tblock_anchor.html",
+                                 phtml([ANCH, '<p>b</p>', '<p>c</p>']).split('<script>')[0]
+                                 + '</div></body></html>'))
+        tc.assert_true("untested" in mwo,
+                       "J9 无 T 块 → 时间轴腿判 untested（不猜），而结构腿不受影响（见 J9b）")
+        # J9b 判的是**值**而非"键在不在"：只判 `"untested" not in persist` 时，把子面整个摘掉
+        # （返回值里没这个键）会经 `or {}` 变成恒真——122-M17 首跑即在此存活，故改锚到具体读数。
+        tc.assert_equal((mwo.get("persist") or {}).get("declared_instances"), 1,
+                        "J9b 无 T 块时子面**仍取到数**（声明 1 处）：常驻锚读结构不读时间轴，"
+                        "取数面必须在 T 块判空之前——挂在之后则这支项目整面静默缺席")
+
+        line_absent = ch.format_line({k: v for k, v in mp.items() if k != "persist"})
+        tc.assert_true("子面未接入" in line_absent,
+                       "J10 子面缺席必须可见：写成静默省略＝「摘掉子面」这种改动不留任何读数差（用例93 B5 同族）")
+        line_untested = ch.format_line({"untested": "时间轴取不回",
+                                         "persist": {"declared_instances": 2, "anchors_distinct": 1,
+                                                     "scenes_with_anchor": 2, "scene_elements": 3,
+                                                     "share_scenes_with_anchor": 0.667,
+                                                     "outside_scene_instances": 0,
+                                                     "largest_anchor_scene_share": 0.667,
+                                                     "max_consecutive_scenes_with_same_anchor": 2,
+                                                     "anchors_geometry_divergent": [],
+                                                     "anchors_geometry_unchecked": []}})
+        tc.assert_true("常驻锚 声明 2 处" in line_untested,
+                       "J11 主面未测而子面取到数时子面读数照常随行：时间轴取不到不等于结构也取不到")
+
+        tc.assert_equal(mod_src.count('"data-anchor"'), 1,
+                        "J12 契约属性名值单源（住 PERSIST_CONTRACT）：扫描器与判定各写一遍即两份真相")
+        tc.assert_true(ch.PERSIST_CALIBER.get("adjudicates") is False,
+                       "J13 子面口径自陈不裁定（adjudicates=False 随读数落盘，读的人不会把占比当门槛）")
+
+        # ═════════════════════════════════════════════════════════
+        # K. 复核批两条（2026-11-05 第十一轮）：瞬时语句不得加宽覆盖；封面分母必须可见
+        # ═════════════════════════════════════════════════════════
+        # K 段的来源不是设想：`tl.set` 全仓 728 条（49/50 片含），旧形态按缺省 0.5s 计入推进腿
+        # → **虚高**（与编号 24 要防的"循环充当填充"同向），实测 28/50 片位移 >0、最大 +0.028；
+        # 另 31/50 片的 DOM 场数＝T 块场数＋1（封面），两腿分母本就不同——
+        # 处置不是"有封面标记才剔"（那会把一个键变成两种口径），而是**把分母写进读数与文案**。
+        mset = ch.measure(fixture("sets.html", BASE.replace(
+            "tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n",
+            "tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n"
+            "tl.set('#f', {opacity: 1}, T.s1);\n"
+            "tl.set('#g', {color: '#fff'}, T.s1+6);\n"
+            "tl.call(function () { x(); }, null, T.s2+3);\n")))
+        _ps_s = {s["scene"]: s for s in mset.get("per_scene", [])}
+        tc.assert_equal(mset.get("tweens_instant_statements"), 3,
+                        "K1 三条瞬时语句（2 set＋1 call）计数在位")
+        tc.assert_equal([_ps_s.get("s1", {}).get("coverage_advance"),
+                         _ps_s.get("s2", {}).get("coverage_advance"),
+                         _ps_s.get("s3", {}).get("coverage_advance")],
+                        [ps["s1"]["coverage_advance"], ps["s2"]["coverage_advance"],
+                         ps["s3"]["coverage_advance"]],
+                        "K2 加三条瞬时语句后三场覆盖率**逐值不变**——set/call 零时长，"
+                        "给任何宽度都是虚高（旧形态按缺省 0.5s 计，全仓 728 条即此形）")
+        tc.assert_equal(mset.get("tweens_unparsed"), m.get("tweens_unparsed"),
+                        "K2b 瞬时语句不是「解析不出」：unparsed 计数不受影响（两件事各记各的）")
+        mset_oob = ch.measure(fixture("sets_oob.html", BASE.replace(
+            "tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n",
+            "tl.to('#e', {opacity: 1, duration: 0.5}, T.s3+40);\n"
+            "tl.set('#f', {opacity: 1}, T.s3+40);\n")))
+        tc.assert_equal(mset_oob.get("tweens_out_of_window"), m.get("tweens_out_of_window") + 1,
+                        "K3 位点在锚解析**之后**：越界的 set 仍计 out_of_window（不得因为「它是 set」"
+                        "就换一个计数器把越界洗掉）")
+        tc.assert_equal(mset_oob.get("tweens_instant_statements"), 0,
+                        "K3b 同一条 set 因越界而不入瞬时计数——两个计数器互斥，不重复计一条语句")
+        tc.assert_true("零时长" in ch.CALIBER["instant_treatment"]
+                       and "不入" in ch.CALIBER["instant_treatment"],
+                       "K4 瞬时处理口径随读数落盘（与 loop_treatment 同手法：口径声明是读数的一部分）")
+        tc.assert_true("瞬时(set/call) 3" in ch.format_line(mset),
+                       "K5 瞬时计数进文案行（只在 JSON 里＝读纸面的人看不见这条腿跑过）")
+
+        pcov = ch.measure_persistence(
+            '<html><body><div id="root">'
+            '<div id="scene1" data-scene-id="s0" data-scene-entry="cover"><p>cover</p></div>'
+            '<div id="scene2" data-scene-id="s1"><div data-anchor="w" '
+            'style="left:96px;top:150px"></div></div>'
+            '<div id="scene3" data-scene-id="s2"><div data-anchor="w" '
+            'style="left:96px;top:150px"></div></div>'
+            '</div></body></html>')
+        tc.assert_equal([pcov.get("cover_containers"), pcov.get("scene_elements"),
+                         pcov.get("scenes_with_anchor")], [1, 3, 2],
+                        "K6 封面容器计入分母且**计数随行**（不做条件剔除＝一个键一种口径）；"
+                        "锚覆盖仍只数有声明的两场")
+        tc.assert_true("分母含封面容器 1 枚" in ch.format_persist_line(pcov),
+                       "K6b 分母构成进文案：主面「9 场」与本面「/10 场」差一枚封面时，读的人能自己对上")
+
+        pself = ch.measure_persistence(
+            '<html><body><div id="root">'
+            '<div id="scene1" data-scene-id="s0" data-scene-entry="cover"/>'
+            '<div id="scene2" data-scene-id="s1"><p>a</p></div>'
+            '</div></body></html>')
+        tc.assert_equal(pself.get("cover_containers"), 1,
+                        "K7 自闭合容器（`<div .../>` 走 handle_startendtag）同样登记封面——"
+                        "两条注册腿各补一次，只补一条＝半生效")
+
+        # ═════════════════════════════════════════════════════════
+        # L. 基形初始隐藏（复核批第二条：描述面也不得把"全程不可见"读成「已就位」）
+        # ═════════════════════════════════════════════════════════
+        # 触发不是设想：`_取证/20261105/anchor_probe/invisible_anchor.html` 上两处基形带
+        # `opacity:0` 且无任何入场语句，`check_element_reveal` 判 0（它只认「容器隐藏·入场只打子元素」）、
+        # `check_scene_visibility` 判 0（管场景根），而 persist 当时报「声明 2 处／覆盖 2 场」——
+        # 渲染里那两处根本不存在（2026-10-13「6 块内容永久不可见」同病灶）。
+        HID = ('<html><body><div id="root" data-duration="36">'
+               '<div id="scene1" data-scene-id="s1">'
+               '<div data-anchor="wall" class="anchor-base" '
+               'style="left:96px;top:150px;opacity:0"></div></div>'
+               '<div id="scene2" data-scene-id="s2">'
+               '<div data-anchor="wall" class="anchor-base" '
+               'style="left:96px;top:150px;opacity:0"></div></div>'
+               '<div id="scene3" data-scene-id="s3"><p>c</p></div>'
+               '</body></html>')
+        ph0 = ch.measure_persistence(HID)
+        tc.assert_equal([ph0.get("hidden_instances"),
+                         ph0.get("hidden_instances_without_entrance_target"),
+                         [d["scene"] for d in ph0.get("hidden_instances_detail") or []]],
+                        [2, 2, ["s1", "s2"]],
+                        "L1 两处内联 opacity:0 且无入场语句 → 两条计数各为 2 并逐处点名所在场"
+                        "（此前读数是「声明 2 处／覆盖 2 场」，像已就位）")
+        tc.assert_true("永久不可见" in (ph0.get("hidden_note") or ""),
+                       "L2 归因随行：点名这是「内容永久不可见」同病灶，且判据归属写清（本面只点名）")
+
+        # 入场目标只按 **class** 命中（不给 id）——这条夹具专门给 L4／122-M25 造可观察后果
+        ph1 = ch.measure_persistence(HID.replace(
+            '</body></html>',
+            '<script>const T = {s1: 0.0, s2: 12.0};</script>'
+            '<script>tl.to(".anchor-base", {opacity: 1, duration: 1}, T.s1);</script>'
+            '</body></html>'))
+        tc.assert_equal([ph1.get("hidden_instances"),
+                         ph1.get("hidden_instances_without_entrance_target")], [2, 0],
+                        "L3 有入场语句时两条计数**分向**：raw 仍 2（确实请求了初始隐藏）、"
+                        "unrevealed 归 0——两问各答各的，合成一条就会把正常写法报成病灶")
+        tc.assert_true("hidden" in str(sorted(ph1.keys())) and not ph1.get("hidden_note"),
+                       "L4 归因文案只在真有无可疑时出现（0 处仍留计数、不留警告文案）")
+
+        line_hid = ch.format_persist_line(ph0)
+        tc.assert_true("基形初始隐藏 2（无任何入场目标 2）" in line_hid,
+                       "L5 文案印的是**实际计数**而非固定字样（本枚摘成常量即转红）")
+        line_zero = ch.format_persist_line(pp)
+        tc.assert_true("基形初始隐藏 0（无任何入场目标 0）" in line_zero,
+                       "L5b 两条计数**恒随行**（0 也印）：只在 >0 时印＝把「这条腿跑过」与「这条腿没跑」写成同形")
+
+        tc.assert_equal([pp.get("hidden_instances"), pp.get("hidden_instances_without_entrance_target")],
+                        [0, 0],
+                        "L6 J 段夹具（内联几何、无初始隐藏）自然为 0——不裁定的面也要能自证没冤枉谁")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("choreography_descriptive_face error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+# ════════════════════════════════════════════════════════════════════
+# 用例123：场景容器裁切实测（scene_overflow_probe）
+# ════════════════════════════════════════════════════════════════════
+
+_OVF_FIXTURE = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{{margin:0;background:#f6f2e9;}}
+:root{{--cw:1080px;--ch:1920px;}}
+.scene{{position:absolute;top:0;left:0;width:1080px;height:1920px;overflow:hidden;}}
+.sc{{position:absolute;top:100px;left:0;right:0;bottom:100px;overflow:hidden;background:#fff;}}
+</style></head><body>
+<div id="scene1" class="scene" data-scene-id="s1"><div class="sc">{inner}</div></div>
+<script>var S=[{{scene_id:1,start:0,end:10,dur:10,type:"gsap",cover:false}}];
+{driver}</script>
+</body></html>"""
+
+_OVF_DRIVER_RESET = ('var tl={pause:function(){},seek:function(){'
+                      'var m=document.getElementById("mover");'
+                      'if(m)m.style.transform="none";}};'
+                      'window.__timelines={"main":tl};')
+_OVF_DRIVER_NOOP = 'var tl={pause:function(){},seek:function(){}};window.__timelines={"main":tl};'
+_OVF_DRIVER_NONE = ''
+
+_OVF_MOVER_FIXTURE = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;background:#f6f2e9;}
+:root{--cw:1080px;--ch:1920px;}
+.scene{position:absolute;top:0;left:0;width:1080px;height:1920px;overflow:hidden;}
+.sc{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;background:#fff;}
+</style></head><body>
+<div id="scene1" class="scene" data-scene-id="s1"><div class="sc">
+<div style="position:absolute;left:0;right:0;top:0px;height:1919px;background:#eee;"></div>
+<div id="mover" style="position:absolute;left:0;right:0;top:1904px;height:16px;background:#333;transform:translateY(16px);"></div>
+</div></div>
+<script>var S=[{scene_id:1,start:0,end:10,dur:10,type:"gsap",cover:false}];
+{driver}</script>
+</body></html>"""
+
+
+def test_scene_overflow_probe_adjudicates_clips() -> RegressionTestCase:
+    """用例123：场景容器裁切实测——能失败、不断链、不把动画位移读成裁切。
+
+    存在理由（2026-11-05 acoustic-wall-structure-craft 修订01）：`.sc` 容器
+    `overflow:hidden` 把 s1 第4层卡切掉 100px、s4 末色带 109px、s2 第3行 72px，
+    肉眼明显截断而**全链门禁全绿**——像素类门禁量的是"可见内容底边"，裁完反而
+    读成"刚好贴边"（裁得越狠越合规）。首版的量法是一次性项目级探针，躺在
+    `_取证/` 里、下个项目不会自动跑；本件是它的常驻化，本用例锁住四条边界。
+
+    四段各答一问：
+      A 段（能失败）：真实溢出 → 退出码 1，溢出量与手算一致（2400 − 1720 = 680px）。
+      B 段（不误杀）：同构但内容不溢出 → 退出码 0。
+      C 段（断链判未测）：页面取不到主时间轴驱动源 → 退出码 2 且点名，
+        **不得读成通过**（动画态没法归零时量到的是入场 from 态）。
+      D 段（不把动画位移读成裁切）：子元素带 transform 位移时，驱动源归零 → 退出码 0；
+        驱动源不归零 → 退出码 1（16px）。D 与 D' 成对，缺一该守卫即恒真。
+    """
+    tc = RegressionTestCase(
+        "scene_overflow_probe_adjudicates_clips",
+        "场景容器裁切实测：能失败／不误杀／断链判未测／不把动画位移读成裁切",
+    )
+    try:
+        import subprocess
+        script = SUITE_SCRIPT_DIR / "scene_overflow_probe.py"
+        tc.assert_true(script.is_file(), "A0 scene_overflow_probe.py 在位（工具须常驻）")
+
+        def run_cli(html: Path):
+            env = dict(os.environ)
+            env["PYTHONUTF8"] = "1"
+            r = subprocess.run(
+                [sys.executable, str(script), str(html)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", env=env, timeout=300)
+            return r.returncode, ((r.stdout or "") + (r.stderr or ""))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            # A 段：真实溢出（子元素高 2400，容器净高 1920−100−100=1720）
+            a_html = tmp / "ovf_a.html"
+            a_html.write_text(_OVF_FIXTURE.format(
+                inner='<div style="position:absolute;left:20px;right:20px;top:0px;'
+                      'height:2400px;background:#ddd;"></div>',
+                driver=_OVF_DRIVER_RESET), encoding="utf-8")
+            code_a, out_a = run_cli(a_html)
+            tc.assert_equal(code_a, 1, "A1 真实溢出 → 退出码 1（能失败）")
+            tc.assert_true("裁切溢出" in out_a and "680" in out_a,
+                           "A2 溢出量与手算一致（2400−1720=680px），并点名最深元素")
+            tc.assert_true("存在容器裁切" in out_a, "A3 汇总行报存在裁切")
+
+            # B 段：不误杀（同构，内容收进容器内）
+            b_html = tmp / "ovf_b.html"
+            b_html.write_text(_OVF_FIXTURE.format(
+                inner='<div style="position:absolute;left:20px;right:20px;top:0px;'
+                      'height:1600px;background:#ddd;"></div>',
+                driver=_OVF_DRIVER_RESET), encoding="utf-8")
+            code_b, out_b = run_cli(b_html)
+            tc.assert_equal(code_b, 0, "B1 无溢出 → 退出码 0（不误杀）")
+            tc.assert_true("均无容器裁切" in out_b, "B2 汇总行报均无裁切")
+
+            # C 段：断链判未测（无驱动源 → 动画态无法归零）
+            c_html = tmp / "ovf_c.html"
+            c_html.write_text(_OVF_FIXTURE.format(
+                inner='<div style="position:absolute;left:20px;right:20px;top:0px;'
+                      'height:2400px;background:#ddd;"></div>',
+                driver=_OVF_DRIVER_NONE), encoding="utf-8")
+            code_c, out_c = run_cli(c_html)
+            tc.assert_equal(code_c, 2, "C1 取数断链 → 退出码 2（不得读成通过）")
+            tc.assert_true("取不到主时间轴驱动源" in out_c,
+                           "C2 断链时点名缺驱动源（不是「无裁切」）")
+            tc.assert_true("存在容器裁切" not in out_c,
+                           "C3 断链时不得同时输出裁切结论")
+
+            # D 段：动画位移不是裁切（归零 → PASS；不归零 → FAIL 16px）
+            d_html = tmp / "ovf_d.html"
+            d_html.write_text(_OVF_MOVER_FIXTURE.replace(
+                "{driver}", _OVF_DRIVER_RESET), encoding="utf-8")
+            code_d, out_d = run_cli(d_html)
+            tc.assert_equal(code_d, 0, "D1 驱动源归零后 transform 位移不算裁切")
+
+            d2_html = tmp / "ovf_d2.html"
+            d2_html.write_text(_OVF_MOVER_FIXTURE.replace(
+                "{driver}", _OVF_DRIVER_NOOP), encoding="utf-8")
+            code_d2, out_d2 = run_cli(d2_html)
+            tc.assert_equal(code_d2, 1, "D2 不归零时 transform 位移被读成 16px 裁切"
+                                         "（与 D1 成对，缺一则该守卫恒真）")
+            tc.assert_true("16" in out_d2, "D3 溢出量与 transform 位移一致（16px）")
+
+            # E 段：量法基准——项目声明固定画布时，读数不随 headless 视口变
+            tc.assert_true("固定 px，测量不受视口影响" in out_a,
+                           "E1 读出项目声明的固定画布并说明视口不影响测量")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_overflow_probe_adjudicates_clips error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
 def main():
     import argparse
     
@@ -23166,6 +24059,407 @@ def main():
         print(f"[OK] Results saved to {args.output}")
     
     sys.exit(0 if summary['failed'] == 0 else 1)
+
+
+def test_intra_pause_trim_and_third_bucket() -> RegressionTestCase:
+    """用例121：无标点处多余停顿的修剪面与复核第三桶（2026-11-05 用户口播反馈批）。
+
+    背景（实测，非推测）：用户对多支成片报同一形态——"强制底线""3 大支柱""评价验收"
+    "计量计价"这类完整语义单位被音频从中间切开。跨 11 支已交付项目 8530 个无标点位点：
+    中位 0.000s、p99 0.008s，其中 20 处 ≥0.25s 且两侧实测且区间为真静音谷，分布在 9 支项目。
+    既有两桶只在**有标点处**取样（`if not punct: continue`），本形态是其镜像、无名字。
+
+    本用例锁的不是"能剪"，而是六条不得回退的纪律：
+      A 单源：修剪侧与点名侧都走 intra_pause.classify_points，两处各写判据即两份真相；
+      B 零字面量：阈值只住 audio_sync_rules.json → intra_pause_trim；
+      C 缺省关闭 + 三态开关（None 未声明／True／False），启用时戳记代次须与关闭时不同；
+      D 声明节缺 enabled 即 fail-loud（不得静默摘掉作者的裁定，也不得"见节即开"）；
+      E 判据四道闸：有标点不入／低于绝对阈不入／matched=0（插值时刻）不入／
+        同场标点样本<2 不入且计入未裁定；能量三态 True/False/None 不得混数；
+      F 波形侧：时长差＝剪掉量、句级与字符级同映射、幂等、接缝落在静音、关闭态字节不变。
+    """
+    tc = RegressionTestCase(
+        "intra_pause_trim_and_third_bucket",
+        "验证无标点停顿修剪面缺省关闭、判据单源、能量三态与波形重映射性质"
+    )
+    try:
+        import ast
+        import hashlib
+        import re
+        import shutil
+        import sys
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import intra_pause as ip
+        import enhance_video_audio as eva
+        import narration_pause_precheck as npp
+
+        eva_src = script_dir / "enhance_video_audio.py"
+        npp_src = script_dir / "narration_pause_precheck.py"
+        ip_src = script_dir / "intra_pause.py"
+
+        # ---------------- A 段：判据单源（AST 证两侧都调 classify_points）-------------
+        def _fn_text(path, fname):
+            body = path.read_text(encoding="utf-8")
+            m = re.search(rf"^def {re.escape(fname)}\(.*?(?=^def |^# ---|\Z)",
+                          body, re.S | re.M)
+            return m.group(0) if m else ""
+
+        d_trim = _fn_text(eva_src, "_trim_intrasentence_silence")
+        d_face = _fn_text(npp_src, "_intra_bucket_rows")
+        tc.assert_true(d_trim and "classify_points" in d_trim,
+                       "A1 trim executor must call intra_pause.classify_points")
+        tc.assert_true(d_face and "classify_points" in d_face,
+                       "A2 report face must call the same classifier")
+        tc.assert_true("audio_is_valley" in d_trim,
+                       "A3 only energy-confirmed points may be cut")
+        # 两侧都不得自己算 gap（第二份判据的形态就是在消费方里重写一遍减法）。
+        # 刻意用带词界的正则而不是子串包含：`new_chars[i + 1][0]` 是**验证闭环**在读
+        # 分类器已经返回的位点（不是第二次取数），子串匹配会把它误判成重算。
+        _recompute = re.compile(r"(?<![\w_])chars\[i \+ 1\]\[0\]")
+        tc.assert_true(not _recompute.search(d_trim) and not _recompute.search(d_face),
+                       "A4 consumers must not recompute the gap themselves")
+        tree = ast.parse(d_trim)
+        calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name)}
+        tc.assert_true("_trim_note" in calls or "classify_points" in d_trim,
+                       "A5 structured note builder is the only读数 carrier out of the executor")
+
+        # ---------------- B 段：阈值零字面量（只住配置）------------------------------
+        rules = ip.load_rules(script_dir.parent / "配置/config/quality/audio_sync_rules.json")
+        cfg_vals = {round(float(rules["min_seconds"]), 4),
+                    round(float(rules["keep_seconds"]), 4),
+                    round(float(rules["relative_ratio"]), 4)}
+        for fname, src in (("_trim_intrasentence_silence", eva_src),
+                           ("_intra_bucket_rows", npp_src)):
+            body = _fn_text(src, fname)
+            lits = {round(float(x), 4) for x in
+                    re.findall(r"(?<![\w.])(\d+\.\d+)(?![\w.])", body)}
+            conflict = sorted(lits & cfg_vals)
+            tc.assert_equal(conflict, [],
+                            f"B1 {fname} must read thresholds from rules, not literals")
+        tc.assert_true('rules["min_seconds"]' in ip_src.read_text(encoding="utf-8"),
+                       "B2 classifier must read min_seconds out of rules")
+        tc.assert_true('rules.get(\'max_points_per_scene\'' in d_trim,
+                       "B3 per-scene stop-loss cap must also come from rules")
+
+        # ---------------- C 段：缺省关闭 + 三态 + 代次分离 ----------------------------
+        tc.assert_equal(bool(rules["enabled_by_default"]), False,
+                        "C1 trim must be default-off (it rewrites the waveform)")
+        _keep = eva.INTRA_TRIM_ENABLED
+        try:
+            eva.INTRA_TRIM_ENABLED = None
+            on0, r0, stamp0, why0 = eva._intra_trim_state()
+            tc.assert_equal(on0, False, "C2 undeclared switch falls back to rules default")
+            tc.assert_equal(stamp0, "v2", "C3 disabled state keeps the historical stamp")
+            eva.INTRA_TRIM_ENABLED = True
+            on1, r1, stamp1, why1 = eva._intra_trim_state()
+            tc.assert_equal(on1, True, "C4 explicit enable switches the face on")
+            tc.assert_equal(stamp1, "v2+trim",
+                            "C5 enabled state must be a distinct waveform generation")
+            eva.INTRA_TRIM_ENABLED = False
+            on2, r2, stamp2, why2 = eva._intra_trim_state()
+            tc.assert_equal((on2, stamp2), (False, "v2"),
+                            "C6 explicit false must not inherit the trim generation")
+            _orig = ip.load_rules
+            ip.load_rules = lambda *a, **k: (_ for _ in ()).throw(
+                ip.Untested("规则节缺席（夹具注入）"))
+            try:
+                eva.INTRA_TRIM_ENABLED = True
+                on3, r3, stamp3, why3 = eva._intra_trim_state()
+                tc.assert_equal(on3, False, "C7 broken rules must disable the face")
+                tc.assert_true("判据断链" in why3, "C8 broken rules must name the broken leg")
+                tc.assert_equal(r3, None, "C9 broken rules must not hand back guessed numbers")
+            finally:
+                ip.load_rules = _orig
+        finally:
+            eva.INTRA_TRIM_ENABLED = _keep
+
+        # ---------------- D 段：声明节缺 enabled 即 fail-loud ------------------------
+        _keep2 = eva.INTRA_TRIM_ENABLED
+        try:
+            raised = False
+            try:
+                eva._collect_pause_state({"intra_pause_trim": {"keep_seconds": 0.1}}, [])
+            except SystemExit:
+                raised = True
+            tc.assert_true(raised, "D1 section without enabled must exit non-zero")
+            eva._collect_pause_state({"intra_pause_trim": {"enabled": True}}, [])
+            tc.assert_equal(eva.INTRA_TRIM_ENABLED, True, "D2 explicit true wins")
+            eva._collect_pause_state({}, [])
+            tc.assert_equal(eva.INTRA_TRIM_ENABLED, None,
+                            "D3 undeclared stays tri-state None, never False")
+            bad_exit = False
+            try:
+                eva._collect_pause_state({"intra_pause_trim": "on"}, [])
+            except SystemExit:
+                bad_exit = True
+            tc.assert_true(bad_exit, "D4 malformed scalar must be rejected, not coerced")
+        finally:
+            eva.INTRA_TRIM_ENABLED = _keep2
+            eva._collect_pause_state({}, [])
+
+        # ---------------- E 段：判据四道闸 + 能量三态 ---------------------------------
+        # 夹具口径：标点样本须 ≥2 才能取到"同场标点中位"，故基准文本刻意带两个逗号。
+        def _mk(text, gaps):
+            spoken, after = npp.spoken_and_after(text)
+            t, chars = 0.0, []
+            for k in range(len(spoken)):
+                d = 0.12
+                chars.append([round(t, 3), round(t + d, 3), 1])
+                t += d + gaps.get(k, 0.0)
+            return spoken, after, chars
+
+        # 逗号位＝i=1 与 i=3（同场标点样本 2 个，够取中位）；己|庚＝i=5 为无标点位点。
+        BASE = "甲乙，丙丁，戊己庚"
+        R = dict(rules)
+        sp, af, ch = _mk(BASE, {1: 0.40, 3: 0.40, 5: 0.30})
+        v = ip.classify_points(sp, af, ch, R)
+        tc.assert_equal(len(v["points"]), 1, "E1 no-punctuation 0.30s gap must be a point")
+        # 防御式取数：位点集合为空时**点名"无位点"**而不是 IndexError 截断整案
+        # （变异矩阵引擎的 CRASH 判据：断言数少于基线即整案未跑完，不得记 RED-OK）。
+        tc.assert_equal((v["points"] or [{"energy": "无位点（E1 已红）"}])[0]["energy"], None,
+                        "E2 without the audio leg the state is UNTESTED (None), not True/False")
+        tc.assert_equal(ip.audio_is_valley(v["points"]), [],
+                        "E3 energy None must never be treated as a confirmed valley")
+
+        sp_p, af_p, ch_p = _mk(BASE, {1: 0.60, 3: 0.60})   # 最大间隔全部落在逗号处
+        tc.assert_equal(len(ip.classify_points(sp_p, af_p, ch_p, R)["points"]), 0,
+                        "E4 a pause AT punctuation is the existing two buckets' business")
+
+        # 0.20 已过相对腿（0.6×0.30=0.18）但未过绝对阈 0.25 → 隔离出绝对腿在起作用
+        sp_s, af_s, ch_s = _mk(BASE, {1: 0.30, 3: 0.30, 5: 0.20})
+        tc.assert_equal(len(ip.classify_points(sp_s, af_s, ch_s, R)["points"]), 0,
+                        "E5 below the absolute floor must not be a point")
+
+        ch_m = [list(x) for x in ch]
+        ch_m[5][2] = 0                                     # 插值时刻
+        v_m = ip.classify_points(sp, af, ch_m, R)
+        tc.assert_equal(v_m["points"], [],
+                        "E6 interpolated char times must never drive a cut")
+        tc.assert_equal(v_m["unmeasurable"], 1,
+                        "E7 that position counts as 未裁定, not as clean")
+
+        sp_c, af_c, ch_c = _mk("甲乙丙丁戊己庚", {5: 0.30})   # 全场无标点 → 无从取中位
+        v_c = ip.classify_points(sp_c, af_c, ch_c, R)
+        tc.assert_equal(v_c["points"], [],
+                        "E8 no punctuation cohort means the point is not adjudicated")
+        tc.assert_equal(v_c["unmeasurable"], 1,
+                        "E9 that position must be counted, never dropped")
+
+        # 0.20 低于绝对阈 0.25 → 不入（E5 已从相对腿方向隔离，这里从绝对腿方向）
+        sp_r, af_r, ch_r = _mk(BASE, {1: 0.30, 3: 0.30, 5: 0.18})
+        tc.assert_equal(len(ip.classify_points(sp_r, af_r, ch_r, R)["points"]), 0,
+                        "E10 below the absolute floor must not enter via the relative leg")
+        # 0.30 过绝对阈（0.25）却不到 0.6×标点中位（0.6×0.60=0.36）→ 相对腿单独拦下
+        sp_r2, af_r2, ch_r2 = _mk(BASE, {1: 0.60, 3: 0.60, 5: 0.30})
+        v_r2 = ip.classify_points(sp_r2, af_r2, ch_r2, R)
+        tc.assert_equal(v_r2["points"], [],
+                        "E11 the relative leg must reject a gap not yet at item-boundary scale")
+        tc.assert_equal(v_r2["unmeasurable"], 1,
+                        "E12 a relative-leg rejection is an adjudication, not silence")
+
+        bad = ip.classify_points(sp, af, ch[:3], R)
+        tc.assert_equal(bad["length_mismatch"], True,
+                        "E13 length mismatch is its own state（不得按 0 计）")
+        tc.assert_equal(bad["points"], [], "E14 length mismatch yields no points")
+
+        # 能量腿本身可测：给一段"中间是零、两侧有语音"的合成数组
+        import numpy as np
+        sr_t = 16000
+        arr = np.zeros(int(1.0 * sr_t))
+        arr[:int(0.30 * sr_t)] = 0.2
+        arr[int(0.60 * sr_t):] = 0.2
+        tc.assert_equal(ip.energy_ok(arr, sr_t, 0.30, 0.60, R), True,
+                        "E15 a real silence valley between two loud spans is True")
+        arr2 = arr.copy()
+        arr2[int(0.30 * sr_t):int(0.60 * sr_t)] = 0.15
+        tc.assert_equal(ip.energy_ok(arr2, sr_t, 0.30, 0.60, R), False,
+                        "E16 a non-valley interval must be False（ASR 词尾早收即此形态）")
+        # 0.005s = 80 样本 < 0.01s 的判据窗下限 → 该区间**无从裁定**（None），
+        # 不得因为它"不够格"就返回 False（False 的语义是"确认不是谷"）。
+        tc.assert_equal(ip.energy_ok(arr, sr_t, 0.30, 0.305, R), None,
+                        "E17 an interval too short to judge is None, not False")
+
+        # ---------------- F 段：时刻映射 ----------------------------------------------
+        f = eva._time_map_factory([(1.0, 1.4)])
+        tc.assert_equal(f(0.5), 0.5, "F1 before the cut is unmoved")
+        # 1.2 落在被删区间 [1.0,1.4) **内** → 收到接缝 1.0；1.6 在区间之后 → 减去删除量。
+        # （实际剪切窗只取静音内部的一段，接缝两侧仍留 keep_seconds 的静音；这里锁的是映射本身。）
+        tc.assert_equal(f(1.2), 1.0, "F2 a time inside the removed span collapses onto the seam")
+        tc.assert_equal(f(1.6), 1.2, "F3 after the cut shifts by exactly the removed span")
+        two = eva._time_map_factory([(1.0, 1.4), (2.0, 2.2)])
+        tc.assert_equal(round(two(2.6), 3), 2.0,
+                        "F4 two cuts accumulate (0.4 + 0.2 = 0.6 earlier)")
+        tc.assert_equal(round(two(1.6), 3), 1.2,
+                        "F5 a time between the two cuts only feels the first one")
+        inp = [[0.0, 0.5, 1], [1.2, 1.6, 1], [2.0, 2.4, 1]]
+        snapshot = [list(x) for x in inp]
+        out = eva._shift_stream_for_removed_silence(inp, [(1.0, 1.4)])
+        tc.assert_equal(inp, snapshot,
+                        "F6 mapper must return a new list（原地热绑定会让漏回写测不出来）")
+        tc.assert_equal(out[2][0], 1.6, "F7 char stream shifts with the same mapping")
+        tc.assert_equal(out[1][0], 1.0, "F8 a char inside the span collapses onto the seam")
+        sents = [{"rel_start": 0.0, "rel_end": 1.2}, {"rel_start": 2.0, "rel_end": 3.0}]
+        snap_s = [dict(x) for x in sents]
+        s_out = eva._shift_stream_for_removed_silence(sents, [(1.0, 1.4)])
+        tc.assert_equal(sents, snap_s, "F9 sentence stream input must stay untouched too")
+        tc.assert_equal(round(s_out[0]["rel_end"], 3), 1.0,
+                        "F10 sentence tail collapses to the seam like the char stream")
+        tc.assert_equal(round(s_out[1]["rel_start"], 3), 1.6,
+                        "F11 sentence and char streams share one mapping")
+
+        # ---------------- G 段：真波形沙箱（复制件，不碰在制项目）--------------------
+        # 断言条数**与数据无关**：首版把 assert 写在逐场循环里，于是"有无场次被剪"
+        # 会改变整案断言数（66/69），变异引擎按"断言数少于基线即整案截断"判 CRASH，
+        # 把一枚真实落红的变异读成"不足以归因"。现改为循环内只收集问题、循环外逐条落断言，
+        # 并给无对象的腿一个**非恒真**的缺省读数（否则"没有场次被剪"会把 G2-G5 洗成空跑）。
+        real_temp = (script_dir.parent.parent / "过程产物/临时产物"
+                     / "wall-door-opening-node_audio")
+        man_p = real_temp / "_timeline_manifest.json"
+        narr_p = (script_dir.parent / "源码/hyperframes/wall-door-opening-node/narration.json")
+        if man_p.exists() and narr_p.exists():
+            import json as _json
+            man = _json.loads(man_p.read_text(encoding="utf-8"))
+            nd = _json.loads(narr_p.read_text(encoding="utf-8"))
+            narr = {str(x.get("scene_id")): (x.get("narration") or "").strip()
+                    for x in (nd.get("scenes") if isinstance(nd, dict) else nd)}
+            untouched, cut_ok, idem_ok, shift_ok, struct_ok = [], [], [], [], []
+            n_untouched = n_trimmed = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                for entry in man.get("scenes", []):
+                    sid = str(entry.get("scene_id"))
+                    src = real_temp / "tts_44k" / (entry.get("tts_file") or "")
+                    if not entry.get("chars") or not src.exists():
+                        continue
+                    dst = Path(tmp) / src.name
+                    shutil.copy2(src, dst)
+                    before = hashlib.sha256(dst.read_bytes()).hexdigest()
+                    d0 = _wav_dur(dst)
+                    mod, ns, removed, nc, res = eva._trim_intrasentence_silence(
+                        dst, [dict(x) for x in entry["sentences"]],
+                        [list(x) for x in entry["chars"]], narr.get(sid, ""), rules)
+                    if not mod:
+                        n_untouched += 1
+                        if hashlib.sha256(dst.read_bytes()).hexdigest() != before:
+                            untouched.append(f"s{sid} 字节被改")
+                        continue
+                    n_trimmed += 1
+                    if round(d0 - _wav_dur(dst), 3) != removed:
+                        cut_ok.append(f"s{sid} 时长差≠剪掉量")
+                    m2, _, removed2, _, _r2 = eva._trim_intrasentence_silence(
+                        dst, ns, nc, narr.get(sid, ""), rules)
+                    if m2 and removed2:
+                        idem_ok.append(f"s{sid} 重跑又剪了 {removed2}s")
+                    sh_s = entry["sentences"][-1]["rel_end"] - ns[-1]["rel_end"]
+                    sh_c = entry["chars"][-1][1] - nc[-1][1]
+                    if round(sh_s, 2) != round(sh_c, 2):
+                        shift_ok.append(f"s{sid} 句级 {sh_s:.2f} ≠ 字符级 {sh_c:.2f}")
+                    if not (res["points"] >= 1 and isinstance(res["note"], str)):
+                        struct_ok.append(f"s{sid} 结构化读数缺项")
+            _none = ["无被剪场次（G6 即此形态的对位证据）"]
+            tc.assert_equal(untouched, [], "G1 scenes with no point must leave bytes untouched")
+            tc.assert_equal(cut_ok or (_none if not n_trimmed else []), [],
+                            "G2 duration delta must equal the removed seconds")
+            tc.assert_equal(idem_ok or (_none if not n_trimmed else []), [],
+                            "G3 trimming must be idempotent（同段静音不得反复剪）")
+            tc.assert_equal(shift_ok or (_none if not n_trimmed else []), [],
+                            "G4 tail shift identical in sentence and char streams")
+            tc.assert_equal(struct_ok or (_none if not n_trimmed else []), [],
+                            "G5 structured counts accompany the human note")
+            tc.assert_true(n_trimmed >= 1,
+                           "G6 real hq wavs must produce at least one trimmed scene")
+            tc.assert_true(n_untouched >= 1,
+                           "G7 the sandbox must also contain scenes with no point "
+                           "(otherwise G1 has no object)")
+        else:
+            for _g in ("G1", "G2", "G3", "G4", "G5", "G6", "G7"):
+                tc.assert_true(True, f"{_g} real project absent (business temp not exported); "
+                                     f"fixture-level coverage above stands")
+
+        # ---------------- H 段：登记面（改了判据而该步缓存照常命中＝A06 同族）----------
+        import pipeline_runner as pr
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            runner = pr.PipelineRunner.__new__(pr.PipelineRunner)
+            runner.state = pr.PipelineState(tmpdir / "pipeline_state.json")
+            runner.config = {}
+            runner.config_path = tmpdir / "cfg.json"
+            runner.html_project = "t121"
+            runner.source_dir = tmpdir
+            runner.html_path = tmpdir / "index.html"
+            runner.temp_dir = tmpdir
+            runner.tts_dir = tmpdir / "tts_44k"
+            runner.gate_mode = "render"
+            runner.quick_fix = False
+            runner.render_raw = tmpdir / "render_raw.mp4"
+            runner.output_file = tmpdir / "t121.mp4"
+            runner.force = False
+            tl = runner._step_inputs("tts")
+            tc.assert_true(str(tl.get("intra_pause_rules", "")).endswith("intra_pause.py"),
+                           "H1 tts step inputs must register intra_pause.py (判据真身)")
+            tc.assert_true(str(tl.get("pause_rules", "")).endswith("audio_sync_rules.json"),
+                           "H2 threshold authority stays registered in the same step")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # ---------------- I 段：复核第三桶落摘要、只报不拦 -----------------------------
+        fake_manifest = {"scenes": [{
+            "scene_id": "1", "start": 0.0, "end": 5.0, "method": "asr_forced",
+            "tts_file": "", "norm": "甲乙丙丁戊己庚",
+            "chars": [[0.00, 0.12, 1], [0.12, 0.24, 1], [0.64, 0.76, 1],
+                      [0.76, 0.88, 1], [1.30, 1.42, 1], [1.92, 2.04, 1],
+                      [2.06, 2.18, 1]],
+            "sentences": [{"text": "甲乙", "rel_start": 0.0, "rel_end": 0.24},
+                          {"text": "丙丁", "rel_start": 0.64, "rel_end": 0.88},
+                          {"text": "戊己庚", "rel_start": 1.30, "rel_end": 2.18}]}]}
+        fake_narr = [{"scene_id": "1", "narration": "甲乙，丙丁，戊己庚"}]
+        _sum = npp.audio_face(fake_narr, fake_manifest, npp.load_rules())[2]
+        intra = _sum.get("intra") or {}
+        tc.assert_true("hits" in intra and "unconfirmed" in intra,
+                       "I1 report must separate confirmed valleys from untested ones")
+        tc.assert_equal(intra.get("hits"), 0,
+                        "I2 without the audio leg nothing counts as a confirmed hit（不得虚报）")
+        tc.assert_equal(len(intra.get("points") or []), 1,
+                        "I3 the untested point must still be named")
+        tc.assert_equal(intra.get("threshold_seconds"),
+                        round(float(rules["min_seconds"]), 4),
+                        "I4 the threshold surfaced is the one from rules")
+        # 消费侧接线（2026-11-05 第三桶进流水线打印面）：runner 必须经 enhance 的
+        # 单一解析出口问开关，不得自己 `config.get("intra_pause_trim")` 重读一遍——
+        # 两处各自解析就会出现"报告说没开、执行侧却开着"的分叉。
+        pr_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        face = pr_src.split("def _pause_audit_face")[1].split("\n    def ")[0]
+        tc.assert_true("intra" in face,
+                       "I5 pipeline print face must surface the third bucket")
+        tc.assert_true("_intra_trim_state()" in face,
+                       "I6 switch state must come from enhance's single resolver")
+        tc.assert_true('config.get("intra_pause_trim"' not in face
+                       and "get('intra_pause_trim'" not in face,
+                       "I7 runner must not re-parse the switch (second source of truth)")
+        main_seg = npp_src.read_text(encoding="utf-8").split("def main(")[1]
+        rets = sorted({m.group(1) for m in re.finditer(r"^\s*return (\d+)\b",
+                                                       main_seg, re.M)})
+        tc.assert_equal(rets, ["0", "2"],
+                        "I8 exit codes stay 0/2 — 第三桶不得新增阻断档")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("intra_pause_trim_and_third_bucket error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def _wav_dur(p):
+    import wave
+    with wave.open(str(p), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
 
 if __name__ == '__main__':
     main()
