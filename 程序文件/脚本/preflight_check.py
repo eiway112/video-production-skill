@@ -1822,6 +1822,43 @@ def check_text_punctuation(html_path: Path, r: PreflightResult):
                  check_id="text_punct")
 
 
+def check_incremental_eligibility(html_path: Path, cfg: dict, r: PreflightResult):
+    """WARN (成本预告，不拦): 手写 HTML 的 T 块若不可信，本项目**每轮**都要全量渲染。
+
+    存在理由（2026-11-06 竖屏复盘 M2，两支竖屏项目实测）：同一条判据
+    `scene_patch_render.extract_scene_times` 原先只在 render 步的增量分类器里跑，
+    返回 `baseline-time-source-untrusted(T-block-not-monotonic)` 后静默降级全量。
+    门洞节点项目因此 attempts/hits 长期停在 1/0，每轮多付一次全量渲染（实测约
+    5.5 分钟机时），而作者在起跑前**没有任何位点知道这件事**——它既不是质量缺陷，
+    也不在任何报告面上显形，只表现为"修订比预期慢"。
+
+    判据不复制第二份：直调分类器的单源函数，读它返回的 reason 原文。
+    只 WARN 不拦：T 块形态本身合法（全量渲染照常成功、门禁照常过），拦下来会把
+    "可交付"变成"不可交付"，属误杀；本条的收益是成本，不是质量。
+    """
+    cid = "incremental_eligibility"
+    try:
+        import scene_patch_render as _spr
+    except Exception as e:
+        r.warn(f"增量资格无从核对：分类器模块取不回（{e}）——不得据此读成"
+               f"「已检查且可走增量」", check_id=cid)
+        return
+    try:
+        html = html_path.read_text(encoding='utf-8', errors='replace')
+    except OSError as e:
+        r.warn(f"增量资格无从核对：HTML 读不回（{e}）", check_id=cid)
+        return
+    times, reason = _spr.extract_scene_times(html, cfg)
+    if times is None:
+        r.warn(f"本项目每轮都将走全量渲染（增量资格未取得）：{reason}。"
+               f"修法见 scene_patch_render.extract_scene_times 的对应分支——"
+               f"常见两条：T 块各场起点须单调递增；有封面时 root data-cover-duration "
+               f"须等于首个 T 起点（容差 0.05s）", check_id=cid)
+    else:
+        r.ok(f"时间源可信，修订轮具备增量渲染资格（{len(times)} 场有 T 条目）",
+             check_id=cid)
+
+
 def check_scene_insert(html_path: Path, r: PreflightResult):
     """CRITICAL (结构级): 新增/删除/重排场景时，三处独立书写的东西必须一起改。
 
@@ -2902,6 +2939,7 @@ def main():
     check_chapter_bar(html_path, r)
     check_text_punctuation(html_path, r)
     check_scene_insert(html_path, r)
+    check_incremental_eligibility(html_path, cfg or pre_cfg, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)
     check_placeholder_images(html_path, r)

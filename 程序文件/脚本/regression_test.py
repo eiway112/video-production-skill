@@ -95,6 +95,21 @@ class RegressionTestCase:
 SUITE_SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+def slug_leg_fixture(tdir: Path) -> dict:
+    """给合成词表补一条**可用但零对象**的业务项目名腿（绝对枚举根 → 空目录）。
+
+    存在理由（2026-11-06 本腿落地当轮由回归自身抓出）：这条腿缺节即整体判未测
+    （fail-closed，与 `delivery_artifact_ban` 缺区同一条理由）。于是所有只测别的层的
+    合成词表都会被它带进 UNTESTED——用例71 的 D1『清空白名单取最严』当场变红，
+    原因不在它自己的层。夹具的正确形状是"这条腿在位、枚举集为空"，而不是不提它。
+    枚举根必须**绝对**且指向夹具临时目录：相对值会解析到本仓真实项目面，
+    夹具就地带上几十个真词条，断言随真实项目增删而漂。
+    """
+    root = Path(tdir) / "slug-universe"
+    root.mkdir(parents=True, exist_ok=True)
+    return {"enumeration_root": str(root), "fixture_allowlist": [], "grandfathered": []}
+
+
 def export_repo_face(tc: RegressionTestCase) -> str:
     """返回 'dev'（本仓面）或 'published'（发布仓面）；半导出即判红并返回 'dev'。
 
@@ -1015,7 +1030,32 @@ def test_exit_code_gate_enforcement() -> RegressionTestCase:
             should_rerun = pstate.should_rerun_step("tts", inputs={})
             tc.assert_true(should_rerun,
                           "Failed step requires rerun")
-            
+
+            # ── 套件自身的退出码判据（2026-11-06 发布仓回归 §8.2 现读抓出）──
+            # 缺陷形态实测：发布仓 123/124 却退 0。旧 `sys.exit(0 if failed==0 else 1)`
+            # 把"一条用例整个没跑（status 停在初值 not_run）"读成绿灯——CI 只看末端码，
+            # 于是"回归全绿"这句自述与真实覆盖面无关。这不是某条判据的造假绿，
+            # 是造假绿发生在报告面本身，故锚在本用例（退出码 enforcement 的同族载体）。
+            _runner = RegressionTestRunner()     # 用本模块的全名类，不再 import 一份副本
+            _ghost = RegressionTestCase("_ghost_case_for_exit_code", "夹具")
+            _runner.results.append(dict(_ghost.result))   # status 仍为初值 not_run
+            _s = _runner.get_summary()
+            tc.assert_equal(_s.get("not_run"), 1,
+                            "E1 未 mark_passed 也未 mark_failed 的用例须计入 not_run")
+            tc.assert_equal(_s.get("not_run_cases"), ["_ghost_case_for_exit_code"],
+                            "E2 not_run 须逐名点名（总数差可反推，但『差1』读起来像失败而非无对象）")
+            tc.assert_equal(_s["failed"], 0,
+                            "E3 not_run 不得混入 failed 桶（两桶修法不同：一改判据一补对象）")
+            _self_src = Path(__file__).resolve().read_text(encoding="utf-8")
+            _exit_line = [ln for ln in _self_src.splitlines()
+                          # 剥缩进后的行首锚：本断言自己的搜索字面量也在文件里，
+                          # 用 "in ln" 会自匹配成恒 2（这条腿永不可能红）
+                          if ln.strip().startswith("sys.exit(0 if summary[")]
+            tc.assert_true(len(_exit_line) == 1,
+                            f"E4 套件退出码单点（两处即两份真相）：{_exit_line}")
+            tc.assert_true("not_run" in _exit_line[0],
+                            "E5 退出码须同时裁 not_run——只裁 failed 即把『没跑成』读成绿")
+
             tc.mark_passed()
             
     except Exception as e:
@@ -5492,6 +5532,13 @@ def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase
             return p
 
         def gate(tdir, doc, files=None, repo=None):
+            # 夹具枚举根：本腿的判据是"按目录枚举"，缺节即整体未测（F 组那条）。
+            # 因此**每个**经 gate() 的合成词表都必须自带这一节，否则测的是"配置残缺"
+            # 而不是词条行为——与上面 delivery_artifact_ban 的缺区即未测同一条理由。
+            # 用绝对路径指向夹具临时目录：真仓的项目目录不该被回归夹具写进生产面。
+            if "project_slug_leg" not in doc:
+                doc = dict(doc)
+                doc["project_slug_leg"] = slug_leg_fixture(tdir)
             tp = put(tdir, "terms.json", json.dumps(doc, ensure_ascii=False))
             return peg.run_gate(repo=repo, files=files, terms_path=tp), tp
 
@@ -5678,6 +5725,107 @@ def test_publish_export_gate_blocks_business_identifiers() -> RegressionTestCase
                            "H4 模块 docstring 声明覆盖边界（不得被读成'发布面已完全脱敏'）")
             tc.assert_true(peg.default_terms_path().exists(),
                            "H5 权威词表在位（清单 §3.3 指向的路径与脚本取数路径一致）")
+
+        # ── F 业务项目目录名这条腿（2026-11-06 导出批后立）──────────────
+        # 威胁实测：本批我在注释与两份模板文档里写了一个真实项目目录名，`--repo` 出
+        # hits=0——`project_codename` 只覆盖三条既有代号形态，现行命名一条都不扫得中。
+        # 闭表补不上（下一支项目必漏），故本腿按目录枚举取数。
+        import json as _fjson
+        _root, _fx, _gf, _prob = peg.load_slug_policy(peg.default_terms_path())
+        tc.assert_true(_root is not None and not _prob,
+                       f"F1 权威词表的这条腿必须可用（无 note 的豁免、缺键、枚举根不在位都进未测）：{_prob}")
+        tc.assert_true(_root.is_dir() and len([p for p in _root.iterdir() if p.is_dir()]) > 0,
+                       "F2 枚举根须真能枚举出目录（零目录＝零词条，读起来与『已扫干净』同形）")
+        # note 面直接从权威词表原文读：load_slug_policy 已把"无 note"记进 problems，
+        # 若这里再拿它的返回结构去判 note 就是同一条腿断两遍（且形状对不上，前版即此错）。
+        _pol_raw = _fjson.loads(peg.default_terms_path().read_text(encoding="utf-8"))
+        _leg = _pol_raw.get("project_slug_leg") or {}
+        _named = ([(e.get("name"), e.get("note")) for e in (_leg.get("fixture_allowlist") or [])]
+                  + [(e.get("name"), e.get("note")) for e in (_leg.get("grandfathered") or [])])
+        tc.assert_true(_named and all((n or "").strip() and (v or "").strip() for n, v in _named),
+                       f"F3 夹具名与宽免名须成对带非空 note（无声豁免是判红形态）：共 {len(_named)} 条")
+
+        with tempfile.TemporaryDirectory() as _td:
+            _tmp = Path(_td)
+            # 新建项目名自动进判据：不往任何清单里加一个字，只造一个目录
+            (_tmp / "程序文件/源码/hyperframes" / "brand-new-business-proj").mkdir(parents=True)
+            _scan = _tmp / "pub"
+            _scan.mkdir()
+            _terms_file = _tmp / "terms.json"
+            _terms_file.write_text(_fjson.dumps({
+                "terms": [ACME],
+                "delivery_artifact_ban": {"fixtures": ["q"],
+                                          "rules": [{"pattern": "^成果文件/.", "note": "夹具禁区"}]},
+                "project_slug_leg": {
+                    # 绝对枚举根：这条腿按目录名取数，用相对值会解析到**本仓真实项目面**，
+                    # 夹具就地变成 76 条真词条——扫到的既是真数据，断言就随真实项目增删而漂。
+                    "enumeration_root": str(_tmp / "程序文件/源码/hyperframes"),
+                    "fixture_allowlist": [],
+                    "grandfathered": [{"name": "old-leaked-proj",
+                                       "note": "存量：已出现在公开面"}]},
+            }, ensure_ascii=False), encoding="utf-8")
+            # ① 全新项目名（既不在夹具也不在宽免）② 已在名单里的存量名 ③ 夹具名
+            (_tmp / "程序文件/源码/hyperframes" / "old-leaked-proj").mkdir()
+            (_tmp / "程序文件/源码/hyperframes" / "bgm-fixture-proj").mkdir()
+            _leaked = _scan / "notes.md"
+            _leaked.write_text("新项目 brand-new-business-proj 的成片\n"
+                               "存量 old-leaked-proj 的说明\n", encoding="utf-8")
+            _rg = peg.run_gate(files=[_leaked], terms_path=_terms_file)
+            _kinds = sorted(h.get("slug") for h in _rg["hits"] if h["kind"] == "project_slug")
+            tc.assert_equal(_kinds, ["brand-new-business-proj"],
+                            "F4 新项目名零维护即进判据；已宽免的名不产生命中（否则下次导出全红）")
+            tc.assert_equal(_rg["verdict"], "FAIL",
+                            "F4b 这类命中必须 FAIL 而非告警——它正是本批漏出去的那类对象")
+            tc.assert_equal(_rg.get("project_slug_grandfathered_hits"), 1,
+                            "F4c 宽免命中必须单独计数：并入 hits 会误杀存量，静默丢弃则无人知道放过多少")
+            # 取数断链：缺节 / 根不在位 / 无 note，三形态一律未测且不得给出干净裁定
+            # 三份坏词表都**带上可用的交付物禁区**：否则 UNTESTED 由缺区那条腿给出，
+            # 本组三条断言无论这条腿好坏都读得绿——2026-11-06 变异 M1（缺键改静默放行）
+            # 正是在这个 contamination 下存活，属"恒真守卫"而非"能失败的守卫"。
+            _BAN = {"fixtures": ["q"], "rules": [{"pattern": "^成果文件/.", "note": "夹具禁区"}]}
+            for _bad, _why in (
+                    ({"terms": [ACME], "delivery_artifact_ban": _BAN}, "缺 project_slug_leg 节"),
+                    ({"terms": [ACME], "delivery_artifact_ban": _BAN, "project_slug_leg":
+                     {"enumeration_root": "不存在/的/根", "fixture_allowlist": [],
+                      "grandfathered": []}}, "枚举根不在位"),
+                    ({"terms": [ACME], "delivery_artifact_ban": _BAN, "project_slug_leg":
+                     {"enumeration_root": str(_tmp / "程序文件/源码/hyperframes"),
+                      "fixture_allowlist": [],
+                      "grandfathered": [{"name": "a", "note": ""}]}}, "无 note 的宽免"),
+            ):
+                _badf = _tmp / "bad.json"
+                _badf.write_text(_fjson.dumps(_bad, ensure_ascii=False), encoding="utf-8")
+                _r2 = peg.run_gate(files=[_leaked], terms_path=_badf)
+                tc.assert_equal(_r2["verdict"], "UNTESTED",
+                                f"F6 {_why} → 整体未测，不得按剩余词条给出『干净』裁定")
+                tc.assert_true(_r2["scanned"] == 0,
+                               f"F6b {_why} 时 scanned 必须为 0（扫了才说没测，比没扫更误导）")
+            # 夹具白名单：夹具名根本不该成为词条，扫中即把自家公开示例判成违规
+            (_tmp / "程序文件/源码/hyperframes" / "fixture-proj").mkdir()
+            (_scan / "fixture.md").write_text("示例项目 fixture-proj 用法\n", encoding="utf-8")
+            _st = peg.project_slug_terms(_tmp / "程序文件/源码/hyperframes",
+                                         {"fixture-proj"}, {"old-leaked-proj": "x"})
+            tc.assert_true("fixture-proj" not in [t["slug"] for t in _st],
+                           "F7 夹具名不进词条（扫自家公开示例＝下次导出必红的误杀形态）")
+            tc.assert_true(any(t["slug"] == "brand-new-business-proj" for t in _st),
+                           "F7b 非夹具的新项目名必须在词条集里（白名单漏收即把新泄露洗白）")
+
+        # 权威词表在真实发布面上的读数：这条腿确有对象，而不是只活在夹具里
+        _pub_root = Path(__file__).resolve().parents[3] / "视频制作Skill"
+        if (_pub_root / ".git").is_dir():
+            _rr = peg.run_gate(repo=str(_pub_root))
+            tc.assert_equal(_rr["verdict"], "PASS",
+                            f"F8 真实发布面须 PASS（红项须逐条点名）：{[h['path'] for h in _rr['hits'][:5]]}")
+            tc.assert_true(_rr.get("project_slug_grandfathered_hits", 0) > 0,
+                           "F8b 存量宽免命中数必须 > 0——为 0 说明这条腿在真实面上没有对象，"
+                           "即普查口径或枚举根变了，PASS 属空跑")
+        else:
+            # 发布仓不在本机时不得留一条恒真断言（"缺席"不是证据）。改取权威词表自身的
+            # 可核读数：宽免名单非空、且每条都带 note——这两件事与发布仓在不在位无关。
+            tc.assert_true(len(_gf) > 0,
+                           "F8-alt 权威词表的宽免名单非空（空名单＝这条腿在真实面上不会命中任何东西）")
+            tc.assert_true(all((v or "").strip() for v in _gf.values()),
+                           "F8-altb 每条宽免都有实质 note")
         tc.mark_passed()
     except Exception as e:
         tc.mark_failed(str(e))
@@ -5811,7 +5959,10 @@ def test_publish_gate_bans_delivery_artifact_categories() -> RegressionTestCase:
                     return peg.run_gate(terms_path=tp, **kw)
 
             def doc_with(ban):
-                d = {"terms": [{"pattern": r"\bZZZNOPE\b", "kind": "k", "note": "n"}]}
+                d = {"terms": [{"pattern": r"\bZZZNOPE\b", "kind": "k", "note": "n"}],
+                     # 本用例裁的是类别面；词条面与项目名面须声明成"在位但零对象"，
+                     # 否则 fail-closed 会把别的层的残缺算到本层断言上（D1 即此形态）
+                     "project_slug_leg": slug_leg_fixture(tdir)}
                 if ban is not None:
                     d["delivery_artifact_ban"] = ban
                 return d
@@ -14250,6 +14401,28 @@ def test_text_fit_gate_adjudicates_measured_line_boxes() -> RegressionTestCase:
                        "E1 行盒取浏览器实测（非容器宽/字号几何推算）")
         tc.assert_true("start + 2.5" in js and "end - 1.5" in js,
                        "E2 稳态两点（入场建完后 + 末段前），不在 t=0 取数")
+
+        # E2b 封面腿（2026-11-06 竖屏复盘 M1）。存在理由是 A/B 实测，不是推断：
+        # 旧实现 `if (s.cover) continue;` 让 text_fit／bar_overflow 对**封面整场零对象**
+        # （读数即自证：采样 12 次＝6 内容场×2，无封面位点）。把本项目 `_修订02` 那版
+        # 已知塌陷的封面（1.08fr 窄栏 × 标识避让 244px → 净宽 233px、每行 2 字）复制成
+        # 复现件交给预览，旧代码判 **[PASS] 候选节点 2 个／采样 12 次**；补上封面中点后
+        # 同一件判 **[FAIL] 候选节点 3 个／采样 13 次、退出码 2**。即"判据在位、取数面
+        # 没有对象"（A06 同族），也正是两支竖屏交付的封面缺陷能在预览全绿下出厂的原因。
+        _samp = js[js.index("async function computeSampleState"):
+                   js.index("const tl = (typeof window.tl")]
+        tc.assert_true("if (s.cover) continue" not in _samp,
+                       "E2b1 封面不得被整场跳过（跳过＝两个几何判据对封面零对象）")
+        tc.assert_true("s.cover" in _samp and "dur / 2" in _samp,
+                       "E2b2 封面走自己的稳态时刻（中点），不套用内容场那两点")
+        # 内容场的 end-1.5 会落在封面淡出里，把半透明中间态当结论（反向假阳），
+        # 故中点须被夹在 [start+1.0, end-0.3] 内；短到夹不出来的封面宁可不测也不造假读数。
+        tc.assert_true("s.start + 1.0" in _samp and "s.end - 0.3" in _samp,
+                       "E2b3 封面中点须被夹住（避开退场段，取不到稳态即不测）")
+        # 采样次数是这条腿的**行为面**证据：内容场两点 + 封面一点。写死项目数即犯
+        # "开放全集计数钉固定值"的错，故只锁结构关系。
+        tc.assert_true("out.push(+mid.toFixed(2))" in _samp,
+                       "E2b4 封面中点须真进 out（只加分支不 push＝静默空转）")
         tc.assert_true("tl.seek(" in js and "gsap.ticker.tick()" in js,
                        "E3 经页面全局时间线落位（与既有预览同一 seek 通道）")
         tc.assert_true("row.cpl > best[row.key].cpl" in js,
@@ -20796,6 +20969,135 @@ def test_scene_insert_three_legs() -> RegressionTestCase:
     return tc
 
 
+def test_incremental_eligibility_warned_before_first_render() -> RegressionTestCase:
+    """用例124：`preflight_check.check_incremental_eligibility`（成本预告位点）。
+
+    存在理由（2026-11-06 竖屏复盘 M2，两支竖屏项目实测）：T 块可信度这条判据原先
+    **只在 render 步的增量分类器里跑**，不可信时静默降级全量。门洞节点项目因此
+    attempts/hits 长期停在 1/0、每轮多付一次全量渲染（实测约 5.5 分钟机时），而作者在
+    起跑前没有任何位点知道——它不是质量缺陷、不在任何报告面显形，只表现为"修订比预期慢"。
+    本检查把同一条判据前移到预检，**判据不复制第二份**（直调分类器单源函数并透传其
+    reason 原文）。
+
+    本用例锁：
+      A 缺陷形态可达：非单调 T 块 → WARN，且 reason 逐字来自分类器（不得自造措辞）；
+      B 正向对照：真实项目 + 真实 config → OK 且报出场次；
+      C 取数断链两形态（模块取不回／HTML 读不回）各判 WARN 并点名"不得读成已检查"；
+      D 单源：预检侧不得出现第二份单调性判据（AST 证它调用分类器函数）；
+      E 挡位：本条是成本预告，**不得进 RENDER_CRITICAL_CHECKS**（进了就把可交付变不可交付）。
+    """
+    tc = RegressionTestCase(
+        "incremental_eligibility_warned_before_first_render",
+        "验证增量资格在预检即点名、reason 与分类器同源、断链不读成干净、且不升格为阻断"
+    )
+    try:
+        import ast
+        import re as _re
+        import tempfile
+        import preflight_check as pfc
+        import scene_patch_render as spr
+
+        class _Rec:
+            def __init__(self):
+                self.warnings, self.errors, self.infos, self.oks = [], [], [], []
+            def warn(self, msg, check_id="unknown", profile_exempt=False):
+                self.warnings.append((check_id, msg))
+            def error(self, msg, check_id="unknown"):
+                self.errors.append((check_id, msg))
+            def info(self, msg, check_id="unknown"):
+                self.infos.append((check_id, msg))
+            def ok(self, msg, check_id="unknown"):
+                self.oks.append((check_id, msg))
+
+        # ── 夹具自建，不取任何业务项目，也不取任何一侧的目录布局 ────────
+        # 存在理由（2026-11-06 导出批 §8.2 现读两次抓到）：
+        # ① 首版取某竖屏业务项目的 index.html 与同名 config 当夹具——开发仓 124/124 全绿，
+        #    **发布仓同一枚文件跑出 123/124**：该项目不在公开面，`is_file()` 为假即提前
+        #    return，用例整个不跑（而套件退出码当时还读成绿，见用例15 E 段）。
+        # ② 改自建后我仍留了一条 `html_root/cfg_dir` 的"目录在位"断言——发布仓的夹具 config
+        #    住 `config/` 根而非 `config/pipelines/`，于是一条**本用例根本不消费**的布局
+        #    断言在公开面判红。已登记判据的再现：无对象腿要么给非恒真的缺省读数，要么删掉；
+        #    留着一条与自己机制无关的哨兵，只会把另一侧的合法布局报成回归坏了。
+        FIXTURE_HTML = """<!DOCTYPE html>
+<html><body>
+<div id="root" data-composition-id="main" data-duration="30">
+  <div id="s1" data-scene-id="s1" data-scene-entry="gsap"><p>第一屏</p></div>
+  <div id="s2" data-scene-id="s2" data-scene-entry="gsap"><p>第二屏</p></div>
+</div>
+<script>
+var T = { s1: 0.0, s2: 15.0 };
+</script>
+</body></html>
+"""
+        FIXTURE_CFG = {"video_duration": 30, "fps": 25}
+        src = FIXTURE_HTML
+        cfg = FIXTURE_CFG
+
+        # ── A 缺陷形态：把 s1 起点改到 s2 之后，制造非单调 ──
+        m = _re.search(r'var T = \{[^}]*\}', src)
+        tc.assert_true(bool(m), "A0 夹具须自带 T-block（否则本用例无对象）")
+        bad = src.replace(m.group(0), m.group(0).replace("s1: 0.0, s2: 15.0",
+                                                         "s1: 20.0, s2: 15.0"), 1)
+        tc.assert_true(bad != src, "A0b 变异必须真的改到字节")
+        _, reason = spr.extract_scene_times(bad, cfg)
+        tc.assert_true(reason, "A1 分类器对非单调 T 块必须给出 reason（否则本检查没有对象）")
+        with tempfile.TemporaryDirectory() as td:
+            bad_path = Path(td) / "index.html"
+            bad_path.write_text(bad, encoding='utf-8')
+            r = _Rec()
+            pfc.check_incremental_eligibility(bad_path, cfg, r)
+            tc.assert_equal(r.errors, [], "A2 成本预告不得判 error（可交付性不受影响）")
+            tc.assert_true(len(r.warnings) == 1, f"A3 缺陷形态须恰一条 WARN：{r.warnings}")
+            tc.assert_true(reason in r.warnings[0][1],
+                           f"A4 WARN 须逐字透传分类器 reason（自造措辞即第二份真相）：{r.warnings}")
+            tc.assert_equal(r.warnings[0][0], "incremental_eligibility",
+                            "A5 check_id 须为 incremental_eligibility")
+
+            # ── C 取数断链：HTML 读不回 ──
+            rc = _Rec()
+            pfc.check_incremental_eligibility(Path(td) / "不存在的目录" / "index.html", cfg, rc)
+            tc.assert_true(len(rc.warnings) == 1 and '无从核对' in rc.warnings[0][1],
+                           f"C1 HTML 读不回须点名『无从核对』而非静默：{rc.warnings}")
+            tc.assert_equal(rc.oks, [], "C2 断链不得写成 OK（把没跑成读成干净）")
+
+        # ── B 正向对照（同一夹具的未变异形态）──
+        rp = _Rec()
+        with tempfile.TemporaryDirectory() as td2:
+            good_path = Path(td2) / "index.html"
+            good_path.write_text(src, encoding='utf-8')
+            pfc.check_incremental_eligibility(good_path, cfg, rp)
+        tc.assert_true(len(rp.oks) == 1 and not rp.warnings,
+                       f"B1 可信时间源须 OK 且无 WARN：oks={rp.oks} warn={rp.warnings}")
+
+        # ── D 单源：预检侧不得有第二份单调性判据 ──
+        _pf_src = (Path(__file__).parent / "preflight_check.py").read_text(encoding='utf-8')
+        _tree = ast.parse(_pf_src)
+        _fn = [n for n in _tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == "check_incremental_eligibility"]
+        tc.assert_true(len(_fn) == 1, "D1 检查函数须恰一个定义")
+        _calls = {f"{n.func.value.id}.{n.func.attr}" for n in ast.walk(_fn[0])
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and isinstance(n.func.value, ast.Name)}
+        tc.assert_true(any(k.endswith(".extract_scene_times") for k in _calls),
+                       f"D2 必须直调分类器单源函数，不得自行重算：{_calls}")
+        _body = ast.get_source_segment(_pf_src, _fn[0]) or ""
+        tc.assert_true("sorted(" not in _body and "!= sorted" not in _body,
+                       "D3 预检侧不得出现第二份单调性比较（判据单源）")
+
+        # ── E 挡位：成本预告不升格为阻断 ──
+        tc.assert_true("incremental_eligibility" not in str(pfc.RENDER_CRITICAL_CHECKS),
+                       "E1 本条不得进 RENDER_CRITICAL_CHECKS（拦下来会把可交付变不可交付）")
+        _main_src = _re.search(r'def main\(\).*', _pf_src, _re.S)
+        tc.assert_true("check_incremental_eligibility(html_path" in (_main_src.group(0) if _main_src else ""),
+                       "E2 必须在 main 的调用序列里（不在生效路径＝条文悬空）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("incremental_eligibility_warned_before_first_render error: "
+                       + str(e) + "\n" + traceback.format_exc())
+    return tc
+
+
 def test_cleanup_splits_paid_tts_cache() -> RegressionTestCase:
     """用例119：`project_cleanup` 把 render 拆成 render-scratch / tts-cache，后者须显式确认。
 
@@ -21377,6 +21679,7 @@ class RegressionTestRunner:
             test_intra_pause_trim_and_third_bucket,
             test_boundaries_probe_names_flat_frames,
             test_scene_insert_three_legs,
+            test_incremental_eligibility_warned_before_first_render,
             test_cleanup_splits_paid_tts_cache,
             test_scene_patch_script_attribution,
             test_choreography_descriptive_face,
@@ -21411,13 +21714,23 @@ class RegressionTestRunner:
         """获取测试摘要"""
         passed = sum(1 for r in self.results if r["status"] == "passed")
         failed = sum(1 for r in self.results if r["status"] == "failed")
-        
+        # not_run＝既没 mark_passed 也没 mark_failed（提前 return / 夹具不在位 / 整体异常前退出）。
+        # 存在理由（2026-11-06 导出批 §8.2 现读）：发布仓跑出 123/124 却**退 0**，
+        # 因为旧退出码只裁 `failed == 0`——一条用例整个没跑（status 停在初值 not_run）
+        # 在退出码上与"全绿"不可区分。这与本仓反复登记的"把没跑成读成干净"同族，
+        # 差别在载体：这次造假绿的不是某条判据，而是套件自身的汇总口。
+        not_run = sum(1 for r in self.results
+                      if r["status"] not in ("passed", "failed"))
+
         from datetime import timezone
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "total_cases": len(self.results),
             "passed": passed,
             "failed": failed,
+            "not_run": not_run,
+            "not_run_cases": [r["name"] for r in self.results
+                              if r["status"] not in ("passed", "failed")],
             "success_rate": passed / len(self.results) if self.results else 0,
             "results": self.results
         }
@@ -24052,13 +24365,21 @@ def main():
     
     # 输出摘要
     print(f"\n[SUMMARY] {summary['passed']}/{summary['total_cases']} passed ({summary['success_rate']*100:.0f}%)")
-    
+    if summary.get("not_run"):
+        # 没跑成的用例必须逐名点名：总数与通过数之差本可反推，但"差 1"读起来
+        # 像"有 1 条失败"，而真实形态常常是整个提前 return（无对象），修法完全不同。
+        print(f"[NOT-RUN] {summary['not_run']} 条用例既未通过也未失败："
+              f"{', '.join(summary['not_run_cases'])}")
+
     if args.output:
         with open(args.output, 'w', encoding='utf-8') as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print(f"[OK] Results saved to {args.output}")
-    
-    sys.exit(0 if summary['failed'] == 0 else 1)
+
+    # 退出码判据＝failed 与 not_run 双双为零。旧形态只看 failed，于是一条
+    # 提前 return 的用例（status 停在 not_run）在 CI 与管道末端码上是绿灯——
+    # 2026-11-06 发布仓回归 123/124 而退 0 即此形态（详见 get_summary 注释）。
+    sys.exit(0 if summary['failed'] == 0 and summary.get('not_run', 0) == 0 else 1)
 
 
 def test_intra_pause_trim_and_third_bucket() -> RegressionTestCase:

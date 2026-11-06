@@ -54,7 +54,21 @@ async function computeSampleState(page, fallbackWindows) {
         if (S && S.length) {
             timeSrc = 'S-block';
             for (const s of S) {
-                if (s.cover) continue;
+                if (s.cover) {
+                    // 封面纳入稳态取数面（2026-11-06 竖屏复盘）。旧实现整场 `continue`，
+                    // 后果不是"少一张截图"而是 text_fit／bar_overflow 对封面**零对象**：
+                    // 两支竖屏交付的封面缺陷（文字塌成每行 2 字、图区偏小）都在预览判据
+                    // PASS 之下发生——判据在位、取数面没有对象（A06 同族）。
+                    // 只取一个中点而非 start+2.5／end-1.5：封面窗常 ≤3s 且末段带淡出，
+                    // 那两个点会落在退场中间，读到的半透明中间态反造假阳。
+                    const dur = s.end - s.start;
+                    if (dur > 0) {
+                        const mid = Math.min(Math.max(s.start + dur / 2, s.start + 1.0),
+                                            Math.max(s.start + 1.0, s.end - 0.3));
+                        out.push(+mid.toFixed(2));
+                    }
+                    continue;
+                }
                 out.push(s.start + 2.5, Math.max(s.start + 2.5, s.end - 1.5));
             }
         } else if (T) {
