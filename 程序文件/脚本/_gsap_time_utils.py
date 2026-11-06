@@ -96,6 +96,83 @@ def resolve_line_time(line, t_map):
 
 # ── S-block: authoritative scene metadata ──
 
+def parse_s_block_array(array_text):
+    """把 `var S = [...]` 的数组字面量解析成 dict 列表，返回 `(scenes 或 None, reason)`。
+
+    存在理由（2026-11-06 架构收口②）：本仓 S 块有**两种书写形态**——编译器产的 JSON
+    形态（41 份）与手写 HTML 的 JS 字面量形态（裸键、单引号，8 份）。旧实现只认前者，
+    且失败即静默：写入侧 `adjust_s_block` 因此 no-op、不打印，而
+    `scene_patch_render.extract_scene_times` 的时间源见证按正则扫全脚本的 `end:` 字面量，
+    **读得到**这份没被维护的旧数值。同一声明"一边不存在、一边是权威见证"，实测
+    某支手写项目每轮因此多付一次全量渲染（末场 end 66.0 对 data-duration 65.6）。
+
+    刻意**只供写入侧与普查/门禁消费，不改 `parse_scene_map` 的 JSON-only 语义**：后者一旦
+    开始看见 JS 字面量形态，`adjust_timeline` 的时长推导就从 narration 指针切到
+    `s_map['duration'] + total_ext`，而两条公式在 `total_ext`（各场扩展量之和）与
+    `extensions[-1]`（末场扩展量）上并不等价——那是音频/字幕对齐层面的行为变更，
+    不属于"把静默 no-op 修成有声音"这一步的收益。要动它须单独成批并给等价性实测。
+
+    已知的转换边界（刻意不做更复杂的词法分析）：双引号字符串值里含**撇号**时，
+    单引号→双引号互换会把该字符串改坏，于是走 `unparsable` 并交调用方点名——
+    这是"读不进就说出来"而非"读错了还改写"，方向安全。
+
+    自校验守卫：裸键加引号与单引号互换都是**可能改坏**的机械变换，故转换后必须
+    `json.loads` 成功**且**每项是带数值 start/end 的对象（cover 项除外），否则一律
+    返回 reason 交调用方点名——宁可报"维护不了"，不得拿一份读错的表去改写。
+    """
+    text = (array_text or "").strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return None, "数组字面量边界不完整"
+    try:
+        scenes = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        conv = re.sub(r"([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)", r'\1"\2"\3', text)
+        conv = conv.replace("'", '"')
+        conv = re.sub(r",(\s*[}\]])", r"\1", conv)
+        try:
+            scenes = json.loads(conv)
+        except (json.JSONDecodeError, ValueError) as e:
+            return None, f"JSON 与 JS 字面量两种形态均解析失败（{type(e).__name__}: {str(e)[:60]}）"
+    if not isinstance(scenes, list) or not scenes:
+        return None, "解析结果不是非空数组"
+    for i, s in enumerate(scenes):
+        if not isinstance(s, dict):
+            return None, f"第 {i + 1} 项不是对象"
+        if s.get("cover"):
+            continue
+        for k in ("start", "end"):
+            if not isinstance(s.get(k), (int, float)):
+                return None, f"第 {i + 1} 项缺数值 {k} 键"
+    return scenes, None
+
+
+def classify_s_block_shape(array_text):
+    """给 `var S` 的数组字面量定形，返回 `(shape, scenes_or_None, reason)`。
+
+    三种合法形状、一种不可维护（2026-11-06 全仓普查现读，79 份 index.html）：
+
+      - `json`            编译器产，键带引号、数值字面量（41 份）→ 写入侧维护
+      - `js_literal`      手写，裸键/单引号、数值字面量（8 份）→ 写入侧维护（本批修复面）
+      - `derived_from_t`  值写成 `start: T.s1, dur: T.s2 - T.s1`（2 份）→ **结构上不会与
+                          T 块分叉**，写入侧无事可做；把它当"维护不了"报警属误报
+      - `unparsable`      以上皆非 → 必须出声，不得静默 no-op
+
+    定形顺序＝**先试解析，解析不进再看是否 T 派生**：`T.s1 - T.s0` 这类表达式两种解析
+    路径都读不进，若不辨来源就会被归进 `unparsable` 并触发一条本不该存在的告警。
+    （本句此前写的是"刻意先判 T 派生"——那个先后关系实测不承重：两种顺序对四类形状的
+    归类结果相同，故按真实因果改写，不保留一条把自己假设写成机制的理由。）
+    """
+    text = (array_text or "").strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return "unparsable", None, "数组字面量边界不完整"
+    scenes, reason = parse_s_block_array(text)
+    if scenes is None:
+        if re.search(r'[:,]\s*"?(?:start|end|dur)"?\s*:\s*T\.', text):
+            return "derived_from_t", None, None
+        return "unparsable", None, reason
+    return ("json" if re.search(r'\{\s*"', text) else "js_literal"), scenes, None
+
+
 def parse_scene_map(script):
     """Parse S-block (var S = [...]) from script content.
 

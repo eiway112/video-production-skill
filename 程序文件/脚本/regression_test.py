@@ -16555,7 +16555,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
                               "norm": "甲乙丙丁戊己庚辛", "chars": chars_d1,
                               "sentences": [{"text": "甲乙丙。", "rel_start": 0.0, "rel_end": 3.0},
                                             {"text": "丁戊己、庚辛", "rel_start": 3.4, "rel_end": 8.4}]}]}
-        silent, rushed, summ, skipped = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d1, rules)
+        silent, rushed, summ, skipped, _ar1 = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d1, rules)
         tc.assert_true(len(silent) == 1 and "、" in silent[0] and "。" not in silent[0],
                        f"D1 被点名的必须是顿号那条（归属错一位会点成句号或全零）：{silent}")
         tc.assert_true(summ["punct_median"].get("。") == 0.4,
@@ -16566,7 +16566,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         man_d2 = {"scenes": [{"scene_id": 1, "method": "asr_forced",
                               "norm": "有171个版本", "chars": chars_d2,
                               "sentences": [{"text": "有 171 个版本。", "rel_start": 0.0, "rel_end": 7.0}]}]}
-        silent2, _, _, skipped2 = npp.audio_face([{"scene_id": 1, "narration": text_d2}], man_d2, rules)
+        silent2, _, _, skipped2, _ar2 = npp.audio_face([{"scene_id": 1, "narration": text_d2}], man_d2, rules)
         tc.assert_true(silent2 == [] and skipped2 == [],
                        f"D2 数字与量词之间的空白不构成停顿请求：{silent2}")
 
@@ -16580,7 +16580,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         ):
             man = {"scenes": [entry]}
             nar = [{"scene_id": 1, "narration": "甲乙丙。丁戊己、庚辛"}]
-            _, _, _, sk = npp.audio_face(nar, man, rules)
+            _, _, _, sk, _arx = npp.audio_face(nar, man, rules)
             tc.assert_true(len(sk) == 1 and needle in sk[0],
                            f"{label} 须逐场点名跳过（不得按 0 计、也不得读成干净）：{sk}")
 
@@ -16589,7 +16589,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
                               "sentences": [{"text": "甲乙丙。", "rel_start": 0.0, "rel_end": 3.0},
                                             {"text": "丁戊己、庚辛",
                                              "rel_start": 3.0 + 0.4 - 1e-9, "rel_end": 8.4}]}]}
-        _, _, summ6, _ = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d6, rules)
+        _, _, summ6, _, _ar6 = npp.audio_face([{"scene_id": 1, "narration": text_d1}], man_d6, rules)
         tc.assert_equal(summ6["segment_pause_below_enforced"], 0,
                         "D6 恰好达标的浮点读数不得计入'低于强制下限'（无容差的比较会数成 1）")
 
@@ -16605,7 +16605,7 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
                               "norm": "甲乙丙丁戊己庚", "chars": chars_d7,
                               "sentences": [{"text": "甲乙，丙丁，戊己，庚",
                                              "rel_start": 0.0, "rel_end": 8.58}]}]}
-        silent7, rushed7, summ7, skipped7 = npp.audio_face(
+        silent7, rushed7, summ7, skipped7, arows7 = npp.audio_face(
             [{"scene_id": 1, "narration": text_d7}], man_d7, rules)
         tc.assert_equal(len(silent7), 0,
                         f"D7 绝对桶须为 0（0.28 > 0.20 可听阈）——否则正样本被绝对桶抢走：{silent7}")
@@ -17016,6 +17016,75 @@ def test_element_reveal_hidden_container_blocked() -> RegressionTestCase:
                        "K1 main 体内存在 check_element_reveal 调用（AST 取，不用源码文本锚）")
         tc.assert_true("element_reveal" in pfc.RENDER_CRITICAL_CHECKS,
                        "L1 该 check_id 已登记进 RENDER_CRITICAL_CHECKS（audit 降级面覆盖它）")
+
+        # ═════════════════════════════════════════════════════════
+        # O. 形态③：初始隐藏元素只被 tl.from() 命中（2026-11-06 _修订01 病灶）
+        # ═════════════════════════════════════════════════════════
+        rO = _run(_html(
+            ".rv{opacity:0;}",
+            '<span class="chip rv" id="c1">翻图集</span>',
+            "tl.from('#c1', {scale: 0.8, opacity: 0, duration: 0.3}, T.s1 + 1.6);"))
+        eO = _errs(rO)
+        tc.assert_equal(len(eO), 1,
+                        f"O1 from-only 命中初始隐藏元素判 1 处错（实得 {len(eO)}：{eO}）")
+        tc.assert_true("from" in (eO[0] if eO else "") and "fromTo" in (eO[0] if eO else ""),
+                       f"O2 文案须同时点名病灶写法与可执行修法：{(eO[0] if eO else '')[:120]}")
+        tc.assert_equal(rO.counts["element_reveal"]["from_only"], 1,
+                        "O3 计数面与点名数同源（判据自报，测试侧不另写一套解析）")
+        # 修法一：改 fromTo（起始态在第一个 vars，目标态把 opacity 抬到非零）
+        rO4 = _run(_html(
+            ".rv{opacity:0;}",
+            '<span class="chip rv" id="c1">翻图集</span>',
+            "tl.fromTo('#c1', {scale: 0.8, opacity: 0}, "
+            "{scale: 1, opacity: 1, duration: 0.3}, T.s1 + 1.6);"))
+        tc.assert_equal(len(_errs(rO4)), 0, "O4 改写成 fromTo 后不判（本批真实修法）")
+        # 修法二：摘掉初始隐藏类，from 自己就够用
+        rO5 = _run(_html(
+            ".rv{opacity:0;}",
+            '<span class="chip" id="c1">翻图集</span>',
+            "tl.from('#c1', {scale: 0.8, opacity: 0, duration: 0.3}, 1.6);"))
+        tc.assert_equal(len(_errs(rO5)), 0, "O5 摘掉隐藏类后不判")
+        # 揭示能力不绑 opacity 字面：visibility:hidden 同样被 from 洗不白
+        rO6 = _run(_html(
+            ".hid{visibility:hidden;}",
+            '<span class="hid" id="c1">a</span>',
+            "tl.from('#c1', {y: 10, duration: 0.3}, 1.6);"))
+        tc.assert_equal(len(_errs(rO6)), 1,
+                        "O6 visibility:hidden 且只有 from() 命中同样判错（判据不认字面属性名）")
+        # 纯淡出型 to 不算揭示：opacity 抬到 0 是"关掉"不是"打开"
+        rO7 = _run(_html(
+            ".rv{opacity:0;}",
+            '<span class="rv" id="c1">a</span>',
+            "tl.from('#c1', {opacity: 0, duration: 0.3}, 1.6);"
+            "tl.to('#c1', {opacity: 0, duration: 0.3}, 3.0);"))
+        tc.assert_equal(len(_errs(rO7)), 1,
+                        "O7 只把 opacity 写成 0 的 to 不得充当揭示（放宽揭示档即错杀的反例）")
+        # 否决票：宽取数里归不进任何语句的选择器命中该元素 → 只漏判不错杀
+        rO8 = _run(_html(
+            ".rv{opacity:0;}",
+            '<span class="rv" id="c1">a</span>',
+            "tl.from('#c1', {opacity: 0, duration: 0.3}, 1.6);"
+            "pushReveal('#c1');"))
+        tc.assert_equal(len(_errs(rO8)), 0,
+                        "O8 存在无法归类的引用腿（自定义封装）时投否决票，本形态降为不判")
+        # fromTo 的目标态必须取第二个 vars；取第一个会把正确写法判成病灶。夹具让同一
+        # 元素**既**被 from 命中**又**被 fromTo 抬起——只被 fromTo 命中的元素在"取错块"
+        # 时根本不会被点名（形态③要求 from 命中），那样变异 92-M13 就无从显形。
+        rO9 = _run(_html(
+            ".rv{opacity:0;}",
+            '<span class="rv" id="c1">a</span><span class="rv" id="c2">b</span>',
+            "tl.fromTo('#c1', {opacity: 0}, {opacity: 1, duration: 0.3}, 2.0);"
+            "tl.from('#c1', {opacity: 0, duration: 0.3}, 1.6);"
+            "tl.from('#c2', {opacity: 0, duration: 0.3}, 1.6);"))
+        got9 = _errs(rO9)
+        tc.assert_equal(len(got9), 1,
+                        f"O9 from 与 fromTo 并存的元素不得判，只判只有 from 的那处（实得 {len(got9)}）")
+        tc.assert_true("c2" in (got9[0] if got9 else "") and "c1" not in (got9[0] if got9 else ""),
+                       f"O9b 点名落在 from-only 的 #c2，不是已抬起的 #c1")
+        # 单源接线：语句索引逻辑只准住 _gsap_reveal_index，判据体内必须调用它
+        _src_er = inspect.getsource(pfc.check_element_reveal)
+        tc.assert_true("_gsap_reveal_index(" in _src_er,
+                       "O10 check_element_reveal 体内确有调用语句索引单源（不得就地重写一套）")
 
         # ═════════════════════════════════════════════════════════
         # M/N. 真实载体：修复前后同一项目 + 全仓普查零误杀
@@ -21684,6 +21753,10 @@ class RegressionTestRunner:
             test_scene_patch_script_attribution,
             test_choreography_descriptive_face,
             test_scene_overflow_probe_adjudicates_clips,
+            test_intra_punctuation_pause_enforcement,
+            test_s_block_writer_maintains_both_shapes,
+            test_presence_check_names_dead_blocks,
+            test_transition_overlap_census_descriptive_face,
         ]
         self.results = []
     
@@ -24324,6 +24397,313 @@ def test_scene_overflow_probe_adjudicates_clips() -> RegressionTestCase:
                        + "\n" + traceback.format_exc())
     return tc
 
+
+def test_transition_overlap_census_descriptive_face() -> RegressionTestCase:
+    """用例128：转场重叠（双曝）描述面——取数面覆盖、算术口径、未覆盖点名、只透传不裁定。
+
+    存在理由（2026-11-06 转场双曝线）：`_修订02` 被用户看到"两个画面在推进转场之间有重叠"，
+    成因是写法算术（入场提前 0.22s 起步、出场晚 0.02s 起步，两条各 0.30s ⇒ 边界瞬间两层
+    都不透明）。旧探针只认一种写法（`#sceneN` ＋ `T.sK` 双 `tl.to`），实测仅 6 支命中；
+    同批 40+ 支把转场写成 `fromTo` 整屏推移、字面时刻锚、命名常量锚、`set` 硬切，
+    **旧取数面对它们逐条看不见**——"扫不到"被读成"没有"正是 A06 同族的失败模式。
+    本件把取数面扩到四种方法 × 三类锚，并把未覆盖写法逐份点名。
+
+    A 段锁场景根判定：DOM 面 `data-scene-id` 为权威、无该属性回落 `id="sceneN"`（仓内既有
+    先例）；语句选择器必须**解析到场景根元素**才计入（`#sN` 与 `#sceneN` 同一条路），
+    带后代的选择器与变量选择器分别计数——两类都不得消失。
+    B 段锁四种写法与三类锚。
+    C 段锁算术：缓动按 GSAP powerN 建模（不建模时 `_修订02` 读 1.80，建模后 1.99）；
+    整屏推移两矩形**平铺** ⇒ 叠印 0；"上层弹出即遮住"⇒ 合成口径 0 而旧 α 口径仍报双可见
+    （两种读数并列，本面不合并成裁定值）。
+    D 段锁取数边界：初值按 `#id` 规则压过 class 规则（否则封面淡出整条消失）、CSS 只扫
+    `<style>`（脚本里的 `opacity:0.25` 曾被读成初值、凭空造出叠印）、`fromTo` 的 from 在
+    t0 之前已生效（否则推移期间凭空读出一段整屏重叠）、无画布尺寸只出 α 读数。
+    E 段锁"只透传不裁定"与接线：data_sources 键、runner 登记面、永不抛异常、不进 issues。
+    F 段现网读数（dev 面）：全仓有边界读数 ≥60 支、`_修订02` 的读数钉住、推移项目叠印 0、
+    每支项目要么有读数要么有未覆盖归因（"既不读数也不点名"计数为 0）。
+
+    变异对应（登记进 mutation_matrices.json，128-M1..M14）：
+    M1 摘 id-literal 回落 → A2/A6
+    M2 选择器改为只认 `#scene` 字面前缀 → A4
+    M3 fromTo 只读 from 段（duration/ease 落在 to 段）→ B2/B3
+    M4 摘命名常量锚 → B6
+    M5 摘缓动建模（按线性）→ C1
+    M6 叠印改回 α_out×α_in（"弹出遮住"虚报满分）→ C6
+    M7 旧口径双可见摘掉面积条件（推移全记成双可见）→ C5/B2
+    M8 CSS 规则扫全文（脚本字面量被当规则）→ D3
+    M9 初值回到"任一规则 opacity:0 即隐藏"（class 压过 id）→ D2
+    M10 时间链 pre 不取 fromTo 的 from → D4
+    M11 单侧边界计入峰值 → C8
+    M12 报告侧摘掉 data_sources 接线 → E1/E2
+    M13 摘掉字面秒数锚 → B5/F1
+    M14 背景读成不透明（上层透明底前提消失）→ D6
+    M15 饱和标记恒假（窗口截断被当成真实上限）→ D8
+    """
+    tc = RegressionTestCase(
+        "transition_overlap_census_descriptive_face",
+        "验证转场重叠描述面：四写法覆盖、未覆盖逐份点名、缓动与合成口径、只透传不裁定"
+    )
+    try:
+        import tempfile
+        from pathlib import Path
+
+        import transition_overlap_census as tr
+
+        script_dir = Path(__file__).parent
+        gcr_src = (script_dir / "generate_completion_report.py").read_text(encoding="utf-8")
+        runner_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        mod_src = (script_dir / "transition_overlap_census.py").read_text(encoding="utf-8")
+
+        tmp = Path(tempfile.mkdtemp(prefix="case128_"))
+
+        def fixture(name, body):
+            p = tmp / name
+            p.write_text(body, encoding="utf-8")
+            return str(p)
+
+        CSS = ('<style>.scene{position:absolute;inset:0;opacity:0;}'
+               '#scene0{opacity:1;}</style>')
+
+        def page(divs, script, style=CSS, width=1920, height=1080):
+            wh = (f' data-width="{width}" data-height="{height}"' if width else '')
+            return ('<html><head>' + style + '</head><body>'
+                    + f'<div id="root"{wh} data-duration="40">' + divs
+                    + '<script>' + script + '</script></div></body></html>')
+
+        def scenes(n, mode="dsid"):
+            out = []
+            for i in range(n):
+                if mode == "none":
+                    out.append(f'<div id="scene{i}" class="scene"></div>')
+                elif mode == "plain":
+                    out.append(f'<div id="scene{i}" class="scene" data-scene-id="s{i}"></div>')
+                else:
+                    cov = ' data-scene-entry="cover"' if i == 0 else ''
+                    out.append(f'<div id="scene{i}" class="scene" '
+                               f'data-scene-id="s{i}"{cov}></div>')
+            return ''.join(out)
+
+        def first_row(m):
+            """取首个边界行；无行时给空 dict——断言须红而非 IndexError（变异 M8 曾 CRASH）。"""
+            rows = m.get("boundaries") or []
+            return rows[0] if rows else {}
+
+        def prefab_script():
+            return ('var T = {s1: 3.0, s2: 10.0};\n'
+                    'tl.to("#scene0", {opacity:0, duration:0.30, ease:"power1.inOut"}, T.s1 - 0.02);\n'
+                    'tl.to("#scene1", {opacity:1, duration:0.30, ease:"power2.out"}, T.s1 - 0.22);\n'
+                    'tl.to("#scene1", {opacity:0, duration:0.30, ease:"power1.inOut"}, T.s2 - 0.02);\n'
+                    'tl.to("#scene2", {opacity:1, duration:0.30, ease:"power2.out"}, T.s2 - 0.22);')
+
+        # ── A 场景根判定（DOM）───────────────────────────────────────────
+        m = tr.measure(fixture("prefab.html", page(scenes(3), prefab_script())))
+        tc.assert_true(m.get("scenes") == 3, "A1 data-scene-id 场景根计数")
+        tc.assert_true(m["scene_root_basis"]["data-scene-id"] == 3,
+                       "A2 场景根主依据＝data-scene-id")
+        m = tr.measure(fixture("idlit.html", page(scenes(3, "none"), prefab_script())))
+        tc.assert_true("untested" not in m and m["scene_root_basis"]["id-literal"] == 3,
+                       "A3 无 data-scene-id 时回落 id=\"sceneN\"（仓内既有先例）")
+        sn = ('<div id="s0" class="scene" data-scene-id="s0" data-scene-entry="cover"></div>'
+              '<div id="s1" class="scene" data-scene-id="s1"></div>')
+        sn_script = ("var T = {s1: 3.0};\n"
+                     "tl.to('#s0', {opacity:0, duration:0.4}, T.s1);\n"
+                     "tl.to('#s1', {opacity:1, duration:0.4}, T.s1);")
+        m = tr.measure(fixture("sn.html", page(sn, sn_script)))
+        tc.assert_true(m.get("boundaries_measured", 0) >= 1,
+                       "A4 `#sN` 命名经 DOM 解析到场景根（不按 id 字面猜）")
+        m = tr.measure(fixture("noroot.html", page('<div class="wrap"></div>', "")))
+        tc.assert_true("untested" in m and "场景根" in m["untested"],
+                       "A5 无场景根 → untested 并点名（不得读成无重叠）")
+        desc_script = ('var T = {s1: 3.0};\n'
+                       'tl.to("#scene0", {opacity:0, duration:0.4}, T.s1);\n'
+                       'tl.to("#scene1", {opacity:1, duration:0.4}, T.s1);\n'
+                       'tl.to("#scene1 .card", {opacity:0, duration:0.3}, T.s1);\n'
+                       'for (var i=0;i<2;i++){ tl.to(sel, {opacity:0}, T.s1); }')
+        m = tr.measure(fixture("desc.html", page(scenes(2), desc_script)))
+        tc.assert_true(m["element_level_statements"] >= 1,
+                       "A6 带后代的选择器计入元素级（不是转场）")
+        tc.assert_true(m["variable_selector_statements"] >= 1,
+                       "A7 变量选择器单独计数（两类别混一桶）")
+
+        # ── B 四种写法 × 三类锚 ─────────────────────────────────────────
+        m = tr.measure(fixture("prefab2.html", page(scenes(3), prefab_script())))
+        tc.assert_equal(m["forms"].get("fade"), 2, "B1 双 tl.to 淡入淡出识别为 fade")
+        push_script = ('var T = {s1: 3.0};\n'
+                       'tl.to("#scene0", {x:-1920, duration:0.8, ease:"power3.inOut"}, T.s1);\n'
+                       'tl.fromTo("#scene1", {x:1920, opacity:1}, '
+                       '{x:0, duration:0.8, ease:"power3.inOut"}, T.s1);')
+        m = tr.measure(fixture("push.html", page(scenes(2), push_script)))
+        tc.assert_equal(m["forms"].get("push"), 1, "B2 fromTo 整屏推移识别为 push")
+        from_script = ('var T = {s1: 3.0};\n'
+                       'tl.to("#scene0", {x:-1920, duration:0.8}, T.s1);\n'
+                       'tl.from("#scene1", {x:1920, duration:0.8}, T.s1);')
+        m = tr.measure(fixture("from.html", page(scenes(2), from_script)))
+        tc.assert_equal(m["forms"].get("push"), 1, "B3 tl.from 推移形态同样计入")
+        cut_script = ('var T = {s1: 3.0};\n'
+                      'tl.set("#scene0", {opacity:0}, T.s1);\n'
+                      'tl.set("#scene1", {opacity:1}, T.s1);')
+        m = tr.measure(fixture("cut.html", page(scenes(2), cut_script)))
+        tc.assert_equal(m["forms"].get("cut"), 1, "B4 tl.set 硬切识别为 cut")
+        lit_script = ('tl.to("#scene0", {opacity:0, duration:0.5}, 2.5);\n'
+                      'tl.to("#scene1", {opacity:1, duration:0.5}, 2.5);')
+        m = tr.measure(fixture("lit.html", page(scenes(2), lit_script)))
+        tc.assert_true(m.get("t_block_keys") == 0 and m.get("boundaries_measured") == 1
+                       and m["unparsed_anchors"] == 0,
+                       "B5 字面时刻锚进入取数面（无 T 块亦可配对）")
+        const_script = ('var T1 = 3; var T1end = T1 + 7;\n'
+                        'tl.to("#scene0", {opacity:0, duration:0.5}, T1);\n'
+                        'tl.to("#scene1", {opacity:1, duration:0.5}, T1);\n'
+                        'tl.to("#scene1", {opacity:0, duration:0.5}, T1end);')
+        m = tr.measure(fixture("const.html", page(scenes(2), const_script)))
+        tc.assert_true(m.get("boundaries_measured", 0) >= 1 and m["unparsed_anchors"] == 0,
+                       "B6 命名数值常量锚（含 T1+7 表达式）解析")
+        rel_script = ('var T = {s1: 3.0};\n'
+                      'tl.to("#scene1", {opacity:1}, "+=0.5");')
+        m = tr.measure(fixture("rel.html", page(scenes(2), rel_script)))
+        tc.assert_true(m["unparsed_anchors"] >= 1,
+                       "B7 相对锚解析不出并被点名（不得按 0 计）")
+
+        # ── C 算术口径 ──────────────────────────────────────────────────
+        mp = tr.measure(fixture("prefab4.html", page(scenes(3), prefab_script())))
+        tc.assert_true(mp["max_alpha_sum_overlap"] >= 1.95,
+                       "C1 重叠处 α和峰按 power 缓动建模达 1.9+（线性近似只到 1.80）")
+        tc.assert_true(0.30 <= mp["max_both_alpha_s"] <= 0.45,
+                       "C2 旧口径双可见 ≈0.37s（用户点名的重叠时长量级）")
+        tc.assert_true(0.40 <= mp["max_ghost_peak"] <= 0.60,
+                       "C3 合成口径叠印峰值 ≈0.49")
+        comp_script = ('var T = {s1: 3.0, s2: 10.0};\n'
+                       'tl.to("#scene0", {opacity:0, duration:0.5, ease:"power2.inOut"}, T.s1 - 0.25);\n'
+                       'tl.to("#scene1", {opacity:1, duration:0.5, ease:"power2.inOut"}, T.s1 - 0.25);\n'
+                       'tl.to("#scene1", {opacity:0, duration:0.5, ease:"power2.inOut"}, T.s2 - 0.25);\n'
+                       'tl.to("#scene2", {opacity:1, duration:0.5, ease:"power2.inOut"}, T.s2 - 0.25);')
+        mc = tr.measure(fixture("comp.html", page(scenes(3), comp_script)))
+        tc.assert_true(mc["max_alpha_sum_peak"] <= 1.02,
+                       "C4 互补淡入淡出 α和峰 ≈1（正常溶接）")
+        tc.assert_true(mc["max_ghost_peak"] < mp["max_ghost_peak"],
+                       "C5 互补溶接的叠印强度低于提前起步形态（区分力）")
+        mpu = tr.measure(fixture("push2.html", page(scenes(2), push_script)))
+        tc.assert_true(mpu["max_ghost_peak"] == 0.0 and mpu["max_both_alpha_s"] == 0.0,
+                       "C6 整屏推移两矩形平铺：叠印 0、旧口径双可见亦 0（面积条件）")
+        pop_script = ('var T = {s1: 3.0};\n'
+                      'tl.set("#scene1", {opacity:1}, T.s1 - 0.5);\n'
+                      'tl.to("#scene0", {opacity:0, duration:0.5}, T.s1 - 0.5);')
+        mpop = tr.measure(fixture("pop.html", page(scenes(2), pop_script)))
+        tc.assert_true(mpop["max_ghost_peak"] == 0.0 and mpop["max_both_alpha_s"] > 0.3,
+                       "C7 上层弹出即遮住：合成口径 0 而旧 α 口径仍报双可见（两读数并列）")
+        single_style = ('<style>.scene{position:absolute;inset:0;opacity:0;}'
+                        '#scene0{opacity:1;} #scene1{opacity:0.5;}</style>')
+        single_script = ('var T = {s1: 3.0};\n'
+                         'tl.to("#scene0", {opacity:0, duration:0.5}, T.s1);')
+        ms = tr.measure(fixture("single.html", page(scenes(2), single_script,
+                                                    style=single_style)))
+        tc.assert_true(ms["forms"].get("single") == 1
+                       and ms["max_ghost_peak"] == 0.0,
+                       "C8 单侧边界不计入峰值（淡出揭示≠叠印）")
+
+        # ── D 取数边界 ──────────────────────────────────────────────────
+        mw = tr.measure(fixture("nowidth.html", page(scenes(3), prefab_script(), width=None)))
+        tc.assert_true(mw["geometry_unmeasured"] >= 1 and mw["boundaries_measured"] >= 1,
+                       "D1 无画布尺寸：面积口径点名不可测，α 读数照出")
+        tc.assert_true(first_row(mp).get("exit_offset_s") is not None,
+                       "D2 封面 `#scene0{opacity:1}` 压过 class 规则，淡出语句不被吞")
+        dim_script = ('var T = {s1: 3.0};\n'
+                      'tl.to("#scene0", {opacity:0, duration:0.5}, T.s1);\n'
+                      'tl.to("#scene1", {opacity:0.6, duration:0.5}, T.s1);')
+        md = tr.measure(fixture("dim.html", page(scenes(2), dim_script)))
+        tc.assert_true(md["max_ghost_peak"] > 0.0,
+                       "D3 CSS 只扫 <style>：脚本里的 opacity 字面量不当初值")
+        vis_style = ('<style>.scene{position:absolute;inset:0;}'
+                     '#scene0{opacity:1;} #scene1{opacity:1;}</style>')
+        mv = tr.measure(fixture("vis.html", page(scenes(2), push_script, style=vis_style)))
+        tc.assert_true(mv["max_both_alpha_s"] == 0.0,
+                       "D4 fromTo 的 from 在 t0 前已生效（推移前不读成整屏重叠）")
+        viz_script = ('var T = {s1: 3.0, s2: 10.0};\n'
+                      'tl.set("#scene1", {visibility:"visible"}, T.s1);\n'
+                      'tl.set("#scene2", {visibility:"visible"}, T.s2);')
+        mvz = tr.measure(fixture("viz.html", page(scenes(3), viz_script)))
+        tc.assert_true("visibility" in (mvz.get("uncovered_reason") or ""),
+                       "D5 visibility 切显逐份点名，不当成无转场")
+        trans_style = ('<style>.scene{position:absolute;inset:0;background:transparent;'
+                       'opacity:0;} #scene0{opacity:1;}</style>')
+        mt = tr.measure(fixture("trans.html", page(scenes(3), prefab_script(),
+                                                   style=trans_style)))
+        tc.assert_true(mt["transparent_scene_roots"] == 2
+                       and first_row(mt).get("upper_transparent") is True,
+                       "D6 透明底场景根：点名上层透明，叠印公式前提显形")
+        opaque_style = ('<style>.scene{position:absolute;inset:0;background:transparent;'
+                        'opacity:0;} #scene0{opacity:1;}'
+                        '#scene1{opacity:0;background:#101010;}'
+                        '#scene2{opacity:0;background:#101010;}</style>')
+        mo = tr.measure(fixture("opaque.html", page(scenes(3), prefab_script(),
+                                                    style=opaque_style)))
+        tc.assert_true(mo["transparent_scene_roots"] == 0
+                       and first_row(mo).get("upper_transparent") is False,
+                       "D7 实色底压过 class 透明声明（同一层叠近似，不造第二套）")
+        sat_style = ('<style>.scene{position:absolute;inset:0;background:transparent;}'
+                     '#scene0{opacity:1;} #scene1{opacity:0;}</style>')
+        sat_script = ('var T = {s1: 3.0};\n'
+                      'tl.set("#scene1", {opacity:1}, T.s1);\n'
+                      'tl.to("#scene0", {opacity:0, duration:0.5}, T.s1 + 6.3);')
+        msat = tr.measure(fixture("sat.html", page(scenes(2), sat_script, style=sat_style)))
+        tc.assert_true(first_row(msat).get("both_saturated") is True
+                       and msat["saturated_boundaries"] >= 1,
+                       "D8 读数顶到采样窗边缘即点名截断（≥窗口值，不是上限）")
+
+        # ── E 只透传不裁定 ＋ 接线 ──────────────────────────────────────
+        tc.assert_true('report["data_sources"]["transition_overlap"]' in gcr_src,
+                       "E1 完工报告写入 data_sources.transition_overlap")
+        tc.assert_true("import transition_overlap_census as _tr" in gcr_src
+                       and "_tr.format_line(m)" in gcr_src,
+                       "E2 报告侧文案与判据单源（转调模块，不自写一句）")
+        tc.assert_true('"transition_module": SCRIPTS / "transition_overlap_census.py"' in runner_src,
+                       "E3 completion_report 步登记面覆盖本模块（A06 同族）")
+        bad = tr.measure(str(tmp))
+        tc.assert_true("untested" in bad, "E4 非法路径返回 untested 而不抛异常")
+        segs = gcr_src.split('data_sources"]["transition_overlap"]', 1)
+        tail = segs[1][:300] if len(segs) > 1 else ""
+        tc.assert_true("issues.append" not in tail and "all_valid = False" not in tail,
+                       "E5 描述面不进 issues、不改变判决")
+        # E6 原形（"模块内不出现业务项目名"）2026-11-06 移交发布面脱敏门禁的
+        # `project_slug` 层统一裁定：它按目录名**实时枚举**扫导出面全集，比本用例只盯
+        # 单个模块更宽，且导出即判。此处不再写第二份判据（同一事实两处维护必过期）。
+        # 本用例保留的结构性约束在 F 段：读数取全族存在性，不钉某一支项目的数值。
+
+        # ── F 现网读数（dev 面）────────────────────────────────────────
+        if export_repo_face(tc) == "dev":
+            from _script_env import HTML_BASE
+            all_m = {h.parent.name: tr.measure(h) for h in sorted(HTML_BASE.glob("*/index.html"))}
+            measured = {k: v for k, v in all_m.items() if v.get("boundaries_measured")}
+            bare = [k for k, v in all_m.items()
+                    if not v.get("boundaries_measured") and not (v.get("uncovered_reason")
+                                                                 or v.get("untested"))]
+            pushes = [v for v in measured.values()
+                      if (v.get("forms") or {}).get("push") and v["max_ghost_peak"] == 0.0]
+            tc.assert_true(len(measured) >= 60,
+                           f"F1 全仓有边界读数的项目 {len(measured)} 支（>=60；旧取数面仅 6 支）")
+            tc.assert_true(len(bare) == 0,
+                           f"F2 既不读数也不点名归因的项目 {len(bare)} 支（必须为 0）")
+            tc.assert_true(len(pushes) >= 20,
+                           f"F3 整屏推移且叠印为 0 的项目 {len(pushes)} 支（>=20）")
+            # F4/F5 的旧形态钉的是某一支业务项目的读数。该片 2026-11-06 已改硬切、
+            # 叠印归零，继续钉它会变成假红；而钉项目名等于把业务 slug 写进公开面
+            # （发布面脱敏门禁 project_slug 层当场判红）。故改为**全族存在性**读数：
+            # 只要本面仍能量出这两种形态，取样面就没有整体退化；缓动数学的判别力住 C 段夹具。
+            ghost_hi = [k for k, v in measured.items() if v.get("max_ghost_peak", 0) >= 0.35]
+            sum_hi = [k for k, v in measured.items() if v.get("max_alpha_sum_overlap", 0) >= 1.9]
+            tc.assert_true(len(ghost_hi) >= 1,
+                           f"F4 现网仍有叠印 >=0.35 的项目 {len(ghost_hi)} 支（形态未被单点修法清零）")
+            tc.assert_true(len(sum_hi) >= 1,
+                           f"F5 现网仍有 α和峰 >=1.9 的边界 {len(sum_hi)} 支"
+                           "（两层同时不透明的形态仍在；缓动数学的判别力住 C 段夹具）")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("transition_overlap_census_descriptive_face error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
+
 def main():
     import argparse
     
@@ -24473,20 +24853,32 @@ def test_intra_pause_trim_and_third_bucket() -> RegressionTestCase:
         tc.assert_equal(bool(rules["enabled_by_default"]), False,
                         "C1 trim must be default-off (it rewrites the waveform)")
         _keep = eva.INTRA_TRIM_ENABLED
+        _keep_enf = eva.INTRA_ENFORCE_ENABLED
         try:
+            # 2026-11-06 机制批：戳记由三段合成（代次 + 强制面 + 修剪面）。本段把强制面
+            # **钉成关闭**，否则 stamp 会随规则缺省值漂移；断言一律由常量拼接而不是抄
+            # "v2+trim" 字面量——抄字面量的那条守卫在代次 bump 时必然误红。
+            eva.INTRA_ENFORCE_ENABLED = False
+            _base = eva.PAUSE_ENFORCE_VERSION
             eva.INTRA_TRIM_ENABLED = None
             on0, r0, stamp0, why0 = eva._intra_trim_state()
             tc.assert_equal(on0, False, "C2 undeclared switch falls back to rules default")
-            tc.assert_equal(stamp0, "v2", "C3 disabled state keeps the historical stamp")
+            tc.assert_equal(stamp0, _base, "C3 disabled state keeps the bare generation")
             eva.INTRA_TRIM_ENABLED = True
             on1, r1, stamp1, why1 = eva._intra_trim_state()
             tc.assert_equal(on1, True, "C4 explicit enable switches the face on")
-            tc.assert_equal(stamp1, "v2+trim",
+            tc.assert_equal(stamp1, _base + eva.PAUSE_TRIM_SUFFIX,
                             "C5 enabled state must be a distinct waveform generation")
             eva.INTRA_TRIM_ENABLED = False
             on2, r2, stamp2, why2 = eva._intra_trim_state()
-            tc.assert_equal((on2, stamp2), (False, "v2"),
+            tc.assert_equal((on2, stamp2), (False, _base),
                             "C6 explicit false must not inherit the trim generation")
+            eva.INTRA_ENFORCE_ENABLED = True
+            _on_e, _r_e, stamp_e, _w_e = eva._intra_trim_state()
+            tc.assert_equal(stamp_e, _base + eva.PAUSE_INTRA_SUFFIX,
+                            "C6b 强制面开启是**第三个代次**：关掉它时旧波形里已插入的静音"
+                            "无法原地检出删除，只有代次不同才会触发从原始 TTS 重建")
+            eva.INTRA_ENFORCE_ENABLED = None
             _orig = ip.load_rules
             ip.load_rules = lambda *a, **k: (_ for _ in ()).throw(
                 ip.Untested("规则节缺席（夹具注入）"))
@@ -24500,6 +24892,7 @@ def test_intra_pause_trim_and_third_bucket() -> RegressionTestCase:
                 ip.load_rules = _orig
         finally:
             eva.INTRA_TRIM_ENABLED = _keep
+            eva.INTRA_ENFORCE_ENABLED = _keep_enf
 
         # ---------------- D 段：声明节缺 enabled 即 fail-loud ------------------------
         _keep2 = eva.INTRA_TRIM_ENABLED
@@ -24773,6 +25166,850 @@ def test_intra_pause_trim_and_third_bucket() -> RegressionTestCase:
     except Exception as e:
         import traceback
         tc.mark_failed("intra_pause_trim_and_third_bucket error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
+    """用例125：句内标点停顿强制面与四态裁定（2026-11-06 机制批）。
+
+    背景（跨项目实测，不是单片症状）：段间停顿自 2026-07-28 有波形强制后，六支项目
+    429 个段间位点**零未达标**；同批**段内标点**位点有 43 个低于 0.2s 可听阈（大量
+    实测 0.00s），每支项目都有，且渲染前复核逐条点名过而没有任何出口接手——用户后来
+    点名的『翻图集、约 3 个专业』正是 run 日志里印过的那条。差别不在引擎，在有没有
+    接进生效路径：`_split_text_to_segments` 只在 。？！； 处切段，逗号/顿号/冒号
+    **结构上不是段界**，段间面永远看不见它们。
+
+    本用例锁九条不得回退的纪律（断言条数与数据无关，不写在逐场循环里）：
+      A 单源：执行侧与点名侧都走 `punctuation_gap_rows`，两侧各算一遍 gap 即两份真相；
+      B 零字面量：下限只住 audio_sync_rules.json → intra_pause_enforce；
+      C 三态开关 + 缺省开 + 声明节缺 enabled 即 fail-loud；
+      D 波形代次：PAUSE_ENFORCE_VERSION=v3，戳记随开关分档；
+      E 波形性质：补齐到下限、幂等、句级与字符级同平移、时长差＝插入量、语音段字节不变；
+      F 不对称纪律：matched=0 的位点拒动刀（计入 interpolated）、取数断链不补并点名、
+        非 s16 即抛——"读不到"永远不等于"照着补"；
+      G 顺序：句界之后、修剪之前；
+      H 裁定四态：FAIL 永不可放行／UNTESTED 放行须留痕／PASS／NOT_APPLICABLE；
+      I 候选面：emit_declarations 覆盖绝对阈命中且按位点去重；报告透传 pause_gate。
+    """
+    tc = RegressionTestCase(
+        "intra_punctuation_pause_enforcement",
+        "验证句内标点停顿强制面的判据单源、幂等、不对称纪律与四态裁定"
+    )
+    try:
+        import ast
+        import hashlib
+        import re
+        import sys
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        import numpy as np
+
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import enhance_video_audio as eva
+        import narration_pause_precheck as npp
+
+        eva_src = script_dir / "enhance_video_audio.py"
+        npp_src = script_dir / "narration_pause_precheck.py"
+        pr_src = script_dir / "pipeline_runner.py"
+        rep_src = script_dir / "generate_completion_report.py"
+        rules_path = script_dir.parent / "配置/config/quality/audio_sync_rules.json"
+
+        def _fn_text(path, fname):
+            body = path.read_text(encoding="utf-8")
+            m = re.search(rf"^def {re.escape(fname)}\(.*?(?=^def |^# ---|\Z)",
+                          body, re.S | re.M)
+            return m.group(0) if m else ""
+
+        d_exec = _fn_text(eva_src, "_enforce_punctuation_pauses")
+        d_face = _fn_text(npp_src, "audio_face")
+        d_rows = _fn_text(npp_src, "punctuation_gap_rows")
+        d_state = _fn_text(eva_src, "_intra_enforce_state")
+        d_build = _fn_text(eva_src, "_build_timeline_manifest")
+
+        # ---------------- A 段：判据单源 -------------------------------------------
+        # 锚语句本体而不是标识符出现：docstring 里必然提到 punctuation_gap_rows，
+        # 写成"该名字出现"即恒真——125-M11 首版正是这样存活的（落点纪律：断言不得
+        # 靠被引文字的在场充数，须证明确有这次调用）。
+        def _calls_shared_row_fn(text):
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                return False
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Call):
+                    f = n.func
+                    if isinstance(f, ast.Attribute) and f.attr == "punctuation_gap_rows":
+                        return True
+                    if isinstance(f, ast.Name) and f.id == "punctuation_gap_rows":
+                        return True
+            return False
+
+        tc.assert_true(d_exec and _calls_shared_row_fn(d_exec),
+                       "A1 执行侧必须以**调用**取位点行（AST 证，不认 docstring 提及）")
+        tc.assert_true(d_face and _calls_shared_row_fn(d_face),
+                       "A2 点名侧必须调用同一函数（AST 证）")
+        tc.assert_true(d_rows.count("float(chars[i + 1][0]) - float(chars[i][1])") == 1,
+                       "A3 gap 的减法在仓内只能有一处（两处即两份真相，A06 同族）")
+        _recompute = re.compile(r"(?<![\w_])chars\[i \+ 1\]\[0\]")
+        tc.assert_true(not _recompute.search(d_exec),
+                       "A4 执行侧不得自己算相邻字符差")
+        tc.assert_true("measured" in d_rows and "int(chars[i][2]" in d_rows,
+                       "A5 位点行必须自带实测/插值旗标（执行侧据此拒动刀）")
+
+        # ---------------- B 段：阈值零字面量 ---------------------------------------
+        import json as _json
+        _sec = _json.loads(rules_path.read_text(encoding="utf-8"))["intra_pause_enforce"]
+        floor = float(_sec["min_seconds"])
+        tc.assert_true(floor > 0,
+                       f"B0 规则里的下限须为正数（读到 {floor}）")
+        # 字面量扫描只看**代码体**：docstring 里必然要复述 0.25/0.2 这两个数（那正是
+        # 本批的论证），把它算进"字面量"会让这条守卫永远红，从而被下一个人删掉。
+        d_exec_code = d_exec.split('"""', 2)[2] if d_exec.count('"""') >= 2 else d_exec
+        lits = {round(float(x), 4) for x in
+                re.findall(r"(?<![\w.])(\d+\.\d+)(?![\w.])", d_exec_code)}
+        tc.assert_true(round(floor, 4) not in lits,
+                       f"B1 执行侧不得出现下限字面量 {floor}（读到 {sorted(lits)}）")
+        tc.assert_true("'intra_pause_enforce'" in d_state,
+                       "B2 开关状态必须从 intra_pause_enforce 节取，不得内联常量")
+
+        # ---------------- C 段：三态开关与 fail-loud -------------------------------
+        _keep_enforce = eva.INTRA_ENFORCE_ENABLED
+        _keep_trim = eva.INTRA_TRIM_ENABLED
+        try:
+            eva.INTRA_ENFORCE_ENABLED = None
+            on_none, f_none, w_none = eva._intra_enforce_state()
+            tc.assert_equal(on_none, bool(_sec.get("enabled_by_default")),
+                            "C1 未声明时由规则 enabled_by_default 裁定")
+            tc.assert_true(on_none,
+                           "C2 本面缺省**开**（与修剪面缺省关相反，理由住规则 description）")
+            eva.INTRA_ENFORCE_ENABLED = False
+            on_off, f_off, w_off = eva._intra_enforce_state()
+            tc.assert_equal(on_off, False, "C3 项目显式声明 false 即关")
+            tc.assert_true("项目显式声明" in w_off,
+                           f"C4 关闭归因须说明是显式声明而非判据断链：{w_off}")
+            _bad_cfg = {"intra_pause_enforce": {"min_seconds": 0.3}}
+            _raised = None
+            try:
+                eva._collect_pause_state(_bad_cfg, [])
+            except SystemExit as e:
+                _raised = e
+            tc.assert_true(_raised is not None and getattr(_raised, "code", 1),
+                           "C5 声明了节却没写 enabled 必须非零退出（不得静默按缺省覆盖作者裁定）")
+            eva._collect_pause_state({}, [])
+            tc.assert_true(eva.INTRA_ENFORCE_ENABLED is None,
+                           "C6 未声明时全局须复位为 None（跨项目不得继承上一项目的开关）")
+        finally:
+            eva.INTRA_ENFORCE_ENABLED = _keep_enforce
+            eva.INTRA_TRIM_ENABLED = _keep_trim
+
+        # ---------------- D 段：波形代次戳记 ---------------------------------------
+        tc.assert_equal(eva.PAUSE_ENFORCE_VERSION, "v3",
+                        "D1 新增强制面必须 bump 代次，否则存量 v2 波形缓存照常命中＝新面静默不生效")
+        _keep_trim2 = eva.INTRA_TRIM_ENABLED
+        _keep_enf2 = eva.INTRA_ENFORCE_ENABLED
+        try:
+            eva.INTRA_TRIM_ENABLED = False
+            eva.INTRA_ENFORCE_ENABLED = True
+            _on, _r, stamp_on, _w = eva._intra_trim_state()
+            eva.INTRA_ENFORCE_ENABLED = False
+            _on, _r, stamp_off, _w = eva._intra_trim_state()
+            tc.assert_true(eva.PAUSE_INTRA_SUFFIX in stamp_on and "trim" not in stamp_on,
+                           f"D2 强制面开启时戳记须含 +intra：{stamp_on}")
+            tc.assert_true(stamp_on != stamp_off,
+                           f"D3 开/关两种波形不是同一代次（关掉后须能从原始 TTS 重建）："
+                           f"{stamp_on} vs {stamp_off}")
+        finally:
+            eva.INTRA_TRIM_ENABLED = _keep_trim2
+            eva.INTRA_ENFORCE_ENABLED = _keep_enf2
+
+        # ---------------- 夹具：两段正弦 + 中间一条短静音 --------------------------
+        sr = 44100
+
+        def _make_wav(path, gap_seconds, sampwidth=2):
+            tone = (8000 * np.sin(2 * np.pi * 220 * np.arange(int(sr * 1.0)) / sr)).astype(
+                np.int16 if sampwidth == 2 else np.uint8)
+            tail = (8000 * np.sin(2 * np.pi * 220 * np.arange(int(sr * 1.0)) / sr)).astype(
+                np.int16 if sampwidth == 2 else np.uint8)
+            sil = np.zeros(int(sr * gap_seconds), dtype=np.int16)
+            data = np.concatenate([tone, sil, tail])
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(sampwidth)
+                w.setframerate(sr)
+                w.writeframes(data.tobytes() if sampwidth == 2 else bytes(len(data)))
+            return data
+
+        text = "甲乙，丙丁"
+        sents = [{"text": "甲乙，丙丁", "rel_start": 0.0, "rel_end": 2.0}]
+
+        def _chars(gap):
+            return [[0.0, 0.5, 1], [0.5, 1.0, 1],
+                    [round(1.0 + gap, 3), round(1.0 + gap + 0.5, 3), 1],
+                    [round(1.0 + gap + 0.5, 3), round(1.0 + gap + 1.0, 3), 1]]
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            # ---------------- E 段：补齐 / 幂等 / 平移 / 语音不损 ------------------
+            gap0 = 0.02
+            w1 = tmp / "e1_hq.wav"
+            _make_wav(w1, gap0)
+            mod, s1, ins1, c1, res1 = eva._enforce_punctuation_pauses(
+                w1, text, sents, _chars(gap0), floor)
+            tc.assert_true(mod, "E1 低于下限的顿号/逗号位点必须补齐")
+            tc.assert_equal([res1["points"], res1["hits"], res1["interpolated"]], [1, 1, 0],
+                            f"E2 读数须结构化（points/hits/interpolated）：{res1}")
+            tc.assert_true(abs(ins1 - (floor - gap0)) < 0.001,
+                           f"E3 插入量＝下限−实测间隙（{ins1} vs {floor - gap0}）")
+            tc.assert_true(abs(c1[2][0] - (1.0 + gap0 + ins1)) < 0.002,
+                           f"E4 字符级时刻随插入平移（cue 取的就是它）：{c1[2][0]}")
+            tc.assert_true(abs(s1[0]["rel_end"] - (2.0 + ins1)) < 0.002,
+                           f"E5 段内插入时该句 rel_end 加平移量（不是收拢到切点）：{s1[0]}")
+            dur_after = eva.get_duration(str(w1))
+            tc.assert_true(abs(dur_after - (2.0 + gap0 + ins1)) < 0.001,
+                           f"E6 波形时长差＝插入量（读到 {dur_after}）")
+            with wave.open(str(w1), "rb") as w:
+                after = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+            ref = np.frombuffer(_make_wav(tmp / "e1_ref.wav", gap0).tobytes(), dtype=np.int16)
+            # 淡变窗（8ms）合法地吃进切点**前一侧**的样本尾巴——这与句界面同一形态，
+            # 不是"损伤语音"。因此判据取淡变窗之前的整段：那一段必须逐字节不变。
+            _guard = int(sr * 1.0) - int(0.008 * sr) - 1
+            tc.assert_true(np.array_equal(after[:_guard], ref[:_guard]),
+                           "E7 插入点之前（除 8ms 淡变窗）的语音字节逐位不变")
+            tc.assert_true(int(np.abs(after[_guard:sr]).max()) <= int(np.abs(ref[_guard:sr]).max()),
+                           "E8 淡变窗内只能是衰减，不得抬高电平（补静音面不得引入新的爆音）")
+            sha_before = hashlib.sha256(w1.read_bytes()).hexdigest()
+            mod2, _s2, ins2, _c2, res2 = eva._enforce_punctuation_pauses(
+                w1, text, s1, c1, floor)
+            tc.assert_equal([mod2, res2["points"], ins2], [False, 0, 0.0],
+                            f"E9 幂等：补齐后重跑即 no-op（读到 {mod2}/{res2}）")
+            tc.assert_equal(hashlib.sha256(w1.read_bytes()).hexdigest(), sha_before,
+                            "E10 幂等重跑不得再改写字节")
+
+            # ---------------- F 段：不对称纪律 ------------------------------------
+            w2 = tmp / "f1_hq.wav"
+            _make_wav(w2, gap0)
+            sha2 = hashlib.sha256(w2.read_bytes()).hexdigest()
+            ch_interp = _chars(gap0)
+            ch_interp[1][2] = 0          # 前一个字的时间是插值造出来的
+            mod3, _s3, ins3, _c3, res3 = eva._enforce_punctuation_pauses(
+                w2, text, sents, ch_interp, floor)
+            tc.assert_equal([mod3, res3["points"], res3["interpolated"], ins3],
+                            [False, 1, 1, 0.0],
+                            f"F1 插值时刻的位点拒动刀（在虚构坐标上插静音＝切进字里）：{res3}")
+            tc.assert_equal(hashlib.sha256(w2.read_bytes()).hexdigest(), sha2,
+                            "F2 拒动刀时波形字节必须一字不改")
+
+            mod4, _s4, ins4, _c4, res4 = eva._enforce_punctuation_pauses(
+                w2, text, sents, None, floor)
+            tc.assert_true(not mod4 and res4["broken"],
+                           f"F3 无字符流＝取数断链，必须点名而非静默跳过：{res4}")
+            mod5, _s5, _i5, _c5, res5 = eva._enforce_punctuation_pauses(
+                w2, "甲乙，丙丁戊", sents, _chars(gap0), floor)
+            tc.assert_true(not mod5 and res5["broken"] and "字 ≠" in res5["broken"][0],
+                           f"F4 原文字数≠对齐字数必须点名（不得猜着补）：{res5}")
+            w3 = tmp / "f5_hq.wav"
+            _make_wav(w3, gap0, sampwidth=1)
+            _raised = None
+            try:
+                eva._enforce_punctuation_pauses(w3, text, sents, _chars(gap0), floor)
+            except RuntimeError as e:
+                _raised = e
+            tc.assert_true(_raised is not None and "s16" in str(_raised),
+                           f"F5 非 s16 波形即抛，不得猜着补：")
+            mod6, _s6, _i6, _c6, res6 = eva._enforce_punctuation_pauses(
+                w1, text, sents, _chars(gap0), 0)
+            tc.assert_equal([mod6, res6["points"]], [False, 0],
+                            "F6 下限设 0 即整面关闭（与 sentence_pause 同一退出键形态）")
+
+        # ---------------- G 段：接线顺序 -----------------------------------------
+        i_sent = d_build.find("_enforce_sentence_pauses(")
+        i_punct = d_build.find("_enforce_punctuation_pauses(")
+        i_trim = d_build.find("_trim_intrasentence_silence(")
+        tc.assert_true(-1 < i_sent < i_punct,
+                       "G1 句内强制必须跑在句界之后（段界已补齐的位点不该再动刀）")
+        tc.assert_true(i_punct < i_trim,
+                       "G2 修剪面在插入面之后（顺序反了在旧坐标上剪）")
+        tc.assert_true("entry['pause_intra']" in d_build,
+                       "G3 未命中的场也要落读数：跑了没命中 与 没跑 必须是两个读数")
+
+        # ---------------- H 段：四态裁定 -----------------------------------------
+        import pipeline_runner as pr
+
+        class _StubState:
+            def __init__(self):
+                self.data = {}
+
+        def _mk(verdict_rows, skipped=None, accept=False):
+            r = pr.PipelineRunner.__new__(pr.PipelineRunner)
+            r.state = _StubState()
+            r.accept_pause_untested = accept
+            r._fail = lambda *a, **k: None
+            return r, verdict_rows, (skipped or [])
+
+        r0, rows_fail, _ = _mk([{"measured": True}, {"measured": False}])
+        ok0 = r0._pause_gate_verdict(None, rows_fail, [], [], audit=None)
+        tc.assert_equal([ok0, r0.state.data["pause_gate"]["verdict"]], [False, "FAIL"],
+                        "H1 实测时刻的命中判 FAIL 且不放行")
+        r0.accept_pause_untested = True
+        ok0b = r0._pause_gate_verdict(None, rows_fail, [], [], audit=None)
+        tc.assert_true(not ok0b,
+                       "H2 --accept-pause-untested 救不了 FAIL（放行开关只覆盖未测面）")
+        r1, rows_un, _ = _mk([{"measured": False}])
+        ok1 = r1._pause_gate_verdict(None, rows_un, [], [], audit=None)
+        tc.assert_equal([ok1, r1.state.data["pause_gate"]["verdict"]], [False, "UNTESTED"],
+                        "H3 插值位点判 UNTESTED 且默认阻断")
+        r2, rows_un2, _ = _mk([{"measured": False}], accept=True)
+        ok2 = r2._pause_gate_verdict(None, rows_un2, [], [], audit=None)
+        _rec = r2.state.data["pause_gate"]
+        tc.assert_true(ok2 and _rec.get("decision") == "untested_accepted"
+                       and _rec.get("accept_flag") == "--accept-pause-untested",
+                       f"H4 放行必须留痕到 state（temp 不入 git，报告再透传进 git 面）：{_rec}")
+        r3, _, _ = _mk([])
+        ok3 = r3._pause_gate_verdict(None, [], [], [], audit=None)
+        tc.assert_equal([ok3, r3.state.data["pause_gate"]["verdict"]], [True, "PASS"],
+                        "H5 无命中判 PASS")
+        r4, _, _ = _mk([])
+        r4.tts_enabled = False
+        r4.state = _StubState()
+        ok4 = r4._pause_audit_face()
+        tc.assert_equal([ok4, r4.state.data["pause_gate"]["verdict"]],
+                        [True, "NOT_APPLICABLE"],
+                        "H6 纯 BGM 项目（tts_enabled=false）判不适用，不得因无从审计被拦")
+        r5, _, _ = _mk([])
+        ok5 = r5._pause_gate_verdict("UNTESTED", [], [], ["取数断链：manifest 不在位"], audit=None)
+        tc.assert_true(not ok5 and r5.state.data["pause_gate"]["broken"],
+                       f"H7 取数断链走 UNTESTED 且归因落 state：{r5.state.data['pause_gate']}")
+
+        # ---------------- I 段：候选面与报告透传 ----------------------------------
+        import pause_marks as pm
+        text_i = "酒店分户墙，隔声 65 分贝，怎么选？"
+        abs_rows = [{"scene_id": "1", "punct": "，", "gap": 0.10,
+                     "ctx": "…酒店分户墙，隔声65分贝…", "anchor": "酒店分户墙",
+                     "measured": True},
+                    {"scene_id": "1", "punct": "，", "gap": 0.12,
+                     "ctx": "…户墙，隔声65分贝，怎么…", "anchor": "声65分贝",
+                     "measured": True}]
+        rushed_only = [dict(abs_rows[1])]
+        # I1 用**急促桶为空**的现场：旧形态此时产出 0 条候选（只收急促桶），
+        # 若沿用"两桶都有"的夹具，摘掉 absolute_rows 也照样有建议＝空跑。
+        out_abs_only = npp.emit_declarations(
+            [{"scene_id": 1, "narration": text_i}], [], "", absolute_rows=abs_rows)
+        _n_abs = sum(x.count('"after"') for x in out_abs_only if "建议" in x)
+        tc.assert_equal(_n_abs, 2,
+                        f"I1 只有绝对阈命中时也必须产出候选（旧形态此处为 0）：{out_abs_only}")
+        out_a = npp.emit_declarations(
+            [{"scene_id": 1, "narration": text_i}], rushed_only, "", absolute_rows=abs_rows)
+        out_b = npp.emit_declarations([{"scene_id": 1, "narration": text_i}], rushed_only, "")
+        _n_a = sum(x.count('"after"') for x in out_a if "建议" in x)
+        _n_b = sum(x.count('"after"') for x in out_b if "建议" in x)
+        tc.assert_true(_n_a > _n_b,
+                       f"I2 合并两桶后的候选数须多于只收急促桶（{_n_a} vs {_n_b}）")
+        _dup = npp.emit_declarations([{"scene_id": 1, "narration": text_i}],
+                                     rushed_only, "", absolute_rows=rushed_only)
+        _n_d = sum(x.count('"after"') for x in _dup if "建议" in x)
+        tc.assert_equal(_n_d, _n_b,
+                        f"I3 同一位点入两桶只声明一次（重复声明双倍占用停顿预算）：{_dup}")
+        tc.assert_true('("pause_gate", "pause_gate")' in rep_src.read_text(encoding="utf-8"),
+                       "I4 裁定结论必须进完工报告 data_sources（temp/state 不入 git）")
+        tc.assert_true("accept_pause_untested=args.accept_pause_untested"
+                       in pr_src.read_text(encoding="utf-8"),
+                       "I5 CLI 开关必须接到构造器（否则放行面是条死键）")
+        tc.assert_true("--accept-pause-untested" in _fn_text(pr_src, "main"),
+                       "I6 开关须在 --help 里可见")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("intra_punctuation_pause_enforcement error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_s_block_writer_maintains_both_shapes() -> RegressionTestCase:
+    """用例126：S 块维护侧的两种形态与"维护不了必须出声"（2026-11-06 架构收口②）。
+
+    存在理由（实测，不是推测）：同一份 `var S` 声明在四个消费者处读数不一致——
+    `_gsap_time_utils.parse_scene_map` 与 `adjust_timeline.adjust_s_block` 走 `json.loads`，
+    对**手写 JS 字面量形态**（裸键、单引号）判"没有这份声明"；而
+    `scene_patch_render.extract_scene_times` 的时间源见证按正则扫全脚本 `end:` 字面量，
+    **读得到**它。于是写入侧静默 no-op（不打印、不留痕）、见证侧照旧裁定，
+    某支手写项目每轮被 `S-block-end(66.0) != data-duration(65.6)` 降级全量渲染。
+    普查现网：79 份 index.html 中 JSON 形态 41 份、JS 字面量形态 8 份、无声明 28 份。
+
+    判据落点＝写入侧（`adjust_s_block`）+ 单源解析器（`parse_s_block_array`）。
+    刻意**不动** `parse_scene_map` 的 JSON-only 语义（E2 锁住）：它一旦开始看见 JS 字面量
+    形态，`adjust_timeline` 的时长推导会切到 `s_map['duration'] + total_ext`，而该式与
+    narration 指针式的 `boundaries[-1][1] + offsets[-1] + extensions[-1]` 在
+    "各场扩展量之和"对"末场扩展量"上并不等价——那是音画对齐层面的行为变更，本批不吞。
+    """
+    tc = RegressionTestCase(
+        "s_block_writer_maintains_both_shapes",
+        "验证 S 块维护侧两种形态都可维护、维护不了必出声、改写保留书写形态、权威读侧未被顺手扩面"
+    )
+    try:
+        import ast
+        import inspect
+        import io
+        import re as _re
+        import contextlib
+        from pathlib import Path
+
+        import adjust_timeline as at
+        import _gsap_time_utils as gtu
+        import _script_env
+
+        root = _script_env.ROOT
+        HTML_BASE = root / "程序文件" / "源码" / "hyperframes"
+
+        def _html_sblock(entries):
+            return ("<!DOCTYPE html><html><body><script>var tl = null;\n"
+                    "var S = [" + entries + "];\n</script></body></html>")
+
+        def _run_adjust(entries, boundaries, extensions):
+            html = _html_sblock(entries)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                out, used = at.adjust_s_block(html, boundaries, extensions)
+            return out, used, buf.getvalue()
+
+        BND = [(3.0, 11.0), (11.0, 18.0)]
+        EXT = [1.0, 0.5]
+
+        # ═════════════════════════════════════════════════════════
+        # A. 单源解析器：两种形态各自解析成功，坏形态给 reason 而非静默
+        # ═════════════════════════════════════════════════════════
+        js_lit = ('{ cover: true, start: 0, end: 3.0 },\n'
+                  '  { scene_id: 1, start: 3.0, end: 11.0 },\n'
+                  '  { scene_id: 2, start: 11.0, end: 18.0 }')
+        jsonish = ('{"cover": true, "start": 0, "end": 3.0},\n'
+                   '  {"start": 3.0, "end": 11.0},\n'
+                   '  {"start": 11.0, "end": 18.0}')
+        sc1, r1 = gtu.parse_s_block_array("[" + js_lit + "]")
+        sc2, r2 = gtu.parse_s_block_array("[" + jsonish + "]")
+        tc.assert_true(sc1 is not None and r1 is None, f"A1 JS 字面量形态必须解析成功（{r1}）")
+        tc.assert_true(sc2 is not None and r2 is None, f"A2 JSON 形态照旧解析成功（{r2}）")
+        tc.assert_equal([s.get("start") for s in (sc1 or [])], [0, 3.0, 11.0],
+                        "A3 两种形态解析结果同形（裸键加引号不得改变数值）")
+        bad = '[{start: 3, end: "x"}]'
+        sc3, r3 = gtu.parse_s_block_array(bad)
+        tc.assert_true(sc3 is None and r3, f"A4 非数值 end 必须给 reason，不得返回半截表：{r3}")
+        sc4, r4 = gtu.parse_s_block_array("[{start: 3, end: 11}, ]")
+        tc.assert_true(sc4 is not None, f"A5 尾逗号形态（JS 合法、JSON 非法）须被容错：{r4}")
+
+        # ═════════════════════════════════════════════════════════
+        # B. 写入侧真改写：JS 字面量形态数值按公式移动，且书写形态保留
+        # ═════════════════════════════════════════════════════════
+        outB, usedB, logB = _run_adjust(js_lit, BND, EXT)
+        # 取数正则须同时命中 "end":（JSON 形态）与 end:（JS 字面量形态），否则 B4 会因
+        # 测试侧取不到数而假红——实现是对的，读法是窄的。
+        END_RE = r'\b"?end"?\s*:\s*([\d.]+)'
+        nums = [float(v) for v in _re.findall(END_RE, outB)]
+        tc.assert_true(usedB, "B1 JS 字面量形态判为已维护（旧实现此处静默返回 False）")
+        # 场景1：offset(3.0)=0 → end 11.0+0+1.0=12.0；场景2：offset(11.0)=1.0 → 18.0+1.0+0.5=19.5
+        tc.assert_equal(nums, [3.0, 12.0, 19.5],
+                        f"B2 两场 end 按既有偏移公式移动（封面不动）：{nums}")
+        tc.assert_true("cover: true" in outB and "scene_id: 1" in outB,
+                       "B3 改写后仍是裸键 JS 字面量形态（转成 JSON 会让权威读侧下一轮突然看见它）")
+        tc.assert_true('"' not in outB.split("var S")[1].split("];")[0],
+                       "B3b S 块内不得出现引号化键（形态保留的反向见证）")
+        outB2, usedB2, _ = _run_adjust(jsonish, BND, EXT)
+        nums2 = [float(v) for v in _re.findall(END_RE, outB2)]
+        tc.assert_equal(nums2, [3.0, 12.0, 19.5],
+                        f"B4 JSON 形态读数与 JS 形态逐位相同（两形态同一条公式）")
+
+        # ═════════════════════════════════════════════════════════
+        # C. 维护不了必须出声（旧实现：静默 no-op，读数与"没有这份声明"不可区分）
+        # ═════════════════════════════════════════════════════════
+        outC, usedC, logC = _run_adjust('{start: 3, end: "x"}', BND, EXT)
+        tc.assert_true("[S-BLOCK-UNSYNCED]" in logC,
+                       f"C1 解析失败必须打印归因行（旧实现此处零输出）：{logC[:90]!r}")
+        tc.assert_true("未改写" in logC and "FULL" in logC,
+                       "C2 归因行须同时说明后果（降级全量），否则读的人不知道代价在哪")
+        tc.assert_equal(usedC, False, "C3 未改写时不得回报'已维护'")
+        apostrophe = "{start: 3, end: 11, note: \"it's fine\"}"
+        outC2, usedC2, logC2 = _run_adjust(apostrophe, BND, EXT)
+        tc.assert_true("[S-BLOCK-UNSYNCED]" in logC2,
+                       f"C4 撇号把字符串改坏的形态须归入维护不了并出声：{logC2[:90]!r}")
+        tc.assert_true(outC2 == _html_sblock(apostrophe),
+                       "C5 该形态下 HTML 字节须逐字不变（不猜、不半改）")
+        tc.assert_equal(usedC2, False, "C6 未维护时不得回报'已维护'")
+
+        # C7-C8 T 派生形态：由页面自己从 T 块算出，结构上不会分叉，报它属误报
+        derived = ('{ scene_id: "s0", start: T.s0, end: T.s1, dur: T.s1 - T.s0, type: "cover" },\n'
+                   '  { scene_id: "s1", start: T.s1, end: T.s2, dur: T.s2 - T.s1, type: "content" }')
+        outC3, usedC3, logC3 = _run_adjust(derived, BND, EXT)
+        tc.assert_true("派生" in logC3 and "[S-BLOCK-UNSYNCED]" not in logC3,
+                       f"C7 T 派生形态须走『结构上不会分叉』分支且不得报警：{logC3[:90]!r}")
+        tc.assert_true(outC3 == _html_sblock(derived) and usedC3,
+                       "C8 T 派生形态字节不变，但回报'已处理'（区别于 C6 的未维护）")
+
+        # ═════════════════════════════════════════════════════════
+        # D. 已在位＝正证据，不是"没跑"
+        # ═════════════════════════════════════════════════════════
+        same_entries = ('{ cover: true, start: 0, end: 3.0 },\n'
+                        '  { scene_id: 1, start: 3.0, end: 11.0 },\n'
+                        '  { scene_id: 2, start: 11.0, end: 18.0 }')
+        outD, usedD, logD = _run_adjust(same_entries, BND, [0.0, 0.0])
+        tc.assert_true("已在位" in logD, f"D1 数值本就一致时须打印'已在位'（正证据）：{logD[:90]!r}")
+        tc.assert_true(outD == _html_sblock(same_entries),
+                       "D2 已在位时不得改写字节（否则每轮刷新 mtime 并被指纹读成输入变化）")
+        tc.assert_equal(usedD, True, "D3 已在位仍回报'已维护'（区别于 C3 的未维护）")
+
+        # ═════════════════════════════════════════════════════════
+        # E. 单源与职责边界（接线类判据走 AST，不锚文本）
+        # ═════════════════════════════════════════════════════════
+        src_at = Path(at.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src_at)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "adjust_s_block")
+        called = {getattr(nn.func, "id", "") for nn in ast.walk(fn) if isinstance(nn, ast.Call)}
+        tc.assert_true("classify_s_block_shape" in called,
+                       "E1 adjust_s_block 必须消费单源定形器（不得在写入侧再写一份转换）")
+        _attr_calls = {(getattr(nn.func.value, "id", ""), nn.func.attr)
+                       for nn in ast.walk(fn)
+                       if isinstance(nn, ast.Call) and isinstance(nn.func, ast.Attribute)}
+        tc.assert_true(("json", "loads") not in _attr_calls,
+                       "E2 写入侧不得再留第二条 json.loads 腿（AST 取调用真身，"
+                       "锚源码文本会被本函数 docstring 里的提及洗白——125-M11 同族）")
+        src_gtu = Path(gtu.__file__).read_text(encoding="utf-8")
+        gtree = ast.parse(src_gtu)
+        psm = next(n for n in ast.walk(gtree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "parse_scene_map")
+        psm_calls = {getattr(nn.func, "id", "") for nn in ast.walk(psm) if isinstance(nn, ast.Call)}
+        tc.assert_true("parse_s_block_array" not in psm_calls,
+                       "E3 权威读侧刻意维持 JSON-only：它一旦看见 JS 字面量形态，"
+                       "时长推导会切到 total_ext 那条不等价公式（题旨见本用例 docstring）")
+
+        # ═════════════════════════════════════════════════════════
+        # F. 真实载体：现网所有 S 块声明都可维护 + 本项目 witness 成立
+        # ═════════════════════════════════════════════════════════
+        declared, shapes = [], {"json": 0, "js_literal": 0, "derived_from_t": 0,
+                                "unparsable": []}
+        for h in sorted(HTML_BASE.glob("*/index.html")):
+            txt = h.read_text(encoding="utf-8", errors="replace")
+            m = _re.search(r'var\s+S\s*=\s*(\[[\s\S]*?\])\s*;', txt)
+            if not m:
+                continue
+            declared.append(h.parent.name)
+            shape, _sc, reason = gtu.classify_s_block_shape(m.group(1))
+            if shape == "unparsable":
+                shapes["unparsable"].append(f"{h.parent.name}: {reason}")
+            else:
+                shapes[shape] += 1
+        if export_repo_face(tc) == "dev":
+            tc.assert_true(len(declared) >= 1, f"F1 普查有对象（{len(declared)} 份声明 S 块）")
+            tc.assert_equal(shapes["unparsable"], [],
+                            f"F2 现网每份 S 块声明都落在可维护或可派生形状内"
+                            f"（不可解析即静默漏维护）：{shapes['unparsable']}")
+            tc.assert_equal(shapes["json"] + shapes["js_literal"] + shapes["derived_from_t"],
+                            len(declared),
+                            "F2b 三形状之和等于声明份数（漏归一档即 F2 恒真）")
+            tc.assert_true(shapes["js_literal"] >= 1,
+                           f"F3 JS 字面量形态在现网确有对象（否则 B 组只活在夹具上）："
+                           f"{shapes['js_literal']} 份")
+            tc.assert_true(shapes["derived_from_t"] >= 1,
+                           f"F4 T 派生形态在现网确有对象（否则 C7 只活在夹具上）："
+                           f"{shapes['derived_from_t']} 份")
+            tc.assert_true(len(declared) < 79,
+                           "F5 无声明的项目确实存在（本仓两条合法路线之一，不得判缺）")
+
+            # 样本人选按**属性**取，不写业务项目名（导出面禁业务 slug；钉名字还会让
+            # 公开面必然红——那里没有业务项目）。判据被摘时 jl 为空，F7/F8/F9 仍逐条执行，
+            # 保证断言条数与数据无关（否则变异引擎会把截断判成 CRASH）。
+            jl = []
+            for h in sorted(HTML_BASE.glob("*/index.html")):
+                txt = h.read_text(encoding="utf-8", errors="replace")
+                mm = _re.search(r'var\s+S\s*=\s*(\[[\s\S]*?\])\s*;', txt)
+                if not mm:
+                    continue
+                sh, _sc, _r = gtu.classify_s_block_shape(mm.group(1))
+                if sh == "js_literal":
+                    jl.append((h, txt, mm))
+            _f, demo, m = jl[0] if jl else (None, "", None)
+            shape, scenes, reason = (None, None, "无对象")
+            if m is not None:
+                shape, scenes, reason = gtu.classify_s_block_shape(m.group(1))
+            tc.assert_equal(shape, "js_literal",
+                            f"F7 样本（按属性取样）正是本批修复的那一档形态（实得 {shape}）")
+            tc.assert_true(scenes is not None, f"F8 样本 S 块可解析（{reason}）")
+            consistent = 0
+            for _ff, _tt, _mm in jl:
+                _sh, _ss, _ = gtu.classify_s_block_shape(_mm.group(1))
+                _ends = [float(x.get("end", 0)) for x in (_ss or [])]
+                _dd = _re.search(r'data-duration="([\d.]+)"', _tt)
+                if _ends and _dd and abs(max(_ends) - float(_dd.group(1))) <= 0.05:
+                    consistent += 1
+            tc.assert_true(consistent >= 1,
+                           f"F9 末场 end 与 data-duration 一致的 JS 字面量项目 "
+                           f"{consistent}/{len(jl)} 份（分类器见证成立，不再每轮降级）")
+        else:
+            tc.assert_true(len(declared) >= 1,
+                           f"F6 公开面夹具声明 S 块 {len(declared)} 份")
+            tc.assert_true(shapes["js_literal"] == 0,
+                           f"F6b 公开面夹具不含 JS 字面量形态（{dict(shapes)}）："
+                           "该形态的现网读数只在开发面可取")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("s_block_writer_maintains_both_shapes error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_presence_check_names_dead_blocks() -> RegressionTestCase:
+    """用例127：内容在场判据（死块）——判据在 Python，取数腿可桩，永不阻断（2026-11-06 架构收口①）。
+
+    存在理由：`_修订01` 六维审计与终检全绿，成片里却有 60 处内容从未出现。7b 形态③ 补住了
+    「CSS 置 0 ＋ 只有 `tl.from()`」这一种写法，但同类形态是开放集合（`display:none` 从未抬起、
+    揭示锚落在场外、类名切换由永不触发的分支承担）。本件量通用面：seek 到该场各时刻，实测
+    承载内容的元素有没有出现过。
+
+    两条判据面都是实测换来的，本用例把它们当作**回归见证**锁住，而不是当注释留下：
+      1. **整场多点采样并取各点峰值**——场末单点会把「浮现后即淡出」的序列标注
+         （`acoustic-wall-structure-craft` 的 `#s6-f1/f2`，已交付且验收通过）读成缺席，
+         占比 0.155；取最小值则会把「先隐后显」的正常揭示整体读成缺席（本批第一次回归即此，
+         真项目当场报出 16 个死块）。
+      2. **判据对象是"极大且全部缺席的内容块"，不是缺席元素数**——步骤行旁的 `✓` 承载内容
+         后代数为 1，结构上不入判；把非内容节点也计进缺席会造出 `div.sc 16/16` 这种
+         满屏可见却报整块空白的假死块。
+    """
+    tc = RegressionTestCase(
+        "presence_check_names_dead_blocks",
+        "验证死块判据的采样语义、极大性、四态归因、不阻断接线与 JS/Python 分工"
+    )
+    try:
+        import ast
+        import re
+        import tempfile
+        from pathlib import Path
+
+        import presence_check as pc
+        import _gate_status as gs
+        import _script_env
+
+        root = _script_env.ROOT
+        HTML_BASE = root / "程序文件" / "源码" / "hyperframes"
+        saved_rows = pc.probe_rows
+
+        def N(label, content, parent, peak):
+            return {"l": label, "c": 1 if content else 0, "p": parent, "o": peak}
+
+        def adj(nodes, scene="s1"):
+            return pc.adjudicate_scene({"scene": scene, "samples": 6, "nodes": nodes})
+
+        # ═════════════════════════════════════════════════════════
+        # A. 判据核心：什么是死块，什么不是
+        # ═════════════════════════════════════════════════════════
+        # 结构：0=场景容器(非内容) → 1=卡片(非内容) → 2,3=卡片内两行文字(全缺席)
+        #                          → 4=另一行可见正文
+        nodesA = [N("root", False, -1, 1.0), N("#grid", False, 0, 0.0),
+                  N(".c1", True, 1, 0.0), N(".c2", True, 1, 0.0),
+                  N(".body", True, 0, 1.0)]
+        rA = adj(nodesA)
+        tc.assert_equal(rA["dead_blocks"], 1, f"A1 整块缺席须点名（实得 {rA['dead_blocks']}）")
+        tc.assert_equal(rA["dead_labels"], ["#grid 2/2"],
+                        f"A1b 点名落在卡片本身：{rA['dead_labels']}")
+        tc.assert_equal(rA["absent"], 2,
+                        f"A1c 缺席只数内容元素（.c1/.c2），祖先重复不得计入：{rA['absent']}")
+        tc.assert_equal(rA["total"], 3,
+                        f"A1d 承载内容元素总数同样按叶子计：{rA['total']}")
+        # 冗余标记：一行文字旁少个角标——观众看到的是内容在、标记没亮
+        nodesB = [N("root", False, -1, 1.0), N(".bd", False, 0, 1.0),
+                  N("p.t", True, 1, 1.0), N("span.done", True, 1, 0.0)]
+        rB = adj(nodesB)
+        tc.assert_equal(rB["dead_blocks"], 0,
+                        f"A2 单元素缺席不成块（已验收交付即此形态）：{rB['dead_labels']}")
+        tc.assert_equal(rB["absent"], 1, "A2b 缺席读数仍在（描述面不得被裁掉）")
+        tc.assert_equal(rB["absent_labels"], ["span.done"],
+                        f"A2c 描述面点名到该标记：{rB['absent_labels']}")
+        # 峰值语义：只要某一刻达到可见即算在场
+        rC = adj([N("root", False, -1, 1.0), N("#s6-f1", False, 0, 0.8),
+                  N("p", True, 1, 0.8)])
+        tc.assert_equal(rC["absent"] + rC["dead_blocks"], 0,
+                        "A3 曾出现即在场（取最小值会把先隐后显读成缺席）")
+        rD = adj([N("root", False, -1, 1.0), N("div.ghost", True, 0, 0.014)])
+        tc.assert_equal(rD["absent"], 0,
+                        "A4 刻意压暗的装饰层不算缺席（阈贴近 0 而非 0.05）")
+        # 极大性：外层与内层同判时只报外层
+        nodesE = [N(".grid", False, -1, 0.0), N(".card", False, 0, 0.0),
+                  N(".t", True, 1, 0.0), N(".d", True, 1, 0.0), N(".u", True, 0, 0.0)]
+        rE = adj(nodesE)
+        tc.assert_equal(rE["dead_blocks"], 1,
+                        f"A5 嵌套死块只报最外层一次：{rE['dead_labels']}")
+        tc.assert_equal(rE["dead_labels"], [".grid 3/3"],
+                        "A5b 报的是外层栅格而非卡片（内层被外层归属，重复报即重复计）")
+        # 非内容节点不得计入缺席——JS 初版把它们的初始 _dead 一并累加，
+        # 实测让零缺席的真项目报出 div.sc 16/16。
+        nodesF = [N("root", False, -1, 1.0), N("div.wrap", False, 0, 0.0),
+                  N("div.a", False, 1, 0.0), N("div.b", False, 1, 0.0),
+                  N("p.x", True, 2, 1.0), N("p.y", True, 3, 1.0)]
+        rF = adj(nodesF)
+        tc.assert_equal(rF["dead_blocks"] + rF["absent"], 0,
+                        f"A6 非内容包装层不得被累加成死块：{rF['dead_labels']}")
+
+        # 样本按**属性**取样：取第一份「能解析出 T 块」的 index.html，不写业务项目名
+        # （发布面脱敏门禁 project_slug 层禁业务 slug；钉名字还会让公开面必然红）。
+        from _gsap_time_utils import parse_t_block as _ptb
+        demo, wins = None, None
+        for _h in sorted(_script_env.HTML_BASE.glob("*/index.html")):
+            _w = pc.scene_windows(_h)
+            if _w:
+                demo, wins = _h, _w
+                break
+        tc.assert_true(demo is not None,
+                       "B0 现网有可解析 T 块的项目（样本按属性取，不写项目名）")
+
+        # ═════════════════════════════════════════════════════════
+        # B. 项目级四态与取数断链点名
+        # ═════════════════════════════════════════════════════════
+        rB1 = pc.adjudicate([{"scene": "s1", "samples": 6,
+                              "nodes": [N("#g", False, -1, 0.0), N("a", True, 0, 0.0),
+                                        N("b", True, 0, 0.0)]}])
+        tc.assert_equal(rB1["status"], gs.PASS,
+                        "B1 有死块仍判 PASS——本件只点名，升格条件不由这里发明")
+        tc.assert_equal(rB1.get("note"), "named_not_adjudicated",
+                        "B1b 点名态必须留独立读数，不得与'干净'同形")
+        rB2 = pc.adjudicate([{"scene": "s1", "error": "scene-root-not-found"},
+                             {"scene": "s2", "samples": 6, "nodes": [N("p", True, -1, 1.0)]}])
+        tc.assert_equal(rB2["status"], gs.UNTESTED, "B2 有未判场即 UNTESTED（不得读成干净）")
+        tc.assert_equal(len(rB2["scenes"]), 1, "B2b 其余场照常裁定")
+        tc.assert_true("s1: scene-root-not-found" in rB2["untested"][0],
+                       f"B2c 点名到具体场次与原因：{rB2['untested']}")
+        rB3 = pc.adjudicate([{"scene": "s1", "samples": 4, "nodes": [N("div", False, -1, 0.0)]}])
+        tc.assert_equal(rB3["status"], gs.NOT_APPLICABLE, "B3 无内容元素判 N/A 而非 PASS")
+        rB4 = pc.adjudicate([{"scene": "s3", "error": "window-too-narrow", "span": 0.5}])
+        tc.assert_true("window-too-narrow" in rB4["untested"][0],
+                       f"B4 窗口过窄点名，不静默丢场：{rB4['untested']}")
+        linesB5 = "".join(pc.format_lines(rB1))
+        tc.assert_true("WARN" in linesB5 and "#g 2/2" in linesB5,
+                       f"B5 文案单源：点名态出 WARN 与块标签：{linesB5[:90]!r}")
+        tc.assert_true("N/A" not in linesB5 and "死块 0" not in linesB5,
+                       "B5b 点名态不得被拼成干净读数")
+        try:
+            pc.probe_rows = lambda chrome, probe: [{"error": "probe-no-marker"}]
+            rB6 = pc.measure(demo)
+        finally:
+            pc.probe_rows = saved_rows
+        tc.assert_equal(rB6["status"], gs.UNTESTED,
+                        "B6 探针无输出判未测（取数断链不得短路成干净）")
+        tc.assert_true(rB6["untested"] == ["probe-no-marker"],
+                       f"B6b 断链原因逐条点名：{rB6['untested']}")
+
+        # ═════════════════════════════════════════════════════════
+        # C. 窗口腿：时间源单取 T 块，不取 narration.json
+        # ═════════════════════════════════════════════════════════
+        tc.assert_true(wins is not None, "C1 样本窗口取自 T 块")
+        _tb = _ptb(demo.read_text(encoding="utf-8", errors="replace")) if demo else {}
+        _exp = (_tb.get(1), _tb.get(2)) if (_tb.get(1) is not None
+                                           and _tb.get(2) is not None) else None
+        tc.assert_equal(wins.get("s1") if wins else None, _exp,
+                        f"C1b 首场窗口逐字等于 T 块相邻两键："
+                        f"{(wins or {}).get('s1')} vs {_exp}")
+        keys = sorted(int(k[1:]) for k in wins if k != "s0")
+        tc.assert_equal(len(keys), len([k for k in wins if k != "s0"]),
+                        "C1c T 块键与窗口一一对应（不重复计封面）")
+        tmp = Path(tempfile.mkdtemp(prefix="presence_case_"))
+        (tmp / "noT.html").write_text(
+            "<html><body><div data-duration='20'>x</div></body></html>", encoding="utf-8")
+        tc.assert_equal(pc.scene_windows(tmp / "noT.html"), None,
+                        "C2 无 T 块即 None（没有窗口坐标系可 seek）")
+        rC2 = pc.measure(tmp / "noT.html")
+        tc.assert_equal(rC2["status"], gs.UNTESTED, "C2b 无 T 块判未测而非跳过")
+        tc.assert_true("no-t-block" in rC2["untested"][0],
+                       f"C2c 归因点名到时间源：{rC2['untested']}")
+        (tmp / "noDur.html").write_text(
+            "<html><body><script>var T = { s1: 3.0 };</script></body></html>", encoding="utf-8")
+        tc.assert_equal(pc.scene_windows(tmp / "noDur.html"), None,
+                        "C3 有 T 块但末场无终点亦 None（不猜末场长度）")
+        nover = sorted(HTML_BASE.glob("*/index.html"))
+        with_t, without_t = 0, 0
+        for h in nover:
+            (with_t, without_t) = (with_t + 1, without_t) if pc.scene_windows(h) \
+                else (with_t, without_t + 1)
+        # 两态"各有对象"是开发面的读数；公开面只有两组夹具，其中一份无 T 块的夹具
+        # 并不存在（也不该为过测而造），故公开面只钉"至少一份可解析"，读数据实印出。
+        if export_repo_face(tc) == "dev":
+            tc.assert_true(with_t >= 1 and without_t >= 1,
+                           f"C4 两态在现网各有对象（有 T 块 {with_t} 份／无 {without_t} 份），"
+                           f"否则 B/C 两组的某一侧只活在夹具上")
+        else:
+            tc.assert_true(with_t >= 1,
+                           f"C4 公开面夹具至少一份有 T 块（有 {with_t} 份／无 {without_t} 份）")
+
+        # ═════════════════════════════════════════════════════════
+        # D. JS/Python 分工：阈值与裁定不得住在页内
+        # ═════════════════════════════════════════════════════════
+        js = pc.PROBE_SCRIPT
+        tc.assert_true("0.0005" not in js and "INVISIBLE_MAX" not in js,
+                       "D1 阈值不住页内：不可见判据只在 Python 侧比较（bar_overflow 同纪律）")
+        tc.assert_true("if (o > peaks[j2]) peaks[j2] = o;" in js,
+                       "D2 采样聚合方向锚语句本体：取峰值。写成取最小即本批第一次回归")
+        tc.assert_true("nodes[j3].o = peaks[j3];" in js,
+                       "D2b 峰值须真写进载荷，否则 Python 收到空读数")
+        # 取数必须带边界：裸子串会被超串洗白（变异把 `{l:` 改成 `{sel:` 后
+        # "l: el.id" 仍是 "sel: el.id" 的子串，首版 D3 因此存活——127-M11 留痕）。
+        for pat, key in ((r"\{l:\s*el\.id", "l"), (r",\s*c:\s*content \? 1 : 0", "c"),
+                         (r",\s*p:\s*p\}", "p"), (r"nodes\[j3\]\.o = peaks\[j3\]", "o")):
+            tc.assert_true(re.search(pat, js) is not None,
+                           f"D3 载荷键 {key} 的赋值语句在位（带边界取数）——JS 改名即断链")
+        fn_pc = next(n for n in ast.walk(ast.parse(
+            Path(pc.__file__).read_text(encoding="utf-8")))
+            if isinstance(n, ast.FunctionDef) and n.name == "adjudicate_scene")
+        # 两种消费形制都要纳入：下标 `n["l"]` 与带默认的 `n.get("p", -1)`。
+        # 只认前者会把"实现其实在消费"读成"没消费"——取数面窄于实现即假红（126-B4 同族）。
+        consumed = {n.slice.value for n in ast.walk(fn_pc)
+                    if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+                    and isinstance(n.slice.value, str)}
+        consumed |= {c.args[0].value for c in ast.walk(fn_pc)
+                     if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                     and c.func.attr == "get" and c.args
+                     and isinstance(c.args[0], ast.Constant)
+                     and isinstance(c.args[0].value, str)}
+        tc.assert_true({"l", "c", "p", "o"} <= consumed,
+                       f"D3b Python 侧确实按这四个键消费载荷（AST 取下标，锚文本会被"
+                       f"docstring 洗白）：{sorted(consumed)}")
+        tc.assert_equal(pc.sample_count(2.0), pc.MIN_SAMPLES, "D4 短窗下夹（少于 4 点会漏瞬时在场）")
+        tc.assert_equal(pc.sample_count(30.0), pc.MAX_SAMPLES, "D4b 长窗上夹（点数只线性加时）")
+        tc.assert_equal(pc.sample_count(5.0), 10, "D4c 中窗按 2 点/秒")
+
+        # ═════════════════════════════════════════════════════════
+        # E. 接线与"永不阻断"
+        # ═════════════════════════════════════════════════════════
+        pr_path = Path(_script_env.ROOT) / "程序文件" / "脚本" / "pipeline_runner.py"
+        tree = ast.parse(pr_path.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_presence_note")
+        fsrc = ast.dump(fn)
+        tc.assert_true("presence_check.py" in fsrc, "E1 接线：runner 指名调本脚本")
+        tc.assert_true("--json" in fsrc, "E1b 以 --json 取数（文案单源在 format_lines）")
+        tc.assert_true("format_lines" in fsrc, "E1c 日志行复用脚本侧拼装，不另写一份")
+        tc.assert_true("mark_failed" not in fsrc,
+                       "E2 永不阻断：函数体内不得出现失败出口")
+        returns_false = [n for n in ast.walk(fn) if isinstance(n, ast.Return)
+                         and isinstance(n.value, ast.Constant) and n.value.value is False]
+        tc.assert_equal(len(returns_false), 0, "E2b 亦不得以 return False 中止渲染链")
+        rec = ast.unparse(fn).count("self._record_presence(")
+        tc.assert_true(rec >= 3, f"E3 三态均留痕（通过路径不静默），实得 {rec} 处调用")
+        runner_cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
+                          and n.name == "PipelineRunner")
+        render_inputs = ""
+        for n in ast.walk(runner_cls):
+            if isinstance(n, ast.FunctionDef) and n.name == "_step_inputs":
+                render_inputs = ast.unparse(n)
+        tc.assert_true("presence_check.py" not in render_inputs,
+                       "E4 刻意不进 render 登记面：登记即'改判据文案'作废一次全量渲染缓存"
+                       "（判据摘掉即红：把本件接进登记腿即转红）")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("presence_check_names_dead_blocks error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
 

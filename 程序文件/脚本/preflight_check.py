@@ -1304,6 +1304,78 @@ def check_scene_visibility(html_path: Path, r: PreflightResult):
         r.ok(f"Scene visibility: {len(visible_scenes)} scenes have visible initial state or GSAP entrance")
 
 
+def _gsap_stmt_block(text, brace_at):
+    """返回从 brace_at 起的 `{...}` 内部文本；括号不配平返回 None（该语句不采信）。"""
+    depth = 0
+    i = brace_at
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_at + 1:i]
+        elif ch in "\"'":
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                i += 1
+        i += 1
+    return None
+
+
+_GSAP_STMT_RE = re.compile(
+    r"\b[A-Za-z_$][\w$.]*\.(fromTo|from|to|set)\(\s*(['\"])([^'\"]+)\2\s*,")
+
+
+def _gsap_reveal_index(scripts):
+    """按**语句**给选择器分箱，返回 (揭示选择器, from 选择器, 已归类选择器)。
+
+    存在理由：check_element_reveal 的取数面按设计取宽（凡像选择器的字符串字面量全纳入），
+    宽取数只能否证"没有任何揭示"，不能确证"这条 tween 会揭示"。形态③问的恰是后者
+    ——命中的那条 tween 到底能不能把元素抬起来——所以必须把取数面收窄到语句级。
+    收窄带来的假阳风险由第三条返回值兜住：宽取数里**归不进任何语句**的选择器（自定义
+    转场封装、forEach 回调、动态拼接）对相应元素投否决票，宁漏判不错杀。
+
+    揭示判据：to/set 的 vars、fromTo 的**第二个** vars 里出现 opacity 非零或 clearProps。
+    from 恒不列入揭示——它的终值就是元素自然值，CSS 写 0 即停在 0。
+
+    第三条返回值是**出现次数** Counter 而非集合：同一枚选择器字面量可以既出现在 `tl.from`
+    里、又出现在本函数认不出的封装调用里（用例92 O8 夹具即此形态）。按集合比会把后一次
+    引用抹掉，"这条引用我归不进语句"的否决票当场丢失，判据就从"宁漏判不错杀"翻成错杀。
+    vars 块解析不出来（括号不配平）同样**不计数**——解析失败等于这条语句我没读懂，
+    读懂的部分才配得上"已归类"。
+    """
+    reveal, froms, stmt_counts = set(), set(), {}
+    for m in _GSAP_STMT_RE.finditer(scripts):
+        kind, sel = m.group(1), m.group(3)
+        brace = scripts.find("{", m.end())
+        if brace < 0:
+            continue
+        first = _gsap_stmt_block(scripts, brace)
+        if first is None:
+            continue
+        stmt_counts[sel] = stmt_counts.get(sel, 0) + 1
+        if kind == "fromTo":
+            second_at = scripts.find("{", brace + len(first) + 2)
+            second = _gsap_stmt_block(scripts, second_at) if second_at >= 0 else None
+            if second is None:
+                continue
+            body = second
+        elif kind == "from":
+            froms.add(sel)
+            continue
+        else:
+            body = first
+        if (re.search(r"opacity\s*:\s*(?:[1-9]|0\.\d)", body)
+                or re.search(r"visibility\s*:\s*visible", body)
+                or "clearProps" in body):
+            reveal.add(sel)
+    return reveal, froms, stmt_counts
+
+
 def check_element_reveal(html_path: Path, r: PreflightResult):
     """CRITICAL (元素级): 初始隐藏的元素必须有入场语句**命中它自己**。
 
@@ -1314,16 +1386,25 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
       CSS `.rv{opacity:0}` 挂在**容器**上，入场 tween 写成 `#容器 .chip`
       → 父层 opacity 恒 0，子元素再亮也不显示，整块内容在成片里永久不可见。
 
-    判据（零阈值，不依赖像素/采样，故不存在"标定"问题）。**只阻断形态①**：
+    判据（零阈值，不依赖像素/采样，故不存在"标定"问题）。**阻断形态①与形态③**：
 
       ① 元素 N 初始隐藏、无 tween 命中 N、但 N 的**后代**被 tween 命中 → ERROR
       ② 元素 N 初始隐藏、N 与其后代都没有 tween 命中 → WARN（不阻断）
+      ③ 元素 N 初始隐藏、命中它的**只有** `from()`（无任何 to/fromTo/set 把它的
+         opacity 抬到非零）→ ERROR。from 的终值＝元素自然值，CSS 写 0 即永远停在 0，
+         "有入场语句"在这里是假象。2026-11-06 `_修订01` 实证：60 处初始隐藏元素全部
+         不可见、成片像素面中位 0.055，而六维审计与终检全绿——门禁不量"内容是否在场"。
 
     为何只阻断①：它问的是**结构关系**（容器出现在选择器的祖先段、却从未作为末段被命中），
     与"认得哪个 GSAP API"无关；取数面按第 2 步说明取宽，宽取数只会让判据漏判、不会错杀。
     ②由"什么都没找到"这一否定证据支撑，而本仓揭示路径是开放集合（`forEach(el => …)`、
     自定义转场封装、动态拼接选择器），把"我没找到"读成"不存在"即 A06 同族误杀 ——
     全仓 64 份 index.html 首次普查因该形态误报 10 份，故它只报不拦。
+    ③问的是肯定证据（这条 tween 确实揭示不了它），故取数面**必须**收窄到语句级
+    （`_gsap_reveal_index`）；收窄的假阳风险由"宽取数里归不进任何语句的选择器"投否决票兜住。
+    误杀面实测（2026-11-06 全仓 79 份 index.html）：1660 处初始隐藏元素 × 328 个
+    from+opacity 选择器，交集 **0**；同一判据在本项目修复前的字节上命中 59 处——
+    区分力与零误杀同时成立，故升为 ERROR。
 
     两条限定（不是排除）：
       · **场景根（带 data-scene-id）一并参与**。曾把它排除、理由是"整场可见性归
@@ -1373,7 +1454,9 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
 
     if not hidden_classes and not hidden_ids:
         r.counts["element_reveal"] = {"hidden": 0, "scene_root_hidden": 0,
-                                      "blocked_container": 0, "no_entrance": 0}
+                                      "blocked_container": 0, "no_entrance": 0,
+                                      "from_only": 0, "reveal_statements": 0,
+                                      "unclassified_selectors": 0}
         r.ok("无初始隐藏元素（CSS 未声明 opacity:0 / visibility:hidden 的类或 id 规则）",
              check_id="element_reveal")
         return
@@ -1393,7 +1476,9 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
     if not selectors:
         r.counts["element_reveal"] = {"acquisition_broken": True,
                                       "hidden": -1, "scene_root_hidden": -1,
-                                      "blocked_container": -1, "no_entrance": -1}
+                                      "blocked_container": -1, "no_entrance": -1,
+                                      "from_only": -1, "reveal_statements": -1,
+                                      "unclassified_selectors": -1}
         r.error(f"CSS 声明了 {len(hidden_classes | hidden_ids)} 个初始隐藏选择器，"
                 f"但脚本里一个 GSAP 目标都取不到 —— 本判据无从核对，按缺陷处理",
                 check_id="element_reveal")
@@ -1487,7 +1572,9 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
     hidden_nodes = [n for n in nodes if _hidden(n)]
     if not hidden_nodes:
         r.counts["element_reveal"] = {"hidden": 0, "scene_root_hidden": 0,
-                                      "blocked_container": 0, "no_entrance": 0}
+                                      "blocked_container": 0, "no_entrance": 0,
+                                      "from_only": 0, "reveal_statements": 0,
+                                      "unclassified_selectors": 0}
         r.ok(f"CSS 声明了隐藏选择器，但无元素受它约束（{len(nodes)} 个元素）",
              check_id="element_reveal")
         return
@@ -1505,6 +1592,32 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
     def _label(n):
         cls = "." + ".".join(sorted(n.classes)) if n.classes else ""
         return f"#{n.id}{cls}" if n.id else f"<{n.tag}{cls}>"
+
+    # 形态③：命中它的**只有** tl.from()。from 的终值＝元素自然值，CSS 里写死 0 就永远
+    # 停在 0——2026-11-06 _修订01 即此形态（60 处初始隐藏元素全部不可见，成片像素面中位
+    # 0.055，而六维审计与终检全绿：门禁不量"内容是否在场"）。该形态在形态①的盲区里，
+    # 因为元素**确实被** tween 命中了（hit 为真），只是命中的那条揭示不了它。
+    reveal_sels, from_sels, stmt_counts = _gsap_reveal_index(scripts)
+    wide_counts = {}
+    for _s in selectors:
+        wide_counts[_s] = wide_counts.get(_s, 0) + 1
+    unclassified = [s for s, c in wide_counts.items() if c > stmt_counts.get(s, 0)]
+    from_only = [
+        n for n in hidden_nodes
+        if any(_matches(s.split(), n) for s in from_sels)
+        and not any(_matches(s.split(), n) for s in reveal_sels)
+        and not any(_matches(s.split(), n) for s in unclassified)
+    ]
+    for n in from_only[:12]:
+        r.error(
+            f"{_label(n)} 初始隐藏（CSS opacity:0/visibility:hidden），而命中它的只有 tl.from(...) "
+            f"—— from 的终值就是元素的自然值 0，等于从未出现。修法：改写成 "
+            f"tl.fromTo(同一选择器, {{起始态}}, {{opacity: 1, …, duration: …}}, 时刻)，"
+            f"或摘掉该元素上的初始隐藏类",
+            check_id="element_reveal")
+    if len(from_only) > 12:
+        r.error(f"另有 {len(from_only) - 12} 处同形态（只有 from() 命中的初始隐藏元素）未逐条点名",
+                check_id="element_reveal")
 
     for n in blocked_container:
         r.error(
@@ -1526,9 +1639,13 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
         "scene_root_hidden": sum(1 for n in hidden_nodes if n.scene_root),
         "blocked_container": len(blocked_container),
         "no_entrance": len(no_entrance),
+        "from_only": len(from_only),
+        "reveal_statements": len(reveal_sels),
+        "unclassified_selectors": len(unclassified),
     }
-    if not blocked_container:
-        r.ok(f"{len(hidden_nodes)} 处初始隐藏元素无「容器隐藏·入场只打子元素」形态"
+    if not blocked_container and not from_only:
+        r.ok(f"{len(hidden_nodes)} 处初始隐藏元素无「容器隐藏·入场只打子元素」与"
+             f"「只有 from() 命中」两种形态"
              f"（{len(no_entrance)} 处未找到 GSAP 目标，仅告警不阻断）",
              check_id="element_reveal")
 

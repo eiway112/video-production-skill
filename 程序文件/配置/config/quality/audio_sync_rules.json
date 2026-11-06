@@ -46,6 +46,11 @@
     "min_seconds": 0.4,
     "description": "段间停顿强制（enhance_video_audio._enforce_sentence_pauses）：TTS 引擎整段合成时句间停顿由内部韵律决定（skill-promo 实测同段音频句号停顿 0~0.38s 浮动，甚至为 0），标点不构成可靠控制面（2026-10-13 限定：该句只描述**不改文本**时的引擎行为——引擎侧另有 `<break>` 声明面，见 pause_declaration；实测仅改标点确实不产生停顿增益，把三处顿号/分号升级为句号后同位点读数 0.36/0.40/0.30 → 0.38/0.34/0.34）。以 ASR 强制对齐段级时间戳度量相邻字幕段声学间隔，不足 min_seconds 时在边界最低能量点插入差额静音并平移后续时间戳。设 0 可关闭。"
   },
+  "intra_pause_enforce": {
+    "enabled_by_default": true,
+    "min_seconds": 0.25,
+    "description": "句内标点停顿强制（enhance_video_audio._enforce_punctuation_pauses，2026-11-06 机制批）。存在理由是跨项目读数而非单片症状：段间停顿自 2026-07-28 有强制后，六支项目 429 个段间位点零未达标；同批数据里**段内标点**位点 43 个低于 narration_prosody_rules.pause_measurement.audible_floor_seconds（0.2s），其中大量实测 0.00s（用户点名的『翻图集、约 3 个专业』即此形态），每支项目都有。差别不在引擎，在有没有接进生效路径——_split_text_to_segments 只在 。？！； 处切段，逗号/顿号/冒号结构上不是段界，段间面永远看不见它们。位点识别与点名侧共用 narration_pause_precheck.punctuation_gap_rows 单源（两处各算即两份真相，与 intra_pause.classify_points 同族）。min_seconds 取 0.25 而非 0.2：高于可听阈使补齐后的位点不再被点名，同时低于段间 0.4 以保持\"句内弱于句间\"的自然停顿层级。只在两侧字符 ASR matched=1（实测时刻）时动刀——插值时刻是虚构坐标，在它上面插静音等于把刀落进字里；这类位点计入 interpolated，由裁定侧按未测归因而非漏治。缺省开的理由与 intra_pause_trim 缺省关相反：修剪面替作者删已合成波形（不可逆、改写不可预期），本面只在实测位点上补静音（可检出、幂等、与段间面同机制），代价是片长增长，由时长预算门禁照常裁定。退出面：项目可声明 intra_pause_enforce.enabled=false 关闭，声明了节却没写 enabled 即退出码非零（与修剪面同一 fail-loud 守卫）。波形代次戳记 v3+intra（见 enhance_video_audio.PAUSE_INTRA_SUFFIX）——关掉时旧波形里已插入的静音无法原地检出删除，只有从原始 TTS 重建才拿得到没有这些停顿的那份波形。刻意不入 align_algo_ver：强制面每轮必检（含缓存命中），写进算法版本只会让全仓白跑一次本地重对齐。"
+  },
   "pause_declaration": {
     "enabled_by_default": false,
     "engines": [

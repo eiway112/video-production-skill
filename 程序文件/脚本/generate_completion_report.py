@@ -514,6 +514,34 @@ def _ch_format(m):
     return _ch.format_line(m)
 
 
+def _transition_face(project_name):
+    """转场面（描述面）的**取数接线**：判据真身与文案单源住 transition_overlap_census。
+
+    与 choreography 同判据：只依赖 HTML，故放在"成片不在位"分支之外。
+    """
+    try:
+        import transition_overlap_census as _tr
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"transition_overlap_census 模块取不回（{type(e).__name__}）"}
+    if not project_name:
+        return {"untested": "未传 --project-name，无从定位 HTML 项目目录（paths.html_project）"}
+    try:
+        from _script_env import HTML_BASE
+        html = Path(HTML_BASE) / str(project_name) / "index.html"
+    except Exception as e:                              # noqa: BLE001
+        return {"untested": f"HTML_BASE 取不回（{type(e).__name__}）"}
+    return _tr.measure(str(html))
+
+
+def _tr_format(m):
+    try:
+        import transition_overlap_census as _tr
+    except Exception:                                   # noqa: BLE001
+        # 独立前缀：接线断了 ≠ 跑过但取不到数（同 _fo_format／_ch_format 的理由）。
+        return "[TRANSITION-DISCONNECTED] 文案生成点取不回（transition_overlap_census 不可导入）"
+    return _tr.format_line(m)
+
+
 def ffprobe_get_metadata(video_path: str) -> Dict[str, Any]:
     """使用 ffprobe 获取视频元数据"""
     try:
@@ -758,6 +786,12 @@ def generate_report(
     # （放里面＝把只依赖 HTML 的面挂到视频在位性上，属取数断链）。
     report["data_sources"]["choreography"] = _choreography_face(project_name)
     print("  " + _ch_format(report["data_sources"]["choreography"]))
+
+    # 转场重叠（描述面，2026-11-06 转场双曝线）：只出数、不裁定、不进 issues、不进退出码。
+    # 与上一面同判据放在"成片不在位"分支之外——本面只依赖 HTML。判据真身与文案单源
+    # 住 transition_overlap_census.py，本处只接线；取数断链按点名处理。
+    report["data_sources"]["transition_overlap"] = _transition_face(project_name)
+    print("  " + _tr_format(report["data_sources"]["transition_overlap"]))
 
     # 数据源2：字幕文件
     if subtitle_file:
@@ -1004,7 +1038,13 @@ def generate_report(
                                      # "这轮渲染前量过多少标点处该停未停"须进 git 可追溯面，
                                      # 否则下一轮又只能靠人耳重新发现。同 frame_occupancy 口径
                                      # ——描述面，只透传不裁定。
-                                     ("pause_audit", "pause_audit")):
+                                     ("pause_audit", "pause_audit"),
+                                     # 句内停顿**裁定**（2026-11-06 机制批）：上面那条 pause_audit
+                                     # 是描述面读数，本键是四态结论与放行归因。裁定面不得只活在
+                                     # state（temp/日志均不入 git）——"这轮放行过没有、谁放的"
+                                     # 与 duration_budget_decision 同判据进 git 可追溯面。
+                                     # 同 render_env_check 口径——只透传不裁定。
+                                     ("pause_gate", "pause_gate")):
                     _val = pipeline_state.get(_skey)
                     if isinstance(_val, dict):
                         report["data_sources"][_dkey] = _val

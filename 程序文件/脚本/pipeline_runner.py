@@ -142,6 +142,7 @@ SUBPROCESS_FAILED = "SUBPROCESS_FAILED"  # 子进程非零退出
 OUTPUT_MISSING = "OUTPUT_MISSING"        # 产物文件缺失/为空
 VERIFY_FAILED = "VERIFY_FAILED"          # 验证/质检类失败
 QUICKFIX_BLOCKED = "QUICKFIX_BLOCKED"    # quick-fix 产物交付拦截
+PAUSE_GATE_FAILED = "PAUSE_GATE_FAILED"  # 句内停顿四态裁定 FAIL／UNTESTED 未放行
 UNKNOWN = "UNKNOWN"                      # 未分类失败
 
 
@@ -867,12 +868,14 @@ class PipelineRunner:
     accept_over_budget = False
     accept_over_render = False
     accept_media_untested = False
+
     take_over_lock = False
     accept_render_env = False
     accept_text_fit_untested = False
     accept_bar_overflow_untested = False
+    accept_pause_untested = False
 
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False, accept_bar_overflow_untested=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False, accept_bar_overflow_untested=False, accept_pause_untested=False):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -948,6 +951,7 @@ class PipelineRunner:
         # step_preview 与 instant_preview.adjudicate_bar_overflow）——与 text_fit 的开关
         # 各管各的面，不互相越界；测出溢出（FAIL）永不可放行
         self.accept_bar_overflow_untested = accept_bar_overflow_untested
+        self.accept_pause_untested = accept_pause_untested
         self.lock = None
         self.last_log_path = None      # 最近一次 _run 的落盘日志（_fail 透传用）
         self._log_seq = 0
@@ -1433,6 +1437,9 @@ class PipelineRunner:
                              # 与文案单源都在本件（generate_completion_report 只接线），
                              # 不登记即"改了编排口径而该步缓存照常命中"——A06 同族第三犯。
                              "choreography_module": SCRIPTS / "choreography_profile.py",
+                             # 2026-11-06 转场双曝线同判据登记：data_sources.transition_overlap
+                             # 的判据真身与文案单源住本件；不登记即"改了转场口径而该步缓存照常命中"。
+                             "transition_module": SCRIPTS / "transition_overlap_census.py",
                              # 2026-10-16 审计批补登两条：本步的"产物-状态一致性"自适应容差
                              # 权威源是 delivery_gate_rules.json（generate_completion_report.py:48
                              # 直读），第 6 维"交付说明同源性"的取数与文案真身是 media_qa_gate.py
@@ -1780,28 +1787,41 @@ class PipelineRunner:
             # 时长预算门禁（wp 批次复盘 P0）：渲染前的最后拦截点
             if not self._budget_gate_ok():
                 return False
-            # 句内停顿审计（描述面）：渲染前的最后一个零成本读数位点
-            self._pause_audit_face()
+            # 句内停顿裁定（四态，渲染前拦截）：改一处停顿在此只付该场 TTS 重合成
+            if not self._pause_audit_face():
+                return False
             self.state.mark_completed("timeline", self._fingerprint("timeline"))
             return True
         self._fail("timeline", "Timeline adjustment failed", SUBPROCESS_FAILED)
         return False
 
     def _pause_audit_face(self):
-        """渲染前的句内停顿审计（描述面，不裁定、不阻断、不进退出码）。
+        """渲染前的句内停顿裁定（2026-11-06 机制批：描述面 → 四态门禁）。
 
-        存在理由（2026-10-28 复盘实测）：停顿类反馈两轮重复出现的根因不是判据不够，
-        而是**唯一的机判件 narration_pause_precheck 从未在交付链上跑过**——用户点名的
-        两处位点在修前波形上实测 0.16s／0.00s，现行 0.2s 绝对阈本来抓得到，只是没人跑。
-        发现位点因此落在成片之后，每轮代价＝一次全量渲染（本项目实测 1512.8s）。
-        本方法把它前移到 timeline 步末：此时 `_timeline_manifest.json` 的逐字时间戳刚实测
-        落盘、且 render 尚未起跑，改一处停顿只付该场 TTS 重合成。
+        为什么这一面从"只报不拦"翻成拦（与 2026-10-10「不为观感新增代码门禁」常设裁定
+        表面上相反，实则不同类）：那条裁定针对的是**没有跨项目一致业务语义的量**
+        （画面占用，实测方向与"健康/病灶"相反）。本面量的是"静音时长"这一物理量，
+        且波形侧已有强制面（`enhance_video_audio._enforce_punctuation_pauses`）声明
+        要把低于下限的位点补齐——于是本裁定的真命题是**强制面有没有把它声明要治的
+        位点治好**，属机制正确性，不属审美。
+        反面证据是跨项目读数而非单片症状：描述面在位两年、六支项目 43 个低于可听阈的
+        位点逐条点名过，其中一支的 run 日志第 169 行就在渲染前印出用户后来点名的两处
+        ——没有任何出口接手，读数最终变成"全绿但听着赶"。
 
-        三条边界：①只报不拦——与 frame_occupancy／narration_pause_precheck 同判据
-        （为观感新增门禁只会多一次"全绿但难看"）；②取数断链一律点名断在哪条腿，
-        不得由"没报问题"读成"没有问题"；③刻意不把该脚本登记进任何步骤指纹面
-        （见回归用例94 F 段），改它不使存量项目重跑。
+        四态（FAIL > UNTESTED > PASS，与 `_gate_status` 同一词汇）：
+          FAIL          实测时刻（两侧字符 matched=1）的低于下限位点仍在——强制面开着
+                        却没治好，或项目显式关掉而位点仍在；作者须改写或显式声明，
+                        `--accept-pause-untested` **救不了** FAIL。
+          UNTESTED      位点时刻是插值（拒动刀）、该场未走 asr_forced、或取数断链——
+                        无从裁定，默认阻断，`--accept-pause-untested` 放行并留痕。
+          PASS          位点全部达标。
+          NOT_APPLICABLE tts_enabled=false 的纯 BGM 项目（无旁白即无停顿对象）。
         """
+        if not self.tts_enabled:
+            print("  [PAUSE-GATE] 不适用：tts_enabled=false（无旁白即无停顿对象）")
+            self.state.data["pause_gate"] = {"at": datetime.now().isoformat(),
+                                             "verdict": "NOT_APPLICABLE"}
+            return True
         try:
             import narration_pause_precheck as npp
             audit = npp.run_project_audit(self.html_project)
@@ -1810,7 +1830,8 @@ class PipelineRunner:
             print("    这不等于「停顿已核过」——需该项目先跑过 TTS 对齐（timeline 步之前完成）")
             self.state.data["pause_audit"] = {"at": datetime.now().isoformat(),
                                               "adjudicated": False, "reason": str(e)[:200]}
-            return
+            return self._pause_gate_verdict(
+                "UNTESTED", [], [], [f"取数断链：{str(e)[:160]}"], audit=None)
         s = audit["summary"]
         try:
             with open(self.temp_dir / "_pause_audit.json", "w", encoding="utf-8") as f:
@@ -1869,6 +1890,61 @@ class PipelineRunner:
             print("    渲染前改此处只付该场 TTS 重合成；渲完再改要付一次全量渲染。")
             print("    取候选声明：python narration_pause_precheck.py --project "
                   f"{self.html_project} --emit-declarations")
+        return self._pause_gate_verdict(
+            None, audit.get("absolute_rows") or [], audit.get("skipped") or [],
+            [], audit=audit)
+
+    def _pause_gate_verdict(self, verdict, absolute_rows, skipped, broken, audit=None):
+        """把停顿复核读数裁成四态并落 state／退出码（判据见 `_pause_audit_face` docstring）。
+
+        `verdict` 传入非 None 时＝调用方已裁定（取数断链路径），本函数只负责落盘与放行；
+        为 None 时按读数自算。绝对阈命中按 `measured` 分桶：**实测时刻**的命中判 FAIL
+        （强制面的对象就在它声明要治的位点上），**插值时刻**判 UNTESTED（执行侧按纪律
+        拒动刀，不是漏治）。两桶不得合并——合并即把"没能力补"报成"没补好"，
+        反过来也一样。
+        """
+        if verdict is None:
+            measured_hits = [r for r in absolute_rows if r.get("measured")]
+            interp_hits = [r for r in absolute_rows if not r.get("measured")]
+            if measured_hits:
+                verdict = "FAIL"
+            elif interp_hits or skipped or broken:
+                verdict = "UNTESTED"
+            else:
+                verdict = "PASS"
+        record = {"at": datetime.now().isoformat(), "verdict": verdict,
+                  "absolute_hits": len(absolute_rows),
+                  "measured_hits": sum(1 for r in absolute_rows if r.get("measured")),
+                  "interpolated_hits": sum(1 for r in absolute_rows if not r.get("measured")),
+                  "scenes_unaudited": len(skipped), "broken": list(broken)[:3]}
+        if audit is not None:
+            record["floor_seconds"] = (audit.get("summary") or {}).get("absolute_floor_seconds")
+        self.state.data["pause_gate"] = record
+        if verdict == "PASS":
+            print(f"  [PAUSE-GATE] PASS｜标点位点全部 ≥ 下限（实测 {record['absolute_hits']} 处命中已清零）")
+            return True
+        if verdict == "NOT_APPLICABLE":
+            return True
+        if verdict == "UNTESTED" and self.accept_pause_untested:
+            record["decision"] = "untested_accepted"
+            record["accept_flag"] = "--accept-pause-untested"
+            print(f"  [PAUSE-GATE] UNTESTED 已放行（--accept-pause-untested）："
+                  f"插值位点 {record['interpolated_hits']}、未量场 {record['scenes_unaudited']}"
+                  f"——放行只覆盖未测面，FAIL 永不可放行")
+            return True
+        why = {"FAIL": "实测时刻的低于下限位点仍在——句内停顿强制面没把它治好"
+                       f"（{record['measured_hits']} 处，逐条见 _pause_audit.json）",
+               "UNTESTED": f"无从裁定：插值时刻 {record['interpolated_hits']} 处"
+                           f"／未走 asr_forced 的场 {record['scenes_unaudited']} 个"
+                           f"／取数断链 {len(broken)} 条"}[verdict]
+        print(f"  [PAUSE-GATE] {verdict}：{why}")
+        if verdict == "UNTESTED":
+            print("    确需按未测放行：--accept-pause-untested（留痕 state.pause_gate.decision）")
+        else:
+            print("    修法：改写该处旁白，或按 --emit-declarations 的候选写 pause_marks 声明；"
+                  "本面不接受放行开关（FAIL 永不可放行）")
+        self._fail("timeline", f"句内停顿裁定 {verdict}", PAUSE_GATE_FAILED)
+        return False
 
     def _record_timeline_run(self, new_dur):
         """时间轴运行历史登记 + 非收敛漂移告警（P1 整改，prefab 复盘根因3）。
@@ -2369,6 +2445,56 @@ class PipelineRunner:
         print("  预判器必要不充分；若已人工确认画面无空窗，可追加 --force 放行并留痕。")
         return False
 
+    def _record_presence(self, entry: Dict[str, Any]) -> None:
+        """在场读数留痕唯一写盘点（PASS/UNTESTED/N/A 与点名态均写）。"""
+        entry.setdefault("at", datetime.now().isoformat(timespec="seconds"))
+        self.state.data["presence_check"] = entry
+        self.state.save()
+
+    def _presence_note(self) -> None:
+        """全量渲染前跑一次内容在场观测，只点名不阻断。
+
+        为何不是门禁（实测而非取舍声明，全文见 `presence_check.py` 模块 docstring）：
+        全仓 49 支可测项目里 3 支各判出 1 处死块，其中 `build-expert-overview` 已有 3 次
+        登记交付。一条会当场判红既有验收通过交付的判据不能升为阻断；升格前置只有一条，
+        写在那个脚本里，不在这里复述。
+
+        指纹面：刻意不进 render 步输入——它不改渲染产物，登记进去会让"改判据文案"
+        这种操作作废一次全量渲染缓存（与 `_vacuum_precheck_ok` 同一理由）。
+        """
+        detail: Dict[str, Any] = {"source": "presence_check.py"}
+        script = SCRIPTS / "presence_check.py"
+        html = self.source_dir / "index.html"
+        if not script.exists() or not html.exists():
+            detail.update({"verdict": "UNTESTED", "reason": "script-or-html-missing"})
+            self._record_presence(detail)
+            print("  [PRESENCE] UNTESTED — 脚本或 HTML 不在位，本读数未执行（不得读成已验证）")
+            return
+        try:
+            r = subprocess.run(
+                [str(VENV_PYTHON), str(script), str(html), "--json"],
+                cwd=str(SCRIPTS), env=self.env, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=300)
+            data = json.loads(r.stdout[r.stdout.index("{"):])
+        except Exception as e:  # noqa: BLE001
+            detail.update({"verdict": "UNTESTED",
+                           "reason": "launch-or-parse-failed: %s" % str(e)[:80]})
+            self._record_presence(detail)
+            print("  [PRESENCE] UNTESTED — 取数断链：%s（不阻断，不得读成已验证）"
+                  % str(e)[:80])
+            return
+        detail.update({"verdict": data.get("status"),
+                       "dead_blocks": data.get("dead_blocks", 0),
+                       "absent": data.get("absent", 0),
+                       "total": data.get("total", 0),
+                       "untested": data.get("untested", []),
+                       "blocks": [x.get("samples_blocks") for x in data.get("scenes", [])
+                                  if x.get("dead_blocks")]})
+        self._record_presence(detail)
+        import presence_check as pc
+        for line in pc.format_lines(data):
+            print("  " + line)
+
     # ── 技能版本身份（2026-10-10 根因批）────────────────────────────────
     # 存在理由：本仓所有对齐判据（--drift / 发布回执 / 双端点 ls-remote）都住在开发仓，
     # 消费者侧一个都没有——"我用的是哪一版技能"在消费者侧从未被定义，因此"落后"不可见，
@@ -2675,6 +2801,10 @@ class PipelineRunner:
             #    避免"注定失败的渲染"白付一次全量。三态与放行出口见方法 docstring。
             if not self._vacuum_precheck_ok():
                 return False
+            # ── 内容在场读数（2026-11-06 架构收口①）：死块点名，永不阻断。
+            #    空窗预判量"点亮行占比"，本读数量"该出现的内容到底有没有出现过"——
+            #    _修订01 六维审计与终检全绿却 60 处内容不存在，缺的正是这一位点。
+            self._presence_note()
             # ── 渲染中断恢复（P1 整改，prefab 复盘根因5）：全量重渲前备份上一版
             #    render_raw——prefab 两次渲染中止于 87%/53% 后毫无恢复路径，只能
             #    从零再来。备份在手：新渲染失败/中断时可回退基线走 --quick-fix。
@@ -3765,6 +3895,18 @@ Examples:
                              "text-fit gate — that gate has its own "
                              "--accept-text-fit-untested.")
 
+    parser.add_argument("--accept-pause-untested", dest="accept_pause_untested",
+                        action="store_true",
+                        help="Explicitly proceed when the pre-render intra-sentence pause "
+                             "gate cannot adjudicate (UNTESTED — the point's timestamp is "
+                             "interpolated rather than ASR-measured, the scene did not go "
+                             "through asr_forced alignment, or the audit's data source is "
+                             "broken). UNTESTED is never read as passed: without this flag "
+                             "the timeline step fails and the decision is recorded in "
+                             "pipeline_state.pause_gate. A measured sub-floor pause (FAIL) "
+                             "is NEVER accepted by this flag — fix it by rewriting the "
+                             "phrase or declaring pause_marks.")
+
     args = parser.parse_args()
 
     # ── SDL 统一入口：意图 → 编译 → 流水线 → 交付 ──
@@ -3840,6 +3982,7 @@ Examples:
         accept_render_env=args.accept_render_env,
         accept_text_fit_untested=args.accept_text_fit_untested,
         accept_bar_overflow_untested=args.accept_bar_overflow_untested,
+        accept_pause_untested=args.accept_pause_untested,
     )
 
     if args.status:

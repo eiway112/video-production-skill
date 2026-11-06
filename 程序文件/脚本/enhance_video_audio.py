@@ -206,6 +206,11 @@ PAUSE_AUTO_ENABLED = False
 # 缺省关——开启＝替作者剪掉已合成波形里的静音并缩短片长（场景窗口由 TTS 时长驱动，
 # 级联时长预算与增量渲染基线），属全仓节奏基准变更，代码落地、缺省不翻。
 INTRA_TRIM_ENABLED = None
+# INTRA_ENFORCE_ENABLED：三态（None＝未声明，按 audio_sync_rules → enabled_by_default 裁定）。
+# **缺省开**，与修剪面相反：修剪面替作者**删**已合成波形（不可逆损伤语音、改写不可预期），
+# 强制面只在实测位点上**补**静音——句界面自 2026-07-28 起即缺省开，六支项目 429 个段间
+# 位点零未达标。代价是片长增长，由时长预算门禁照常裁定；关掉走项目显式声明。
+INTRA_ENFORCE_ENABLED = None
 _PAUSE_PLAN_MEMO: dict = {}
 
 
@@ -269,11 +274,11 @@ def _pause_engine_text(scene_id, text):
 def _collect_pause_state(cfg, scenes_list):
     """load_config 尾部统一采集停顿声明与开关——**先重置再采集**。
 
-    重置是必需项而非加分：这三个全局曾被上一项目的值填充过（用例76 C 段
+    重置是必需项而非加分：这些全局曾被上一项目的值填充过（用例76 C 段
     "不惰性赋值"同族），跨项目 in-process 调用时后一个项目会静默继承前一个
     项目的停顿声明——那等于把 A 项目的朗读节奏装进 B 项目的音频。
     """
-    global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED, INTRA_TRIM_ENABLED
+    global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED, INTRA_TRIM_ENABLED, INTRA_ENFORCE_ENABLED
     PAUSE_DECLARATIONS = {}
     PAUSE_AUTO_ENABLED = False
     _PAUSE_PLAN_MEMO.clear()
@@ -303,6 +308,26 @@ def _collect_pause_state(cfg, scenes_list):
         sys.exit(1)
     else:
         INTRA_TRIM_ENABLED = None
+    # 强制面开关：与修剪面同一套三态与 fail-loud 守卫（声明了节却没写 enabled
+    # 即退出码非零并点名两键——不得静默把作者的裁定洗成缺省）。
+    _enf_cfg = cfg.get("intra_pause_enforce")
+    if _enf_cfg is None and isinstance(cfg.get("audio"), dict):
+        _enf_cfg = cfg["audio"].get("intra_pause_enforce")
+    if isinstance(_enf_cfg, dict):
+        if "enabled" not in _enf_cfg:
+            print("[ERROR] 声明了 intra_pause_enforce 节却未声明其 enabled 键——")
+            print("[ERROR]   要么显式写 intra_pause_enforce.enabled: true/false，")
+            print("[ERROR]   要么整节删掉（交回 audio_sync_rules.json → enabled_by_default 裁定）。")
+            sys.exit(1)
+        INTRA_ENFORCE_ENABLED = _coerce_bool(_enf_cfg.get("enabled"), default=True)
+    elif isinstance(_enf_cfg, bool):
+        INTRA_ENFORCE_ENABLED = _enf_cfg
+    elif _enf_cfg is not None:
+        print(f"[ERROR] intra_pause_enforce 必须是对象（含 enabled 键）或布尔，读到 "
+              f"{type(_enf_cfg).__name__}：{_enf_cfg!r}")
+        sys.exit(1)
+    else:
+        INTRA_ENFORCE_ENABLED = None
     for s in scenes_list or []:
         marks = s.get("pause_marks")
         if marks:
@@ -515,6 +540,63 @@ def _parse_bitrate_value(raw):
     return value if value > 0 else None
 
 
+def _silence_cut_point(audio, sr, gap_lo, gap_hi):
+    """在 [gap_lo, gap_hi] 这段**字间隙**内取下刀点（采样索引）。
+
+    判据本体（为什么必须是字间隙、窗口不能越界）住 `_enforce_sentence_pauses` 的
+    注释与回归用例111；此处只把它从两处调用点收成一条腿——插入面现在有句界与句内
+    标点两个生产者，各写一遍最低能量点就会分叉（A06 同族）。
+    间隙宽度不足 2 样本（两字相接）时取间隙端点，即两字之间那条缝，不切任何字。
+    """
+    import numpy as np
+    if gap_hi < gap_lo:
+        gap_hi = gap_lo
+    lo = max(0, int(round(gap_lo * sr)))
+    hi = min(len(audio), int(round(gap_hi * sr)))
+    if hi - lo < 2:
+        return min(len(audio), max(0, lo))
+    env = np.abs(audio[lo:hi].astype(np.int32)).sum(axis=1).astype(np.float64)
+    win = max(1, int(0.015 * sr))
+    env = np.convolve(env, np.ones(win) / win, mode="same")
+    return lo + int(np.argmin(env))
+
+
+def _splice_silence(audio, sr, n_ch, cut, n_ins):
+    """在采样索引 cut 处插入 n_ins 个静音样本，切口两侧各 8ms 淡变防咔哒。返回新数组。"""
+    import numpy as np
+    fade = min(int(0.008 * sr), cut, len(audio) - cut)
+    if fade > 0:
+        audio[cut - fade:cut] = (
+            audio[cut - fade:cut].astype(np.float64)
+            * np.linspace(1.0, 0.0, fade)[:, None]).astype(np.int16)
+        audio[cut:cut + fade] = (
+            audio[cut:cut + fade].astype(np.float64)
+            * np.linspace(0.0, 1.0, fade)[:, None]).astype(np.int16)
+    return np.concatenate([audio[:cut], np.zeros((n_ins, n_ch), dtype=np.int16), audio[cut:]])
+
+
+def _read_wav_int16(hq_file):
+    """读 s16 wav → (numpy 二维数组, 采样率)。非 s16 即抛，调用方不得"猜着剪/猜着补"。"""
+    import wave
+    import numpy as np
+    with wave.open(str(hq_file), 'rb') as wf:
+        n_ch, sw, sr = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    if sw != 2:
+        raise RuntimeError(f"pause enforce: {Path(hq_file).name} 非 s16 wav (sampwidth={sw})")
+    return np.frombuffer(raw, dtype=np.int16).reshape(-1, n_ch).copy(), sr
+
+
+def _write_wav_int16(hq_file, audio, sr, n_ch):
+    import wave
+    import numpy as np
+    with wave.open(str(hq_file), 'wb') as wf:
+        wf.setnchannels(n_ch)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(np.ascontiguousarray(audio).tobytes())
+
+
 def _shift_chars_for_inserted_silence(chars, cut_t, inserted):
     """在 cut_t 处插入 inserted 秒静音后，字符级时刻的同步平移（词级 cue 批，2026-10-12）。
 
@@ -576,60 +658,21 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
     if not deficits:
         return False, sentences, 0.0, chars
 
-    import wave
-    import numpy as np
-    with wave.open(str(hq_file), 'rb') as wf:
-        n_ch = wf.getnchannels()
-        sw = wf.getsampwidth()
-        sr = wf.getframerate()
-        raw = wf.readframes(wf.getnframes())
-    if sw != 2:
-        raise RuntimeError(f"sentence-pause enforce: {hq_file.name} 非 s16 wav (sampwidth={sw})")
-    audio = np.frombuffer(raw, dtype=np.int16).reshape(-1, n_ch).copy()
+    audio, sr = _read_wav_int16(hq_file)
+    n_ch = audio.shape[1]
 
     sentences = [dict(s) for s in sentences]
     total_inserted = 0.0
     for i in deficits:
         gap = sentences[i + 1]['rel_start'] - sentences[i]['rel_end']
         deficit = min_pause - gap
-        # 下刀点只能落在**字间隙**里：前段末字的结束 → 后段首字的开始。
-        #
-        # 旧实现（boundary±0.08s 取窗内最低能量点）有一处未覆盖的形态：当引擎在
-        # 句号处不留静音时（ASR 给出的段间间隔为 0.00s），该窗口的正半边整段落在
-        # **下一段首字**上，窗内最低能量点必然落进那个字内部或其后——实测
-        # build-expert-overview 第 2 场「照着验收，就用。写文案」：刀落在 7.0588s
-        # （正好在「写」字之后），结果是句界仍无停顿、「写」被压成 80ms、且被劈离
-        # 「文案」。收紧到 ±0.08s 只挡住了"漂进**前**一句词内部"，没挡住"落进
-        # **后**一段首字"——两者是同一处窗口的两个方向。
-        #
-        # 收敛到字间隙即从根上排除这一形态：间隙宽度为 0（两字相接）时切点取间隙
-        # 端点，即两字之间的那条缝，不切任何字；间隙有宽度时仍取窗内最低能量点，
-        # 但窗口就是这条字间隙本身，不会越界。
-        gap_lo = float(sentences[i]['rel_end'])
-        gap_hi = float(sentences[i + 1]['rel_start'])
-        if gap_hi < gap_lo:
-            gap_hi = gap_lo
-        lo = max(0, int(round(gap_lo * sr)))
-        hi = min(len(audio), int(round(gap_hi * sr)))
-        if hi - lo < 2:
-            cut = min(len(audio), max(0, int(round(gap_lo * sr))))
-        else:
-            env = np.abs(audio[lo:hi].astype(np.int32)).sum(axis=1).astype(np.float64)
-            win = max(1, int(0.015 * sr))
-            env = np.convolve(env, np.ones(win) / win, mode='same')
-            cut = lo + int(np.argmin(env))
-        fade = min(int(0.008 * sr), cut, len(audio) - cut)
-        if fade > 0:
-            audio[cut - fade:cut] = (
-                audio[cut - fade:cut].astype(np.float64)
-                * np.linspace(1.0, 0.0, fade)[:, None]).astype(np.int16)
-            audio[cut:cut + fade] = (
-                audio[cut:cut + fade].astype(np.float64)
-                * np.linspace(0.0, 1.0, fade)[:, None]).astype(np.int16)
-        n_ins = int(round(deficit * sr))
-        audio = np.concatenate(
-            [audio[:cut], np.zeros((n_ins, n_ch), dtype=np.int16), audio[cut:]])
-        inserted = n_ins / sr
+        # 下刀点只能落在**字间隙**里（前段末字结束 → 后段首字开始）：判据本体与它
+        # 治过的形态住 `_silence_cut_point` 与回归用例111。插入面现有两个生产者
+        # （句界 / 句内标点），下刀与拼接两条腿各写一遍即分叉，故收成共用函数。
+        cut = _silence_cut_point(audio, sr, float(sentences[i]['rel_end']),
+                                 float(sentences[i + 1]['rel_start']))
+        audio = _splice_silence(audio, sr, n_ch, cut, int(round(deficit * sr)))
+        inserted = int(round(deficit * sr)) / sr
         cut_t = cut / sr
         # 字符级流与句级同批平移（词级 cue 的数据一致性所系）：与句子走同一条
         # "返回新值"的路径，不在入参列表上动手——原地热绑定会让调用方漏回写
@@ -657,12 +700,116 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
                 f"sentence-pause enforce 失败：{hq_file.name} 段 {i}→{i+1} 插入后间隔仍为 "
                 f"{gap:.3f}s < {min_pause}s，拒绝静默放行")
 
-    with wave.open(str(hq_file), 'wb') as wf:
-        wf.setnchannels(n_ch)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(np.ascontiguousarray(audio).tobytes())
+    _write_wav_int16(hq_file, audio, sr, n_ch)
     return True, sentences, total_inserted, chars
+
+
+def _shift_sentences_for_intra_insertion(sentences, cut_t, inserted):
+    """句内插入后句级时刻的平移（返回新列表，不改入参——与字符级同一纪律）。
+
+    与 `_enforce_sentence_pauses` 内联那套"分侧收拢"规则**刻意不同**：那套处理的是
+    字幕段边界（静音落在两句之间，前句尾时刻须收到切点才能保证间隔 ≥ 下限）；本函数
+    处理的是段内插入——被插的那句的尾音整体后移，故其 rel_end 加平移量而非收拢到切点。
+    把两套规则合成一套会把段内插入读成"前句在切点结束"，字幕会在半句处被截短。
+    """
+    out = []
+    cut_c = round(float(cut_t), 3)
+    for s in sentences:
+        d = dict(s)
+        rs, re = float(d.get('rel_start', 0.0)), float(d.get('rel_end', 0.0))
+        if rs >= cut_c - 0.001:
+            d['rel_start'] = round(rs + inserted, 3)
+            d['rel_end'] = round(re + inserted, 3)
+        elif re > cut_c:
+            d['rel_end'] = round(re + inserted, 3)
+        out.append(d)
+    return out
+
+
+def _enforce_punctuation_pauses(hq_file, text, sentences, chars, min_pause):
+    """句内标点停顿强制——波形层（2026-11-06 机制批）。
+
+    存在理由（跨项目实测，不是单片症状）：句界停顿自 2026-07-28 起有波形强制，六支
+    项目 429 个段间位点**零未达标**；同一批数据里**段内标点**位点有 43 个低于 0.2s
+    可听阈（其中大量实测为 0.00s，即"图集、约 3 个专业"这类被吞掉的停顿），每支项目
+    都有。差别不在引擎，在有没有接进生效路径——分段函数 `_split_text_to_segments`
+    只在 。？！； 处切段，逗号/顿号/冒号**结构上不是段界**，句界面永远看不见它们。
+
+    位点识别与点名侧共用 `narration_pause_precheck.punctuation_gap_rows` 单源：
+    两侧各算一遍即两份真相，会出现"报告里绿、波形里没补"（与 `intra_pause.classify_points`
+    那条同族）。下限高于可听阈（0.25 > 0.2）是刻意的层级：补完的位点不该再被点名，
+    而句内停顿仍弱于句界 0.4s，符合自然语言的停顿层级。
+
+    三条不对称纪律
+    --------------
+    1. **只在两侧字符 matched=1（实测时刻）时动刀**。插值时刻是虚构坐标，在它上面插
+       静音等于把刀落进字里——与句界面"下刀点须落字间隙"同一族。这类位点照常计入
+       `interpolated`，由裁定侧按"未测"归因而非"漏治"。
+    2. 取数断链（无字符流、原文字数≠对齐字数、非 s16）一律**不补并点名**，
+       不得由"没补"读成"不需要补"。
+    3. 补完仍不达标 → RuntimeError，禁止静默放行（与句界面同一收口）。
+
+    幂等：补齐后间隙 ≥ min_pause，重跑即 no-op（每轮必检，含缓存命中路径）。
+
+    Returns (modified, sentences, inserted_seconds, chars, res)
+        `res` = {"points": 低于下限的标点位数, "hits": 实际补了几处,
+                 "interpolated": 因时刻是插值而拒动刀几处, "broken": [归因…]}
+    """
+    res = {"points": 0, "hits": 0, "interpolated": 0, "broken": []}
+    if min_pause <= 0:
+        return False, sentences, 0.0, chars, res
+    if not chars:
+        res["broken"].append("无字符级对齐数据（该场走句级降级链），句内停顿面未运行")
+        return False, sentences, 0.0, chars, res
+    import narration_pause_precheck as npp
+    spoken, after = npp.spoken_and_after((text or "").strip())
+    if len(spoken) != len(chars):
+        res["broken"].append(
+            f"原文发音字符 {len(spoken)} 字 ≠ 对齐字符 {len(chars)} 字，位点归属无从核对，未补")
+        return False, sentences, 0.0, chars, res
+    eps = 0.02
+    targets = [r for r in npp.punctuation_gap_rows(chars, spoken, after)
+               if r["punct"] and r["gap"] < min_pause - eps]
+    res["points"] = len(targets)
+    if not targets:
+        return False, sentences, 0.0, chars, res
+    actionable = [r for r in targets if r["measured"]]
+    res["interpolated"] = len(targets) - len(actionable)
+    if not actionable:
+        return False, sentences, 0.0, chars, res
+
+    audio, sr = _read_wav_int16(hq_file)
+    n_ch = audio.shape[1]
+    sentences = [dict(s) for s in sentences]
+    chars = [list(c) for c in chars]
+    total = 0.0
+    # 从右往左补：后面的插入不影响前面位点的时间坐标，故 targets 一次算完即可，
+    # 不必每补一处重算全表（左往右则每次都要重算，且漏算一次即在旧坐标上动刀）。
+    for r in sorted(actionable, key=lambda x: -x["index"]):
+        left = r["index"] - 1
+        gap_lo, gap_hi = float(chars[left][1]), float(chars[r["index"]][0])
+        deficit = min_pause - (gap_hi - gap_lo)
+        if deficit <= 0:
+            continue
+        cut = _silence_cut_point(audio, sr, gap_lo, gap_hi)
+        n_ins = int(round(deficit * sr))
+        audio = _splice_silence(audio, sr, n_ch, cut, n_ins)
+        inserted = n_ins / sr
+        cut_t = cut / sr
+        chars = _shift_chars_for_inserted_silence(chars, cut_t, inserted)
+        sentences = _shift_sentences_for_intra_insertion(sentences, cut_t, inserted)
+        total += inserted
+        res["hits"] += 1
+
+    still = [x for x in npp.punctuation_gap_rows(chars, spoken, after)
+             if x["punct"] and x["measured"] and x["gap"] < min_pause - 0.05]
+    if still:
+        raise RuntimeError(
+            f"punctuation-pause enforce 失败：{Path(hq_file).name} 补后仍有 "
+            f"{len(still)} 处低于 {min_pause}s（首处『…{still[0]['ctx']}…』），拒绝静默放行")
+
+    _write_wav_int16(hq_file, audio, sr, n_ch)
+    return True, sentences, round(total, 3), chars, res
 
 
 def _time_map_factory(cuts):
@@ -889,12 +1036,21 @@ ALIGN_ALGO_VERSION = "v3"
 #   "raw"  = 未经停顿强制的干净波形（刚从原始 TTS 上采样得到）
 #   本常量 = 已由该版本逻辑处理过
 # 改动停顿强制的裁定逻辑（下刀点、插入量、fade 等）时必须 bump。
-PAUSE_ENFORCE_VERSION = "v2"
+# v3（2026-11-06 机制批）：新增**句内标点**停顿强制面（_enforce_punctuation_pauses）。
+# 不 bump 的后果与该常量设立时同族——存量 v2 波形已按"只有句界"的逻辑处理过、戳记
+# 写着 v2，缓存照常命中，新面只对空波形生效，即"改了判据而存量项目静默不生效"。
+# bump 后 v2 波形在下一轮从原始 TTS（本地 mp3，零网络）重建并重走两腿。
+PAUSE_ENFORCE_VERSION = "v3"
 _ENF_STAMP_RAW = "raw"
 # 修剪面上线后**已入桶位点处**的静音被物理删除，旧波形上没有"该剪未剪"的复检信号，
 # 故启用时戳记另加后缀：v2 → 与 v2+trim 不是同一份波形代次，必须从原始 TTS 重建后重走
 # 强制+修剪。未启用时后缀为空，存量项目零冲击（既有戳记逐字照旧命中）。
 PAUSE_TRIM_SUFFIX = "+trim"
+# 句内标点强制面（2026-11-06）同样入戳记：开着补过静音的波形与关着没补的不是同一代次。
+# 方向与修剪面相反也能成立——**关掉**这一面时，旧波形里已插入的静音无法在原地检出并
+# 删除，只有从原始 TTS 重建才拿得到"没有这些停顿"的那份波形；不写进戳记，切换开关就是
+# 静默不生效（本常量设立理由的同族）。缺省开的一侧写作 v3+intra，显式关闭写作 v3。
+PAUSE_INTRA_SUFFIX = "+intra"
 
 
 def _intra_trim_state():
@@ -915,9 +1071,43 @@ def _intra_trim_state():
         return False, None, PAUSE_ENFORCE_VERSION, f"判据断链：{e}"
     enabled = (bool(rules.get('enabled_by_default'))
                if INTRA_TRIM_ENABLED is None else bool(INTRA_TRIM_ENABLED))
-    stamp = PAUSE_ENFORCE_VERSION + (PAUSE_TRIM_SUFFIX if enabled else "")
+    intra_on, _intra_min, _intra_why = _intra_enforce_state()
+    stamp = (PAUSE_ENFORCE_VERSION
+             + (PAUSE_INTRA_SUFFIX if intra_on else "")
+             + (PAUSE_TRIM_SUFFIX if enabled else ""))
     return enabled, rules, stamp, ("项目显式声明" if INTRA_TRIM_ENABLED is not None
                                    else "按缺省 enabled_by_default")
+
+
+def _intra_enforce_state():
+    """返回 (enabled, min_pause, 归因)——句内标点停顿强制面的开关与下限**单一出口**。
+
+    存在理由：执行侧（本模块）与裁定侧（pipeline_runner 的停顿裁定）都要答"这面开着吗、
+    下限是多少"，两处各读一遍配置即两份真相——报告说没开而执行侧在补，或反之，
+    都是本仓登记过的病灶形态（修剪面开关状态取数同族）。
+
+    fail-closed：规则缺节、残键、非正数、读盘失败一律 enabled=False 并给出归因；
+    "读不到判据"不得退化成"按脚本内字面量补静音"。归因文案要能回答"没补是决定不补
+    还是没能力补"，故缺节与断链分开写。
+    """
+    global INTRA_ENFORCE_ENABLED
+    try:
+        sec = _load_audio_sync_rules().get('intra_pause_enforce')
+    except Exception as e:
+        return False, 0.0, f"判据断链：audio_sync_rules 读不回（{type(e).__name__}）"
+    if not isinstance(sec, dict):
+        return False, 0.0, "规则缺节 intra_pause_enforce（面未启用，低于下限的位点不会被自动补齐）"
+    try:
+        val = float(sec.get('min_seconds'))
+    except (TypeError, ValueError):
+        return False, 0.0, (f"intra_pause_enforce.min_seconds 缺失或不可解析"
+                            f"（读到 {sec.get('min_seconds')!r}），面未启用")
+    if val <= 0:
+        return False, 0.0, f"intra_pause_enforce.min_seconds={val:g} 非正数，面未启用"
+    enabled = (bool(sec.get('enabled_by_default')) if INTRA_ENFORCE_ENABLED is None
+               else bool(INTRA_ENFORCE_ENABLED))
+    return enabled, val, ("项目显式声明" if INTRA_ENFORCE_ENABLED is not None
+                          else "按缺省 enabled_by_default")
 
 
 def _enf_stamp_path(hq_file):
@@ -1012,6 +1202,14 @@ def _build_timeline_manifest(temp_dir):
     scenes_out = []
     aligned = 0
     pause_min = float((_load_audio_sync_rules().get('sentence_pause') or {}).get('min_seconds', 0.4))
+    # 句内标点强制面状态同样在循环外解析一次（与修剪面同一理由：逐场重读会造出
+    # "同一轮里有的场补了、有的场因读盘失败没补"的分裂代次）。
+    # **刻意不入 algo_ver**：强制面每轮必检（含缓存命中路径），对齐结果复用与否不影响
+    # 它生效；把它写进算法版本只会让全仓每个项目白跑一次本地重对齐（CPU 成本、零收益）。
+    enf_on, enf_min, enf_归因 = _intra_enforce_state()
+    if not enf_on:
+        print(f"  [INTRA-ENFORCE] 句内停顿强制面未启用（{enf_归因}）："
+              f"低于下限的标点位点**不会被自动补齐**，将由渲染前复核逐条点名")
     algo_ver = f"{ALIGN_ALGO_VERSION}|{_fa.MODEL_SIZE}|pause={pause_min:g}"
     # 修剪面状态在循环外解析一次：逐场重读规则文件会造出"同一轮里有的场剪了、
     # 有的场因读盘失败没剪"的分裂代次（stamp 也是同一轮的唯一判据）。
@@ -1121,6 +1319,35 @@ def _build_timeline_manifest(temp_dir):
                 entry['wave_sha256'] = _wave_sha256(hq_file)
                 print(f"  Scene {scene_id}: sentence-pause enforced "
                       f"(+{ins:.2f}s silence → {entry['tts_duration']:.2f}s)")
+            # 句内标点停顿强制（2026-11-06 机制批）：跑在句界**之后**。逗号/顿号恰好
+            # 也是段界时（超长句 sub-split），句界已把它补到 0.4s，本面按同一份取数
+            # 读到的是补齐后的间隙，自然不再动刀——顺序反过来会在旧坐标上补两次。
+            # 读数无论是否命中都落盘（"跑了但没命中"与"没跑"必须是两个读数，A06 同族）。
+            if enf_on:
+                e_mod, e_sents, e_ins, e_chars, e_res = _enforce_punctuation_pauses(
+                    hq_file, text, entry['sentences'], entry.get('chars'), enf_min)
+                entry['pause_intra'] = {k: e_res[k] for k in
+                                        ("points", "hits", "interpolated")}
+                if e_res["broken"]:
+                    entry['pause_intra_broken'] = e_res["broken"]
+                if e_mod:
+                    entry['sentences'] = e_sents
+                    if e_chars is not None:
+                        entry['chars'] = e_chars
+                    entry['tts_duration'] = round(get_duration(str(hq_file)), 3)
+                    entry['pause_intra_inserted'] = e_ins
+                    entry['wave_sha256'] = _wave_sha256(hq_file)
+                    print(f"  Scene {scene_id}: punctuation-pause enforced "
+                          f"(补 {e_res['hits']}/{e_res['points']} 处 → "
+                          f"+{e_ins:.2f}s → {entry['tts_duration']:.2f}s"
+                          + (f"；另有 {e_res['interpolated']} 处时刻为插值，未动刀"
+                             if e_res['interpolated'] else "") + ")")
+                elif e_res["broken"]:
+                    print(f"  Scene {scene_id}: [INTRA-ENFORCE] 未补（取数断链）："
+                          f"{'；'.join(e_res['broken'])}")
+                elif e_res["interpolated"]:
+                    print(f"  Scene {scene_id}: [INTRA-ENFORCE] {e_res['interpolated']} 处低于下限"
+                          f"但两侧字符时刻为插值——**拒动刀**（在虚构坐标上插静音等于切进字里）")
             # 修剪面（缺省关闭）：跑在插入面**之后**，量的是插入完成后将要交付的那份波形。
             # 顺序反过来就会在旧波形上剪、再被插入面把时刻挪一次——两腿共用同一条
             # "返回新时间戳"的路径才只有一份真相。

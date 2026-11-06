@@ -197,8 +197,52 @@ def spoken_and_after(text: str):
     return spoken, after
 
 
+def punctuation_gap_rows(chars, spoken, after):
+    """相邻发音字符之间的静音位点——三桶点名与波形强制面**共用的唯一取数入口**。
+
+    存在理由（2026-11-06 机制批）：句内标点的停顿强制此前不在生效路径上，而它要判的
+    "这个位点低于下限"与点名侧判的"这个位点低于可听阈"是同一件事。两处各算一遍即两份
+    真相（与 `intra_pause.classify_points` 那条同族：修剪侧与复核第三桶必须共用入口），
+    会出现"报告里绿、波形里没补"或反之。取数因此只写这一份，两侧都消费它。
+
+    归属判据：静音住在 `spoken[i]` 与 `spoken[i+1]` 之间，归给紧跟 i+1 之前的那串标点
+    （`after[k]` 存的是 `spoken[k]` **之前**的标点串——归属错一位会把所有停顿读成 0.00，
+    audio_face 首版即栽在此处，实测中位全部 0.00 才暴露）。纯空白（数字与量词间的
+    "171 个"）不构成停顿请求，剥掉后按"无标点"归类。
+
+    `measured` ＝ 两侧字符的 ASR matched 旗标均为 1。旗标为假时 gap 是插值造出的时间：
+    **点名侧照常入桶**（它报的是"这里读起来赶"，插值时刻不影响该结论的方向），
+    **执行侧必须按 measured 拒绝动刀**（在虚构时刻插静音等于把刀落进字里，与
+    `_enforce_sentence_pauses` 的"下刀点须落字间隙"同判据）。
+
+    `anchor` ＝ 该标点前**同一小句内**的尾 ≤4 个发音字。刻意不跨上一个标点取字：跨标点的
+    锚虽仍能定到位，但它把两句粘成一个串，歧义命中面变大、作者也难核对。
+    """
+    rows = []
+    for i in range(len(chars) - 1):
+        gap = float(chars[i + 1][0]) - float(chars[i][1])
+        punct = after[i + 1].strip()
+        start = i
+        while start > 0 and not after[start].strip():
+            start -= 1
+        rows.append({
+            "index": i + 1,
+            "punct": punct,
+            "gap": gap,
+            "ctx": "".join(spoken[max(0, i - 4):i + 1]) + punct + "".join(spoken[i + 1:i + 7]),
+            "anchor": "".join(spoken[start:i + 1])[-4:],
+            "measured": bool(int(chars[i][2] or 0)) and bool(int(chars[i + 1][2] or 0)),
+        })
+    return rows
+
+
 def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
-    """返回 (连读桶点名, 急促桶点名, 读数摘要, 逐场状态)。
+    """返回 (连读桶点名, 急促桶点名, 读数摘要, 逐场状态, 连读桶结构化行)。
+
+    第五元 `absolute_rows`（2026-11-06 机制批）与第一元的字符串点名同源，供
+    `emit_declarations` 把**绝对阈命中**也转成候选声明——旧形态只把急促桶转候选，
+    于是"0.10s 的顿号"被机器点名后没有任何可执行出口，正是"机器看见了、没人接手"
+    的第三处断链。点名侧与候选侧因此仍走同一份取数（`punctuation_gap_rows`）。
 
     两桶**并列不合并**：连读＝绝对阈（该处几乎没停，听感是词被吞）；急促＝相对该场
     该类标点中位明显偏短（听感是用户口播点名的"这里该停一下"）。判据依据与标定读数
@@ -220,6 +264,7 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
     rows: list = []          # (sid, punct, gap, ctx) —— 相对桶要按 cohort 二次过，先留底
     gaps_by_punct: dict = {}
     silent_punct: list = []
+    silent_rows: list = []
     seg_pause = []
     skipped = []
     intra_rows: list = []
@@ -243,30 +288,16 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
         if len(spoken) != len(chars):
             skipped.append(f"s{sid}(原文 {len(spoken)} 字 ≠ 对齐 {len(chars)} 字，疑含拉丁/数字展开)")
             continue
-        for i in range(len(chars) - 1):
-            g = float(chars[i + 1][0]) - float(chars[i][1])
-            # 该静音住在 spoken[i] 与 spoken[i+1] 之间，归属给"紧跟 i+1 之前的那串标点"
-            # （after[k] 存的是 spoken[k] **之前**的标点串——归属错一位会把所有停顿读成 0.00，
-            #  本函数首版即栽在此处，实测中位全部 0.00 才暴露）
-            # 纯空白（数字与量词间的 "171 个"）不构成停顿请求，剥掉后按"无标点"归类，
-            # 否则全仓普查会被数十条空格噪声淹没（首版实测 22 条点名里 14 条是空格）。
-            punct = after[i + 1].strip()
-            key = punct if punct else "无标点"
-            gaps_by_punct.setdefault(key, []).append(g)
+        for row in punctuation_gap_rows(chars, spoken, after):
+            g, punct = row["gap"], row["punct"]
+            gaps_by_punct.setdefault(punct if punct else "无标点", []).append(g)
             if not punct:
                 continue
-            ctx = "".join(spoken[max(0, i - 4):i + 1]) + punct + "".join(spoken[i + 1:i + 7])
-            # 锚词＝该标点前**同一小句内**的尾 ≤4 个发音字。刻意不跨上一个标点取字：
-            # 跨标点的锚（如「实测名称」实为「…现场实测。名称，」）虽仍能定到位（插入点在
-            # 锚尾之后），但它把两句粘成一个串，歧义命中面变大、作者也难核对。
-            start = i
-            while start > 0 and not after[start].strip():
-                start -= 1
-            anchor = "".join(spoken[start:i + 1])[-4:]
-            rows.append((sid, punct, g, ctx, anchor))
+            rows.append((sid, punct, g, row["ctx"], row["anchor"]))
             if g < floor:
                 silent_punct.append(
-                    f"s{sid} 标点处实测 {g:.2f}s（<{floor:g}s 可听阈）『…{ctx}…』")
+                    f"s{sid} 标点处实测 {g:.2f}s（<{floor:g}s 可听阈）『…{row['ctx']}…』")
+                silent_rows.append({**row, "scene_id": sid})
         # 第三桶：无标点处出现的可听停顿（判据与修剪面同源，见 _intra_bucket_rows）
         res, err = _intra_bucket_rows(sid, spoken, after, chars, entry, wav_dir)
         if err:
@@ -337,7 +368,7 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
             "broken": intra_broken,
         },
     }
-    return silent_punct, rushed, summary, skipped
+    return silent_punct, rushed, summary, skipped, silent_rows
 
 
 _TRIM_RULES_MEMO: dict = {}
@@ -424,7 +455,7 @@ def resolve_project(name: str):
 def run_project_audit(project: str) -> dict:
     """流水线与命令行共用的单一入口（取数路径解析不得各写一份）。
 
-    返回 {project, absolute, rushed, summary, skipped}；取数断链一律抛 Broken，
+    返回 {project, absolute, rushed, summary, skipped, absolute_rows}；取数断链一律抛 Broken，
     调用方（pipeline_runner）据此打印"无从审计"并点名断在哪条腿，不得读成 0 条。
     """
     narration_path, manifest_path = resolve_project(project)
@@ -436,7 +467,7 @@ def run_project_audit(project: str) -> dict:
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     except Exception as e:
         raise Broken(f"音频面取数断链：_timeline_manifest.json 不可解析（{e}）")
-    absolute, rushed, summary, skipped = audio_face(
+    absolute, rushed, summary, skipped, absolute_rows = audio_face(
         narration, manifest, rules,
         wav_dir=Path(manifest_path).parent / "tts_44k")
     html = Path(narration_path).parent / "index.html"
@@ -447,7 +478,8 @@ def run_project_audit(project: str) -> dict:
         except OSError:
             html_text = ""      # 取不到 HTML 只影响"画面联动"这一条提示，不影响两桶读数
     return {"project": project, "narration": narration, "absolute": absolute,
-            "rushed": rushed, "summary": summary, "skipped": skipped, "html": html_text}
+            "rushed": rushed, "summary": summary, "skipped": skipped,
+            "absolute_rows": absolute_rows, "html": html_text}
 
 
 _CUE_OFFSET_RE = re.compile(r'C\[\s*"([^"]+)"\s*\]\s*\+\s*(0?\.\d+|\d+\.\d+)')
@@ -479,8 +511,13 @@ def cue_offset_refs(html_text: str):
     return named, concat
 
 
-def emit_declarations(narration: list, rushed: list, html_text: str = "") -> list:
-    """把急促桶候选转成可直接并入 narration.json 的 pause_marks 片段（只打印，不落盘）。
+def emit_declarations(narration: list, rushed: list, html_text: str = "",
+                      absolute_rows: list = None) -> list:
+    """把两桶命中转成可直接并入 narration.json 的 pause_marks 片段（只打印，不落盘）。
+
+    2026-11-06 机制批：入参旧形态只收**急促桶**，于是"0.10s 的顿号"这类绝对阈命中
+    被点名后没有任何可执行出口。现两桶一并收，按 (场, 上下文) 去重（同一位点常同时
+    入两桶，重复声明会双倍占用停顿预算）。
 
     刻意不做成自动写盘：写停顿＝改朗读节奏＋加长片长，裁定权在作者（与
     `pause_declaration.enabled_by_default=false` 同判据）。本函数把"作者逐条手抄"
@@ -493,7 +530,15 @@ def emit_declarations(narration: list, rushed: list, html_text: str = "") -> lis
     named, concat = cue_offset_refs(html_text)
     by_scene = {str(s.get("scene_id")): s for s in narration}
     grouped: dict = {}
-    for r in rushed:
+    cands = list(rushed)
+    seen = {(str(r.get("scene_id")), r.get("ctx")) for r in cands}
+    for r in (absolute_rows or []):
+        key = (str(r.get("scene_id")), r.get("ctx"))
+        if key in seen:
+            continue
+        seen.add(key)
+        cands.append(r)
+    for r in cands:
         grouped.setdefault(str(r["scene_id"]), []).append(r)
     out = []
     for sid, cands in sorted(grouped.items(), key=lambda kv: _scene_sort_key(kv[0])):
@@ -601,7 +646,7 @@ def main(argv=None) -> int:
         hits, counts = text_face(narration, rules, split)
         grand["merge_risk"] += counts["merge_risk"]
         grand["segment_overload"] += counts["segment_overload"]
-        silent, rushed, summary, skipped = [], [], {}, []
+        silent, rushed, summary, skipped, absolute_rows = [], [], {}, [], []
         audio_ran = False
         if manifest_path is not None:
             # 传了路径却不在位＝取数断链，必须点名——2026-10-28 实测：相对路径写错一层
@@ -613,7 +658,7 @@ def main(argv=None) -> int:
             else:
                 try:
                     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-                    silent, rushed, summary, skipped = audio_face(
+                    silent, rushed, summary, skipped, absolute_rows = audio_face(
                         narration, manifest, rules,
                         wav_dir=Path(manifest_path).parent / "tts_44k")
                     audio_ran = True
@@ -671,7 +716,7 @@ def main(argv=None) -> int:
             if not hits and not silent and not rushed and not (_intra.get("points") or []):
                 print("  文本面与音频面均无点名对象"
                       + ("（音频面未跑，此句不代表停顿已核）" if not audio_ran else ""))
-        if a.emit_declarations and rushed:
+        if a.emit_declarations and (rushed or absolute_rows):
             print(f"—— {name}：可并入 narration.json 的 pause_marks 建议（只打印，不落盘）——")
             html_file = path.parent / "index.html"
             html_text = ""
@@ -680,7 +725,8 @@ def main(argv=None) -> int:
                     html_text = html_file.read_text(encoding="utf-8")
                 except OSError as e:
                     print(f"  画面联动未核（HTML 读不回，两桶建议照常）：{e}")
-            for line in emit_declarations(narration, rushed, html_text):
+            for line in emit_declarations(narration, rushed, html_text,
+                                          absolute_rows=absolute_rows):
                 print(f"  {line}")
     print(
         f"[PROSODY] 描述面（不裁定）：{grand['projects']} 个项目｜连读风险 {grand['merge_risk']}"

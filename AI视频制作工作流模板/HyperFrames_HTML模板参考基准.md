@@ -258,6 +258,18 @@ tl.fromTo("#sN-title", { y:50, opacity:0 }, { y:0, opacity:1, duration:0.9, ease
 })();
 ```
 
+**入场一律 `fromTo`，不得用 `from` 打初始隐藏元素**（2026-11-06 由一次不合格交付定稿）：
+`from()` 的终值就是元素的自然值。CSS 里已写 `opacity:0`（如 `.rv{opacity:0}`）时再写
+`tl.from(sel, {opacity:0, …})`，元素是从 0 动到 0——成片里从未出现，而预览、终检、
+六维审计全绿，因为门禁不量"内容是否在场"。两种合法写法任选其一：
+
+```javascript
+tl.fromTo("#sN-c1", { scale:0.8, opacity:0 }, { scale:1, opacity:1, duration:0.3 }, T+1.6); // 抬起目标态
+```
+
+或者不给该元素挂初始隐藏类，让 `from` 自己生效。渲染前由预检 7b 形态③拦截
+（判据、否决票与全仓误杀普查见 `AGENTS.md` 的 `preflight_check.check_element_reveal` 同名行，本处不复制）。
+
 ### 3.5 装饰层持续动画
 
 ```javascript

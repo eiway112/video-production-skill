@@ -46,7 +46,8 @@ _streams_kept = (sys.stdout, sys.stderr)
 
 # Import shared GSAP time resolution utilities
 sys.path.insert(0, str(Path(__file__).parent))
-from _gsap_time_utils import parse_scene_map
+from _gsap_time_utils import (parse_scene_map, parse_s_block_array,
+                                classify_s_block_shape)
 import cue_resolve
 
 
@@ -356,43 +357,127 @@ def parse_boundaries_from_sblock(html_content):
     return boundaries, s_map
 
 
+def _split_s_block_entries(array_text):
+    """按**顶层花括号配对**切出 S 块的条目区间，返回 [(begin, end), ...]。
+
+    不用 `\\{[^{}]*\\}`：它对 `{ meta: { a: 1 }, start: 3 }` 会切到内层对象上，改写
+    落在错的段里；字符串值含花括号时同样切错。配对扫描把两者都排除。
+    """
+    out = []
+    depth = 0
+    begin = None
+    quote = None
+    i = 0
+    n = len(array_text)
+    while i < n:
+        ch = array_text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "{":
+            if depth == 0:
+                begin = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and begin is not None:
+                out.append((begin, i + 1))
+                begin = None
+        i += 1
+    return out
+
+
 def adjust_s_block(html_content, boundaries, extensions):
-    """Rewrite S-block with adjusted scene start/end/dur values.
+    """Rewrite S-block scene start/end/dur values **in place, preserving the written shape**.
 
     Applies cumulative offsets to each scene's timing, keeping the declaration
     authoritative and in sync with the T-block.
+
+    三条纪律（2026-11-06 架构收口②，由一次"每轮多付全量渲染"的实测换来）：
+
+    1. **两种数值形态都要维护**。旧实现只走 `json.loads`，于是编译器产的 JSON 形态被
+       维护、手写 HTML 的 JS 字面量形态（裸键/单引号）静默跳过——不打印、不留痕。而
+       `scene_patch_render.extract_scene_times` 的时间源见证按正则扫全脚本 `end:`，
+       **读得到**这份没人维护的旧数值，于是该项目每轮被判
+       `S-block-end != data-duration` 并降级全量渲染。定形单源在
+       `_gsap_time_utils.classify_s_block_shape`。
+    2. **T 派生形态不是缺陷**。`{ start: T.s1, dur: T.s2 - T.s1 }` 由页面自己从 T 块
+       算出，结构上不会分叉——报它"维护不了"属误报，故单独成一支并说明为何不改写。
+    3. **维护不了必须出声**。数值形态确实读不进（含撇号的字符串值会被形态互换改坏，
+       见 `parse_s_block_array` 的自校验守卫）时，打印 `[S-BLOCK-UNSYNCED]` 并保持原字节
+       （不猜、不半改），因为
+       下游见证仍会读到它——静默 no-op 把"没人维护"伪装成"没有这份声明"，属 A06 同族。
+
+    刻意保留原书写形态（只做数值就地替换，不把 JS 字面量重排成 JSON）：改写形态会让
+    `parse_scene_map` 下一轮突然开始看见这份 S 块，进而把时长推导切到
+    `s_map['duration'] + total_ext` 那条不等价公式（见 `classify_s_block_shape` docstring）。
     """
     s_match = re.search(r'(var\s+S\s*=\s*)(\[[\s\S]*?\])(\s*;)', html_content)
     if not s_match:
         return html_content, False
 
-    try:
-        scenes = json.loads(s_match.group(2))
-    except (json.JSONDecodeError, ValueError):
+    array_text = s_match.group(2)
+    shape, scenes, reason = classify_s_block_shape(array_text)
+    if shape == "derived_from_t":
+        print("  S-block: 数值由 T 块表达式派生（结构上不会与 T 分叉），未改写")
+        return html_content, True
+    if shape == "unparsable":
+        print(f"  [S-BLOCK-UNSYNCED] S 块声明在场但维护侧读不进：{reason} —— 未改写。"
+              f"其数值若与 T 块/data-duration 分叉，增量渲染将按时间源不可信降级 FULL")
         return html_content, False
 
-    new_scenes = []
-    content_idx = 0
-    for s in scenes:
-        if s.get('cover'):
-            new_scenes.append(s)  # Cover timing doesn't change
-            continue
-        if content_idx < len(boundaries):
-            offset = get_offset_for_time(s['start'], boundaries, extensions)
-            ext = extensions[content_idx] if content_idx < len(extensions) else 0
-            s = dict(s)  # Copy
-            s['start'] = round(s['start'] + offset, 1)
-            s['end'] = round(s['end'] + offset + ext, 1)
-            s['dur'] = round(s['end'] - s['start'], 1)
-        new_scenes.append(s)
-        content_idx += 1
+    # 解析已确证每项是对象，配对扫描必然逐项给出一段，故不再写"切分数≠项数"的守卫
+    # ——那是个造不出夹具的分叉（2026-11-06 架构收口②自查：无对象可验的分支即假设）。
+    spans = _split_s_block_entries(array_text)
 
-    new_json = json.dumps(new_scenes, separators=(',', ': '))
-    # Reformat with line breaks for readability
-    new_json = new_json.replace('}, {', '},\n    {')
-    new_block = s_match.group(1) + new_json + s_match.group(3)
-    result = html_content[:s_match.start()] + new_block + html_content[s_match.end():]
-    return result, True
+    def _replace_num(seg, key, val):
+        # 键可能带引号（JSON 形态）也可能裸写（JS 字面量形态），两种都要命中
+        return re.sub(r'("%s"|\'%s\'|%s)(\s*:\s*)[\d.]+' % (key, key, key),
+                      lambda mm: mm.group(1) + mm.group(2) + ("%.1f" % val), seg)
+
+    parts = []
+    cursor = 0
+    content_idx = 0
+    changed = False
+    for (b, e), s in zip(spans, scenes):
+        seg = array_text[b:e]
+        if s.get('cover'):
+            new_seg = seg                      # Cover timing doesn't change
+        elif content_idx >= len(boundaries):
+            new_seg = seg                      # 边界表比声明短：不猜，原样带过（旧行为）
+        else:
+            offset = get_offset_for_time(float(s['start']), boundaries, extensions)
+            ext = extensions[content_idx] if content_idx < len(extensions) else 0
+            ns = round(float(s['start']) + offset, 1)
+            ne = round(float(s['end']) + offset + ext, 1)
+            new_seg = _replace_num(seg, 'start', ns)
+            new_seg = _replace_num(new_seg, 'end', ne)
+            new_seg = _replace_num(new_seg, 'dur', round(ne - ns, 1))
+            content_idx += 1
+        if new_seg != seg:
+            changed = True
+        parts.append(array_text[cursor:b] + new_seg)
+        cursor = e
+    parts.append(array_text[cursor:])
+    new_array = "".join(parts)
+
+    if not changed:
+        print("  S-block: 数值已在位（就地核对一致，未改写）")
+        return html_content, True
+
+    after, after_reason = parse_s_block_array(new_array)
+    if after is None:
+        print(f"  [S-BLOCK-UNSYNCED] 改写结果自身读不回去：{after_reason} —— 放弃改写，"
+              f"原字节保持不变（半改比不改更糟）")
+        return html_content, False
+
+    new_block = s_match.group(1) + new_array + s_match.group(3)
+    return html_content[:s_match.start()] + new_block + html_content[s_match.end():], True
 
 
 def update_data_duration(content, new_duration):
