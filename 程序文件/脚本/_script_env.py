@@ -60,6 +60,12 @@ LOG_PATH = TEMP_BASE / "asset_audit.jsonl"
 QUALITY_DIR = CONFIG_BASE / "config" / "quality"
 FORENSIC_RULES_PATH = QUALITY_DIR / "forensic_artifact_rules.json"
 
+# TTS 引擎缺省值（单一权威源）：生效路径 enhance_video_audio 与预检
+# preflight_check.check_pause_declarations 都从此处取。2026-11-07 切换前该缺省
+# 在两处各写一份字面量——预检那一份若漏改，就会对"该引擎支不支持 <break>"给出
+# 与运行期相反的结论（A06 同族：同一事实的第二份副本）。
+DEFAULT_TTS_ENGINE = "elevenlabs"
+
 # venv 解释器：存在则用项目 venv，否则回退当前解释器（异机/CI 兼容）
 VENV_PYTHON = ROOT / "程序文件" / "运行环境" / "venv" / "Scripts" / "python.exe"
 if not VENV_PYTHON.exists():

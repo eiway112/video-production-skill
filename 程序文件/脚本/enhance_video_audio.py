@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _gsap_time_utils import parse_t_block, resolve_line_time, resolve_script_times, parse_scene_map
 from _narration_lint import scan_srt_file as _lint_scan_srt, format_findings as _lint_format
 from _script_env import (ROOT as WF_ROOT, HTML_BASE as WF_HTML_BASE,
+                         DEFAULT_TTS_ENGINE,
                          resolve_delivery_names, validate_managed_name)
 from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
@@ -79,20 +80,31 @@ def _load_env_files():
 _load_env_files()
 
 # === TTS 引擎参数 ===
-# tts_engine 控制使用哪个 TTS 后端：
-#   - "qwen"（默认）：阿里云百炼 DashScope 的 CosyVoice / Qwen-Audio-TTS（需 DASHSCOPE_API_KEY）
+# tts_engine 控制使用哪个 TTS 后端（缺省值住 _script_env.DEFAULT_TTS_ENGINE，单一权威源）：
+#   - "elevenlabs"（默认，2026-11-07 用户裁定切换）：ElevenLabs HTTP API（需 ELEVENLABS_API_KEY；
+#     voice 传 voice_id）。缺省音色 Arthur＝2026-11-07 用户逐条听感选定的主音色；不支持 SSML
+#     <break>，故有 pause_marks 声明的项目在该引擎上按 pause_marks 既有语义直接报错（不静默忽略）。
+#   - "qwen"：阿里云百炼 DashScope 的 CosyVoice / Qwen-Audio-TTS（需 DASHSCOPE_API_KEY）。
+#     存量项目按 config 显式声明继续使用——切换当日已为全部存量 config 补齐显式键，
+#     故"改缺省"不会把任何已交付项目静默换音色（音色不一致是不可逆的交付缺陷）。
 #   - "edge"：Edge-TTS（旧默认，无需 Key，仅存量项目显式声明保留）
-#   - "elevenlabs"：ElevenLabs HTTP API（需 ELEVENLABS_API_KEY；voice 传 voice_id）。
-#     缺省音色 Arthur＝2026-11-07 用户逐条听感选定的主音色；不支持 SSML <break>，
-#     故有 pause_marks 声明的项目在该引擎上按 pause_marks 既有语义直接报错（不静默忽略）。
 # 引擎不自动 fallback — AGENTS.md 明令禁止跨引擎自动降级（造成音色不一致）。
-TTS_ENGINE = "qwen"
-VOICE = "longanling_v3"       # Qwen 默认音色：龙安灵V3（思维灵动女，cosyvoice-v3-flash）
+TTS_ENGINE = DEFAULT_TTS_ENGINE
+VOICE = "longanling_v3"       # engine=qwen 时的缺省音色：龙安灵V3（思维灵动女，cosyvoice-v3-flash）
 # QWEN_MODEL 留空 = 按音色自动推断（_infer_qwen_model）；config 显式声明 qwen_model 为权威。
 # 2026-08-06 实测：v3 系列走标准 dashscope 端点即可（旧注释"需专属域名"不成立）。
 QWEN_MODEL = ""
 RATE = "+0%"                  # Edge 语法，Qwen 分支会自动换算成 float（0.5-2.0）
 PITCH = "+0Hz"
+# load_config 每次从这些常量取缺省，**不读"上一次 load 的结果"**：in-process 多项目
+# 调用（回归套件、批量探针、同进程父脚本）下，惰性继承会把 A 项目的引擎/音色/语速/
+# 模型装进 B 项目——2026-11-07 切换缺省时实测：先 load 一个 qwen 项目，再 load 一个
+# 不声明引擎的项目，后者拿到的是 qwen 而不是新缺省 elevenlabs（同 BGM/字幕样式/
+# 停顿声明三条"不做惰性赋值"判据）。
+_DEFAULT_TTS_ENGINE = DEFAULT_TTS_ENGINE   # 来自 _script_env（单一权威源），此处只做快照
+_DEFAULT_VOICE = VOICE
+_DEFAULT_RATE = RATE
+_DEFAULT_PITCH = PITCH
 TTS_INSTRUCTION = ""          # config tts_instruction：Instruct 音色的情感/场景指令（如 longanyang/longanhuan）
 SAMPLE_RATE = 44100
 
@@ -200,6 +212,10 @@ VIDEO_TYPE = ""         # config "video_type"：视频类型声明（如 product
 TTS_ENABLED = True      # config "tts_enabled"：false = 纯BGM无旁白路径（默认 true，既有项目零变化）
 BGM_SOURCE = None       # config "bgm_source" 解析后的外部 BGM 文件 Path（纯BGM路径必填）
 AUDIO_BITRATE = "256k"  # config "audio_bitrate"：成片 AAC 码率（现状默认 256k 不变）
+# 时长与码率的模块缺省（与上面 _DEFAULT_VOICE 同判据）：load_config 每次从这里取，
+# 不读"上一次 load 的结果"——否则同进程第二个项目会继承上一个项目的时长与码率。
+_DEFAULT_VIDEO_DURATION = VIDEO_DURATION
+_DEFAULT_AUDIO_BITRATE = AUDIO_BITRATE
 
 # === 停顿声明（2026-10-13 停顿可控性接入批；裁定真身住 pause_marks.py）===
 # PAUSE_DECLARATIONS：{str(scene_id): [{"after": 锚词, "ms": 毫秒}, ...]}，由
@@ -1535,7 +1551,7 @@ def load_config(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     
-    VIDEO_DURATION = float(cfg.get('video_duration', VIDEO_DURATION))
+    VIDEO_DURATION = float(cfg.get('video_duration') or _DEFAULT_VIDEO_DURATION)
     # 未声明一律回缺省常量，不沿用上一次 load 残留在模块全局的值（与 SUBTITLE_STYLE
     # 的"不做惰性赋值"同一判据：跨项目 in-process 调用时，前一个项目显式声明的
     # bgm_enabled 会污染下一个未声明的项目）。JSON null 按未声明处理。
@@ -1554,7 +1570,7 @@ def load_config(config_path):
     # ---- P0 类型体系（2026-07-29）：纯BGM无旁白路径的类型化配置 ----
     VIDEO_TYPE = str(cfg.get('video_type', '') or '')
     TTS_ENABLED = _coerce_bool(cfg.get('tts_enabled', True))
-    AUDIO_BITRATE = str(cfg.get('audio_bitrate', AUDIO_BITRATE))
+    AUDIO_BITRATE = str(cfg.get('audio_bitrate') or _DEFAULT_AUDIO_BITRATE)
     BGM_SOURCE = None
     if cfg.get('bgm_source'):
         # bgm_source 解析：绝对路径 → 工作流根目录相对 → HTML 项目目录。
@@ -1592,11 +1608,13 @@ def load_config(config_path):
             print("[ERROR] 合成正弦 drone 不适合作为成片唯一音轨。")
             sys.exit(1)
     SUBTITLE_DISPLAY_REPLACEMENTS = cfg.get('subtitle_display_replacements', {}) or {}
-    VOICE = cfg.get('voice', VOICE)
-    RATE = cfg.get('rate', RATE)
-    PITCH = cfg.get('pitch', PITCH)
-    TTS_ENGINE = cfg.get('tts_engine', TTS_ENGINE).lower()
-    QWEN_MODEL = cfg.get('qwen_model', QWEN_MODEL)
+    VOICE = cfg.get('voice') or _DEFAULT_VOICE
+    RATE = cfg.get('rate') or _DEFAULT_RATE
+    PITCH = cfg.get('pitch') or _DEFAULT_PITCH
+    TTS_ENGINE = str(cfg.get('tts_engine') or _DEFAULT_TTS_ENGINE).lower()
+    # qwen_model 同样每次从零解析：显式声明优先，否则交下面 _infer_qwen_model 按音色
+    # 推断。不归零即"上一个项目的模型"被当成本项目声明（音色-模型严格配对会被绕过）。
+    QWEN_MODEL = cfg.get('qwen_model') or ""
     TTS_INSTRUCTION = str(cfg.get('tts_instruction', TTS_INSTRUCTION) or '')
     # ElevenLabs 两键每次 load 先回缺省再叠声明：不做惰性继承（同 BGM/字幕样式判据）。
     ELEVEN_MODEL = str(cfg.get('eleven_model') or "eleven_v4")

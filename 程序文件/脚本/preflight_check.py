@@ -87,7 +87,11 @@ RENDER_CRITICAL_CHECKS = {
     # 引擎不支持这些形态若留到 TTS 步炸，已是白扣一轮账号余额（缓存被清后）。
     # 判据本体住 pause_marks.plan_scene，预检与生效路径同一裁定源。
     "pause_declaration",
-    "asset_signoff",      # check 14: 屏显/旁白与位点1 素材确认单分叉
+    "asset_signoff",      # check 14:  屏显/旁白与位点1 素材确认单分叉
+    # check 13c（2026-11-07 借鉴批）：内容事实台账。本仓门禁全量在技术正确性面，
+    # 没有一条问"这句话凭什么这么说"——旁白数字无出处、引文在快照里查不到、
+    # 弱来源标 T1，这些形态此前全绿出厂。声明了台账即硬判；未声明记未测不阻断。
+    "content_facts",
     # check 7e: 插入/删除/重排场景时三处独立书写的东西须一起改——隐藏声明、
     # 进/退转场语句、z-index 层序。实证：插一场只改了 T 块与 div，新场缺 CSS 节
     # （t=0 常驻）、旧场退场锚没前移（新场永不退场）、z-index 没重排（层序错位），
@@ -2503,7 +2507,10 @@ def check_pause_declarations(cfg: dict, r: PreflightResult):
         auto_raw = cfg["audio"].get("pause_auto_enabled")
     auto_on = _as_bool(auto_raw, False)
 
-    engine = str(cfg.get("tts_engine", "qwen") or "qwen").lower()
+    # 缺省值从 _script_env 取（与 enhance_video_audio 同一权威源）：此处若各写一份
+    # 字面量，改缺省时漏改这一处，预检就会对"引擎支不支持 <break>"给出相反结论。
+    engine = str(cfg.get("tts_engine", _script_env.DEFAULT_TTS_ENGINE)
+                 or _script_env.DEFAULT_TTS_ENGINE).lower()
     if isinstance(cfg.get("audio"), dict) and 'engine' in cfg["audio"]:
         engine = str(cfg["audio"]["engine"]).lower()
 
@@ -2614,6 +2621,69 @@ def _quant_tokens(text: str) -> set:
     """需要溯源的数字：剔除公历日期（"9 月 1 日"/"3 号"属日历引用而非量化指标）。"""
     t = re.sub(r'\d+(?:\.\d+)?\s*(?=[月日号])', '', text or "")
     return _num_tokens(t)
+
+
+def check_content_facts(project_dir: Path, cfg: dict, r: PreflightResult):
+    """[13c] 内容事实台账（内容溯源面，2026-11-07 借鉴批）。
+
+    存在理由：本仓门禁全量在技术正确性面（指纹、四态、交付槽位、媒体终检），
+    没有一条问"这句话凭什么这么说"。旁白里的参数、结论只要字幕不溢出、时长不超
+    预算，就没有任何机算面能发现它无出处。
+
+    判据本体住 `content_facts_gate`（借鉴 vibe-knowledge 的 check.py 33 条中
+    可机算的部分：快照哈希、引文逐字命中、来源等级、数字挂事实、状态有说明），
+    本函数只做三件事：定位台账、把四态翻成预检面、把读数印出来——阈值一律不在
+    此处重写（两处各写一套即 A06 同族）。
+
+    声明面：config 顶层 `content_facts`（相对项目目录）；未声明回 `facts.json`。
+    两者都不在位 → INFO 跳过（**不阻断**），且必须印出"未测"字样——不得让
+    "没声明"读成"检查通过"。
+    """
+    print("\n[13c] Content facts ledger (旁白事实台账 — 内容溯源面)")
+    if not cfg:
+        r.warn("Skipped — no config loaded", check_id="content_facts")
+        return
+    try:
+        import content_facts_gate as _cf_gate
+    except Exception as e:
+        r.error(f"事实台账门禁模块取不回：{e}——不可判为通过",
+                check_id="content_facts")
+        return
+    try:
+        rules = _cf_gate.load_rules()
+    except _cf_gate.RulesBroken as e:
+        r.error(f"事实台账判据断链：{e}", check_id="content_facts")
+        return
+
+    declared = cfg.get(rules.get("facts_config_key") or "content_facts")
+    if declared:
+        facts_path = Path(str(declared))
+        if not facts_path.is_absolute():
+            facts_path = project_dir / facts_path
+    else:
+        facts_path = project_dir / str(rules.get("default_filename") or "facts.json")
+
+    scenes = [(str(s.get("scene_id")), str(s.get("narration") or ""))
+              for s in (cfg.get("scenes") or []) if isinstance(s, dict)]
+    res = _cf_gate.check(facts_path, scenes, rules)
+    counts = res["counts"]
+    gsmod = _cf_gate.gs
+
+    if res["status"] == gsmod.NOT_APPLICABLE:
+        r.info(f"未声明事实台账（{facts_path.name} 不在位）——本项未测，"
+               "不得读成已检查且干净", check_id="content_facts")
+        return
+    if res["status"] == gsmod.UNTESTED:
+        for u in res["untested"]:
+            r.error(f"未测：{u}", check_id="content_facts")
+        return
+    for v in res["violations"]:
+        r.error(v, check_id="content_facts")
+    if res["status"] == gsmod.PASS:
+        r.ok(f"事实台账自洽：来源 {counts['sources']}／事实 {counts['facts']}／"
+             f"快照哈希 {counts['snapshots_verified']}／引文命中 {counts['quotes_verified']}／"
+             f"旁白数字 {counts['numbers_sourced']}/{counts['numbers_in_narration']} 有出处",
+             check_id="content_facts")
 
 
 def check_alignment_model_cache(cfg: dict, r: PreflightResult):
@@ -3064,6 +3134,7 @@ def main():
     check_subtitle_safe_zone(html_path, r)
     check_narration_digits(cfg or pre_cfg, r)
     check_pause_declarations(cfg or pre_cfg, r)
+    check_content_facts(project_dir, cfg or pre_cfg, r)
     check_alignment_model_cache(cfg or pre_cfg, r)
     check_asset_signoff(project_dir, cfg or pre_cfg, html_path, r)
     check_output_dir_cleanliness(output_dir, r)

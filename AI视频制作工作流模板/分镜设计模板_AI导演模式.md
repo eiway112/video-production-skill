@@ -89,6 +89,47 @@
 
 ---
 
+## 事实台账与出处自检（规定 · 机器门 check 13c）
+
+机器门为 `preflight_check.check_content_facts`（判据本体 `程序文件/脚本/content_facts_gate.py`，阈值唯一权威源 `程序文件/配置/config/quality/content_facts_rules.json`）。**声明即硬判，未声明判未测并点名（不阻断）**——不建台账的项目照常出片，但预检日志里会留一行"未测"，不得被读成"检查通过"。
+
+什么时候必须建：旁白里出现**参数、结论、年份、机构/标准名**任一项。纯叙述性文案（"我们来看看"）不需要。
+
+**放哪、怎么放**：项目目录下 `facts.json`（或 config 顶层 `content_facts` 指向别处）；来源快照放项目目录内（建议 `证据/`），**必须是相对路径、不得越出台账目录**。
+
+```json
+{
+  "version": 1,
+  "sources": [
+    {"id": "S1", "kind": "standard", "tier": "T1",
+     "title": "GB/T 19889.3 声学 建筑和建筑构件隔声测量",
+     "snapshot": "证据/GB-T-19889.3.txt", "sha256": "<sha256sum 的 64 位>"}
+  ],
+  "facts": [
+    {"id": "F1", "claim": "双空腔隔墙空气声隔声量 ≥50 dB", "type": "spec",
+     "status": "verified", "source": "S1",
+     "quote": "实测空气声隔声量 Rw+Ctr ≥ 50 dB", "numbers": ["50"]}
+  ]
+}
+```
+
+机器会逐条裁：
+- 快照在盘且 `sha256` 与记录一致（**取证件被改、或登记错件，都判违规**）
+- `quote` 在快照里逐字命中（空白/换行差异不算改动）
+- `verified` 需 1×T1 或 2×T2；`type: mechanism`（讲"为什么/怎么起作用"）必须有 T1
+- `kind` 为 `social`/`media`/`forum` 的来源**不得标 T1**——把一条短视频当一手依据是这套判据最常见的自欺形态
+- **旁白里每个数字都必须出现在某条事实的 `numbers` 里**（序数"第 N"豁免）——这是唯一能自动圈出"这句没人给它出过处"的一条
+- `status` 为 `inferred`/`conflict`/`undisclosed` 必须写 `notes` 说明边界（没查清可以说，但必须说清没查清）
+
+**边界（不得读宽）**：这道门证明**记账合规**，不证明**内容为真**。"引文在快照里"不等于"引文支撑该结论"，那一层仍由人裁定；`quote` 只是让你在复核时能一秒回去看原文。
+
+- [ ] 旁白里的每个数字都能在 `facts.json` 某条事实的 `numbers` 里找到
+- [ ] 每条 `verified` 都真有来源，且有引文可回查（没有引文更要写清 `notes`）
+- [ ] 快照是**原文**字节，不是截图转述、不是二手摘要
+- [ ] 台账改过之后重跑预检（台账在预检步指纹面上，改了会自动判 `inputs-changed`）
+
+---
+
 ## 断词与停顿自检（规定）
 
 2026-10-13 用户对多支成片给出同一条口播反馈："断句停顿的节奏（停顿和标点）把握不准"。复盘实测后根因分两类，**都不是停顿阈值的问题**，且都在撰写侧可预防。机器面为 `程序文件/脚本/narration_pause_precheck.py`（零渲染／零 TTS／零 ASR，判据住 `config/quality/narration_prosody_rules.json`；**2026-11-06 起其绝对阈命中不再是纯描述面**——timeline 步末按四态裁定，实测时刻的低于下限判 FAIL 并阻断渲染，见 `agents.md` 门禁表`_enforce_punctuation_pauses` 与 `_pause_gate_verdict` 两行）；本节是撰写侧自检，脚本无点名不替代本节（脚本只认已登记的形状）。

@@ -17548,6 +17548,11 @@ def test_pause_declaration_effective_face() -> RegressionTestCase:
         T2 = "带触发条件的红线至少一条，条件在带内。"
         # 复位登记先取（E 段之前任何一步失败时 finally 仍要拿得到原值）
         old_decls, old_auto = ev.PAUSE_DECLARATIONS, ev.PAUSE_AUTO_ENABLED
+        # 本用例全部断言语义都锚在 CosyVoice `<break>` 上（C 段"引擎不支持+有声明→抛"
+        # 的反面就是它），引擎必须**显式固定**：缺省已于 2026-11-07 改为 elevenlabs，
+        # 依赖模块缺省会让本用例悄悄改成量另一种引擎（E 段旧公式也随之失配）。
+        old_engine = ev.TTS_ENGINE
+        ev.TTS_ENGINE = "qwen"
         try:
             # ═══ A. 档位 fail-closed：六形态各自点名断在哪条腿 ═══
             pm.rules_path = lambda: tmpdir / "definitely_missing_pause.json"
@@ -17835,6 +17840,10 @@ def test_pause_declaration_effective_face() -> RegressionTestCase:
             # 取数面 = r._log_entries（level/check_id/message 三键，类实现的唯一结构化面）。
             # 刻意不在测试侧另拼一份"违规清单"——那会成为第二个取数面并与判据漂移。
             def _run_check(cfg, mode="render"):
+                # 夹具显式声明被测引擎：本段量的是 CosyVoice `<break>` 面，依赖模块缺省
+                # 会在缺省切换（2026-11-07 → elevenlabs）后悄悄改测另一种引擎。
+                cfg = dict(cfg)
+                cfg.setdefault("tts_engine", "qwen")
                 r = pc.PreflightResult(mode=mode)
                 pc.check_pause_declarations(cfg, r)
                 errs = [m for m in r.errors]
@@ -17943,6 +17952,7 @@ def test_pause_declaration_effective_face() -> RegressionTestCase:
             pm.rules_path = REAL_RULES_PATH
             _script_env.QUALITY_DIR = REAL_QUALITY_DIR
             ev.PAUSE_DECLARATIONS, ev.PAUSE_AUTO_ENABLED = old_decls, old_auto
+            ev.TTS_ENGINE = old_engine
             ev._PAUSE_PLAN_MEMO.clear()
 
         tc.mark_passed()
@@ -22056,6 +22066,7 @@ class RegressionTestRunner:
             test_presence_check_names_dead_blocks,
             test_transition_overlap_census_descriptive_face,
             test_elevenlabs_engine_branch_and_term_rewrite,
+            test_content_facts_ledger_gate,
         ]
         self.results = []
     
@@ -26337,6 +26348,7 @@ def test_elevenlabs_engine_branch_and_term_rewrite() -> RegressionTestCase:
         engine=eva.TTS_ENGINE, voice=eva.VOICE, qwen=eva.QWEN_MODEL,
         emodel=eva.ELEVEN_MODEL, eset=dict(eva.ELEVEN_VOICE_SETTINGS),
         decl=dict(eva.PAUSE_DECLARATIONS), auto=eva.PAUSE_AUTO_ENABLED,
+        rate=eva.RATE, pitch=eva.PITCH,
     )
     TEXT = "装配式隔墙的空腔厚度、密封条做法与连接件形式，都会影响最终的隔声量。"
     try:
@@ -26452,6 +26464,89 @@ def test_elevenlabs_engine_branch_and_term_rewrite() -> RegressionTestCase:
         tc.assert_true('"tts_pronunciation_rules"' in pr_src
                        and "tts_pronunciation.json" in pr_src,
                        "F2 术语表 JSON 已登记在 tts 步输入面")
+
+        # ── G 缺省链：引擎缺省单一权威源，两条消费腿同读一处 ──────────
+        # 存在理由：切换前该缺省在 enhance 与 preflight 各写一份字面量；预检那份
+        # 漏改即对"该引擎支不支持 <break>"给出与运行期相反的结论（A06 同族）。
+        import ast as _astg
+        from pathlib import Path as _Pathg
+        import _script_env as _seg
+        tc.assert_equal(_seg.DEFAULT_TTS_ENGINE, "elevenlabs",
+                        "G1 缺省引擎＝ElevenLabs（2026-11-07 用户裁定切换）")
+        ev_tree = _astg.parse(_Pathg(eva.__file__).read_text(encoding="utf-8"))
+        mod_assign = [n for n in ev_tree.body if isinstance(n, _astg.Assign)
+                      and any(getattr(t, "id", "") == "TTS_ENGINE" for t in n.targets)]
+        tc.assert_equal(len(mod_assign), 1, "G2 模块级 TTS_ENGINE 赋值唯一")
+        tc.assert_true(isinstance(mod_assign[0].value, _astg.Name)
+                       and mod_assign[0].value.id == "DEFAULT_TTS_ENGINE",
+                       "G2b 生效路径的缺省取自 _script_env.DEFAULT_TTS_ENGINE（不写字面量）")
+        pc_tree = _astg.parse(
+            (SUITE_SCRIPT_DIR / "preflight_check.py").read_text(encoding="utf-8"))
+        pc_fn = next(n for n in pc_tree.body if isinstance(n, _astg.FunctionDef)
+                     and n.name == "check_pause_declarations")
+        refs = [n for n in _astg.walk(pc_fn) if isinstance(n, _astg.Attribute)
+                and n.attr == "DEFAULT_TTS_ENGINE"]
+        tc.assert_true(len(refs) >= 1,
+                       "G3 预检面同读 _script_env.DEFAULT_TTS_ENGINE（不是第二份字面量）")
+        literals = [n for n in _astg.walk(pc_fn) if isinstance(n, _astg.Constant)
+                    and n.value in ("qwen", "elevenlabs", "edge")]
+        tc.assert_equal(literals, [], "G3b 预检面不得残留引擎名字面量（改缺省只改一处）")
+
+        # ── G4 缺省不跨项目惰性继承（in-process 连续 load 两个项目）────────
+        # 2026-11-07 实测缺陷：旧写法 `cfg.get('tts_engine', TTS_ENGINE)` 用**当前全局**
+        # 作缺省，先 load 一个 qwen 项目后，再 load 一个不声明引擎的项目拿到的仍是 qwen
+        # ——改缺省只在进程内第一个项目生效。回归套件/批量探针正是这种多项目同进程形态。
+        import tempfile as _tf
+        import json as _jsong
+        _tmpg = _Pathg(_tf.mkdtemp(prefix="case129_g_"))
+        # 夹具自带最小 config（内联 scenes），不依赖任何真实项目 config——
+        # 依赖真实文件会让"改了个项目名/删了个老配置"表现为本用例离奇失败。
+        _base_cfg = {
+            "paths": {"html_project": "case129-proj",
+                      "temp_subdir": "case129_probe"},
+            "tts_enabled": True,
+            "scenes": [{"scene_id": "s1", "start": 0, "end": 2, "narration": "测试。"}],
+        }
+
+        def _mkc(name, **over):
+            doc = _jsong.loads(_jsong.dumps(_base_cfg))
+            doc.update(over)
+            f = _tmpg / name
+            f.write_text(_jsong.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            return f
+
+        eva.load_config(str(_mkc("q.json", tts_engine="qwen", voice="longanling_v3")))
+        tc.assert_equal(eva.TTS_ENGINE, "qwen", "G4a 首个项目按其显式声明解析")
+        eva.load_config(str(_mkc("n.json")))
+        tc.assert_equal(eva.TTS_ENGINE, _seg.DEFAULT_TTS_ENGINE,
+                        "G4b 第二个项目不声明引擎 → 回缺省，不继承上一项目")
+        tc.assert_equal(eva.VOICE, eva.ELEVEN_DEFAULT_VOICE_ID,
+                        "G4c 音色同样不继承（继承即等于静默换音色）")
+
+        # ── G5 时长/码率同属"不跨项目继承"一族（同类漏项，2026-11-07 补）──
+        eva.load_config(str(_mkc("d.json", video_duration=99, audio_bitrate="320k")))
+        tc.assert_equal((eva.VIDEO_DURATION, eva.AUDIO_BITRATE), (99.0, "320k"),
+                        "G5a 显式声明按声明生效")
+        eva.load_config(str(_mkc("d2.json")))
+        tc.assert_equal(eva.VIDEO_DURATION, eva._DEFAULT_VIDEO_DURATION,
+                        "G5b 不声明时长 → 回模块缺省，不继承上一项目的 99s")
+        tc.assert_equal(eva.AUDIO_BITRATE, eva._DEFAULT_AUDIO_BITRATE,
+                        "G5c 不声明码率 → 回模块缺省，不继承上一项目的 320k")
+
+        # ── G6 登记面（A06）：缺省值所在文件进 preflight／tts 两步指纹 ──────
+        _pr_tree = _astg.parse((SUITE_SCRIPT_DIR / "pipeline_runner.py").read_text(encoding="utf-8"))
+        _si_fn = next(n for n in _astg.walk(_pr_tree)
+                      if isinstance(n, _astg.FunctionDef) and n.name == "_step_inputs")
+        _big = next(n for n in _astg.walk(_si_fn)
+                    if isinstance(n, _astg.Dict)
+                    and {k.value for k in n.keys if isinstance(k, _astg.Constant)}
+                    >= {"preflight", "tts", "postprocess"})
+        _steps = {k.value: v for k, v in zip(_big.keys, _big.values)
+                  if isinstance(k, _astg.Constant)}
+        for _step in ("preflight", "tts"):
+            _keys = {k.value for k in _steps[_step].keys if isinstance(k, _astg.Constant)}
+            tc.assert_true("script_env" in _keys,
+                           f"G6[{_step}] 缺省值所在文件未登记：改缺省而该步缓存照常命中")
         tc.mark_passed()
     except Exception as e:
         import traceback
@@ -26461,6 +26556,8 @@ def test_elevenlabs_engine_branch_and_term_rewrite() -> RegressionTestCase:
         eva.TTS_ENGINE = saved["engine"]
         eva.VOICE = saved["voice"]
         eva.QWEN_MODEL = saved["qwen"]
+        eva.RATE = saved.get("rate", eva.RATE)
+        eva.PITCH = saved.get("pitch", eva.PITCH)
         eva.ELEVEN_MODEL = saved["emodel"]
         eva.ELEVEN_VOICE_SETTINGS = dict(saved["eset"])
         eva.PAUSE_DECLARATIONS = dict(saved["decl"])
@@ -26469,6 +26566,262 @@ def test_elevenlabs_engine_branch_and_term_rewrite() -> RegressionTestCase:
             eva._PAUSE_PLAN_MEMO.clear()
         except Exception:
             pass
+    return tc
+
+
+def test_content_facts_ledger_gate() -> RegressionTestCase:
+    """用例130：内容事实台账门禁（内容溯源面，2026-11-07 借鉴批）。
+
+    存在理由：本仓门禁全量在技术正确性面（指纹、四态、交付槽位、媒体终检），
+    没有一条问"这句话凭什么这么说"——旁白里的参数与结论只要字幕不溢出、时长不
+    超预算，就没有任何机算面能发现它无出处。借鉴 vibe-knowledge check.py 的
+    可机算部分（取舍与边界见 `content_facts_gate` 模块 docstring）。
+
+    各段各证一件事：
+    A 判据面：快照哈希／引文逐字命中（空白差异不算改动）／等级充分性（verified
+      需 1×T1 或 2×T2，mechanism 必须有 T1）／弱来源不得标 T1／旁白数字必须挂事实／
+      非确定状态必须写 notes／id 唯一与引用完整性／快照路径不得越出台账目录——
+      各自点名断在哪条腿；序数（第N）不是事实断言，豁免
+    B 四态：台账不在位 → NOT_APPLICABLE（**不得写 PASS**）；不可解析 → UNTESTED；
+      缺 sources → FAIL（"没有来源"与"没写台账"是两件事，不得合并）
+    C 判据 fail-closed：文件缺失／缺节／空表 → RulesBroken，不得按空规则继续裁
+    D 预检接线：main() 内经 AST 锚定真调用；check_id 入 RENDER_CRITICAL_CHECKS
+      （audit 降级语义）；真跑 check_content_facts——违规进 errors 且 check_id 归属、
+      未声明只记 INFO 不进 errors/warnings、判据断链判 error 而**不判通过**
+    E 登记面（A06）：pipeline_runner 预检步三键在位；其中台账路径是按规则文件两键
+      解析的**镜像字面量**，两键改名须同改——此处断言二者相等
+    """
+    import ast as _ast
+    import hashlib as _hashlib
+    import json as _json
+    import tempfile
+    from pathlib import Path
+
+    tc = RegressionTestCase(
+        "content_facts_ledger_gate",
+        "验证内容事实台账：判据面六条、四态、判据 fail-closed、预检接线与指纹登记面"
+    )
+    tmp = Path(tempfile.mkdtemp(prefix="case130_"))
+    try:
+        import content_facts_gate as g
+        import preflight_check as pc
+
+        rules = g.load_rules()
+
+        snap_text = "双空腔轻钢龙骨隔声隔墙，实测空气声隔声量 Rw+Ctr ≥ 50 dB。"
+        snap = tmp / "证据" / "国标摘录.txt"
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        snap.write_text(snap_text, encoding="utf-8")
+        snap_sha = _hashlib.sha256(snap.read_bytes()).hexdigest()
+
+        def ledger(**over):
+            doc = {
+                "version": 1,
+                "sources": [{
+                    "id": "S1", "kind": "standard", "tier": "T1",
+                    "title": "GB/T 19889.3 隔声测量",
+                    "snapshot": "证据/国标摘录.txt", "sha256": snap_sha,
+                }],
+                "facts": [{
+                    "id": "F1", "claim": "双空腔隔墙空气声隔声量 ≥50 dB",
+                    "type": "spec", "status": "verified",
+                    "source": "S1", "quote": "实测空气声隔声量 Rw+Ctr ≥ 50 dB",
+                    "numbers": ["50"],
+                }],
+            }
+            doc.update(over)
+            return doc
+
+        def run(doc, narration=("s1", "隔声量达到 50 dB。")):
+            fp = tmp / "facts.json"
+            fp.write_text(_json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            return g.check(fp, [narration], rules)
+
+        # ═══ A. 判据面 ═══
+        ok = run(ledger())
+        tc.assert_equal(ok["status"], g.gs.PASS, f"A1 干净台账 PASS：{ok['violations']}")
+        tc.assert_equal(ok["counts"]["quotes_verified"], 1, "A1b 引文命中计数")
+        tc.assert_equal(ok["counts"]["snapshots_verified"], 1, "A1c 快照哈希计数")
+
+        d = ledger()
+        d["sources"][0]["sha256"] = "0" * 64
+        res = run(d)
+        tc.assert_equal(res["status"], g.gs.FAIL, "A2 快照哈希不符 FAIL")
+        tc.assert_true(any("哈希不符" in v for v in res["violations"]),
+                       f"A2b 点名哈希：{res['violations']}")
+
+        d = ledger()
+        d["sources"][0]["snapshot"] = "证据/不存在.txt"
+        res = run(d)
+        tc.assert_true(any("快照不在位" in v for v in res["violations"]),
+                       f"A3 快照缺失点名：{res['violations']}")
+
+        d = ledger()
+        d["facts"][0]["quote"] = "引文只在别处出现过"
+        res = run(d)
+        tc.assert_true(any("引文在" in v and "找不到" in v for v in res["violations"]),
+                       f"A4 引文不在快照里 FAIL：{res['violations']}")
+
+        d = ledger()
+        d["sources"][0]["tier"] = "T2"
+        d["facts"][0]["type"] = "spec"
+        res = run(d)
+        tc.assert_true(any("等级不足" in v for v in res["violations"]),
+                       f"A5 verified 仅 1×T2 → FAIL：{res['violations']}")
+
+        d = ledger()
+        d["facts"][0]["type"] = "mechanism"
+        d["sources"][0]["kind"] = "paper"
+        d["sources"][0]["tier"] = "T2"
+        res = run(d)
+        tc.assert_true(any("必须有 T1" in v for v in res["violations"]),
+                       f"A6 mechanism 无 T1 → FAIL：{res['violations']}")
+
+        d = ledger()
+        d["sources"][0].update({"kind": "social", "tier": "T1"})
+        res = run(d)
+        tc.assert_true(any("不得标 T1" in v for v in res["violations"]),
+                       f"A7 社交来源标 T1 → FAIL：{res['violations']}")
+
+        d = ledger()
+        d["facts"][0].update({"status": "inferred"})
+        res = run(d)
+        tc.assert_true(any("必须写 notes" in v for v in res["violations"]),
+                       f"A8 inferred 缺 notes → FAIL：{res['violations']}")
+        d["facts"][0]["notes"] = "来源未覆盖该工况，按同类构造推断"
+        res = run(d)
+        tc.assert_equal(res["status"], g.gs.PASS,
+                        f"A8b 写清边界即放行（不得把没查清读成不能说）：{res['violations']}")
+
+        res = run(ledger(), narration=("s1", "隔声量达到 52 dB。"))
+        tc.assert_true(any("52" in v and "没有挂在任何事实上" in v for v in res["violations"]),
+                       f"A9 旁白数字无出处 → FAIL：{res['violations']}")
+        res = run(ledger(), narration=("s1", "第 3 道关卡｜隔声量 50 dB。"))
+        tc.assert_equal(res["status"], g.gs.PASS, "A9b 序数『第N』豁免，不是事实断言")
+
+        d = ledger()
+        d["sources"].append(dict(d["sources"][0]))
+        res = run(d)
+        tc.assert_true(any("来源 id 重复" in v for v in res["violations"]),
+                       f"A10 来源 id 重复 FAIL：{res['violations']}")
+
+        d = ledger()
+        d["facts"][0]["source"] = "S9"
+        res = run(d)
+        tc.assert_true(any("不存在的来源" in v for v in res["violations"]),
+                       f"A11 引用不存在来源 FAIL：{res['violations']}")
+
+        d = ledger()
+        d["sources"][0]["snapshot"] = "../outside.txt"
+        res = run(d)
+        tc.assert_true(any("越出台账目录" in v for v in res["violations"]),
+                       f"A12 快照路径越界 FAIL：{res['violations']}")
+
+        d = ledger()
+        d["facts"][0]["quote"] = "实测空气声隔声量  Rw+Ctr\n≥ 50 dB"
+        res = run(d)
+        tc.assert_equal(res["status"], g.gs.PASS,
+                        f"A13 引文空白/换行差异不算改动：{res['violations']}")
+
+        # ═══ B. 四态 ═══
+        missing = tmp / "nope.json"
+        res = g.check(missing, [("s1", "隔声量 50 dB。")], rules)
+        tc.assert_equal(res["status"], g.gs.NOT_APPLICABLE,
+                        "B1 台账不在位＝NOT_APPLICABLE（不得读成 PASS）")
+        bad = tmp / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        res = g.check(bad, [], rules)
+        tc.assert_equal(res["status"], g.gs.UNTESTED, "B2 台账不可解析＝UNTESTED")
+        res = run({"facts": ledger()["facts"]})
+        tc.assert_equal(res["status"], g.gs.FAIL,
+                        "B3 缺 sources 是 FAIL（没有来源≠没写台账）")
+
+        # ═══ C. 判据 fail-closed ═══
+        real_rules_file = g.RULES_FILE
+        try:
+            g.RULES_FILE = tmp / "missing_rules.json"
+            try:
+                g.load_rules()
+                tc.assert_true(False, "C1 判据文件缺失应抛")
+            except g.RulesBroken as e:
+                tc.assert_true("判据文件缺失" in str(e), f"C1 点名：{e}")
+            broken = tmp / "rules_missing_key.json"
+            broken.write_text(_json.dumps({"tiers": ["T1"]}, ensure_ascii=False), encoding="utf-8")
+            try:
+                g.load_rules(broken)
+                tc.assert_true(False, "C2 判据缺键应抛")
+            except g.RulesBroken as e:
+                tc.assert_true("缺键" in str(e), f"C2 点名：{e}")
+            empty = tmp / "rules_empty.json"
+            doc = _json.loads((real_rules_file).read_text(encoding="utf-8"))
+            doc["tiers"] = []
+            empty.write_text(_json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            try:
+                g.load_rules(empty)
+                tc.assert_true(False, "C3 空表应抛（空表＝该腿永不成立）")
+            except g.RulesBroken as e:
+                tc.assert_true("空表" in str(e), f"C3 点名：{e}")
+        finally:
+            g.RULES_FILE = real_rules_file
+
+        # ═══ D. 预检接线 ═══
+        mfn = next(n for n in _ast.parse(
+            Path(pc.__file__).read_text(encoding="utf-8")).body
+            if isinstance(n, _ast.FunctionDef) and n.name == "main")
+        wired = [n for n in _ast.walk(mfn)
+                 if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+                 and n.func.id == "check_content_facts"]
+        tc.assert_equal(len(wired), 1, "D1 main() 内经 AST 锚定真调用（非文本锚）")
+        tc.assert_true("content_facts" in pc.RENDER_CRITICAL_CHECKS,
+                       "D2 登记为 render-critical（audit 降级语义）")
+
+        proj = tmp / "proj"
+        proj.mkdir()
+        (proj / "证据").mkdir()
+        (proj / "证据" / "国标摘录.txt").write_text(snap_text, encoding="utf-8")
+        (proj / "facts.json").write_text(
+            _json.dumps(ledger(), ensure_ascii=False), encoding="utf-8")
+        cfg = {"scenes": [{"scene_id": "s1", "narration": "隔声量达到 52 dB。"}]}
+        r = pc.PreflightResult(mode="render")
+        pc.check_content_facts(proj, cfg, r)
+        tc.assert_true(any("52" in e for e in r.errors),
+                       f"D3 预检面真跑：违规进 errors：{r.errors}")
+        tc.assert_true(any(e["check_id"] == "content_facts" and e["level"] == "ERROR"
+                           for e in r._log_entries),
+                       f"D3b check_id 归属 content_facts：{r._log_entries}")
+
+        proj_empty = tmp / "proj_empty"
+        proj_empty.mkdir()
+        r = pc.PreflightResult(mode="render")
+        pc.check_content_facts(proj_empty, cfg, r)
+        tc.assert_equal(r.errors, [], f"D4 未声明台账不阻断（errors 空）：{r.errors}")
+        tc.assert_true(any("未声明事实台账" in e["message"] and e["level"] == "INFO"
+                           for e in r._log_entries),
+                       f"D4b 但必须留『未测』正证据：{r._log_entries}")
+
+        real = g.RULES_FILE
+        try:
+            g.RULES_FILE = tmp / "missing_rules2.json"
+            r = pc.PreflightResult(mode="render")
+            pc.check_content_facts(proj, cfg, r)
+            tc.assert_true(any("判据断链" in e for e in r.errors),
+                           f"D5 判据断链判 error，不得判通过：{r.errors}")
+        finally:
+            g.RULES_FILE = real
+
+        # ═══ E. 登记面与镜像字面量 ═══
+        pr_src = (SUITE_SCRIPT_DIR / "pipeline_runner.py").read_text(encoding="utf-8")
+        for key in ("content_facts_script", "content_facts_rules", "content_facts_ledger"):
+            tc.assert_true(f'"{key}"' in pr_src, f"E1 预检步登记缺 {key}")
+        tc.assert_equal(rules["facts_config_key"], "content_facts",
+                        "E2 规则键名与 runner 镜像字面量一致")
+        tc.assert_equal(rules["default_filename"], "facts.json",
+                        "E2b 默认文件名与 runner 镜像字面量一致")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("content_facts_ledger_gate error: " + str(e) + "\n"
+                       + traceback.format_exc())
     return tc
 
 

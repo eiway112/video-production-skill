@@ -1,0 +1,33 @@
+{
+  "$schema": "内容事实台账判据（内容溯源门禁）",
+  "$description": "旁白里的可核查断言必须挂在事实台账上，且台账内部自洽。判据本体全住本文件，脚本内零阈值字面量。借鉴对象＝vibe-knowledge 的 check.py（2026-11-07 评估批），只取可机算部分：来源快照哈希、引文逐字命中、来源等级充分性、旁白数字必须挂事实、非确定状态必须写说明。刻意不借其 44 套风格库与时长偏差 15% 判据（后者本仓 duration_budget 是更严的绝对秒数门禁）。",
+
+  "facts_config_key": "content_facts",
+  "default_filename": "facts.json",
+
+  "tiers": ["T1", "T2", "T3"],
+  "source_kinds": [
+    "standard", "official", "book", "paper", "user_authority",
+    "social", "media", "forum", "other"
+  ],
+  "kind_max_tier": {
+    "social": "T3",
+    "media": "T3",
+    "forum": "T3"
+  },
+  "_kind_max_tier_note": "三类弱来源不得标 T1/T2——把一条短视频/一条社媒帖当一手依据，是这套判据最容易出现的自欺形态。",
+
+  "fact_types": ["spec", "mechanism", "case", "opinion"],
+  "t1_required_types": ["mechanism"],
+  "_t1_required_types_note": "机理类断言（为什么/怎么起作用）必须有一手来源；参数值类允许两个 T2 互证——与本仓『用户是专业数值权威源』一致，product 参数可由 user_authority 承担。",
+
+  "statuses": ["verified", "inferred", "conflict", "undisclosed"],
+  "statuses_requiring_notes": ["inferred", "conflict", "undisclosed"],
+  "_statuses_note": "inferred/conflict/undisclosed 是『没查清就说出口』的三种合法形态，但必须写 notes 说明边界；不写即与 verified 无法区分。",
+
+  "verified_min_sources": {"t1": 1, "else_t2": 2},
+
+  "number_claim_field": "numbers",
+  "ordinal_prefix_chars": ["第"],
+  "_number_policy": "旁白中每一个独立数字（排除『第N』序数）都必须出现在某条事实的 numbers 里。这是整套判据里唯一能自动圈出『这句没人给它出过处』的腿——其余各条只保证台账自身自洽。"
+}

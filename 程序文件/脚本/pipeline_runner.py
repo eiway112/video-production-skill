@@ -1248,8 +1248,10 @@ class PipelineRunner:
         # _gsap_time_utils 是 T-block/S-block 的解析真身（AGENTS.md 核心原则#1 点名的
         # 单一权威源读取器），被 adjust_timeline/enhance/instant_preview/preflight 及本
         # 文件的 verify 腿导入。改任一件即令对应步的历史结论失去依据，故按消费者各记一次。
-        # 刻意不登记 script_interface（原子写＝落盘机制，不产出裁定）与 _script_env
-        # （路径推导，每次运行现算）：登记面按"影响该步结论"取，不做全量覆盖。
+        # 刻意不登记 script_interface（原子写＝落盘机制，不产出裁定）：登记面按
+        # "影响该步结论"取，不做全量覆盖。_script_env 自 2026-11-07 起不再豁免——
+        # 它持有 DEFAULT_TTS_ENGINE，被 preflight（引擎支持面）与 tts（合成分支）读取，
+        # 故按消费者各记一次（键名 script_env）。
         gate_status = SCRIPTS / "_gate_status.py"
         gsap_utils = SCRIPTS / "_gsap_time_utils.py"
         # tts_manifest 落盘位置是 temp 根，不是 temp/tts_44k/：写入方
@@ -1304,6 +1306,23 @@ class PipelineRunner:
                              # 而预检缓存照常命中"，与 preview 批那条 capture_script 同族。
                              "narration_lint": SCRIPTS / "_narration_lint.py",
                              "gsap_time_utils": gsap_utils,
+                             # 2026-11-07 内容溯源批（A06：登记面＝真实读取路径）：
+                             # check_content_facts 读判据文件 + 台账本体。台账路径按
+                             # content_facts_rules.json 的 facts_config_key/default_filename
+                             # 两键解析；此处的 "content_facts"/"facts.json" 是那两键的镜像，
+                             # 改名须同改（用例130 K 段断言二者相等）。不登记即"改了台账
+                             # 而预检缓存照常命中"——台账正是最容易只改事实、不改 HTML 的输入。
+                             "content_facts_script": SCRIPTS / "content_facts_gate.py",
+                             "content_facts_rules": quality_dir / "content_facts_rules.json",
+                             "content_facts_ledger": self.html_path.parent / str(
+                                 (getattr(self, "config", {}) or {}).get("content_facts")
+                                 or "facts.json"),
+                             # 2026-11-07 缺省引擎切换：TTS 引擎缺省值住 _script_env
+                             # （DEFAULT_TTS_ENGINE），预检与 tts 两步都读它决定结论
+                             # （预检：该引擎支不支持 <speak>/<break>；tts：合成哪条分支）。
+                             # 旧注释把 _script_env 归为"路径推导、每次现算"故不登记——
+                             # 该前提自本批起不成立，不登记即"改了缺省而两步缓存照常命中"。
+                             "script_env": SCRIPTS / "_script_env.py",
                              "script": SCRIPTS / "preflight_check.py"},
             "tts":          {"config": self.config_path, "narration": narration,
                              "compiled_scenes": compiled,
@@ -1317,6 +1336,9 @@ class PipelineRunner:
                              "pause_marks_script": SCRIPTS / "pause_marks.py",
                              "align_normalizer": SCRIPTS / "_forced_align.py",
                              "cue_resolver": SCRIPTS / "cue_resolve.py",
+                             # 引擎缺省值（同 preflight 那条）：改缺省即该步产出的音频
+                             # 依据变了，缓存不得照常命中。
+                             "script_env": SCRIPTS / "_script_env.py",
                              "pause_rules": audio_rules,
                              "pause_prosody_shape_rules": quality_dir / "narration_prosody_rules.json",
                              # 2026-10-16 审计批补登：TTS 产物七层验证的判据真身
