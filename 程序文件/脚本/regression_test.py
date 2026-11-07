@@ -8260,6 +8260,62 @@ def test_forced_align_segment_face_guards() -> RegressionTestCase:
         tc.assert_equal(len(calls), 1, "a first-attempt pass must not trigger a retry")
         tc.assert_true(bool(calls[0]), "initial_prompt (reference text) is still in use")
 
+        # ── K. 宿主 NO_PROXY 的方括号 IPv6 条目不得把离线模型加载打成"依赖不可用"
+        #      （2026-11-06／11-07 两次实测：httpx 构造 Client 即抛 Invalid port，
+        #       HF_HUB_OFFLINE 躲不开；表现为整项目 0/N asr_forced，根因却在宿主）。──
+        import os as _k_os
+        _k_saved = {k: _k_os.environ.get(k) for k in ("NO_PROXY", "no_proxy")}
+        try:
+            _k_host = "localhost,.localhost,127.0.0.1,127.0.0.0/8,[::1],::1"
+            for _k in ("NO_PROXY", "no_proxy"):
+                _k_os.environ[_k] = _k_host
+            _k_changed = fa._normalize_no_proxy()
+            tc.assert_true(any("[::1]→::1" in c for c in _k_changed),
+                           f"K1 方括号 IPv6 须被剥成裸形态并点名：{_k_changed}")
+            _k_now = _k_os.environ.get("NO_PROXY", "")
+            # 逐项精确比对，不用 `"::1" in ...`：宿主串里本就另有一条裸 ::1，
+            # 子串判据会把「病灶条目被清空」洗成通过（59-M16 首版即因此存活）。
+            tc.assert_equal(
+                [p for p in _k_now.split(",")],
+                ["localhost", ".localhost", "127.0.0.1", "127.0.0.0/8", "::1", "::1"],
+                f"K2 归一须逐项保真：方括号剥掉、其余条目原样原序：{_k_now}")
+            # 逐形态保真：实测只有方括号这一形态会让 httpx 崩，其余一律不许动
+            for _keep in ("127.0.0.0/8", "127.0.0.1", "localhost", ".localhost"):
+                tc.assert_true(_keep in _k_now.split(","),
+                               f"K3 非病灶条目 {_keep} 不得被顺手改掉：{_k_now}")
+            tc.assert_equal(fa._normalize_no_proxy(), [],
+                            "K4 幂等：再跑一次不得再改写（否则每轮印一行假动作）")
+            # 反向：真正让 httpx 崩的那条载荷，归一后必须能构造 Client
+            try:
+                import httpx as _k_httpx
+                _k_c = _k_httpx.Client()
+                _k_c.close()
+                _k_ok = True
+            except Exception as _ke:
+                _k_ok = False
+            tc.assert_true(_k_ok, "K5 归一后 httpx Client 可构造（病灶的实际后果面）")
+            # 空/缺环境变量不得抛
+            for _k in ("NO_PROXY", "no_proxy"):
+                _k_os.environ.pop(_k, None)
+            tc.assert_equal(fa._normalize_no_proxy(), [],
+                            "K6 变量缺席是合法终态，不报错也不造值")
+        finally:
+            for _k, _v in _k_saved.items():
+                if _v is None:
+                    _k_os.environ.pop(_k, None)
+                else:
+                    _k_os.environ[_k] = _v
+        # 接线：归一必须发生在 WhisperModel 构造之前，否则装了等于没装
+        _k_src = (Path(__file__).parent / "_forced_align.py").read_text(encoding="utf-8")
+        import re as _k_re
+        _k_fn = _k_re.search(r"def load_align_model\(\).*?(?=\ndef )", _k_src, _k_re.S)
+        tc.assert_true(_k_fn is not None, "K7 load_align_model 函数体可定位")
+        _k_body = _k_fn.group(0) if _k_fn else ""
+        tc.assert_true("_normalize_no_proxy()" in _k_body
+                       and _k_body.index("_normalize_no_proxy()")
+                       < _k_body.index("WhisperModel("),
+                       "K7b 归一须排在 WhisperModel 构造之前（崩溃点在构造，不在请求）")
+
         tc.mark_passed()
 
     except Exception as e:
@@ -16781,6 +16837,248 @@ def test_narration_prosody_pause_precheck() -> RegressionTestCase:
         #   复核面仍是手动入口、零冲击。两条不得混读。
         tc.assert_true("narration_prosody_rules" in pr,
                        "F2 形状阈值文件现经生效面真读进登记面（不在即改了阈值而缓存照常命中）")
+
+        # ═════════════════════════════════════════════════════════
+        # G. 停顿构成：引擎原声 vs 流水线补零（2026-11-06 用户口播反馈批）
+        #    存在理由：句内标点强制面把不足 0.25s 的位点补成数字零，而裁定读的是
+        #    补完后的 ASR 间隙，于是这些位点全部显示 0.25s、判达标——机器量的是
+        #    自己补的那一刀。本段锁三件事：①补零量可从波形本身实测出来；
+        #    ②「没量到」不得读成「没补过」；③该面不得进四态裁定。
+        # ═════════════════════════════════════════════════════════
+        import wave as _wave
+        import numpy as _np
+        gdir = Path(tempfile.mkdtemp(prefix="case94_g_"))
+        _sr = 16000
+        _a = (_np.sin(_np.arange(int(2.5 * _sr)) / _sr * 2 * _np.pi * 220)
+              * 0.2 * 32767).astype("<i2")
+        _a[int(0.82 * _sr):int(1.17 * _sr)] = 0      # 0.35s 数字零＝拼接静音
+        with _wave.open(str(gdir / "tts_x_hq.wav"), "wb") as _wf:
+            _wf.setnchannels(1)
+            _wf.setsampwidth(2)
+            _wf.setframerate(_sr)
+            _wf.writeframes(_a.tobytes())
+        _grules = _json.loads(npp.RULES_FILE.read_text(encoding="utf-8"))
+        _gnar = [{"scene_id": 1, "narration": "甲乙，丙丁。"}]
+        # 逗号落在 chars[1] 与 chars[2] 之间：ASR 间隙 0.40s，其中 0.30s 是补的零
+        _gman = {"scenes": [{
+            "scene_id": 1, "method": "asr_forced", "tts_file": "tts_x_hq.wav",
+            "norm": "甲乙丙丁",
+            "chars": [[0.0, 0.4, 1], [0.4, 0.8, 1], [1.2, 1.6, 1], [1.6, 2.0, 1]],
+        }]}
+        _r5 = npp.audio_face(_gnar, _gman, _grules, wav_dir=gdir)
+        gc = _r5[2]["pause_composition"]
+        tc.assert_true(gc["points_measured"] == 1, f"G0 标点位点应量到 1 个：{gc}")
+        tc.assert_true(abs(gc["zero_silence_total_seconds"] - 0.35) <= 0.02,
+                       f"G1 精确零静音须由波形实测为 0.35s：{gc['zero_silence_total_seconds']}")
+        _g1 = gc["rows"][0]
+        tc.assert_true(abs(_g1["asr_gap"] - 0.40) <= 0.02, f"G2 ASR 间隙 0.40s：{_g1}")
+        tc.assert_true(abs(_g1["signal_gap"] - 0.05) <= 0.03,
+                       f"G3 带噪部分＝ASR−精确零≈0.05s：{_g1}")
+        tc.assert_true(gc["short_pause"] == 1,
+                       f"G3b 生效间隙 <0.10s 须计 1 处：{gc['short_pause']}")
+        # 反向：区间里没有绝对零 ⇒ 不得记成补零
+        _gman2 = {"scenes": [{
+            "scene_id": 1, "method": "asr_forced", "tts_file": "tts_x_hq.wav",
+            "norm": "甲乙丙丁",
+            "chars": [[0.0, 0.4, 1], [0.8, 1.2, 1], [1.6, 2.0, 1], [2.0, 2.4, 1]],
+        }]}
+        _g2 = npp.audio_face(_gnar, _gman2, _grules, wav_dir=gdir)[2]["pause_composition"]
+        tc.assert_true(_g2["zero_silence_total_seconds"] == 0.0,
+                       f"G4 无绝对零的间隙不得记成精确零：{_g2['zero_silence_total_seconds']}")
+        tc.assert_true(abs(_g2["rows"][0]["signal_gap"] - _g2["rows"][0]["asr_gap"]) <= 1e-6,
+                       f"G5 无精确零时带噪＝ASR 间隙：{_g2['rows'][0]}")
+        # 「没量到」不得读成「没补过」
+        _g3 = npp.audio_face(_gnar, _gman, _grules, wav_dir=None)[2]["pause_composition"]
+        tc.assert_true(_g3["points_measured"] == 0 and bool(_g3["unmeasured"]),
+                       f"G6 未给波形目录＝无从计数并点名：{_g3}")
+        # 不裁定：四态裁定函数不得消费本面
+        _pv = re.search(r"def _pause_gate_verdict\(.*?(?=\n    def )", pr, re.S)
+        tc.assert_true(_pv is not None and "pause_composition" not in _pv.group(0),
+                       "G7 停顿构成不得进四态裁定（描述面，只透出不阻断）")
+        tc.assert_true("精停构成" in pr,
+                       "G8 pipeline 必须把精停构成印进 [PAUSE-AUDIT]（否则读数无人看）")
+
+        # ═════════════════════════════════════════════════════════
+        # G9-G15 生产者归因（2026-11-07 判据修正批）
+        #   病灶：波形里"样本精确为 0"的段被直接记成"流水线补零"，而引入
+        #   `pause_marks` 之后引擎的 SSML `<break>` 在**原始合成件**里就是精确零
+        #   （本项目实测 0.471/0.750/0.458s），两者字节同形。旧判据于是把引擎停顿
+        #   记到流水线头上（完工报告印 2.19s，账本实为 0.19s），并经 effective
+        #   分档把已拿到约 1.0s 停顿的位点重新报成"大气口候选"。
+        #   本段锁：声明是生产者事实源；声明位点不吃补零推断；未声明位点仍能抓到
+        #   真正的短停顿（不得为了修误报把检出能力一起关掉）；账本缺席 ≠ 补零为 0。
+        # ═════════════════════════════════════════════════════════
+        _gdir2 = Path(tempfile.mkdtemp(prefix="case94_g9_"))
+        _a2 = (_np.sin(_np.arange(int(4.8 * _sr)) / _sr * 2 * _np.pi * 220)
+               * 0.2 * 32767).astype("<i2")
+        _a2[int(2.0 * _sr):int(2.5 * _sr)] = 0     # 精确零恰好覆盖整个 0.50s 间隙
+        with _wave.open(str(_gdir2 / "tts_y_hq.wav"), "wb") as _wf2:
+            _wf2.setnchannels(1); _wf2.setsampwidth(2); _wf2.setframerate(_sr)
+            _wf2.writeframes(_a2.tobytes())
+        # 同一段波形、同一份 chars，唯一差别是旁白里有没有 pause_marks 声明。
+        # 旁白须够长（逗号两侧合计 ≥8 字）才会被分到 clause 档——否则本段会退化成
+        # minor 档、候选腿恒空，G12 就变成空跑（首版 4 字夹具即栽在此处）。
+        _gman9 = {"scenes": [{
+            "scene_id": 1, "method": "asr_forced", "tts_file": "tts_y_hq.wav",
+            "norm": "甲乙丙丁戊己庚辛壬癸",
+            "chars": [[0.0, 0.4, 1], [0.4, 0.8, 1], [0.8, 1.2, 1], [1.2, 1.6, 1],
+                      [1.6, 2.0, 1],
+                      [2.5, 2.9, 1], [2.9, 3.3, 1], [3.3, 3.7, 1], [3.7, 4.1, 1],
+                      [4.1, 4.5, 1]],
+        }]}
+        _nar_plain = [{"scene_id": 1, "narration": "甲乙丙丁戊，己庚辛壬癸。"}]
+        _nar_decl = [{"scene_id": 1, "narration": "甲乙丙丁戊，己庚辛壬癸。",
+                      "pause_marks": [{"after": "戊", "ms": 400}]}]
+        _p_plain = npp.audio_face(_nar_plain, _gman9, _grules, wav_dir=_gdir2)[2]
+        _p_decl = npp.audio_face(_nar_decl, _gman9, _grules, wav_dir=_gdir2)[2]
+        _rp = _p_plain["pause_composition"]["rows"][0]
+        _rd = _p_decl["pause_composition"]["rows"][0]
+        tc.assert_true(_p_plain["pause_composition"]["declared_positions"] == 0,
+                       f"G9 无声明时声明位点应为 0：{_p_plain['pause_composition']}")
+        tc.assert_true(_p_decl["pause_composition"]["declared_positions"] == 1
+                       and _rd["declared"] is True,
+                       f"G9b 声明须被定位到该标点位点：{_rd}")
+        # 精确零在两种情形下都要照实量出来（它只是"人工插入"的痕迹）
+        tc.assert_true(_rp["zero_silence"] > 0.4 and _rd["zero_silence"] > 0.4,
+                       f"G10 精确零量不随声明改变：{_rp['zero_silence']} / {_rd['zero_silence']}")
+        # 分档用的量才随声明分岔：声明位点用交付间隙，未声明位点扣掉精确零
+        tc.assert_true(abs(_rd["effective_gap"] - _rd["asr_gap"]) <= 1e-6,
+                       f"G11 声明位点的生效间隙＝交付间隙（零是引擎按作者意图生成的）：{_rd}")
+        tc.assert_true(abs(_rp["effective_gap"] - _rp["signal_gap"]) <= 1e-6,
+                       f"G11b 未声明位点的生效间隙＝带噪部分（扣掉可能来自补零的零）：{_rp}")
+        # 后果腿：同一段音频、同一份时间戳，只因"有没有声明"，候选结论必须相反
+        _bp = {x["scene_id"] for x in _p_plain["prosody"]["beat_candidates"]}
+        _bd = {x["scene_id"] for x in _p_decl["prosody"]["beat_candidates"]}
+        tc.assert_true("1" in _bp,
+                       f"G12 未声明且带噪 0.10s ⇒ 仍须报成大气口候选（不得为修误报关掉检出）："
+                       f"{_p_plain['prosody']['beat_candidates']}")
+        tc.assert_true("1" not in _bd,
+                       f"G12b 已有声明（交付 0.90s）⇒ 不得再报成候选（这就是本次修的误报）："
+                       f"{_p_decl['prosody']['beat_candidates']}")
+        # 账本：缺席 ≠ 补零为 0
+        _bk_absent = _p_plain["pause_composition"]
+        tc.assert_true(_bk_absent["pipeline_booked_scenes"] == 0
+                       and _bk_absent["pipeline_booked_total_seconds"] == 0.0,
+                       f"G13 账本缺席时须报 0 场（不是报'补零 0 秒'）：{_bk_absent}")
+        _gman9b = {"scenes": [dict(_gman9["scenes"][0], pause_intra_inserted=0.19)]}
+        _bk_on = npp.audio_face(_nar_plain, _gman9b, _grules, wav_dir=_gdir2)[2]["pause_composition"]
+        tc.assert_true(_bk_on["pipeline_booked_scenes"] == 1
+                       and abs(_bk_on["pipeline_booked_total_seconds"] - 0.19) <= 1e-6,
+                       f"G13b 账本在场时须按场求和（同一场多个位点不得重复计）：{_bk_on}")
+        # 断电点：声明的锚词定位不到时须点名，不得静默当成"没声明"
+        # 夹具须与 _gman9 同为 10 字：字数不等会先被判「原文字数≠对齐字数」跳过该场，
+        # 断链点名就永远到不了这条断言（首版 4 字夹具即栽在此处，断言恒假）。
+        _nar_bad = [{"scene_id": 1, "narration": "甲乙丙丁戊，己庚辛壬癸。",
+                     "pause_marks": [{"after": "子虚", "ms": 400}]}]
+        _bk_bad = npp.audio_face(_nar_bad, _gman9, _grules, wav_dir=_gdir2)[2]["pause_composition"]
+        tc.assert_true(bool(_bk_bad["declaration_broken"])
+                       and _bk_bad["declared_positions"] == 0,
+                       f"G14 锚词定位不到须进 declaration_broken：{_bk_bad['declaration_broken']}")
+        # 印面不得把整段归给流水线（旧文案的病灶）
+        tc.assert_true("流水线补入数字零" not in pr,
+                       "G15 pipeline 不得再印「流水线补入数字零」（生产者不可由波形判定）")
+
+        # ═════════════════════════════════════════════════════════
+        # H. 语义停顿分层（2026-11-06 用户口播反馈批）
+        #    分档依据是标点等级 + 两侧词组长度（不是"逗号一律 0.25"）：顿号成
+        #    独立一档、不与逗号共用下限；分句逗号低于档位时给"大气口"声明候选。
+        #    本段锁：分档、越界、层级倒挂、候选与声明出口、锚词缩写。
+        # ═════════════════════════════════════════════════════════
+        H_cls = npp._classify_boundary
+        tc.assert_true(H_cls("。", 7, 3) == "end", "H1 句末成档：end")
+        tc.assert_true(H_cls("、", 2, 2) == "enum",
+                       "H2 顿号必须独立成档（不与逗号共用下限）")
+        tc.assert_true(H_cls("，", 7, 3) == "clause",
+                       "H3 两侧合计 10 字＝两个词组单元 → 分句逗号")
+        tc.assert_true(H_cls("，", 2, 4) == "minor",
+                       "H4 两侧合计 6 字＝修饰语粘连 → 轻逗号")
+        tc.assert_true(H_cls("：", 4, 6) == "colon", "H5 冒号成档")
+        tc.assert_true(H_cls("；", 4, 6) == "semicolon", "H6 分号成档")
+        _hrows = [
+            {"scene_id": "1", "punct": "。", "ctx": "甲。乙", "anchor": "甲",
+             "cls": "end", "effective_gap": 0.40, "declared": False},
+            {"scene_id": "1", "punct": "，", "ctx": "乙，丙", "anchor": "乙",
+             "cls": "clause", "effective_gap": 0.10, "declared": False},
+            {"scene_id": "1", "punct": "，", "ctx": "丙，丁", "anchor": "丙",
+             "cls": "clause", "effective_gap": 0.30, "declared": False},
+            {"scene_id": "1", "punct": "、", "ctx": "丁、戊", "anchor": "丁",
+             "cls": "enum", "effective_gap": 0.30, "declared": False},
+            {"scene_id": "1", "punct": "，", "ctx": "戊，己", "anchor": "戊",
+             "cls": "minor", "effective_gap": 0.20, "declared": False},
+        ]
+        _hp = npp._build_prosody_summary(_hrows, 400)
+        tc.assert_true(abs(_hp["classes"]["clause"]["median"] - 0.20) < 1e-6,
+                       f"H7 同档中位须按档计算：{_hp['classes']['clause']}")
+        tc.assert_true(len(_hp["below_range"]) == 1
+                       and _hp["below_range"][0]["cls"] == "clause",
+                       f"H8 低于档位的只有 0.10s 那条分句逗号：{_hp['below_range']}")
+        tc.assert_true(len(_hp["hierarchy_violations"]) == 1,
+                       f"H9 句末>分句逗号>=顿号 不成立须点名：{_hp['hierarchy_violations']}")
+        tc.assert_true(len(_hp["beat_candidates"]) == 1
+                       and _hp["beat_candidates"][0]["anchor"] == "乙",
+                       f"H10 大气口候选只收引擎原声 <0.15s 的分句逗号：{_hp['beat_candidates']}")
+        tc.assert_true("大气口候选 1 处" in _hp["summary_line"],
+                       f"H11 汇总行须透出候选数：{_hp['summary_line']}")
+        # 声明出口：语义档候选与两桶同形、按（场, 上下文）去重
+        _hn = [{"scene_id": 1,
+                "narration": "生成和校验，由两个技能分开做。校验方只看提交单。"}]
+        _hb = [{"scene_id": "1", "ctx": "成和校验，由", "anchor": "成和校验", "gap": 0.08}]
+        _hlines = npp.emit_declarations(_hn, [], "", beat_rows=_hb)
+        _hjoin = "\n".join(_hlines)
+        tc.assert_true('"after": "和校验"' in _hjoin,
+                       f"H12 锚词须缩到最短唯一后缀（和校验）：{_hjoin}")
+        tc.assert_true(_hjoin.count('"ms"') == 1,
+                       f"H13 语义档候选只产出 1 条：{_hjoin}")
+        _hlines_dup = npp.emit_declarations(_hn, _hb, "", beat_rows=_hb)
+        tc.assert_true("\n".join(_hlines_dup).count('"ms"') == 1,
+                       "H14 同一（场, 上下文）不得重复声明")
+        # ── 大气口声明值单一权威源（2026-11-07 收口）────────────────────
+        # 病灶：候选行由脚本字面量 400 给值，而 emit_declarations 另取
+        # rules["auto_ms"]=500 ⇒ 同一位点在「语义层级」行报 400、在声明建议里
+        # 报 500。同工具两份真相（A06 同族）。以下锁：值来自规则文件、候选自带
+        # 的值一路传到声明出口、两桶无 ms 时才退 auto_ms。
+        _h_rules_ms = int(npp.load_rules()["pause_measurement"]["beat_ms"])
+        _h_auto_ms = int(_pm_rules["auto_ms"])
+        tc.assert_true(_h_rules_ms != _h_auto_ms,
+                       f"H15 夹具前提：beat_ms({_h_rules_ms}) 须不等于 "
+                       f"auto_ms({_h_auto_ms})，否则本段两条腿无从区分")
+        # 探针值刻意不取 400：取规则现值会让"实现写死 400"这条变异恒真通过
+        _h_probe_ms = 640
+        _hp_alt = npp._build_prosody_summary(_hrows, _h_probe_ms)
+        tc.assert_true(_hp_alt["beat_candidates"][0]["ms"] == _h_probe_ms,
+                       f"H16 候选 ms 须由入参（规则文件）给，不得是脚本字面量："
+                       f"{_hp_alt['beat_candidates'][0]}")
+        _hb_ms = [dict(_hb[0], ms=_h_rules_ms)]
+        _hjoin_ms = "\n".join(npp.emit_declarations(_hn, [], "", beat_rows=_hb_ms))
+        tc.assert_true(f'"ms": {_h_rules_ms}' in _hjoin_ms,
+                       f"H17 声明出口须沿用候选自带的 ms（不得改取 auto_ms）：{_hjoin_ms}")
+        tc.assert_true(f'"ms": {_h_auto_ms}' in _hjoin,
+                       f"H18 候选不带 ms（两桶行）时才退 auto_ms：{_hjoin}")
+        # 接线：真身调用点必须把规则值传进去，且候选构造里不得留第二份字面量
+        _hsrc = Path(npp.__file__).read_text(encoding="utf-8")
+        tc.assert_true(re.search(r"_build_prosody_summary\(\s*\n?\s*comp_rows,\s*int\(pm\[\"beat_ms\"\]\)\)",
+                                 _hsrc) is not None,
+                       "H19 audio_face 须把 rules 的 beat_ms 传给语义摘要（否则规则改了而读数不变）")
+        tc.assert_true('"ms": 400' not in _hsrc,
+                       "H20 候选构造里不得留 ms 字面量（第二真相源）")
+        _h_bad_rules = _json.loads(npp.RULES_FILE.read_text(encoding="utf-8"))
+        _h_bad_rules["pause_measurement"] = {
+            k: v for k, v in _h_bad_rules["pause_measurement"].items() if k != "beat_ms"}
+        _h_rf = npp.RULES_FILE
+        try:
+            _hp_bad = Path(tmpdir) / "prosody_no_beat_ms.json"
+            _hp_bad.write_text(_json.dumps(_h_bad_rules, ensure_ascii=False),
+                               encoding="utf-8")
+            npp.RULES_FILE = _hp_bad
+            _h_raised = False
+            try:
+                npp.load_rules()
+            except npp.Broken as _he:
+                _h_raised = "beat_ms" in str(_he)
+            tc.assert_true(_h_raised,
+                           "H21 规则缺 beat_ms 须 fail-closed 点名，不得静默退 auto_ms")
+        finally:
+            npp.RULES_FILE = _h_rf
         tc.mark_passed()
     except Exception as e:
         import traceback

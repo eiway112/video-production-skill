@@ -59,11 +59,54 @@ MODEL_REPO_ID = f"Systran/faster-whisper-{MODEL_SIZE}"
 _stdout_keepalive = []
 
 
+def _normalize_no_proxy() -> list:
+    """把 NO_PROXY 里的**方括号 IPv6** 条目剥成裸形态，返回被改写的条目。
+
+    存在理由（2026-11-06／11-07 两次实测，同一形态卡住两支项目的对齐）：
+    宿主 Windows 注册表给出的 `NO_PROXY` 含 `[::1]`，httpx 把它当 `host:port`
+    解析 → 构造 `Client` 即抛 `InvalidURL: Invalid port: ':1]'`。崩溃点在
+    **构造**而不是请求，故 `HF_HUB_OFFLINE=1` 躲不开；表现是
+    `load_align_model()` 打 `[WARN] forced-align model unavailable` 返 None →
+    整项目落 punct-gap 降级 → 字幕主路径命中率与停顿裁定一起塌，而根因在宿主环境。
+
+    只剥方括号、不清空整个变量：逐形态实测（httpx Client 构造）——
+    `localhost`／`.localhost`／`127.0.0.1`／`127.0.0.0/8`／`::1`／`host:8080`／`*.local`
+    **全部正常**，唯独 `[::1]` 抛错。故 CIDR 与裸 IPv6 不动（此前把成因写成
+    "CIDR/IPv6 条目"过宽），`[::1]` → `::1` 语义等价且 httpx 接受。
+    带端口的 `[host]:port` 不在实测失败集内，保持原样不猜。
+
+    刻意不改宿主注册表、不写全局环境策略：这是本进程加载本地模型的前置条件，
+    与上面 `HF_HUB_OFFLINE` 同层。靠"记得给命令加 NO_PROXY= 前缀"是协议式约定，
+    已经连着两轮失效，故收进生效路径。
+    """
+    changed = []
+    for key in ("NO_PROXY", "no_proxy"):
+        val = os.environ.get(key)
+        if not val:
+            continue
+        parts = [p.strip() for p in val.split(",")]
+        new = []
+        hit = False
+        for p in parts:
+            m = re.fullmatch(r"\[([^\]]+)\]", p)
+            if m:
+                changed.append(f"{key}:{p}→{m.group(1)}")
+                new.append(m.group(1))
+                hit = True
+            else:
+                new.append(p)
+        if hit:
+            os.environ[key] = ",".join(new)
+    return changed
+
+
 def load_align_model():
     """加载 faster-whisper 模型（进程级单例）。失败返回 None（调用方降级）。"""
     global _MODEL
     if _MODEL is not None:
         return _MODEL
+    for _c in _normalize_no_proxy():
+        print(f"  [PROXY] NO_PROXY 条目归一（httpx 解析不了方括号 IPv6）：{_c}")
     try:
         from faster_whisper import WhisperModel
         _MODEL = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")

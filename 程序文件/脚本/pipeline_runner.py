@@ -1884,6 +1884,53 @@ class PipelineRunner:
                     print(f"    修剪面已启用（波形代次 {_stamp}·开关归因 {_why}）："
                           "本审计读的是 manifest 里的对齐采样，修剪量逐场见同文件 "
                           "scenes[].pause_trimmed 与渲染日志 [TRIM] 行")
+        _comp = s.get("pause_composition") or {}
+        if _comp.get("points_measured"):
+            # 归因纪律（2026-11-07）：波形只能证明"这里有一段样本精确为 0 的静音"，
+            # 不能证明是谁插的——引擎的 SSML `<break>` 与流水线补零字节同形。故本行
+            # 只说"精确零"，生产者分两处给出：声明数（引擎侧的记录）与账本量
+            # （流水线本轮的记录）。两者都可能缺席，缺席时报"未记账"而不是按 0 计。
+            _zs = _comp.get("zero_silence_total_seconds", 0)
+            _decl = _comp.get("declared_positions", 0)
+            _bk = _comp.get("pipeline_booked_total_seconds", 0)
+            _bk_n = _comp.get("pipeline_booked_scenes", 0)
+            _bk_txt = (f"流水线本轮账本 {_bk:.2f}s（{_bk_n} 场）" if _bk_n
+                       else "流水线本轮无补零记账（缓存轮次不写账，不能读成没补过）")
+            if _zs > 0:
+                print(f"  [PAUSE-AUDIT] 精停构成｜标点 {_comp['points_measured']} 位："
+                      f"其中 {_comp['short_pause']} 处生效间隙 "
+                      f"<{_comp['dead_floor_seconds']:g}s；"
+                      f"样本精确为 0 的静音 {_zs:.2f}s，其中 {_decl} 位有 pause_marks 声明"
+                      f"（＝引擎 break）；{_bk_txt}")
+                print("    （精确零只是「人工插入」的痕迹，引擎 break 与补零同形——"
+                      "本行不把整段归给流水线）")
+                for _q in sorted([r for r in _comp["rows"] if r["zero_silence"] > 0],
+                                 key=lambda x: -x["zero_silence"])[:3]:
+                    _who = "引擎break" if _q.get("declared") else "未声明"
+                    print(f"    · s{_q['scene_id']}『…{_q['ctx']}…』"
+                          f"交付 {_q['asr_gap']:.2f}s ＝ 带噪 {_q['signal_gap']:.2f}s "
+                          f"＋ 精确零 {_q['zero_silence']:.2f}s〔{_who}〕")
+            else:
+                print(f"  [PAUSE-AUDIT] 精停构成｜标点 {_comp['points_measured']} 位："
+                      f"无样本精确为 0 的静音；{_bk_txt}")
+            for _b in (_comp.get("declaration_broken") or [])[:3]:
+                print(f"    · 声明定位断链（该位点按「无声明」计，可能把引擎停顿读成补零）：{_b}")
+        elif _comp.get("unmeasured"):
+            print(f"  [PAUSE-AUDIT] 停顿构成｜无从计数："
+                  f"{'、'.join(_comp['unmeasured'][:6])}"
+                  + ("…" if len(_comp["unmeasured"]) > 6 else "")
+                  + "——不得由『没量到』读成『没补过』")
+        _pro = s.get("prosody") or {}
+        if _pro.get("summary_line"):
+            print(f"  [PAUSE-AUDIT] 语义层级｜{_pro['summary_line']}")
+            for _b in (_pro.get("beat_candidates") or [])[:3]:
+                print(f"    · s{_b['scene_id']}『…{_b['ctx']}…』分句逗号 "
+                      f"{_b['gap']:.2f}s → 可声明 {_b['ms']}ms"
+                      f"（SSML，实测约 +0.7s，引擎生成的真停顿）")
+            for _e in (_pro.get("enum_slow") or [])[:2]:
+                print(f"    · s{_e['scene_id']}『…{_e['ctx']}…』顿号 "
+                      f"{_e['gap']:.2f}s 偏长：列举被拉开，修法是改写（合并项/换逗号），"
+                      f"不是剪波形")
         if audit["skipped"]:
             print(f"    音频面未量（逐场点名）：{'、'.join(audit['skipped'])}")
         if audit["rushed"]:

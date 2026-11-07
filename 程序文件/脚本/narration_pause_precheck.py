@@ -130,6 +130,14 @@ def load_rules() -> dict:
             raise Broken(f"pause_measurement.{key} 缺失或不可解析（相对桶无从产出，不得按 0 计）")
         if val <= 0:
             raise Broken(f"pause_measurement.{key} 非正数")
+    # 大气口推荐值 fail-closed：缺键不得回退 auto_ms——那正是本次收口掉的第二真相源
+    # （同一位点在语义层级行与声明建议里报两个不同的 ms）。
+    try:
+        beat_ms = int(rules["pause_measurement"]["beat_ms"])
+    except (KeyError, TypeError, ValueError):
+        raise Broken("pause_measurement.beat_ms 缺失或不可解析（大气口候选无从给声明值）")
+    if beat_ms <= 0:
+        raise Broken("pause_measurement.beat_ms 非正数")
     return rules
 
 
@@ -236,6 +244,210 @@ def punctuation_gap_rows(chars, spoken, after):
     return rows
 
 
+_PAUSE_CLASS_RANGES = {
+    # 档位不是设计出来的，是 6 支项目 435 个标点位点的实测分布 + 语义层级定的：
+    #   引擎中位：句末 0.40／分号 0.42／冒号 0.42／逗号 0.32／顿号 0.30，
+    #   但重叠很大（顿号 p90 0.42 > 句末 p10 0.21），所以档位用于**判断该不该有气口**，
+    #   不用于「把某处调到某个值」——实测同一位置换 comma/period/colon/dash 只差 0.05s。
+    "end":       (0.30, 0.70, "句末"),
+    "semicolon": (0.28, 0.65, "分号"),
+    "colon":     (0.22, 0.55, "冒号"),
+    "clause":    (0.20, 0.45, "分句逗号"),
+    "minor":     (0.08, 0.32, "轻逗号"),
+    "enum":      (0.06, 0.35, "顿号"),
+    "beat":      (0.30, 0.90, "破折/省略"),
+}
+
+# 分句逗号低于它＝语义上是两个词组单元、引擎却几乎没停 → 大气口候选（SSML 声明）。
+_BEAT_MIN_CLAUSE_GAP = 0.15
+
+
+def _classify_boundary(punct: str, prev_len: int, next_len: int) -> str:
+    """按标点等级 + 两侧词组长度给边界分档（语义档，不是字符类）。
+
+    逗号再分两档：两侧发音字合计 >=8 视为两个词组单元（分句逗号），否则是修饰语粘连
+    （轻逗号）。这条分界被语料逼出来——「翻图集，要两天」两侧合计 10 字，
+    「现在，10 分钟」只有 6 字；前者需要气口，后者不需要。
+    """
+    p = punct or ""
+    if "。" in p or "？" in p or "！" in p or "." in p or "?" in p or "!" in p:
+        return "end"
+    if "；" in p or ";" in p:
+        return "semicolon"
+    if "：" in p or ":" in p:
+        return "colon"
+    if "—" in p or "…" in p:
+        return "beat"
+    if "、" in p:
+        return "enum"
+    if "，" in p or "," in p:
+        return "clause" if (prev_len + next_len) >= 8 else "minor"
+    return "minor"
+
+
+def _build_prosody_summary(rows, beat_ms):
+    """从精停构成行里再派生一层语义读数（只透出、不进四态裁定）。
+
+    分档用的量是 `effective_gap`，它的取法记载了 2026-11-07 的一次判据更正：
+
+    - **旧口径**用「ASR 间隙 − 精确零」当"引擎原声"，理由是补出来的零不算引擎的
+      韵律。该理由在**引入 SSML 之前**成立——那时精确零只有流水线一个生产者。
+    - **引入 `pause_marks` 之后**，引擎的 `<break>` 在原始合成件里就是精确零
+      （实测 0.471／0.750／0.458s），与补零字节同形。旧口径于是把引擎的停顿减到
+      0.11s 量级，把已拿到约 1.0s 停顿的位点重新列成"大气口候选"。
+    - **现口径**：波形分不出生产者，故生产者由**记录**回答——`declared`（本场
+      `pause_marks` 声明）为真时，那段零是引擎按作者意图生成的，交付间隙即生效量；
+      无声明时扣掉精确零（此时它只可能来自流水线补零或引擎的无意短零）。
+
+    这条更正的边界：无声明位点的"精确零＝补零"仍是**推断**（引擎也有短零段），故
+    它只影响描述面的分档，不进任何裁定；真正的账本读数由
+    `pause_composition.pipeline_booked_*` 单独给出。
+
+    `beat_ms` 由调用方从 rules 传入（唯一持有者 narration_prosody_rules.json →
+    pause_measurement.beat_ms），候选行携带它一路到 `emit_declarations`；
+    两处各自取值就会同一位点报两个 ms。
+    """
+    import statistics
+
+    by_cls = {}
+    for r in rows:
+        by_cls.setdefault(r["cls"], []).append(r["effective_gap"])
+    classes = {}
+    for c, v in sorted(by_cls.items()):
+        v = sorted(v)
+        classes[c] = {
+            "label": _PAUSE_CLASS_RANGES.get(c, (0, 0, c))[2],
+            "n": len(v),
+            "p10": round(v[max(0, int((len(v) - 1) * 0.1))], 3),
+            "median": round(statistics.median(v), 3),
+            "p90": round(v[max(0, int((len(v) - 1) * 0.9))], 3),
+            "range": list(_PAUSE_CLASS_RANGES.get(c, (None, None, c))[:2]),
+        }
+    short = [r for r in rows
+             if r["effective_gap"] < _PAUSE_CLASS_RANGES.get(r["cls"], (0, 99))[0]]
+    long_ = [r for r in rows
+             if r["effective_gap"] > _PAUSE_CLASS_RANGES.get(r["cls"], (0, 99))[1]]
+    by_scene = {}
+    for r in rows:
+        by_scene.setdefault(str(r["scene_id"]), []).append(r)
+    viol = []
+    for sid, rs in by_scene.items():
+        med = {}
+        for c in ("end", "clause", "enum"):
+            v = [x["effective_gap"] for x in rs if x["cls"] == c]
+            if v:
+                med[c] = statistics.median(v)
+        if len(med) == 3 and not (med["end"] > med["clause"] >= med["enum"] - 0.03):
+            viol.append({"scene_id": sid,
+                         "end": round(med["end"], 3),
+                         "clause": round(med["clause"], 3),
+                         "enum": round(med["enum"], 3)})
+    beats = [
+        {"scene_id": r["scene_id"], "ctx": r["ctx"], "anchor": r["anchor"],
+         "gap": r["effective_gap"], "ms": beat_ms,
+         "why": "分句逗号两侧合计 >=8 字、生效间隙 <0.15s（语义要气口而这里没停够）"}
+        for r in rows if r["cls"] == "clause" and r["effective_gap"] < _BEAT_MIN_CLAUSE_GAP
+    ]
+    enum_slow = [
+        {"scene_id": r["scene_id"], "ctx": r["ctx"], "gap": r["effective_gap"]}
+        for r in rows if r["cls"] == "enum"
+        and r["effective_gap"] > _PAUSE_CLASS_RANGES["enum"][1]
+    ]
+    parts = []
+    for c in ("end", "clause", "enum"):
+        if c in classes:
+            parts.append(f"{classes[c]['label']} {classes[c]['median']:.2f}s")
+    line = ("／".join(parts) + "（生效间隙中位）" if parts else "无可用档位读数")
+    line += (f"｜低于档位 {len(short)} 处｜高于档位 {len(long_)} 处"
+             f"｜层级倒挂 {len(viol)} 场｜大气口候选 {len(beats)} 处")
+    return {
+        "classes": classes,
+        "below_range": [{"scene_id": r["scene_id"], "cls": r["cls"], "gap": r["effective_gap"],
+                         "ctx": r["ctx"]} for r in short],
+        "above_range": [{"scene_id": r["scene_id"], "cls": r["cls"], "gap": r["effective_gap"],
+                         "ctx": r["ctx"]} for r in long_],
+        "hierarchy_violations": viol,
+        "beat_candidates": beats,
+        "enum_slow": enum_slow,
+        "summary_line": line,
+    }
+
+
+_SHORT_PAUSE_GAP_SECONDS = 0.10   # 描述面切点：生效间隙低于它＝基本没停
+
+
+def _zero_silence_runs(audio, sr, min_seconds=0.02):
+    """样本**精确为 0**的连续段（秒区间）。
+
+    **本函数只量"精确零静音"，不裁定它的生产者**——这条边界是 2026-11-07 由实测
+    逼出来的：引入 `pause_marks` 之后，引擎的 SSML `<break>` 在原始合成件里就已是
+    样本精确为 0 的连续段（本项目实测 0.471／0.750／0.458s），与流水线
+    `_splice_silence` 补出来的数字零**字节同形**。旧文档写"整段 0 只可能来自数字零
+    插入"，那句话在 SSML 之前成立，现在不成立；据它把整段归给流水线，会把引擎的
+    停顿记到流水线头上（本项目完工报告印 2.19s，而账本实为 0.19s）。
+
+    生产者归因改由**记录**回答（`_declared_punct_indices` 读 `pause_marks` 声明；
+    账本读 manifest 的 `pause_intra_inserted`），不再由波形猜。
+
+    判据依据（仍然成立的部分）：自然语音的衰减、呼吸与房间底噪不会落到 s16 的绝对零，
+    故"精确零"确实是人工插入的痕迹，只是插入者有两位。**描述面用，不参与任何裁定。**
+    """
+    import numpy as np
+    hop = max(1, int(round(0.01 * sr)))
+    n = len(audio) // hop
+    if n <= 0:
+        return []
+    rms = np.sqrt((audio[: n * hop].reshape(n, hop) ** 2).mean(axis=1))
+    runs, st = [], None
+    for i, v in enumerate(rms):
+        z = v == 0.0
+        if z and st is None:
+            st = i
+        elif not z and st is not None:
+            if (i - st) * hop / sr >= min_seconds:
+                runs.append((st * hop / sr, i * hop / sr))
+            st = None
+    if st is not None and (n - st) * hop / sr >= min_seconds:
+        runs.append((st * hop / sr, n * hop / sr))
+    return runs
+
+
+def _declared_punct_indices(scene):
+    """该场 `pause_marks` 声明落在哪些标点位点上（发音字符流索引集合）。
+
+    这是本面**唯一的生产者事实源**：波形分不出引擎 break 与流水线补零，而
+    "作者在这里声明过停顿"是一条记录，不是推断。定位口径复用
+    `pause_marks.anchor_positions`（与 cue、与合成侧同一条归一化字符流），
+    不另写一份索引。
+
+    返回 `(索引集合, 断链点名)`。断链时按"无声明"继续，但必须点名——
+    把"解析不到"当成"没声明"，就会把引擎的停顿重新记成流水线补零，
+    正是本次要修的那个形态。
+    """
+    marks = scene.get("pause_marks") or []
+    text = (scene.get("narration") or "").strip()
+    if not marks or not text:
+        return set(), []
+    try:
+        import pause_marks as _pm
+    except Exception as e:  # 取数断链不得静默降级成"没声明"
+        return set(), [f"pause_marks 模块取不回（{e}）"]
+    out, broken = set(), []
+    for m in marks:
+        anchor = str((m or {}).get("after") or "")
+        try:
+            hits = _pm.anchor_positions(text, anchor)
+        except Exception as e:
+            broken.append(f"锚词 {anchor!r} 定位失败（{e}）")
+            continue
+        if len(hits) != 1:
+            broken.append(f"锚词 {anchor!r} 命中 {len(hits)} 次（须恰 1 次）")
+            continue
+        # 锚词末字符的下一原文位 → 其前有多少个发音字符 ⇒ 该标点位点的流索引
+        out.add(sum(1 for ch in text[:hits[0]] if ch not in NON_SPOKEN))
+    return out, broken
+
+
 def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
     """返回 (连读桶点名, 急促桶点名, 读数摘要, 逐场状态, 连读桶结构化行)。
 
@@ -271,6 +483,10 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
     intra_unmeasurable = 0
     intra_no_energy = 0
     intra_broken: list = []
+    comp_rows: list = []       # 标点位点的精停构成（交付间隙／精确零／带噪／声明／账本）
+    comp_unmeasured: list = []
+    comp_decl_broken: list = []
+    _booked_by_scene: dict = {}   # 场 → 本轮账本补入秒数（缺键＝未记账，不是 0）
     for entry in manifest.get("scenes", []):
         sid = str(entry.get("scene_id"))
         if entry.get("method") != "asr_forced" or not entry.get("chars"):
@@ -288,12 +504,55 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
         if len(spoken) != len(chars):
             skipped.append(f"s{sid}(原文 {len(spoken)} 字 ≠ 对齐 {len(chars)} 字，疑含拉丁/数字展开)")
             continue
+        # 精停构成（2026-11-06 建、2026-11-07 修归因）：波形里样本精确为 0 的段
+        # 是「人工插入的静音」——但插入者可能是**引擎的 SSML break**，也可能是
+        # 流水线的补零，两者字节同形。故本面只量"精确零"这一事实，生产者由
+        # 声明记录（本场 pause_marks）与账本（manifest 的本轮补入量）回答。
+        _bidx = [k for k in range(len(spoken)) if after[k].strip()]
+        _declared, _decl_broken = _declared_punct_indices(sc)
+        comp_decl_broken += _decl_broken
+        _booked = entry.get("pause_intra_inserted")
+        if _booked is not None:
+            _booked_by_scene[sid] = float(_booked)
+        zr = None
+        if wav_dir and entry.get("tts_file"):
+            import intra_pause as _ip
+            _a, _sr = _ip.mono_from_wav(Path(wav_dir) / str(entry["tts_file"]))
+            if _a is None:
+                comp_unmeasured.append(f"s{sid}(波形读不回)")
+            else:
+                zr = _zero_silence_runs(_a, _sr)
+        elif not wav_dir:
+            comp_unmeasured.append(f"s{sid}(未给波形目录)")
         for row in punctuation_gap_rows(chars, spoken, after):
             g, punct = row["gap"], row["punct"]
             gaps_by_punct.setdefault(punct if punct else "无标点", []).append(g)
             if not punct:
                 continue
             rows.append((sid, punct, g, row["ctx"], row["anchor"]))
+            if zr is not None:
+                _lo = float(chars[row["index"] - 1][1]) if row["index"] > 0 else 0.0
+                _hi = float(chars[row["index"]][0])
+                _zs = sum(max(0.0, min(_hi, b) - max(_lo, a)) for a, b in zr)
+                _prev_b = max([b for b in _bidx if b < row["index"]], default=0)
+                _next_b = min([b for b in _bidx if b > row["index"]],
+                              default=len(spoken))
+                _decl = row["index"] in _declared
+                _sig = max(0.0, _hi - _lo - _zs)
+                comp_rows.append({
+                    "scene_id": sid, "punct": punct, "ctx": row["ctx"],
+                    "anchor": row["anchor"],
+                    "cls": _classify_boundary(punct, row["index"] - _prev_b,
+                                              _next_b - row["index"]),
+                    "asr_gap": round(_hi - _lo, 3),
+                    "zero_silence": round(_zs, 3),
+                    "signal_gap": round(_sig, 3),
+                    "declared": _decl,
+                    # 分档用的量：有声明＝这段零是引擎的 break，交付间隙就是引擎给的；
+                    # 无声明＝扣掉可能来自流水线补零的那部分。见 _build_prosody_summary。
+                    "effective_gap": round(_hi - _lo if _decl else _sig, 3),
+                    "pipeline_booked": _booked,
+                })
             if g < floor:
                 silent_punct.append(
                     f"s{sid} 标点处实测 {g:.2f}s（<{floor:g}s 可听阈）『…{row['ctx']}…』")
@@ -367,6 +626,30 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
             "no_energy": intra_no_energy,
             "broken": intra_broken,
         },
+        # ---- 精停构成（2026-11-06 建、2026-11-07 修归因，描述面）----
+        # 逗号/顿号处看似「达标」的间隙里，有多少是样本精确为 0 的人工静音。
+        # **不区分生产者**（引擎 break 与流水线补零同形）；生产者分别由
+        # `declared`（声明记录）与 `pipeline_booked`（账本）给出，两者都可能缺席，
+        # 缺席时宁可报"未记账"也不按 0 计。只透出、不改变任何裁定。
+        "pause_composition": {
+            "points_measured": len(comp_rows),
+            "dead_floor_seconds": _SHORT_PAUSE_GAP_SECONDS,
+            "short_pause": sum(1 for r in comp_rows
+                               if r["effective_gap"] < _SHORT_PAUSE_GAP_SECONDS),
+            "zero_silence_total_seconds": round(
+                sum(r["zero_silence"] for r in comp_rows), 3),
+            "declared_positions": sum(1 for r in comp_rows if r["declared"]),
+            "pipeline_booked_total_seconds": round(sum(_booked_by_scene.values()), 3),
+            "pipeline_booked_scenes": len(_booked_by_scene),
+            "rows": comp_rows,
+            "unmeasured": comp_unmeasured,
+            "declaration_broken": comp_decl_broken,
+        },
+        # ---- 语义停顿分层（2026-11-06 用户口播反馈批，描述面）----
+        # 用途是回答「该不该有气口」，**不是**「把某处调到多少秒」：实测同一位置换
+        # comma/period/colon/dash 只差 0.05s，标点等级不驱动引擎停顿。
+        "prosody": _build_prosody_summary(
+            comp_rows, int(pm["beat_ms"])),
     }
     return silent_punct, rushed, summary, skipped, silent_rows
 
@@ -512,7 +795,7 @@ def cue_offset_refs(html_text: str):
 
 
 def emit_declarations(narration: list, rushed: list, html_text: str = "",
-                      absolute_rows: list = None) -> list:
+                      absolute_rows: list = None, beat_rows: list = None) -> list:
     """把两桶命中转成可直接并入 narration.json 的 pause_marks 片段（只打印，不落盘）。
 
     2026-11-06 机制批：入参旧形态只收**急促桶**，于是"0.10s 的顿号"这类绝对阈命中
@@ -532,6 +815,14 @@ def emit_declarations(narration: list, rushed: list, html_text: str = "",
     grouped: dict = {}
     cands = list(rushed)
     seen = {(str(r.get("scene_id")), r.get("ctx")) for r in cands}
+    # 语义档候选（2026-11-06）：分句逗号「该有气口而引擎没给」的位点。
+    # 与两桶同形，去重同样按（场, 上下文），不另起一套口径。
+    for r in (beat_rows or []):
+        key = (str(r.get("scene_id")), r.get("ctx"))
+        if key in seen:
+            continue
+        seen.add(key)
+        cands.append(r)
     for r in (absolute_rows or []):
         key = (str(r.get("scene_id")), r.get("ctx"))
         if key in seen:
@@ -555,6 +846,14 @@ def emit_declarations(narration: list, rushed: list, html_text: str = "",
                     for p in pm.anchor_positions(text, str(e.get("after") or ""))}
         for c in sorted(cands, key=lambda x: x["gap"]):
             anchor = c["anchor"]
+            # 2026-11-06：锚词原本取标点前 ≤4 字，会切在词中（「会翻图集」）。
+            # 声明是给人核对并入 narration.json 的，缩到**最短唯一后缀**（≥2 字）即可；
+            # 不唯一时才保留原锚并进拒绝清单，不猜更长的词。
+            if len(anchor) > 2:
+                for _n in range(2, len(anchor) + 1):
+                    if len(pm.anchor_positions(text, anchor[-_n:])) == 1:
+                        anchor = anchor[-_n:]
+                        break
             hits = pm.anchor_positions(text, anchor)
             if len(hits) != 1:
                 rejected.append(f"『{anchor}』锚点命中 {len(hits)} 次（须恰 1 次，不产出；"
@@ -567,7 +866,10 @@ def emit_declarations(narration: list, rushed: list, html_text: str = "",
             if pos in declared:
                 rejected.append(f"『{anchor}』该标点位已有声明（原文位点 {pos}）")
                 continue
-            ms = int(rules["auto_ms"])
+            # 候选自带的 ms 优先（大气口候选由 pause_measurement.beat_ms 给值）；
+            # 两桶行不带 ms，退回 auto_ms。一律取 auto_ms 会让同一位点在
+            # 「语义层级」行与本建议里报两个不同的值（第二真相源）。
+            ms = int(c.get("ms") or rules["auto_ms"])
             if len(merged) + 1 > int(rules["max_count_per_scene"]):
                 rejected.append(f"『{anchor}』超每场上限 {rules['max_count_per_scene']} 处")
                 continue
@@ -716,7 +1018,8 @@ def main(argv=None) -> int:
             if not hits and not silent and not rushed and not (_intra.get("points") or []):
                 print("  文本面与音频面均无点名对象"
                       + ("（音频面未跑，此句不代表停顿已核）" if not audio_ran else ""))
-        if a.emit_declarations and (rushed or absolute_rows):
+        _beat_rows = (summary.get("prosody") or {}).get("beat_candidates") or []
+        if a.emit_declarations and (rushed or absolute_rows or _beat_rows):
             print(f"—— {name}：可并入 narration.json 的 pause_marks 建议（只打印，不落盘）——")
             html_file = path.parent / "index.html"
             html_text = ""
@@ -726,7 +1029,8 @@ def main(argv=None) -> int:
                 except OSError as e:
                     print(f"  画面联动未核（HTML 读不回，两桶建议照常）：{e}")
             for line in emit_declarations(narration, rushed, html_text,
-                                          absolute_rows=absolute_rows):
+                                          absolute_rows=absolute_rows,
+                                          beat_rows=_beat_rows):
                 print(f"  {line}")
     print(
         f"[PROSODY] 描述面（不裁定）：{grand['projects']} 个项目｜连读风险 {grand['merge_risk']}"

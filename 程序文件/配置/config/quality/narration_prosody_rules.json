@@ -66,6 +66,8 @@
     "audible_floor_seconds": 0.2,
     "relative_ratio": 0.5,
     "relative_ceiling_seconds": 0.3,
+    "beat_ms": 400,
+    "_beat_ms依据": "大气口候选（分句逗号、引擎原声几乎没停）转成 pause_marks 时推荐的声明值，唯一持有者住本键。取 400 而非 audio_sync_rules.pause_declaration.auto_ms（500）的理由：400 是 SSML 合法区间 [400,1000] 的下沿，2026-11-06 实测 400ms 档总停顿已达 1.02/1.04s（`_取证/20261106/audio_pause/tts_probe/probe_result.json`），语义重点要的是『听得出的气口』而不是『最长停顿』；auto_ms=500 标定的是自动补位面（顿号枚举挤段），两者用途不同。2026-11-07 收口：本值原为 narration_pause_precheck.py 内的字面量 400，而 --emit-declarations 另取 auto_ms=500，同一位点在『语义层级』行报 400、在声明建议里报 500——同工具两份真相（A06 同族）。现候选行与声明出口共读候选自带的 ms，本键是该 ms 的唯一来源。",
     "_判据": "音频面读数（可选，需该项目已有 _timeline_manifest.json 且该场 method=asr_forced 且带 chars）：把逐发音字符的实测时间戳映射回旁白原文，量每个标点后的静音间隔；间隔 < audible_floor_seconds 即点名『标了标点但几乎没停』（连读桶）。取不到 manifest／该场未对齐／chars 与 norm 长度不等 → 该场逐场点名跳过，不得按 0 计。",
     "_下限依据": "本仓实测停顿分布（标点类中位）：句号 0.40、分号 0.44、冒号 0.40、逗号 0.34、顿号 0.30、字间无标点 0.00；0.2s 取在『短停顿』与『连读』之间，用于点名异常而非裁定合格。",
     "_相对判据": "第二桶（急促桶）：位点间隔 < relative_ratio × 该场该类标点的中位，且 < relative_ceiling_seconds。两桶**并列不合并**——绝对桶抓『连读』（听感是词被吞），相对桶抓『比该场该类的正常节奏明显短』（听感是用户说的那种『这里该停一下』）。",
