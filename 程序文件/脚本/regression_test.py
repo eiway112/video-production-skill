@@ -22055,6 +22055,7 @@ class RegressionTestRunner:
             test_s_block_writer_maintains_both_shapes,
             test_presence_check_names_dead_blocks,
             test_transition_overlap_census_descriptive_face,
+            test_elevenlabs_engine_branch_and_term_rewrite,
         ]
         self.results = []
     
@@ -26309,6 +26310,165 @@ def test_presence_check_names_dead_blocks() -> RegressionTestCase:
         import traceback
         tc.mark_failed("presence_check_names_dead_blocks error: " + str(e) + "\n"
                        + traceback.format_exc())
+    return tc
+
+
+def test_elevenlabs_engine_branch_and_term_rewrite() -> RegressionTestCase:
+    """用例129：ElevenLabs 引擎分支与送引擎文本的术语修法（2026-11-07 接入批）。
+
+    存在理由（真实交付前置）：用户选定 ElevenLabs 作旁白引擎，而该引擎会把
+    「装配式」读错、且不支持 SSML `<break>`。本用例锁四条纪律：
+      A 术语修法只作用于送引擎的文本，旁白原文/字幕/对齐不被改写（改写点单源）；
+      B 表按引擎生效（qwen 不读表），表字节指纹与模型、声学参数一起进 elevenlabs 缓存键；
+      C 未知引擎直接抛错，**不得落到 Edge 分支**（旧实现是"不是 qwen 就是 edge"的
+        静默 fall-through，一个配置笔误就会静默换音色）；
+      D 缺 key / 暂停声明冲突两类都 fail-loud，不静默降级。
+    """
+    tc = RegressionTestCase(
+        "elevenlabs_engine_branch_and_term_rewrite",
+        "锁 ElevenLabs 引擎分支：术语修法只动引擎文本、缓存键覆盖模型与术语表、未知引擎不落到 Edge、失败一律出声"
+    )
+    import asyncio
+    import os
+    import enhance_video_audio as eva
+    import tts_terms
+
+    saved = dict(
+        engine=eva.TTS_ENGINE, voice=eva.VOICE, qwen=eva.QWEN_MODEL,
+        emodel=eva.ELEVEN_MODEL, eset=dict(eva.ELEVEN_VOICE_SETTINGS),
+        decl=dict(eva.PAUSE_DECLARATIONS), auto=eva.PAUSE_AUTO_ENABLED,
+    )
+    TEXT = "装配式隔墙的空腔厚度、密封条做法与连接件形式，都会影响最终的隔声量。"
+    try:
+        # ── A 术语表：只改引擎文本，且只对声明引擎生效 ────────────────
+        a_text, a_applied = tts_terms.apply(TEXT, "elevenlabs")
+        tc.assert_equal(len(a_applied), 1, "A1 elevenlabs 命中一条术语规则")
+        tc.assert_true("\u200b" in a_text, "A2 引擎文本含零宽分隔（只改切分，不换字形）")
+        tc.assert_equal(a_text.replace("\u200b", ""), TEXT,
+                        "A3 去掉零宽后与原文逐字相同——语义单位不变")
+        q_text, q_applied = tts_terms.apply(TEXT, "qwen")
+        tc.assert_equal(q_applied, [], "A4 qwen 不读本表（它本来读得对，读了只会白击穿缓存）")
+        tc.assert_equal(q_text, TEXT, "A5 qwen 的引擎文本逐字等于原文")
+
+        # ── B 缓存键：模型 / 声学参数 / 术语表都在键上 ─────────────────
+        eva.TTS_ENGINE, eva.VOICE = "qwen", "longanling_v3"
+        eva.QWEN_MODEL = "cosyvoice-v3-flash"
+        k_qwen = eva._tts_cache_key(TEXT, None)
+        eva.TTS_ENGINE, eva.VOICE = "elevenlabs", "xQsp9uyB3OResmXFYuFx"
+        eva.ELEVEN_MODEL = "eleven_v4"
+        k_el = eva._tts_cache_key(TEXT, None)
+        tc.assert_true(k_qwen != k_el, "B1 换引擎即换键（跨引擎不得复用同一份音频）")
+        tc.assert_equal(k_el, eva._tts_cache_key(TEXT, None), "B2 同参数重复取键稳定")
+
+        orig_fp = eva._tts_terms_fingerprint
+        try:
+            eva._tts_terms_fingerprint = lambda: "fp-aaaa"
+            k_el_a = eva._tts_cache_key(TEXT, None)
+            eva._tts_terms_fingerprint = lambda: "fp-bbbb"
+            k_el_b = eva._tts_cache_key(TEXT, None)
+            tc.assert_true(k_el_a != k_el_b,
+                           "B3 术语表变则 elevenlabs 键变（改了修法必须重合成）")
+            eva.TTS_ENGINE = "qwen"
+            k_q_a = eva._tts_cache_key(TEXT, None)
+            eva._tts_terms_fingerprint = lambda: "fp-cccc"
+            k_q_b = eva._tts_cache_key(TEXT, None)
+            tc.assert_equal(k_q_a, k_q_b, "B4 qwen 键不受术语表影响（登记面不越权）")
+            eva.TTS_ENGINE = "elevenlabs"
+            eva.ELEVEN_VOICE_SETTINGS = {"stability": 0.9, "similarity_boost": 0.75}
+            tc.assert_true(eva._tts_cache_key(TEXT, None) != k_el,
+                           "B5 声学参数变则键变（同 A08：影响音频的输入必须进键）")
+        finally:
+            eva._tts_terms_fingerprint = orig_fp
+            eva.ELEVEN_VOICE_SETTINGS = dict(saved["eset"])
+
+        # ── C 改写点单源：合成入口返回的文本改了，权威源没动 ──────────
+        eva.TTS_ENGINE, eva.VOICE = "elevenlabs", "xQsp9uyB3OResmXFYuFx"
+        eva.PAUSE_DECLARATIONS, eva.PAUSE_AUTO_ENABLED = {}, False
+        eva._PAUSE_PLAN_MEMO.clear()
+        et = eva._pause_engine_text("s1", TEXT)
+        tc.assert_true("\u200b" in et, "C1 合成入口返回的引擎文本已修法")
+        tc.assert_equal(TEXT, "装配式隔墙的空腔厚度、密封条做法与连接件形式，都会影响最终的隔声量。",
+                        "C2 旁白原文调用前后逐字未变（修法不写回权威源）")
+
+        eva.PAUSE_DECLARATIONS = {"s1": [{"after": "厚度", "ms": 500}]}
+        eva._PAUSE_PLAN_MEMO.clear()
+        raised = None
+        try:
+            eva._pause_engine_text("s1", TEXT)
+        except Exception as e:  # noqa: BLE001 — 这里要的正是"任何报错都算数"
+            raised = type(e).__name__
+        tc.assert_equal(raised, "PausePlanError",
+                        "C3 有 pause_marks 声明而引擎不支持 SSML break → 报错，不静默忽略")
+
+        # ── D 分派：未知引擎不得落到 Edge ─────────────────────────────
+        calls = []
+
+        async def _fake_edge(t, p):
+            calls.append("edge")
+
+        async def _fake_eleven(t, p):
+            calls.append("eleven")
+
+        orig_edge, orig_eleven = eva._edge_tts, eva._eleven_tts
+        eva._edge_tts, eva._eleven_tts = _fake_edge, _fake_eleven
+        try:
+            eva.PAUSE_DECLARATIONS = {}
+            eva._PAUSE_PLAN_MEMO.clear()
+            eva.TTS_ENGINE = "elevenlabs"
+            asyncio.run(eva.generate_tts(TEXT, os.devnull))
+            tc.assert_equal(calls, ["eleven"], "D1 elevenlabs 引擎路由到自身分支")
+            calls.clear()
+            eva.TTS_ENGINE = "foo"
+            err = None
+            try:
+                asyncio.run(eva.generate_tts(TEXT, os.devnull))
+            except RuntimeError as e:
+                err = str(e)
+            tc.assert_true(bool(err and "Unknown tts_engine" in err),
+                           "D2 未知引擎抛错（静默 fall-through 是本批修掉的关键缺陷）")
+            tc.assert_equal(calls, [], "D3 抛错时不得调用任何引擎（尤其不得落到 Edge）")
+        finally:
+            eva._edge_tts, eva._eleven_tts = orig_edge, orig_eleven
+
+        # ── E 缺 key fail-loud（不触网）───────────────────────────────
+        eva.TTS_ENGINE, eva.VOICE = "elevenlabs", "xQsp9uyB3OResmXFYuFx"
+        bak = os.environ.pop("ELEVENLABS_API_KEY", None)
+        try:
+            msg = None
+            try:
+                asyncio.run(eva._eleven_tts("测试", os.devnull))
+            except RuntimeError as e:
+                msg = str(e)
+            tc.assert_true(bool(msg and "ELEVENLABS_API_KEY" in msg),
+                           "E1 缺 key 直接报错并点名环境变量，不回退到其它引擎")
+        finally:
+            if bak is not None:
+                os.environ["ELEVENLABS_API_KEY"] = bak
+
+        # ── F 登记面：新文件进 tts 步指纹（改了表要让该步重跑）────────
+        pr_src = (SUITE_SCRIPT_DIR / "pipeline_runner.py").read_text(encoding="utf-8")
+        tc.assert_true('"tts_terms"' in pr_src and "tts_terms.py" in pr_src,
+                       "F1 tts_terms 脚本已登记在 tts 步输入面")
+        tc.assert_true('"tts_pronunciation_rules"' in pr_src
+                       and "tts_pronunciation.json" in pr_src,
+                       "F2 术语表 JSON 已登记在 tts 步输入面")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("elevenlabs_engine_branch_and_term_rewrite error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    finally:
+        eva.TTS_ENGINE = saved["engine"]
+        eva.VOICE = saved["voice"]
+        eva.QWEN_MODEL = saved["qwen"]
+        eva.ELEVEN_MODEL = saved["emodel"]
+        eva.ELEVEN_VOICE_SETTINGS = dict(saved["eset"])
+        eva.PAUSE_DECLARATIONS = dict(saved["decl"])
+        eva.PAUSE_AUTO_ENABLED = saved["auto"]
+        try:
+            eva._PAUSE_PLAN_MEMO.clear()
+        except Exception:
+            pass
     return tc
 
 

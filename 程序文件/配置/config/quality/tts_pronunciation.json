@@ -1,0 +1,21 @@
+{
+  "_note": "送引擎文本的术语修法唯一权威源。只作用于 generate_tts 收到的文本（enhance_video_audio._pause_engine_text），旁白原文/字幕/ASR 对齐/词级 cue 全部沿用原文。engines 之外的引擎不读本表（qwen 对这些词读得对，改了反而多一次缓存击穿）。",
+  "engines": [
+    "elevenlabs"
+  ],
+  "terms": [
+    {
+      "word": "装配式",
+      "engine_text": "装配\u200b式",
+      "reason": "分词误读：ElevenLabs 把「装配」读错（2026-11-07 Arthur/Gavin 实测）。改用零宽空格只改切分、不改字形；同批实测四种写法加空格后时长 6.72~7.04s（基线 6.80s），无可闻断口，而常规空格在 Gavin 上会产生 0.4s 断口并切断「装配式隔墙」这一语义单位。",
+      "verified": {
+        "date": "2026-11-07",
+        "voices": [
+          "Arthur (xQsp9uyB3OResmXFYuFx)",
+          "Gavin (YGeNjTKY1wBaKygyl4y8)"
+        ],
+        "evidence": "过程产物/临时产物/_取证/20261107/fix2/装配式_零宽与同音字.mp3"
+      }
+    }
+  ]
+}

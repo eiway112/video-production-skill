@@ -188,9 +188,11 @@ preflight → tts → timeline → render
 
 ---
 
-## TTS 引擎纪律（Tier 3，2026-08-06）
+## TTS 引擎纪律（Tier 3，2026-08-06；2026-11-07 增 ElevenLabs）
 
 **原则**：全仓统一 Qwen（DashScope CosyVoice）为主引擎；Edge-TTS 仅限存量项目已声明的配置保留，新项目禁止声明 `tts_engine: "edge"`。禁止跨引擎自动降级（音色不一致）——失败即报错，修复后重跑。
+
+**elevenlabs（2026-11-07 接入，按项目 opt-in）**：需 `ELEVENLABS_API_KEY`（落 `程序文件/配置/openmontage.env.local`，该文件已 gitignore）；`voice` 传 voice_id，缺省 Arthur（`xQsp9uyB3OResmXFYuFx`，技术讲解主音色），Gavin（`YGeNjTKY1wBaKygyl4y8`）为案例/叙事备选。模型缺省 `eleven_v4`（单请求上限 10000 字符，超限报错不分片）。三条边界：①**不支持 SSML `<break>`**——项目若声明 `pause_marks`，`pause_marks.plan_scene` 按既有语义直接抛 `PausePlanError`，不静默忽略（波形层的句间 0.4s / 句内 0.25s 强制与引擎无关，照常生效）；②术语误读修在**送引擎的文本**上，唯一权威源 `config/quality/tts_pronunciation.json`（只收真人听感确认过的词条，修法优先"只改切分不换字形"的零宽分隔），旁白原文/字幕/ASR 对齐/词级 cue 全部沿用原文；③该表、模型、`eleven_voice_settings` 与术语表字节指纹**都进 TTS 缓存键**，换任一项即重合成。未知引擎名一律抛错——`generate_tts` 不再"不是 qwen 就落到 edge"。**pause_marks 的处置（2026-11-07 用户裁定）**：带停顿声明的项目切 elevenlabs 时**删掉该项目的 `pause_marks`**（弃声明、接受引擎自身韵律），不另建"文本切分＋补静音"机制——那会与现有声明面并存成两套真相，且破坏整段韵律。
 
 **默认链**（实测验证，见 `enhance_video_audio.py`）：
 - 默认：`cosyvoice-v3-flash` + `longanling_v3`（2026-08-06 从 cosyvoice-v2/longanling 升级，v3 韵律更自然；旧注释“v3 需专属域名”实测不成立）

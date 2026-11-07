@@ -82,6 +82,9 @@ _load_env_files()
 # tts_engine 控制使用哪个 TTS 后端：
 #   - "qwen"（默认）：阿里云百炼 DashScope 的 CosyVoice / Qwen-Audio-TTS（需 DASHSCOPE_API_KEY）
 #   - "edge"：Edge-TTS（旧默认，无需 Key，仅存量项目显式声明保留）
+#   - "elevenlabs"：ElevenLabs HTTP API（需 ELEVENLABS_API_KEY；voice 传 voice_id）。
+#     缺省音色 Arthur＝2026-11-07 用户逐条听感选定的主音色；不支持 SSML <break>，
+#     故有 pause_marks 声明的项目在该引擎上按 pause_marks 既有语义直接报错（不静默忽略）。
 # 引擎不自动 fallback — AGENTS.md 明令禁止跨引擎自动降级（造成音色不一致）。
 TTS_ENGINE = "qwen"
 VOICE = "longanling_v3"       # Qwen 默认音色：龙安灵V3（思维灵动女，cosyvoice-v3-flash）
@@ -92,6 +95,17 @@ RATE = "+0%"                  # Edge 语法，Qwen 分支会自动换算成 floa
 PITCH = "+0Hz"
 TTS_INSTRUCTION = ""          # config tts_instruction：Instruct 音色的情感/场景指令（如 longanyang/longanhuan）
 SAMPLE_RATE = 44100
+
+# === ElevenLabs（2026-11-07 接入）===
+# 音色身份与模型分开声明：voice 复用既有的顶层字段（传 voice_id），模型/参数单独两键。
+# 默认音色 Arthur：用户从 9 个中文男声里选定（2026-11-07），主用于技术讲解；
+# Gavin（YGeNjTKY1wBaKygyl4y8）为案例/叙事类备选，由项目 config 显式声明。
+ELEVEN_MODEL = "eleven_v4"
+ELEVEN_DEFAULT_VOICE_ID = "xQsp9uyB3OResmXFYuFx"   # Arthur - 清晰讲解男声
+ELEVEN_VOICE_SETTINGS_DEFAULT = {"stability": 0.5, "similarity_boost": 0.75}
+# 不做惰性继承：未声明的项目回缺省，避免 in-process 跨项目污染（同 BGM/字幕样式判据）。
+ELEVEN_VOICE_SETTINGS = dict(ELEVEN_VOICE_SETTINGS_DEFAULT)
+ELEVEN_MAX_CHARS_PER_REQUEST = 10000   # 官方 v4 单请求上限，超限直接报错不分片
 
 # 官方音色规格（2026-08-06 核对）：支持 Instruct 情感指令的音色仅这几个，
 # 其余音色（含默认 longanling_v3）声明 instruction 无效，加载配置时告警。
@@ -268,7 +282,15 @@ def _pause_engine_text(scene_id, text):
         print(f"  [PAUSE] 场 {scene_id}: 插入 {plan['applied']} 处强制停顿（{det}）")
     for n in plan.get("notes") or []:
         print(f"  [PAUSE] 场 {scene_id}: {n}")
-    return plan["engine_text"]
+    engine_text = plan["engine_text"]
+    # 术语修法只落在这一份 engine_text 上（旁白原文/字幕/对齐/cue 全部沿用原文）。
+    # 表按引擎生效，qwen 不读（它本来读得对，读了只会白击穿缓存）。
+    if TTS_ENGINE == "elevenlabs":
+        import tts_terms
+        engine_text, applied = tts_terms.apply(engine_text, TTS_ENGINE)
+        for word, repl in applied:
+            print(f"  [PRON] 场 {scene_id}: {word} → {tts_terms.describe_replacement(repl)}")
+    return engine_text
 
 
 def _collect_pause_state(cfg, scenes_list):
@@ -334,6 +356,19 @@ def _collect_pause_state(cfg, scenes_list):
             PAUSE_DECLARATIONS[str(s.get("scene_id"))] = marks
 
 
+def _tts_terms_fingerprint():
+    """术语表字节指纹（只有 elevenlabs 的缓存键消费它）。
+
+    模块或表读不回时返回 none 而不是抛错：指纹只影响"改表后是否重合成"，
+    真正的取数断链由 tts_terms.apply 在合成前 fail-loud，两处职责不混。
+    """
+    try:
+        import tts_terms
+        return tts_terms.fingerprint()
+    except Exception:
+        return "none"
+
+
 def _tts_cache_key(text, scene_id=None):
     """Compute short hash from narration text for cache keying.
     
@@ -349,7 +384,16 @@ def _tts_cache_key(text, scene_id=None):
     docstring 登记的同族缺陷，此处为其消费端收口）。
     """
     normalized = re.sub(r'\s+', '', text.strip())
-    model_tag = QWEN_MODEL if TTS_ENGINE == "qwen" else "edge"
+    if TTS_ENGINE == "qwen":
+        model_tag = QWEN_MODEL
+    elif TTS_ENGINE == "elevenlabs":
+        # 模型 + 声学参数 + 术语表指纹三者都进键：换模型/调 stability/改术语表都换键，
+        # 旧音频不会被当成新参数下的产物复用（A08 同族：影响音频的输入必须进键）。
+        model_tag = (f"{ELEVEN_MODEL}|"
+                     f"{json.dumps(ELEVEN_VOICE_SETTINGS, sort_keys=True)}|"
+                     f"{_tts_terms_fingerprint()}")
+    else:
+        model_tag = "edge"
     cache_input = f"{normalized}|{TTS_ENGINE}|{model_tag}|{VOICE}|{RATE}|{PITCH}|{TTS_INSTRUCTION or ''}"
     if scene_id is not None:
         tag = _scene_pause_plan(scene_id, text).get("cache_tag") or ""
@@ -1481,6 +1525,7 @@ def load_config(config_path):
     会自动加上 cover_duration，避免下游脚本再次叠加 COVER_DURATION。
     """
     global SCENES, VIDEO_DURATION, VOICE, RATE, PITCH, TTS_ENGINE, QWEN_MODEL, BGM_ENABLED
+    global ELEVEN_MODEL, ELEVEN_VOICE_SETTINGS
     # 停顿声明全局态由 _collect_pause_state 在各 return 前接管（先重置再采集，
     # 禁止跨项目 in-process 继承上一轮的声明——用例76 C 段同族缺陷）。
     global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED
@@ -1553,6 +1598,19 @@ def load_config(config_path):
     TTS_ENGINE = cfg.get('tts_engine', TTS_ENGINE).lower()
     QWEN_MODEL = cfg.get('qwen_model', QWEN_MODEL)
     TTS_INSTRUCTION = str(cfg.get('tts_instruction', TTS_INSTRUCTION) or '')
+    # ElevenLabs 两键每次 load 先回缺省再叠声明：不做惰性继承（同 BGM/字幕样式判据）。
+    ELEVEN_MODEL = str(cfg.get('eleven_model') or "eleven_v4")
+    ELEVEN_VOICE_SETTINGS = dict(ELEVEN_VOICE_SETTINGS_DEFAULT)
+    _vs_raw = cfg.get('eleven_voice_settings')
+    if isinstance(_vs_raw, dict):
+        for _k, _v in _vs_raw.items():
+            if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                ELEVEN_VOICE_SETTINGS[str(_k)] = float(_v)
+            else:
+                print(f"[WARN] eleven_voice_settings.{_k} 不是数值，已忽略（{_v!r}）")
+    elif _vs_raw is not None:
+        print("[ERROR] eleven_voice_settings 必须是对象（stability/similarity_boost/style/speed）")
+        sys.exit(1)
     
     # 支持 audio 对象中的语音参数（高优先级）
     if 'audio' in cfg and isinstance(cfg['audio'], dict):
@@ -1569,6 +1627,16 @@ def load_config(config_path):
             QWEN_MODEL = _audio_cfg['qwen_model']
         if 'instruction' in _audio_cfg:
             TTS_INSTRUCTION = str(_audio_cfg['instruction'] or '')
+        if 'eleven_model' in _audio_cfg:
+            ELEVEN_MODEL = str(_audio_cfg['eleven_model'] or ELEVEN_MODEL)
+        if 'eleven_voice_settings' in _audio_cfg:
+            _vs2 = _audio_cfg['eleven_voice_settings']
+            if not isinstance(_vs2, dict):
+                print("[ERROR] audio.eleven_voice_settings 必须是对象")
+                sys.exit(1)
+            for _k, _v in _vs2.items():
+                if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                    ELEVEN_VOICE_SETTINGS[str(_k)] = float(_v)
 
     # 模型解析：config 显式声明 qwen_model 为权威；未声明时按音色推断，
     # 保证音色与模型严格配对（官方约束：不得跨模型混用音色）。
@@ -1590,13 +1658,36 @@ def load_config(config_path):
         print(f"[ERROR] 请修正 config：用 qwen 音色（如 'longanling'），或显式声明 tts_engine: 'edge'")
         sys.exit(1)
     
-    if TTS_ENABLED and TTS_ENGINE not in ('qwen', 'edge'):
-        print(f"[ERROR] Unknown tts_engine='{TTS_ENGINE}' — supported: 'qwen', 'edge'")
+    if TTS_ENABLED and TTS_ENGINE == 'elevenlabs':
+        # 音色与引擎一致性门禁（与上面 qwen/edge 那条同判据）：voice 必须是 voice_id。
+        # 显式声明了却不像 voice_id → 报错；完全没声明 → 回缺省 Arthur 并出声说明，
+        # 不静默把 qwen 音色名（longanling_v3）发去 ElevenLabs 换一个 404。
+        _voice_declared = ('voice' in cfg) or (
+            isinstance(cfg.get('audio'), dict) and 'voice' in cfg['audio'])
+        if not re.match(r'^[A-Za-z0-9]{16,}$', str(VOICE or '')):
+            if _voice_declared:
+                print(f"[ERROR] tts_engine=elevenlabs 但 voice='{VOICE}' 不是 ElevenLabs voice_id")
+                print("[ERROR] 请把 voice 改成工作区音色 ID（如 Arthur: xQsp9uyB3OResmXFYuFx），")
+                print("[ERROR] 或删掉 voice 键使用缺省音色 Arthur。")
+                sys.exit(1)
+            VOICE = ELEVEN_DEFAULT_VOICE_ID
+            print(f"[INFO] tts_engine=elevenlabs 未声明 voice，使用缺省音色 Arthur（{VOICE}）")
+        # rate/pitch 是 Edge 语法，ElevenLabs 只认 voice_settings.speed；声明了却不生效
+        # 必须出声（与 tts_instruction 非 Instruct 音色的告警同判据：不静默吞掉作者声明）。
+        _rate_ignored = str(RATE or '').strip() not in ('', '+0%', '0%', '0', '1.0', '+0.0%')
+        _pitch_ignored = str(PITCH or '').strip() not in ('', '+0Hz', '0Hz', '0')
+        if _rate_ignored or _pitch_ignored:
+            print(f"[WARN] tts_engine=elevenlabs 不读 Edge 语法的 rate={RATE!r}/pitch={PITCH!r}，"
+                  "这两个值不会生效；要调语速请用 eleven_voice_settings.speed 并试听确认")
+
+    if TTS_ENABLED and TTS_ENGINE not in ('qwen', 'edge', 'elevenlabs'):
+        print(f"[ERROR] Unknown tts_engine='{TTS_ENGINE}' — supported: 'qwen', 'edge', 'elevenlabs'")
         sys.exit(1)
     
     if TTS_ENABLED:
         print(f"[INFO] TTS engine: {TTS_ENGINE}, voice: {VOICE}" +
               (f", model: {QWEN_MODEL}" if TTS_ENGINE == 'qwen' else '') +
+              (f", model: {ELEVEN_MODEL}" if TTS_ENGINE == 'elevenlabs' else '') +
               (f", instruction: {TTS_INSTRUCTION}" if TTS_ENGINE == 'qwen' and TTS_INSTRUCTION else ''))
     else:
         print(f"[INFO] TTS disabled (tts_enabled=false) — pure-BGM audio path" +
@@ -2098,12 +2189,100 @@ async def _qwen_tts(text, output_path):
                 ) from e
 
 
+async def _eleven_tts(text, output_path):
+    """Generate TTS using ElevenLabs HTTP API (eleven_v4).
+
+    输出格式固定 mp3_44100_128：下游 step1 统一 ffmpeg 升 44.1kHz stereo s16，
+    与 qwen/edge 两条分支共用同一段升采样代码，本函数内不重采样。
+
+    失败语义：鉴权/音色/模型类错误（401/403/404/400/422）**不重试**——重试也拿不到
+    结果，只会把"音色没加入工作区"拖成 5 次等待；只对网络中断、429、5xx 重试。
+    不降级到其它引擎（AGENTS.md 禁止跨引擎自动降级）。
+    """
+    import asyncio as aio
+    import urllib.error
+    import urllib.request
+
+    api_key = os.environ.get('ELEVENLABS_API_KEY')
+    if not api_key:
+        raise RuntimeError(
+            "ELEVENLABS_API_KEY not set in environment.\n"
+            "写进 程序文件/配置/openmontage.env.local（该文件已被 .gitignore 排除）：\n"
+            "  ELEVENLABS_API_KEY=sk_xxx"
+        )
+    if len(text) > ELEVEN_MAX_CHARS_PER_REQUEST:
+        raise RuntimeError(
+            f"ElevenLabs 单请求上限 {ELEVEN_MAX_CHARS_PER_REQUEST} 字符，本场 {len(text)} 字符。"
+            "请拆分场次；适配层不分片——分片会让停顿与对齐基准脱离原文。"
+        )
+
+    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE}"
+           f"?output_format=mp3_44100_128")
+    payload = json.dumps({
+        "text": text,
+        "model_id": ELEVEN_MODEL,
+        "voice_settings": dict(ELEVEN_VOICE_SETTINGS),
+    }).encode('utf-8')
+
+    max_retries = 5
+    retry_delays = [3, 5, 10, 15, 20]
+    for attempt in range(1, max_retries + 1):
+        try:
+            def _call_sync():
+                req = urllib.request.Request(url, data=payload, headers={
+                    'xi-api-key': api_key,
+                    'Content-Type': 'application/json',
+                    'Accept': 'audio/mpeg',
+                })
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    return resp.read()
+
+            data = await aio.to_thread(_call_sync)
+            if len(data) < 500:
+                raise Exception(f"ElevenLabs returned invalid audio ({len(data)} bytes)")
+            with open(output_path, 'wb') as f:
+                f.write(data)
+            return
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', 'replace')[:300]
+            if e.code in (401, 403):
+                raise RuntimeError(
+                    f"ElevenLabs 鉴权失败（HTTP {e.code}）：{body}\n"
+                    "检查 ELEVENLABS_API_KEY 与 key 的权限（需「文本转语音」访问）。"
+                ) from e
+            if e.code == 404:
+                raise RuntimeError(
+                    f"ElevenLabs 找不到音色 {VOICE}（HTTP 404）：{body}\n"
+                    "音色未加入当前工作区，或 voice_id 写错。"
+                ) from e
+            if e.code in (400, 422):
+                raise RuntimeError(
+                    f"ElevenLabs 拒绝请求（HTTP {e.code}）：{body}\n"
+                    f"model={ELEVEN_MODEL}, voice={VOICE}, 文本 {len(text)} 字符。"
+                ) from e
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"ElevenLabs HTTP {e.code} after {max_retries} retries: {body}"
+                ) from e
+            print(f"  eleven_tts attempt {attempt}/{max_retries} failed: HTTP {e.code}")
+        except Exception as e:
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"ElevenLabs TTS failed after {max_retries} retries: {e}. "
+                    f"model={ELEVEN_MODEL}, voice={VOICE}, text={text[:40]}..."
+                ) from e
+            print(f"  eleven_tts attempt {attempt}/{max_retries} failed: {e}")
+        wait = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+        print(f"  Retrying in {wait}s...")
+        await aio.sleep(wait)
+
+
 async def generate_tts(text, output_path):
     """Dispatch TTS generation by TTS_ENGINE.
 
     Empty text → 3s silence (opening/transition scenes).
-    Otherwise → Qwen (default) or Edge branch. Both retry+fail-loudly;
-    neither auto-fallbacks to the other (AGENTS.md 禁止 cross-engine fallback).
+    Otherwise → qwen / elevenlabs / edge 显式三选一，各自 retry+fail-loudly；
+    未知引擎直接抛错——不得"落到 Edge 分支"（那样一个配置笔误就会静默换音色）。
     """
     # Skip empty narration (opening scenes often have no text)
     if not text or text.strip() == "":
@@ -2116,9 +2295,14 @@ async def generate_tts(text, output_path):
 
     if TTS_ENGINE == 'qwen':
         await _qwen_tts(text, output_path)
-        return
-    # Fall through to Edge-TTS branch
-    await _edge_tts(text, output_path)
+    elif TTS_ENGINE == 'elevenlabs':
+        await _eleven_tts(text, output_path)
+    elif TTS_ENGINE == 'edge':
+        await _edge_tts(text, output_path)
+    else:
+        raise RuntimeError(
+            f"Unknown tts_engine={TTS_ENGINE!r} — supported: qwen / elevenlabs / edge"
+        )
 
 
 async def _edge_tts(text, output_path):

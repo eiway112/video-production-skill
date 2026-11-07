@@ -1324,6 +1324,13 @@ class PipelineRunner:
                              # 不登记即"改了七层判据而 tts 步缓存照常命中、旧结论继续供数"，
                              # 与 2026-10-12 批 preview_capture.js 那条同族。
                              "tts_verify": SCRIPTS / "verify_tts_product.py",
+                             # 2026-11-07 ElevenLabs 接入批：送引擎文本的术语修法真身
+                             # （enhancer 的 _pause_engine_text 按名导入 tts_terms.apply，
+                             # 规则住 quality/tts_pronunciation.json）。不登记则"改了术语表
+                             # 而 tts 步缓存照常命中"——缓存键虽会换，但步骤指纹面先判 CACHED
+                             # 就不会重跑该步，与 A06 同族。
+                             "tts_terms": SCRIPTS / "tts_terms.py",
+                             "tts_pronunciation_rules": quality_dir / "tts_pronunciation.json",
                              # 2026-11-05 用户口播反馈批补登：无标点处多余停顿的判据真身。
                              # 修剪与重映射住在 _build_timeline_manifest（本 enhancer 件、
                              # 即 **tts 步末尾**执行），它按名导入 intra_pause.classify_points；
