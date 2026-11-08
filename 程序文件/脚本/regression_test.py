@@ -7301,7 +7301,7 @@ def test_alignment_cache_binds_real_waveform() -> RegressionTestCase:
             # 四元组（第四元＝平移后的字符级流）。桩必须与生产同形——不同形即 TypeError，
             # 由本用例自身暴露，而不是靠"桩恰好没接住关键字参数"蒙过去。
             _stub('_enforce_sentence_pauses',
-                  lambda f, s, m, chars=None: (False, s, 0.0, chars))
+                  lambda f, s, m, chars=None, stats=None: (False, s, 0.0, chars))
             _stub('_split_text_to_segments', lambda t: ['第一句测试旁白。', '第二句继续朗读。'])
             saved_fa_load = fa.load_align_model
             saved_fa_align = fa.align_scene
@@ -7392,7 +7392,7 @@ def test_alignment_cache_binds_real_waveform() -> RegressionTestCase:
                 _make_wav(hq, seconds=1.0)   # 新字节
                 # 四元组同形（第四元＝平移后的字符级流）；本场景对齐桩不产 chars，
                 # 故原样回传入的 None—— chars 平移自身的正确性由字符级用例另锁。
-                def _enforce_modifying(f, s, m, chars=None):
+                def _enforce_modifying(f, s, m, chars=None, stats=None):
                     with open(f, 'ab') as fp:      # 模拟插静音：追加字节
                         fp.write(b'\x01\x02' * 441)
                     return True, [dict(x) for x in s], 0.2, chars
@@ -7406,7 +7406,7 @@ def test_alignment_cache_binds_real_waveform() -> RegressionTestCase:
                                 "otherwise every next run would thrash the cache")
                 # 下一轮（停顿已达标 no-op）应命中
                 eva._enforce_sentence_pauses = (
-                    lambda f, s, m, chars=None: (False, s, 0.0, chars))
+                    lambda f, s, m, chars=None, stats=None: (False, s, 0.0, chars))
                 n_before = align_calls['n']
                 eva._build_timeline_manifest(tmpdir)
                 tc.assert_equal(align_calls['n'], n_before,
@@ -14751,7 +14751,7 @@ def test_word_level_cue_time_source_and_resolver() -> RegressionTestCase:
                         "sentences": [dict(s) for s in SENTS_IN],
                         "norm": NORM_IN, "chars": [list(c) for c in CHARS_IN]}
 
-            def _fake_enforce(f, s, m, chars=None):
+            def _fake_enforce(f, s, m, chars=None, stats=None):
                 mod, _s, ins, out = state['enforce']
                 if not mod:
                     return False, s, 0.0, chars
@@ -16423,6 +16423,47 @@ def test_frame_occupancy_descriptive_face() -> RegressionTestCase:
             tc.assert_true(gm.get("static_share", -1) >= 0.0
                            and gm.get("seconds", 0) > 0,
                            f"G4c 子面取到正数读数：{gm.get('static_share')}/{gm.get('seconds')}")
+
+        # ═════════════════════════════════════════════════════════
+        # K. 静止窗口清单（2026-11-08 观感回收批）：读数必须能定位到片子里的位置
+        # ═════════════════════════════════════════════════════════
+        # 存在理由：只给 `max_static_seconds` 时，知道"最长停了 7.2s"却不知道停在哪；
+        # 2026-11-08 那轮的定位是现写一次性探针做的（逐帧差分里找连续段）——每次要看
+        # 都得重写一遍的取数面不算公共能力。本段锁三件事：窗口起点正确、与最长秒数同源、
+        # 键缺席必须可见（摘掉子面不得变成静默省略）。
+        with tempfile.TemporaryDirectory() as td:
+            still = Path(td) / "still.mp4"
+            rc_still = _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                                "-i", "color=c=gray:s=320x180:r=10:duration=3",
+                                "-pix_fmt", "yuv420p", str(still)], capture_output=True)
+            if rc_still.returncode != 0:
+                tc.assert_true(True, "K1-K5 无 ffmpeg 对象，按无对象通过（非恒真：有 ffmpeg 时必跑）")
+            else:
+                rs = fo.measure_motion(str(still))
+                sw = rs.get("static_windows")
+                tc.assert_true(isinstance(sw, list) and len(sw) >= 1,
+                               f"K1 全静止片给出静止窗口清单（实得 {sw}）")
+                _first = sw[0] if isinstance(sw, list) and sw else {}
+                tc.assert_equal(_first.get("start_s"), 0.0,
+                                f"K2 窗口起点自片头 0.0s 起（实得 {_first.get('start_s')}）")
+                tc.assert_true(_first.get("seconds", 0) >= 2.0,
+                               f"K3 3s 静止片的窗口时长 ≥2.0s（实得 {_first.get('seconds')}）")
+                tc.assert_equal(_first.get("seconds"), rs.get("max_static_seconds"),
+                                "K4 两份读数同源：窗口时长＝max_static_seconds（不得各算一遍）")
+                line_sw = fo.format_line({"median": 0.2, "p10": 0.1, "min": 0.0, "frames": 30,
+                                          "low_blank_seconds": 0, "max_low_blank_run_seconds": 0,
+                                          "caliber": dict(fo.CALIBER), "motion": rs})
+                tc.assert_true("静止窗 0.0s 起" in line_sw,
+                               f"K5 窗口进文案行（只在 JSON 里＝读纸面的人还得现写探针）：{line_sw[-90:]}")
+        line_no_sw = fo.format_line({"median": 0.2, "p10": 0.1, "min": 0.0, "frames": 30,
+                                     "low_blank_seconds": 0, "max_low_blank_run_seconds": 0,
+                                     "caliber": dict(fo.CALIBER),
+                                     "motion": {"caliber": dict(fo.MOTION_CALIBER), "frames": 30,
+                                                "seconds": 3.0, "diff_median": 0.0,
+                                                "diff_p90": 0.0, "moving_share": 0.0,
+                                                "static_share": 1.0, "max_static_seconds": 2.9}})
+        tc.assert_true("静止窗 未取数" in line_no_sw,
+                       "K6 窗口键缺席时文案点名「未取数」（静默省略＝摘掉子面不留读数差）")
         tc.mark_passed()
     except Exception as e:
         import traceback
@@ -21932,6 +21973,196 @@ def test_scene_patch_script_attribution() -> RegressionTestCase:
     return tc
 
 
+def test_pause_insert_energy_gate() -> RegressionTestCase:
+    """用例132：停顿插入面的能量闸门——只在真静音处下刀
+
+    存在理由（2026-11-08 第二轮真实反馈）：使用者把症状从"停顿"重述为"额外杂音"。
+    逐处定位得到：成片 69 段数字零（样本恒为 0）里 **8 段两侧 20ms 均为 -15~-25dB 的
+    说话电平**，而原始引擎 mp3 里数字零段为 **0**——即强制面在 ASR 边界落在词中间
+    （gap≈0）时，把 0.24~0.4s 静音塞进了连续语音，听感是断口/杂音而不是停顿。
+    闸门要求切点本来就是静音：切点 ±12ms 的 RMS ≤ floor_db_max，且两侧 ±80ms 的
+    较响一侧比它高 ≥ side_sep_db_min；量到是说话声即**拒插并点名**，量不到也拒插
+    （"读不到判据"不得读成"可以插"）。
+
+    锁定：A 规则单源与三态读取／B `_cut_is_quiet` 三态／C 连续语音拒插且字节不变／
+    D 真间隙照插、切点落在间隙内部而非交界／E 句内面同样拒插／F 证据落盘接线。
+    """
+    tc = RegressionTestCase(
+        "pause_insert_energy_gate",
+        "验证停顿插入只在真静音处下刀：连续语音拒插、真间隙照插、判据读不回按拒插处理")
+    try:
+        import wave as _w
+        import tempfile as _tf
+        import re as _re
+        import hashlib
+        import numpy as _np
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+
+        # ---------------- A 规则单源与三态读取 ----------------
+        _on, _floor, _sep, _why = eva._insert_gate_state()
+        tc.assert_equal((_on, _floor, _sep, _why), (True, -35.0, 8.0, ""),
+                        "A1 闸门缺省开启，阈值取 audio_sync_rules.insert_gap_gate")
+        _orig_load = eva._load_audio_sync_rules
+        try:
+            eva._load_audio_sync_rules = lambda: {}
+            _on2, _f2, _s2, _why2 = eva._insert_gate_state()
+            tc.assert_true((not _on2) and ("缺节" in _why2),
+                           "A2 规则缺节：enabled=False 且点名（调用方据此按拒插处理）")
+            eva._load_audio_sync_rules = lambda: {
+                "insert_gap_gate": {"floor_db_max": "x", "side_sep_db_min": 8}}
+            _on3, _f3, _s3, _why3 = eva._insert_gate_state()
+            tc.assert_true((not _on3) and ("残键" in _why3),
+                           "A3 残键：不可解析即点名，不得落到缺省字面量")
+        finally:
+            eva._load_audio_sync_rules = _orig_load
+
+        def _write(path, spans, total, sr=16000):
+            n = int(total * sr)
+            t = _np.arange(n) / sr
+            sig = _np.zeros(n)
+            for s, e in spans:
+                m = (t >= s) & (t < e)
+                sig[m] = 0.25 * _np.sin(2 * _np.pi * 220 * t[m])
+            a = _np.repeat((sig * 32767).astype(_np.int16)[:, None], 2, axis=1)
+            with _w.open(str(path), "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(a.tobytes())
+
+        with _tf.TemporaryDirectory() as td:
+            tmp = Path(td)
+            # ---------------- B 三态 ----------------
+            p_cont = tmp / "cont.wav"
+            _write(p_cont, [(0.0, 2.0)], 2.0)
+            au, sr = eva._read_wav_int16(p_cont)
+            tc.assert_equal(eva._cut_is_quiet(au, sr, int(1.0 * sr), -35.0, 8.0), False,
+                            "B1 切点在连续语音里 → False（插进去就是开洞）")
+            p_quiet = tmp / "quiet.wav"
+            _write(p_quiet, [(0.0, 0.5), (1.5, 2.0)], 2.0)
+            au2, sr2 = eva._read_wav_int16(p_quiet)
+            tc.assert_equal(eva._cut_is_quiet(au2, sr2, int(1.0 * sr2), -35.0, 8.0), True,
+                            "B2 切点在真静音里 → True（可以插）")
+            p_tiny = tmp / "tiny.wav"
+            _write(p_tiny, [(0.0, 0.003)], 0.003)   # 48 样本：±12ms 窗都不满 64 样本
+            au3, sr3 = eva._read_wav_int16(p_tiny)
+            tc.assert_equal(eva._cut_is_quiet(au3, sr3, 1, -35.0, 8.0), None,
+                            "B3 窗口太短 → None（无从裁定，调用方须同样拒插）")
+
+            # ---------------- C 连续语音拒插 ----------------
+            p_c = tmp / "no_gap.wav"
+            _write(p_c, [(0.0, 2.0)], 2.0)
+            before = hashlib.sha256(p_c.read_bytes()).hexdigest()
+            st = {}
+            mod, _s, ins, _c = eva._enforce_sentence_pauses(
+                p_c,
+                [{"rel_start": 0.0, "rel_end": 1.0}, {"rel_start": 1.0, "rel_end": 2.0}],
+                0.4, stats=st)
+            tc.assert_equal(mod, False, "C1 连续语音：不得插入（返回未修改）")
+            tc.assert_equal(hashlib.sha256(p_c.read_bytes()).hexdigest(), before,
+                            "C2 拒插时波形字节必须不变（可从字节面复核，不靠返回值自述）")
+            tc.assert_equal(st.get("not_gap"), 1,
+                            "C3 拒插须计数并点名（not_gap），不得静默跳过")
+
+            # ---------------- D 真间隙照插 ----------------
+            p_d = tmp / "real_gap.wav"
+            _write(p_d, [(0.0, 0.9), (1.0, 2.0)], 2.0)
+            d0 = eva.get_duration(str(p_d))
+            au4, sr4 = eva._read_wav_int16(p_d)
+            cut = eva._silence_cut_point(au4, sr4, 0.9, 1.0)
+            tc.assert_true(cut / sr4 > 0.905,
+                           "D1 下刀点须落在间隙内部，不是语音/静音交界（旧 same 平滑会取到边缘）")
+            st2 = {}
+            mod2, _s2, ins2, _c2 = eva._enforce_sentence_pauses(
+                p_d,
+                [{"rel_start": 0.0, "rel_end": 0.9}, {"rel_start": 1.0, "rel_end": 2.0}],
+                0.4, stats=st2)
+            tc.assert_equal(mod2, True, "D2 真间隙：照插（不得因闸门整体失效）")
+            tc.assert_true(abs(ins2 - 0.3) <= 0.01,
+                           f"D3 插入量＝差额 0.3s（实得 {ins2}）")
+            tc.assert_true(abs((eva.get_duration(str(p_d)) - d0) - ins2) <= 0.002,
+                           "D4 时长增量＝插入量")
+            tc.assert_equal(st2.get("not_gap"), 0, "D5 真间隙不得被记成 not_gap")
+
+            # ---------------- E 句内标点面同样拒插 ----------------
+            p_e = tmp / "punct_cont.wav"
+            _write(p_e, [(0.0, 2.0)], 2.0)
+            before_e = hashlib.sha256(p_e.read_bytes()).hexdigest()
+            chars = [[0.0, 0.5, 1], [0.5, 1.0, 1], [1.0, 1.5, 1], [1.5, 2.0, 1]]
+            e_mod, _es, e_ins, _ec, e_res = eva._enforce_punctuation_pauses(
+                p_e, "甲乙，丙丁",
+                [{"text": "甲乙，丙丁", "rel_start": 0.0, "rel_end": 2.0}],
+                [list(x) for x in chars], 0.25)
+            tc.assert_equal(e_mod, False, "E1 句内面：切点在连续语音里须拒插")
+            tc.assert_equal(e_res.get("not_gap"), 1, "E2 句内面：拒插须计数（not_gap）")
+            tc.assert_equal(hashlib.sha256(p_e.read_bytes()).hexdigest(), before_e,
+                            "E3 句内面拒插时字节不变")
+            tc.assert_equal(e_res.get("declined_idx"), [2],
+                            "E4 拒插位点的标点行索引须落盘——裁定侧据此把"
+                            "「主动不补」与「补了没治好」分开，不得靠'没被补'反推")
+
+        # ---------------- F 证据落盘接线 ----------------
+        _src = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8")
+        tc.assert_true(_re.search(r"entry\['pause_sentence_gate'\]\s*=\s*\{k: _sp_stats\.get\(",
+                                  _src),
+                       "F1 句界面拒插读数须写进 manifest（entry.pause_sentence_gate）")
+        tc.assert_true(_re.search(r"for k in \('not_gap', 'un_measured'\)", _src),
+                       "F2 句内面读数须同时登记 not_gap 与 un_measured（两态都可见）")
+        tc.assert_true(_re.search(
+            r"\{k: e_res\[k\] for k in\s*\(\s*\"points\", \"hits\", \"interpolated\",\s*"
+            r"\"not_gap\", \"un_measured\", \"declined_idx\"\)", _src, _re.S),
+            "F3 拒插索引须随 manifest 落盘（只落计数会让裁定侧退回'实测即 FAIL'）")
+
+        # ---------------- G 审计面透传与旧记录分列 ----------------
+        import narration_pause_precheck as npp_g
+        import pipeline_runner as pr_g
+        rules_g = npp_g.load_rules()
+        nar_g = [{"scene_id": 1, "narration": "甲乙，丙丁"},
+                 {"scene_id": 2, "narration": "戊己，庚辛"}]
+        chars_g = [[0.0, 0.5, 1], [0.5, 1.0, 1], [1.0, 1.5, 1], [1.5, 2.0, 1]]
+        mf_g = {"scenes": [
+            {"scene_id": 1, "method": "asr_forced", "chars": chars_g, "norm": "甲乙丙丁",
+             "pause_intra": {"points": 1, "hits": 0, "interpolated": 0, "not_gap": 1,
+                             "un_measured": 0, "declined_idx": [2]}},
+            # 旧 manifest：跑过但无 declined_idx 键——不得按 0 条拒插读
+            {"scene_id": 2, "method": "asr_forced", "norm": "戊己庚辛",
+             "chars": [[0.0, 0.5, 1], [0.5, 1.0, 1], [1.25, 1.75, 1], [1.75, 2.25, 1]],
+             "pause_intra": {"points": 1, "hits": 1, "interpolated": 0, "not_gap": 0,
+                             "un_measured": 0}},
+        ]}
+        _silent_g, _rushed_g, _sum_g, _sk_g, rows_g = npp_g.audio_face(
+            nar_g, mf_g, rules_g, wav_dir=None)
+        _dec_g = _sum_g["insert_declined"]
+        tc.assert_equal(_dec_g["points"], [{"scene_id": "1", "index": 2}],
+                        "G2 拒插位点经审计面单列透传（不是从'该点没补'推出来的）")
+        tc.assert_equal((_dec_g["scenes"], _dec_g["scenes_without_record"]), (1, 1),
+                        "G3 旧记录场单独计数，不与'零拒插'同形")
+
+        class _StubStateG:
+            def __init__(self):
+                self.data = {}
+
+        r_g = pr_g.PipelineRunner.__new__(pr_g.PipelineRunner)
+        r_g.state = _StubStateG()
+        r_g.accept_pause_untested = False
+        r_g._fail = lambda *a, **k: None
+        tc.assert_equal(r_g._pause_gate_verdict(None, rows_g, [], [], audit={"summary": _sum_g}),
+                        False, "G4 默认阻断（未测面）")
+        _rec_g = r_g.state.data["pause_gate"]
+        tc.assert_equal([_rec_g["verdict"], _rec_g["declined_hits"], _rec_g["measured_hits"]],
+                        ["UNTESTED", 1, 0],
+                        f"G5 拒插位点归未测、不记作未治（实得 {_rec_g}）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("pause_insert_energy_gate error: " + str(e) + chr(10)
+                       + traceback.format_exc())
+    return tc
+
+
 class RegressionTestRunner:
 
     """回归测试运行器"""    
@@ -22067,6 +22298,8 @@ class RegressionTestRunner:
             test_transition_overlap_census_descriptive_face,
             test_elevenlabs_engine_branch_and_term_rewrite,
             test_content_facts_ledger_gate,
+            test_video_crf_config_knob,
+            test_pause_insert_energy_gate,
         ]
         self.results = []
     
@@ -22763,9 +22996,10 @@ def test_sentence_pause_cut_point_and_cache_invalidation() -> RegressionTestCase
       被旧逻辑切坏的波形，而所有下游门禁照常通过（A06 同族）。
 
     本用例锁定：
-    A 负向对照：段间间隔 0.00s 时，下刀点必须落在字间隙——**两个字的内容逐样本
-      逐字节不变**（切进任一个字即红）。切口处 8ms 防咔哒淡入淡出属实现细节，
-      断言按"除淡化窗外逐字节不变 + 受损样本数 ≤ 2×淡化窗"表述。
+    A 段间间隔 0.00s（引擎没停）＝**拒插**：波形逐字节不变、时间戳不动、落 `not_gap`
+      读数。2026-11-08 起判据方向反转——旧行为"取缝隙下刀"在 ASR 边界落在词中间时
+      就是往连续语音里塞一个 0.4s 的数字零，使用者点名的"额外杂音"即此（原断言锁的
+      是插入行为与逐字节保护，现由 B 段的真间隙夹具承担；本段改锁拒插，不是放宽）。
     A' 夹具分辨力见证：旧规则（边界 ±0.08s 窗内最低能量点）在本夹具上**必须**
       落进某一个字内部——否则该夹具在旧实现下也过，锁不住任何东西。
     B 真实间隙：间隙有宽度时仍取窗内最低能量点，但**不得越出这条间隙**；
@@ -22811,7 +23045,11 @@ def test_sentence_pause_cut_point_and_cache_invalidation() -> RegressionTestCase
         return _np.frombuffer(raw, dtype=_np.int16).astype(_np.int64)
 
     try:
-        # ── A. 段间间隔 0.00s：刀必须落在两字之间的缝里 ──
+        # ── A. 段间间隔 0.00s（引擎没停）：拒插，波形一字不改 ──
+        # 2026-11-08 改判据：这类位点以前会"取缝下刀"，而 ASR 边界落在词中间时
+        # 那一刀就是在连续语音里开一个 0.4s 的洞——使用者听到的"额外杂音"。
+        # 现状＝闸门量到切点是说话声即拒插；本节锁"拒插"本身（旧断言锁的是插入行为，
+        # 语义方向已反转，不是放宽）。真间隙的插入与逐字节保护住 B 段。
         w1 = _tone(440.0, 0.5, 8000)
         w2 = _tone(880.0, 0.5, 8000)
         orig = _np.concatenate([w1, w2])
@@ -22822,38 +23060,18 @@ def test_sentence_pause_cut_point_and_cache_invalidation() -> RegressionTestCase
                  {"rel_start": 0.5, "rel_end": 1.0, "text": "乙"}]
         chars = [[0.0, 0.25, 1.0], [0.25, 0.5, 1.0],
                  [0.5, 0.75, 1.0], [0.75, 1.0, 1.0]]
+        st_a = {}
         modified, out_sents, inserted, out_chars = eva._enforce_sentence_pauses(
-            hq, sents, 0.4, chars=chars)
-        tc.assert_true(modified, "a 0.00s sentence gap must trigger enforcement")
-        tc.assert_true(inserted > 0.3, "a measurable amount of silence must be inserted")
-        gap_out = out_sents[1]['rel_start'] - out_sents[0]['rel_end']
-        tc.assert_true(gap_out >= 0.4 - 0.02,
-                       "the sentence gap after enforcement must reach min_pause "
-                       f"(got {gap_out:.3f}s)")
-        out = _read_wav(hq)
-        ins_n = len(out) - len(orig)
-        tc.assert_equal(ins_n, int(round(inserted * SR)),
-                        "the waveform grew by exactly the reported inserted amount")
-        tc.assert_true(_np.array_equal(out[:n1 - FADE], w1[:n1 - FADE].astype(_np.int64)),
-                       "the first word must survive byte-for-byte apart from the 8ms "
-                       "anti-click fade at the cut (the old ±0.08s window landed "
-                       "inside a word)")
-        tail = out[n1 + ins_n:]
-        tc.assert_true(len(tail) == len(w2)
-                       and _np.array_equal(tail[FADE:], w2[FADE:].astype(_np.int64)),
-                       "the second word must survive byte-for-byte apart from the "
-                       "anti-click fade — the old implementation cut into the NEXT "
-                       "segment's first word (crushed it to 80ms and split it from "
-                       "the following word)")
-        damaged = int((out[:n1] != w1.astype(_np.int64)).sum()) \
-            + int((tail != w2.astype(_np.int64)).sum())
-        tc.assert_true(damaged <= 2 * FADE,
-                       f"the damaged span must stay inside the two 8ms fade windows "
-                       f"(got {damaged} samples) — a cut inside a word destroys far "
-                       f"more than that")
-        sil = out[n1:n1 + ins_n]
-        tc.assert_true(int(_np.abs(sil).max()) <= 200,
-                       "the inserted region must be silence (8ms fade aside)")
+            hq, sents, 0.4, chars=chars, stats=st_a)
+        tc.assert_true(not modified,
+                       "A1 0.00s 段间隙＝引擎没停：切点在说话声里，必须拒插（不得开洞）")
+        tc.assert_equal(inserted, 0.0, "A2 拒插时插入量为 0（返回值不得自述已补）")
+        tc.assert_true(_np.array_equal(_read_wav(hq), orig.astype(_np.int64)),
+                       "A3 拒插时波形逐字节不变（可从字节面复核，不靠返回值自述）")
+        tc.assert_equal(st_a.get("not_gap"), 1,
+                        "A4 拒插须计数（not_gap），否则裁定侧会把'主动不补'读成'漏治'")
+        tc.assert_true(out_sents == sents and out_chars == chars,
+                       "A5 拒插不得顺手平移时间戳（没插静音却后移＝音画错位）")
 
         # ── A'. 夹具分辨力见证：旧规则在本夹具上必须切进某个字 ──
         # 旧规则＝「边界 ±0.08s 窗内最低能量点」。若旧规则在本夹具上也落在缝里，
@@ -24563,6 +24781,90 @@ def test_choreography_descriptive_face() -> RegressionTestCase:
                         [0, 0],
                         "L6 J 段夹具（内联几何、无初始隐藏）自然为 0——不裁定的面也要能自证没冤枉谁")
 
+        # ═════════════════════════════════════════════════════════
+        # M. cue() 锚解析（2026-11-08 观感批：时间轴改由词级 cue 驱动）
+        # ═════════════════════════════════════════════════════════
+        # 存在理由（本仓首次出现，不是设想形态）：新时间轴把 69 个元素点亮时刻写成
+        # `T.sN + cue('sN','锚词',fallback)`，旧解析器只认 `T.sN±x` 与字面秒 →
+        # 76 条语句整批落入 unparsed，同一支 HTML 的推进覆盖率从 0.16 读成 0.034。
+        # 这是取数面缺陷（A06 同族：扫不到不得读成没有），不是编排退化。
+        CUE_HEAD = HEAD.replace(
+            '<script>const T',
+            '<script>var C = {"s1:甲": 2.0, "s1:乙": 6.0, "s2:丙": 3.0};\nconst T')
+        CU = (CUE_HEAD +
+              "tl.to('#a', {opacity: 1, duration: 2}, T.s1 + cue('s1','甲',1.0));\n"
+              "tl.to('#b', {opacity: 1, duration: 2}, T.s1 + cue('s1','乙',9.5) + 1.0);\n"
+              "tl.to('#c', {opacity: 1, duration: 1}, T.s2 + cue('s2','丙',0.5));\n"
+              "tl.to('#d', {opacity: 1, duration: 1}, T.s2 + cue('s2','缺键',1.5));\n"
+              "tl.to('#e', {opacity: 1, duration: 1}, T.s2 + cue('s2','缺键且无回退'));\n" + TAIL)
+        mc = ch.measure(fixture("cue.html", CU))
+        _ps_c = {s["scene"]: s for s in mc.get("per_scene", [])}
+        tc.assert_equal([mc.get("tweens_cue_resolved"), mc.get("tweens_cue_fallback"),
+                         mc.get("tweens_unparsed")],
+                        [3, 1, 1],
+                        "M1 cue 锚三态各记各的：键命中 3／键缺回退作者秒 1／两处都取不到 1"
+                        "（互不混计：回退是**解析成功**，只是时刻来自撰写侧估算）")
+        tc.assert_equal([_ps_c.get("s1", {}).get("coverage_advance"),
+                         _ps_c.get("s2", {}).get("coverage_advance"),
+                         _ps_c.get("s3", {}).get("coverage_advance")],
+                        [0.4, 0.2, 0.0],
+                        "M2 时刻按 `T.sN + C['sN:词']` 落位（s1 = [2,4]∪[7,9] 含尾随 +1.0 偏移；"
+                        "s2 = [11.5,12.5]∪[13,14]）；回退值 1.5 也照常入覆盖")
+        tc.assert_equal(mc.get("cue_map_entries"), 3,
+                        "M3 CUE-MAP 只认含 ':' 的键（3 项），同名变量的普通数值表不得被读成时刻表")
+        CU_NOMAP = (HEAD +
+                    "tl.to('#a', {opacity: 1, duration: 2}, T.s1 + cue('s1','甲',2.0));\n"
+                    "tl.to('#b', {opacity: 1, duration: 2}, T.s2 + cue('s2','丙',3.0));\n"
+                    "tl.to('#c', {opacity: 1, duration: 1}, T.s2 + cue('s2','丁',6.0));\n"
+                    "tl.to('#d', {opacity: 1, duration: 1}, T.s2 + cue('s2','无回退'));\n" + TAIL)
+        mnc = ch.measure(fixture("cue_nomap.html", CU_NOMAP))
+        _ps_n = {s["scene"]: s for s in mnc.get("per_scene", [])}
+        tc.assert_equal([mnc.get("tweens_cue_resolved"), mnc.get("tweens_cue_fallback"),
+                         mnc.get("cue_map_entries"), mnc.get("tweens_unparsed")],
+                        [0, 3, 0, 1],
+                        "M4 CUE-MAP 整块缺席（timeline 尚未跑）时回退作者固定秒，"
+                        "并**逐条计数**——不得静默当 0 偏移，否则整段脚本被读成从场首开始")
+        tc.assert_equal([_ps_n.get("s1", {}).get("coverage_advance"),
+                         _ps_n.get("s2", {}).get("coverage_advance")],
+                        [0.2, 0.3],
+                        "M5 回退值真进覆盖（s1 [2,4]、s2 [13,15]∪[16,17]）："
+                        "若只计不回退，这两场会被读成 0 覆盖＝把取数面降级说成编排退化")
+        mmal = ch.measure(fixture("cue_badmap.html", CU_NOMAP.replace(
+            'const T', 'var C = {a: 2, b: 6};\nconst T')))
+        tc.assert_equal([mmal.get("cue_map_entries"), mmal.get("tweens_cue_resolved"),
+                         mmal.get("tweens_cue_fallback")], [0, 0, 3],
+                        "M6 无 ':' 键的数值表不算 CUE-MAP：宁可全线回退（可见）也不按同名字面量猜")
+        mva = ch.measure(fixture("cue_var.html", BASE.replace(
+            TAIL, "tl.to('#f', {opacity: 1, duration: 1}, onAt);\n" + TAIL)))
+        tc.assert_equal([mva.get("tweens_variable_anchor"), mva.get("tweens_unparsed")], [1, 1],
+                        "M7 辅助函数内的变量锚单独计数并计入 unparsed："
+                        "它按数据执行 N 次，静态面看不见其覆盖——不点名即把下界洗成精确值")
+        tc.assert_true("cue 锚 3 条" in ch.format_line(mc) and "CUE-MAP 3 项" in ch.format_line(mc),
+                       "M8 cue 解析数与 CUE-MAP 项数进文案行（只在 JSON 里＝读纸面的人看不见这条腿）")
+        tc.assert_true("变量锚 1" in ch.format_line(mva),
+                       "M9 变量锚计数进文案行，并须以产出面复核（声明面的结构性盲区必须显形）")
+        tc.assert_true("cue" in ch.CALIBER["cue_treatment"] and
+                       "unparsed" in ch.CALIBER["cue_treatment"],
+                       "M10 cue 处理口径随读数落盘（与 loop/instant 同手法：口径声明是读数的一部分）")
+
+        # ═════════════════════════════════════════════════════════
+        # N. cue 节拍子面（2026-11-08 观感回收批）：渲染前就能看见"多久换一次焦点"
+        # ═════════════════════════════════════════════════════════
+        # 存在理由：本轮使用者点名的病灶就是节拍间隔——每场 4~6 个 cue 摊在 30~46s 上、
+        # 最长空档 13.5s，而当时的读数只有"覆盖率"与"最长无推进段"，看不出"多久换一次焦点"。
+        # 本子面只答换焦点的频率，不答两次之间画面有没有在动（后者归产出面），两者不互替。
+        nb = mc.get("cue_beats") or {}
+        tc.assert_equal([nb.get("count"), nb.get("scenes")], [3, 2],
+                        "N1 节拍按 CUE-MAP 计数（3 个 cue 分布在 2 场）")
+        tc.assert_equal([nb.get("interval_median"), nb.get("interval_max")], [4.0, 4.0],
+                        "N2 场内相邻 cue 间隔（s1 2.0→6.0＝4.0s；s2 只有一个 cue 不产生间隔）——"
+                        "不得把跨场间隔混进来（那会把 3 秒的场边界算成节拍）")
+        nbn = mnc.get("cue_beats") or {}
+        tc.assert_equal([nbn.get("count"), nbn.get("interval_median")], [0, None],
+                        "N3 CUE-MAP 缺席时 0 个 cue、无间隔可算（None 不是 0：0 会被读成「间隔为零」）")
+        tc.assert_true("cue 节拍 中位间隔 4.0s" in ch.format_line(mc),
+                       "N4 节拍进文案行（只在 JSON 里＝读纸面的人看不见换焦点的频率）")
+
         tc.mark_passed()
     except Exception as e:
         import traceback
@@ -25338,73 +25640,95 @@ def test_intra_pause_trim_and_third_bucket() -> RegressionTestCase:
         tc.assert_equal(round(s_out[1]["rel_start"], 3), 1.6,
                         "F11 sentence and char streams share one mapping")
 
-        # ---------------- G 段：真波形沙箱（复制件，不碰在制项目）--------------------
+        # ---------------- G 段：确定性合成沙箱（不依赖在制项目 temp）------------------
         # 断言条数**与数据无关**：首版把 assert 写在逐场循环里，于是"有无场次被剪"
         # 会改变整案断言数（66/69），变异引擎按"断言数少于基线即整案截断"判 CRASH，
         # 把一枚真实落红的变异读成"不足以归因"。现改为循环内只收集问题、循环外逐条落断言，
         # 并给无对象的腿一个**非恒真**的缺省读数（否则"没有场次被剪"会把 G2-G5 洗成空跑）。
-        real_temp = (script_dir.parent.parent / "过程产物/临时产物"
-                     / "wall-door-opening-node_audio")
-        man_p = real_temp / "_timeline_manifest.json"
-        narr_p = (script_dir.parent / "源码/hyperframes/wall-door-opening-node/narration.json")
-        if man_p.exists() and narr_p.exists():
-            import json as _json
-            man = _json.loads(man_p.read_text(encoding="utf-8"))
-            nd = _json.loads(narr_p.read_text(encoding="utf-8"))
-            narr = {str(x.get("scene_id")): (x.get("narration") or "").strip()
-                    for x in (nd.get("scenes") if isinstance(nd, dict) else nd)}
-            untouched, cut_ok, idem_ok, shift_ok, struct_ok = [], [], [], [], []
-            n_untouched = n_trimmed = 0
-            with tempfile.TemporaryDirectory() as tmp:
-                for entry in man.get("scenes", []):
-                    sid = str(entry.get("scene_id"))
-                    src = real_temp / "tts_44k" / (entry.get("tts_file") or "")
-                    if not entry.get("chars") or not src.exists():
-                        continue
-                    dst = Path(tmp) / src.name
-                    shutil.copy2(src, dst)
-                    before = hashlib.sha256(dst.read_bytes()).hexdigest()
-                    d0 = _wav_dur(dst)
-                    mod, ns, removed, nc, res = eva._trim_intrasentence_silence(
-                        dst, [dict(x) for x in entry["sentences"]],
-                        [list(x) for x in entry["chars"]], narr.get(sid, ""), rules)
-                    if not mod:
-                        n_untouched += 1
-                        if hashlib.sha256(dst.read_bytes()).hexdigest() != before:
-                            untouched.append(f"s{sid} 字节被改")
-                        continue
-                    n_trimmed += 1
-                    if round(d0 - _wav_dur(dst), 3) != removed:
-                        cut_ok.append(f"s{sid} 时长差≠剪掉量")
-                    m2, _, removed2, _, _r2 = eva._trim_intrasentence_silence(
-                        dst, ns, nc, narr.get(sid, ""), rules)
-                    if m2 and removed2:
-                        idem_ok.append(f"s{sid} 重跑又剪了 {removed2}s")
-                    sh_s = entry["sentences"][-1]["rel_end"] - ns[-1]["rel_end"]
-                    sh_c = entry["chars"][-1][1] - nc[-1][1]
-                    if round(sh_s, 2) != round(sh_c, 2):
-                        shift_ok.append(f"s{sid} 句级 {sh_s:.2f} ≠ 字符级 {sh_c:.2f}")
-                    if not (res["points"] >= 1 and isinstance(res["note"], str)):
-                        struct_ok.append(f"s{sid} 结构化读数缺项")
-            _none = ["无被剪场次（G6 即此形态的对位证据）"]
-            tc.assert_equal(untouched, [], "G1 scenes with no point must leave bytes untouched")
-            tc.assert_equal(cut_ok or (_none if not n_trimmed else []), [],
-                            "G2 duration delta must equal the removed seconds")
-            tc.assert_equal(idem_ok or (_none if not n_trimmed else []), [],
-                            "G3 trimming must be idempotent（同段静音不得反复剪）")
-            tc.assert_equal(shift_ok or (_none if not n_trimmed else []), [],
-                            "G4 tail shift identical in sentence and char streams")
-            tc.assert_equal(struct_ok or (_none if not n_trimmed else []), [],
-                            "G5 structured counts accompany the human note")
-            tc.assert_true(n_trimmed >= 1,
-                           "G6 real hq wavs must produce at least one trimmed scene")
-            tc.assert_true(n_untouched >= 1,
-                           "G7 the sandbox must also contain scenes with no point "
-                           "(otherwise G1 has no object)")
-        else:
-            for _g in ("G1", "G2", "G3", "G4", "G5", "G6", "G7"):
-                tc.assert_true(True, f"{_g} real project absent (business temp not exported); "
-                                     f"fixture-level coverage above stands")
+        # 2026-11-08：夹具从"某业务项目 temp 的复制件"改为**本段自建的合成波形**。存在理由
+        # 是实测而非偏好——该项目重跑后波形里已无可剪位点，G6 判红并连带 G2-G5 落进"无对象"
+        # 缺省；用 HEAD 版本代码在同一份数据上重放得到同样的"无入桶位点"，证明漂移在夹具侧、
+        # 不在被测逻辑。合成件把位点、间隙、能量谷、matched 旗标全部显式给定，与工作区跑过
+        # 什么无关；真实项目面仍由用例 121 的普查腿覆盖（那里量的是分布，不要求有对象）。
+        import wave as _wave
+        import numpy as _np
+
+        def _synth_wav(path, sr, spans):
+            total = max(e for _s, e in spans) + 0.2
+            n = int(round(total * sr))
+            t = _np.arange(n, dtype=_np.float64) / sr
+            sig = _np.zeros(n, dtype=_np.float64)
+            for s, e in spans:
+                m = (t >= s) & (t < e)
+                sig[m] = 0.25 * _np.sin(2 * _np.pi * 440.0 * t[m])
+            a = _np.repeat((sig * 32767).astype(_np.int16)[:, None], 2, axis=1)
+            with _wave.open(str(path), 'wb') as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(a.tobytes())
+
+        _sr = 16000
+        # 场 A：两个 0.30s 标点间隙（构成同场中位）＋ 一个 0.60s 无标点间隙（可剪）
+        a_spans = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.9, 1.1), (1.1, 1.3),
+                   (1.3, 1.5), (1.8, 2.0), (2.0, 2.2), (2.8, 3.0)]
+        a_chars = [[0.0, 0.2, 1], [0.2, 0.4, 1], [0.4, 0.6, 1], [0.9, 1.1, 1],
+                   [1.1, 1.3, 1], [1.3, 1.5, 1], [1.8, 2.0, 1], [2.0, 2.2, 1],
+                   [2.8, 3.0, 1]]
+        # 场 B：间隙够长但一侧时刻是插值（matched=0）→ 必须原地不动（G1/G7 的对象）
+        b_spans = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (1.4, 1.6)]
+        b_chars = [[0.0, 0.2, 1], [0.2, 0.4, 1], [0.4, 0.6, 1], [1.4, 1.6, 0]]
+        sandbox = [
+            {"sid": "A", "text": "甲乙丙，丁戊己，庚辛癸", "chars": a_chars,
+             "sentences": [{"rel_start": 0.0, "rel_end": 3.0}], "spans": a_spans},
+            {"sid": "B", "text": "子丑寅卯", "chars": b_chars,
+             "sentences": [{"rel_start": 0.0, "rel_end": 1.6}], "spans": b_spans},
+        ]
+        untouched, cut_ok, idem_ok, shift_ok, struct_ok = [], [], [], [], []
+        n_untouched = n_trimmed = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            for sc in sandbox:
+                sid = sc["sid"]
+                dst = Path(tmp) / f"synth_{sid}.wav"
+                _synth_wav(dst, _sr, sc["spans"])
+                before = hashlib.sha256(dst.read_bytes()).hexdigest()
+                d0 = _wav_dur(dst)
+                mod, ns, removed, nc, res = eva._trim_intrasentence_silence(
+                    dst, [dict(x) for x in sc["sentences"]],
+                    [list(x) for x in sc["chars"]], sc["text"], rules)
+                if not mod:
+                    n_untouched += 1
+                    if hashlib.sha256(dst.read_bytes()).hexdigest() != before:
+                        untouched.append(f"s{sid} 字节被改")
+                    continue
+                n_trimmed += 1
+                if round(d0 - _wav_dur(dst), 3) != removed:
+                    cut_ok.append(f"s{sid} 时长差≠剪掉量")
+                m2, _, removed2, _, _r2 = eva._trim_intrasentence_silence(
+                    dst, ns, nc, sc["text"], rules)
+                if m2 and removed2:
+                    idem_ok.append(f"s{sid} 重跑又剪了 {removed2}s")
+                sh_s = sc["sentences"][-1]["rel_end"] - ns[-1]["rel_end"]
+                sh_c = sc["chars"][-1][1] - nc[-1][1]
+                if round(sh_s, 2) != round(sh_c, 2):
+                    shift_ok.append(f"s{sid} 句级 {sh_s:.2f} ≠ 字符级 {sh_c:.2f}")
+                if not (res["points"] >= 1 and isinstance(res["note"], str)):
+                    struct_ok.append(f"s{sid} 结构化读数缺项")
+        _none = ["无被剪场次（G6 即此形态的对位证据）"]
+        tc.assert_equal(untouched, [], "G1 scenes with no point must leave bytes untouched")
+        tc.assert_equal(cut_ok or (_none if not n_trimmed else []), [],
+                        "G2 duration delta must equal the removed seconds")
+        tc.assert_equal(idem_ok or (_none if not n_trimmed else []), [],
+                        "G3 trimming must be idempotent（同段静音不得反复剪）")
+        tc.assert_equal(shift_ok or (_none if not n_trimmed else []), [],
+                        "G4 tail shift identical in sentence and char streams")
+        tc.assert_equal(struct_ok or (_none if not n_trimmed else []), [],
+                        "G5 structured counts accompany the human note")
+        tc.assert_true(n_trimmed >= 1,
+                       "G6 sandbox must produce at least one trimmed scene")
+        tc.assert_true(n_untouched >= 1,
+                       "G7 the sandbox must also contain scenes with no point "
+                       "(otherwise G1 has no object)")
 
         # ---------------- H 段：登记面（改了判据而该步缓存照常命中＝A06 同族）----------
         import pipeline_runner as pr
@@ -25494,7 +25818,7 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
       A 单源：执行侧与点名侧都走 `punctuation_gap_rows`，两侧各算一遍 gap 即两份真相；
       B 零字面量：下限只住 audio_sync_rules.json → intra_pause_enforce；
       C 三态开关 + 缺省开 + 声明节缺 enabled 即 fail-loud；
-      D 波形代次：PAUSE_ENFORCE_VERSION=v3，戳记随开关分档；
+      D 波形代次：PAUSE_ENFORCE_VERSION=v5（v5 起切点须过能量闸门），戳记随开关分档；
       E 波形性质：补齐到下限、幂等、句级与字符级同平移、时长差＝插入量、语音段字节不变；
       F 不对称纪律：matched=0 的位点拒动刀（计入 interpolated）、取数断链不补并点名、
         非 s16 即抛——"读不到"永远不等于"照着补"；
@@ -25618,8 +25942,8 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
             eva.INTRA_TRIM_ENABLED = _keep_trim
 
         # ---------------- D 段：波形代次戳记 ---------------------------------------
-        tc.assert_equal(eva.PAUSE_ENFORCE_VERSION, "v3",
-                        "D1 新增强制面必须 bump 代次，否则存量 v2 波形缓存照常命中＝新面静默不生效")
+        tc.assert_equal(eva.PAUSE_ENFORCE_VERSION, "v5",
+                        "D1 新增强制面/下刀闸门必须 bump 代次，否则存量波形缓存照常命中＝新判据静默不生效")
         _keep_trim2 = eva.INTRA_TRIM_ENABLED
         _keep_enf2 = eva.INTRA_ENFORCE_ENABLED
         try:
@@ -25662,10 +25986,26 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
                     [round(1.0 + gap, 3), round(1.0 + gap + 0.5, 3), 1],
                     [round(1.0 + gap + 0.5, 3), round(1.0 + gap + 1.0, 3), 1]]
 
+        def _make_wav_gap_at(path, gap_start, gap_seconds, total):
+            """静音落在指定位置的夹具波形（J 段要把逗号放在 2.0s 之后的间隙里）。"""
+            t = np.arange(int(sr * total)) / sr
+            sig = 8000 * np.sin(2 * np.pi * 220 * t)
+            sig[(t >= gap_start) & (t < gap_start + gap_seconds)] = 0
+            data = sig.astype(np.int16)
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(data.tobytes())
+            return data
+
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             # ---------------- E 段：补齐 / 幂等 / 平移 / 语音不损 ------------------
-            gap0 = 0.02
+            # 0.10s 真静音：插入面自 2026-11-08 起只在量到静音的切点下刀，
+            # 旧夹具的 0.02s 间隙连 ±12ms 探测窗都填不满（那是"没停"的形态，
+            # 插进去就是用户点名的断口/杂音）。
+            gap0 = 0.10
             w1 = tmp / "e1_hq.wav"
             _make_wav(w1, gap0)
             mod, s1, ins1, c1, res1 = eva._enforce_punctuation_pauses(
@@ -25795,6 +26135,39 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
         tc.assert_true(not ok5 and r5.state.data["pause_gate"]["broken"],
                        f"H7 取数断链走 UNTESTED 且归因落 state：{r5.state.data['pause_gate']}")
 
+        # ---- H8-H10 拒插位点（2026-11-08）：执行侧落盘的"主动不补"归未测，
+        #      但没有记录的实测命中必须仍判 FAIL——否则"这一轮根本没跑强制面"
+        #      会被同批的拒插记录一起洗白。
+        _audit_dec = {"summary": {"insert_declined": {
+            "points": [{"scene_id": "1", "index": 7}], "scenes": 1,
+            "scenes_without_record": 0}}}
+        _rows_dec = [{"measured": True, "scene_id": "1", "index": 7, "ctx": "甲乙，丙丁"}]
+        r6, _, _ = _mk([])
+        ok6 = r6._pause_gate_verdict(None, _rows_dec, [], [], audit=_audit_dec)
+        _rec6 = r6.state.data["pause_gate"]
+        tc.assert_equal([ok6, _rec6["verdict"], _rec6["declined_hits"]],
+                        [False, "UNTESTED", 1],
+                        f"H8 有拒插记录的实测命中归未测（不得判 FAIL）：{_rec6}")
+        r6.accept_pause_untested = True
+        ok6b = r6._pause_gate_verdict(None, _rows_dec, [], [], audit=_audit_dec)
+        tc.assert_true(ok6b and r6.state.data["pause_gate"].get("decision") == "untested_accepted",
+                       "H8b 归未测后可经 --accept-pause-untested 放行并留痕")
+        _rows_mix = _rows_dec + [{"measured": True, "scene_id": "1", "index": 8, "ctx": "戊己"}]
+        r7, _, _ = _mk([])
+        ok7 = r7._pause_gate_verdict(None, _rows_mix, [], [], audit=_audit_dec)
+        _rec7 = r7.state.data["pause_gate"]
+        tc.assert_equal([ok7, _rec7["verdict"], _rec7["measured_hits"], _rec7["declined_hits"]],
+                        [False, "FAIL", 1, 1],
+                        f"H9 同批里没有拒插记录的命中仍判 FAIL（不得整批豁免）：{_rec7}")
+        _audit_old = {"summary": {"insert_declined": {
+            "points": [], "scenes": 0, "scenes_without_record": 3}}}
+        r8, _, _ = _mk([])
+        ok8 = r8._pause_gate_verdict(None, _rows_dec, [], [], audit=_audit_old)
+        _rec8 = r8.state.data["pause_gate"]
+        tc.assert_equal([ok8, _rec8["verdict"], _rec8["declined_scenes_without_record"]],
+                        [False, "FAIL", 3],
+                        f"H10 旧 manifest 无拒插记录：按无记录计数并仍判 FAIL，不按 0 条拒插读：{_rec8}")
+
         # ---------------- I 段：候选面与报告透传 ----------------------------------
         import pause_marks as pm
         text_i = "酒店分户墙，隔声 65 分贝，怎么选？"
@@ -25831,6 +26204,43 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
                        "I5 CLI 开关必须接到构造器（否则放行面是条死键）")
         tc.assert_true("--accept-pause-untested" in _fn_text(pr_src, "main"),
                        "I6 开关须在 --help 里可见")
+
+        # ---------------- J 段：数字/拉丁密集文本的发音口径统一（2026-11-08） --------
+        # 病灶：旧口径把 "." "%" 算发音字符，而强制对齐只保留汉字/字母/数字 ⇒ 原文与
+        # 对齐字符数不等，句内强制面整场跳过（本片 7/10 场），逗号/顿号停顿长短全由
+        # 引擎自己决定——用户听到的"停顿轻微波动"。
+        from _forced_align import _normalize_chars as _fa_norm
+        j_text = "刚度是2.03乘10的5次方，跨度6米。"
+        j_spoken, j_after = npp.spoken_and_after(j_text)
+        tc.assert_equal(len(j_spoken), len(_fa_norm(j_text)[0]),
+                        "J1 发音流须与强制对齐流逐字符同长（旧口径差在 . 与 %）")
+        tc.assert_true("." not in j_spoken and "%" not in j_spoken,
+                       "J2 小数点/百分号不计发音字符（否则数字稠密场整场被跳过）")
+        tc.assert_true("，" in "".join(j_after),
+                       "J3 逗号仍须出现在停顿请求流里（修口径不得把该补的位点一起删掉）")
+        j_idx = next(i for i, a in enumerate(j_after) if "，" in a)
+        j_chars = []
+        t = round(2.0 - 0.08 * j_idx, 3)   # 让逗号前一个字在 2.00s 收尾
+        for i in range(len(j_spoken)):
+            if i == j_idx:
+                t = 2.10                    # 与夹具波形里 2.0s 起的 0.10s 静音对齐
+            j_chars.append([round(t, 3), round(t + 0.08, 3), 1])
+            t += 0.08
+        wj_dir = tempfile.TemporaryDirectory()
+        try:
+            wj = Path(wj_dir.name) / "j1_hq.wav"
+            _make_wav_gap_at(wj, 2.0, gap0, 3.0)
+            mod_j, _sj, ins_j, _cj, res_j = eva._enforce_punctuation_pauses(
+                wj, j_text,
+                [{"text": j_text, "rel_start": 0.0, "rel_end": round(t, 3)}],
+                j_chars, floor)
+            tc.assert_equal([mod_j, res_j["points"], res_j["hits"], res_j["broken"]],
+                            [True, 1, 1, []],
+                            f"J4 数字密集文本必须真正执行（旧口径此处整场 broken）：{res_j}")
+            tc.assert_true(abs(ins_j - (floor - gap0)) < 0.001,
+                           f"J5 只在逗号位点补齐，小数点不成为位点（插入量 {ins_j}）")
+        finally:
+            wj_dir.cleanup()
 
         tc.mark_passed()
     except Exception as e:
@@ -26829,6 +27239,89 @@ def _wav_dur(p):
     import wave
     with wave.open(str(p), "rb") as w:
         return w.getnframes() / float(w.getframerate())
+
+
+def test_video_crf_config_knob() -> RegressionTestCase:
+    """用例131：字幕烧录重编码质量可按项目声明（`video_crf`，缺省 18＝历史行为）
+
+    存在理由（2026-11-08 真实交付）：1080p 静态浅底文字动画烧字幕时 CRF 18 重编码
+    得 199 kbps，压在 `min_video_bitrate_kbps_fail=200` 上被判"疑似空白"，而源片
+    （render_raw）是 241 kbps、画面覆盖率实测 17~57%——CRF 18 反而丢了源片细节。
+    CRF 15 实测 245 kbps。故按项目开放声明，缺省逐字不变。
+
+    锁定：A 缺省单源（常量恰一处、全局初值取常量）/ B 烧录命令使用该全局（锚语句本体，
+    不是标识符在场）/ C 载入行为（未声明→18、整数与字符串同判、非法回退并点名键）/
+    D 不惰性继承（上一项目 15 之后未声明必须回 18）。
+    """
+    tc = RegressionTestCase(
+        "video_crf_config_knob",
+        "验证 video_crf 缺省 18 不变、声明生效、非法 fail-loud 回退且不跨项目继承")
+    try:
+        import contextlib
+        import io
+        import json as _json
+        import re as _re
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        eva = _safe_import_rebinding_module("enhance_video_audio")
+        _saved_crf = eva.VIDEO_CRF
+        try:
+            src = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8")
+            # A 缺省单源
+            tc.assert_equal(len(_re.findall(r'^VIDEO_CRF\s*=\s*18\s*#', src, _re.M)), 1,
+                            "A 缺省值 18 只声明一次（第二处即第二个真相源）")
+            tc.assert_true(_re.search(r'^_DEFAULT_VIDEO_CRF\s*=\s*VIDEO_CRF\s*$', src, _re.M),
+                           "A 模块缺省常量取自全局初值，不是第二个字面量")
+            tc.assert_true(_re.search(r'global[^\n]*\bVIDEO_CRF\b', src),
+                           "A load_config 声明 global VIDEO_CRF")
+            # B 烧录命令本体使用该全局
+            tc.assert_true(_re.search(r'"-crf",\s*str\(VIDEO_CRF\)', src),
+                           "B 烧录 ffmpeg 命令的 -crf 取 VIDEO_CRF（标识符在场不等于该处使用）")
+
+            SC = [{"scene_id": "s1", "type": "content", "start": 0.0, "end": 10.0,
+                   "duration": 10.0, "narration": "验证编码质量键的旁白",
+                   "narration_required": True, "subtitle_required": True}]
+
+            import tempfile as _tf
+
+            def _load(tmp, tag, body):
+                cfg = dict(video_duration=10.0, scenes=SC)
+                cfg.update(body)
+                p = tmp / f"{tag}.json"
+                p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    eva.load_config(str(p))
+                return buf.getvalue()
+
+            with _tf.TemporaryDirectory() as td:
+                tmp = Path(td)
+                # C 载入行为
+                _load(tmp, "c_undeclared", {})
+                tc.assert_equal(eva.VIDEO_CRF, 18, "C 未声明 → 18（历史行为不变）")
+                _load(tmp, "c_int", {"video_crf": 15})
+                tc.assert_equal(eva.VIDEO_CRF, 15, "C 整数声明生效")
+                _load(tmp, "c_str", {"video_crf": "16"})
+                tc.assert_equal(eva.VIDEO_CRF, 16, "C 字符串声明同判")
+                out_bad = _load(tmp, "c_bad", {"video_crf": 99})
+                tc.assert_equal(eva.VIDEO_CRF, 18, "C 越界值回退缺省")
+                tc.assert_true("video_crf" in out_bad,
+                               "C 非法值必须点名该键（不得静默改用别的质量）")
+                # D 不惰性继承
+                _load(tmp, "d_prev", {"video_crf": 15})
+                tc.assert_equal(eva.VIDEO_CRF, 15, "D 前置：上一项目声明 15")
+                _load(tmp, "d_undeclared", {})
+                tc.assert_equal(eva.VIDEO_CRF, 18,
+                                "D 未声明的项目回缺省，不得继承上一项目档位")
+        finally:
+            eva.VIDEO_CRF = _saved_crf
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("video_crf_config_knob error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
 
 if __name__ == '__main__':
     main()

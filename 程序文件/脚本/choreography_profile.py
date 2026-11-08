@@ -24,9 +24,19 @@
 **翻转前置（何时才该考虑定档）**：同画布向、用户逐支点过观感合格的项目 ≥3 支的
 本面同口径分布，并同时回答四态给法与"会错杀哪些既有交付"。
 
-**两条取数边界（不得读成"没有缺陷"）**：
-  ① 相对锚（`'<'`／`'<<'`／`'+=0.5'`）与标签锚解析不出 → 计入 `unparsed` 并随读数透出。
-     它们紧跟前一条，计入只会**抬高**覆盖率，故本面覆盖率是**下界**、无推进段是**上界**。
+**三条取数边界（不得读成"没有缺陷"）**：
+  ① 相对锚（`'<'`／`'<<'`／`'+=0.5'`）、标签锚、以及 living 在辅助函数里的变量锚
+     （`onAt`／`offAt - 0.45`：同一语句跑 N 次）解析不出 → 计入 `unparsed` 并随读数透出。
+     它们紧跟前一条/由数据驱动，计入只会**抬高**覆盖率，故本面覆盖率是**下界**、无推进段是**上界**。
+  ③ `cue('sN','词',fallback)` 型锚（2026-11-08，词级 cue 驱动时间轴）按 HTML 里的
+     `CUE-MAP`（timeline 步生成、值为场内相对秒）解析成 `T.sN + C['sN:词']`；
+     **键缺时回退作者写的固定秒**并单独计入 `tweens_cue_fallback`——回退值是撰写侧估算，
+     不是实测时刻，故它算"解析成功"但可能在音频上偏移；CUE-MAP 整块缺席时一律按
+     `unparsed` 处理（不得按 0 计，否则把"没解析"洗成"从场首开始"）。
+  ④ **节拍子面**（`cue_beats`）：同一场内相邻 cue 时刻之差的中位与最大——即"画面多久换
+     一次焦点"。它答的是**换焦点的频率**，不答"两次之间画面有没有在动"（后者看
+     `frame_occupancy` 的活跃度子面），两者不得互替。2026-11-08 观感批的病灶就是
+     每场 4~6 个 cue 摊在 30~46s 上、最长空档 13.5s。
   ② 锚点越界（如 `T.s5+40` 落在 s5 窗口外）夹到窗口后为空 → 既不计入覆盖**也不计入分母**，
      单独计数 `out_of_window` 点名。首版未夹时算出过 `coverage_min = -2.188` 的负覆盖，
      负覆盖是取数缺陷不是业务量（该错误留在裁定文档 §14.1/§14.2 不回改）。
@@ -42,12 +52,23 @@ CALIBER = {"default_duration": DEFAULT_DURATION,
            "last_scene_fallback": LAST_SCENE_FALLBACK,
            "loop_treatment": "repeat:-1 计入含循环覆盖，剔除出推进型覆盖",
            "instant_treatment": "tl.set／tl.call 按 GSAP 语义零时长，"
-                                "计入 tweens_instant_statements，不入任一腿"}
+                                "计入 tweens_instant_statements，不入任一腿",
+           "cue_treatment": "cue('sN','词',fallback) 按 CUE-MAP 解析为场内相对秒；"
+                            "键缺回退作者固定秒并单计，CUE-MAP 缺席一律 unparsed"}
 
 _TBLOCK = re.compile(r'(?:const|var|let)\s+T\s*=\s*\{([^}]*)\}', re.S)
 _TVALS = re.compile(r'(\w+)\s*:\s*([0-9.]+)')
+_CUE_MAP = re.compile(r'(?:var|let|const)\s+C\s*=\s*\{([^}]*)\}', re.S)
+# 键必须含 ':'（`sN:锚词` 形态），故不会把同名变量的其它数值表读成 CUE-MAP
+_CUE_ENTRY = re.compile(r'["\']([^"\']*:[^"\']*)["\']\s*:\s*([0-9.]+)')
 _CALL = re.compile(r'\btl\.(to|from|fromTo|set|call|add|fromToOnce)\s*\(', re.I)
 _ANCHOR = re.compile(r'^T\.(\w+)(?:\s*([+-])\s*([0-9.]+))?$')
+# `T.s1 + cue('s1','使用极限状态',12.2)`，可带尾随偏移（`+ 1.30`）
+_CUE_ANCHOR = re.compile(
+    r"^T\.(\w+)\s*\+\s*cue\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]*)['\"]"
+    r"\s*(?:,\s*([0-9.]+)\s*)?\)\s*(?:([+-])\s*([0-9.]+))?$")
+# 辅助函数内的变量锚（`onAt`／`offAt - 0.45`）：同一语句按数据执行 N 次，静态面看不见其覆盖
+_VAR_ANCHOR = re.compile(r'^[A-Za-z_$][\w$]*(?:\s*[+-]\s*[0-9.]+)?$')
 _BARE = re.compile(r'^([0-9.]+)$')
 _DUR_DECL = re.compile(r'duration\s*:\s*([0-9.]+)')
 _DUR_EXPR = re.compile(r'duration\s*:\s*\(')
@@ -120,6 +141,33 @@ def _merge(intervals):
     return merged
 
 
+def _cue_beats(cue_map):
+    """词级 cue 的**节拍间隔**（场内相对秒）：同一场景内相邻 cue 时刻之差。
+
+    这是"画面多久换一次焦点"的渲染前读数——2026-11-08 观感批的病灶正是它：
+    每场 4~6 个 cue 分布在 30~46s 上，最长空档 13.5s，观众看到"TTS 在进行、画面停住"。
+    取数只认 CUE-MAP（timeline 按实测字符时刻生成），不猜作者写的 fallback。
+    边界：本面量的是**声明的节拍**；焦点保持（呼吸脉冲）由辅助函数按数据执行，
+    静态面看不见其覆盖——所以本数只答"多久换一次焦点"，不答"中间有没有在动"，
+    后者看 `frame_occupancy` 的活跃度子面。
+    """
+    from collections import defaultdict
+    by = defaultdict(list)
+    for k, v in cue_map.items():
+        by[str(k).split(":")[0]].append(float(v))
+    iv = []
+    for _sid, vals in by.items():
+        ts = sorted(set(vals))
+        iv.extend(b - a for a, b in zip(ts, ts[1:]))
+    if not iv:
+        return {"count": len(cue_map), "scenes": len(by),
+                "interval_median": None, "interval_max": None}
+    import statistics as st
+    return {"count": len(cue_map), "scenes": len(by),
+            "interval_median": round(float(st.median(iv)), 2),
+            "interval_max": round(float(max(iv)), 2)}
+
+
 def _coverage(intervals, win):
     """返回 (覆盖率, 最长无覆盖段秒数)。区间先夹到窗口内，夹空者由调用方计数不入分母。"""
     merged = _merge(intervals)
@@ -173,9 +221,16 @@ def measure(html_path):
     root_dur = float(m.group(1)) if m else None
     win = _scene_windows(T, root_dur)
 
+    cue_map = {}
+    _cm = _CUE_MAP.search(txt)
+    if _cm:
+        cue_map = {k: float(v) for k, v in _CUE_ENTRY.findall(_cm.group(1))}
+    beats = _cue_beats(cue_map)
+
     per = {k: [] for k in win}
     per_noloop = {k: [] for k in win}
     unparsed = out_of_window = default_dur = total = instant = 0
+    cue_resolved = cue_fallback = variable_anchor = 0
     for mo in _CALL.finditer(txt):
         seg = _match_call(txt, mo.end() - 1)
         if seg is None:
@@ -185,10 +240,26 @@ def measure(html_path):
         args = _split_args(seg[1:-1])
         anchor = args[-1] if args else ''
         g, b = _ANCHOR.match(anchor), _BARE.match(anchor)
+        cg = _CUE_ANCHOR.match(anchor)
         if g and g.group(1) in T:
             key, a = g.group(1), T[g.group(1)]
             if g.group(2):
                 a += float(g.group(3)) * (1 if g.group(2) == '+' else -1)
+        elif cg and cg.group(1) in T:
+            key = cg.group(1)
+            _ck = f"{cg.group(2)}:{cg.group(3)}"
+            if _ck in cue_map:
+                a = T[key] + cue_map[_ck]
+                cue_resolved += 1
+            elif cg.group(4) is not None:
+                a = T[key] + float(cg.group(4))
+                cue_fallback += 1
+            else:
+                # cue() 两处都取不到（键缺且无 fallback）＝无从定位，不得按场首计
+                unparsed += 1
+                continue
+            if cg.group(5):
+                a += float(cg.group(6)) * (1 if cg.group(5) == '+' else -1)
         elif b:
             v = float(b.group(1))
             key = next((k for k, (s0, s1) in win.items() if s0 <= v < s1), None)
@@ -198,6 +269,8 @@ def measure(html_path):
                 continue
         else:
             # 相对锚（'<'/'+=x'）、标签锚、或时间参数缺位——一律点名，不按 0 覆盖计
+            if _VAR_ANCHOR.match(anchor):
+                variable_anchor += 1
             unparsed += 1
             continue
         s0, s1 = win[key]
@@ -268,6 +341,11 @@ def measure(html_path):
         "tweens_total": total,
         "tweens_parsed": n_parsed,
         "tweens_unparsed": unparsed,
+        "tweens_cue_resolved": cue_resolved,
+        "tweens_cue_fallback": cue_fallback,
+        "tweens_variable_anchor": variable_anchor,
+        "cue_map_entries": len(cue_map),
+        "cue_beats": beats,
         "tweens_out_of_window": out_of_window,
         "tweens_default_duration": default_dur,
         "tweens_instant_statements": instant,
@@ -313,15 +391,30 @@ def format_line(m):
         persist_txt = "｜常驻锚 未取数（子面未接入，非「取不到」）"
     else:
         persist_txt = format_persist_line(mo)
+    # 节拍子面：读的是"多久换一次焦点"。缺席与无间隔分开写——把两者混成一句，
+    # 摘掉子面与"这片每场只有一个 cue"读起来一样（用例122 N 段锁住）。
+    _b = m.get("cue_beats")
+    if not isinstance(_b, dict):
+        beat_txt = "｜cue 节拍 未取数（键缺席，须重跑本面）"
+    elif _b.get("interval_max") is None:
+        beat_txt = (f"｜cue 节拍 无间隔可算（{_b.get('count', 0)} 个 cue／"
+                    f"{_b.get('scenes', 0)} 场，每场不足 2 个）")
+    else:
+        beat_txt = (f"｜cue 节拍 中位间隔 {_b['interval_median']}s／最大 {_b['interval_max']}s"
+                    f"（{_b['count']} 个 cue／{_b['scenes']} 场）")
     return (f"[CHOREOGRAPHY] 描述面（不裁定，**下界读数**）：推进型覆盖率 中位 {m['coverage_advance_p50']} "
             f"最低 {m['coverage_advance_min']}（含循环口径 {m['coverage_loop_p50']}，循环不计入推进）"
             f"｜最长无推进段 中位 {m['advance_gap_p50']}s／全片最大 {m['advance_gap_max']}s"
             f"｜>{c['still_run_seconds']}s 无推进的场景占比 {m['share_scenes_gap_over_still_run']}"
             f"（{m['scenes']} 场，场窗中位 {m['scene_window_p50']}s）"
             f"｜动效语句 解析 {m['tweens_parsed']}/{m['tweens_total']}"
-            f"，未解析 {m['tweens_unparsed']}（相对锚/标签锚，计入会抬高覆盖率）"
+            f"，未解析 {m['tweens_unparsed']}（相对锚/标签锚/变量锚，计入会抬高覆盖率；"
+            f"其中变量锚 {m.get('tweens_variable_anchor', '缺键')}＝辅助函数内数据驱动，"
+            f"静态面看不见其覆盖，须以产出面复核）"
+            f"，cue 锚 {m.get('tweens_cue_resolved', '缺键')} 条（回退作者固定秒 "
+            f"{m.get('tweens_cue_fallback', '缺键')}，CUE-MAP {m.get('cue_map_entries', '缺键')} 项）"
             f"，越界 {m['tweens_out_of_window']}，缺省时长 {m['tweens_default_duration']}"
-            f"，瞬时(set/call) {m.get('tweens_instant_statements', '缺键')}（零时长，不入覆盖）"
+            f"，瞬时(set/call) {m.get('tweens_instant_statements', '缺键')}（零时长，不入覆盖）" + beat_txt +
             f"｜口径 静态解析 T-block＋tl 语句时间并集，零渲染" + persist_txt)
 
 

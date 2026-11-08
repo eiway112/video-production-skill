@@ -1974,25 +1974,53 @@ class PipelineRunner:
         """把停顿复核读数裁成四态并落 state／退出码（判据见 `_pause_audit_face` docstring）。
 
         `verdict` 传入非 None 时＝调用方已裁定（取数断链路径），本函数只负责落盘与放行；
-        为 None 时按读数自算。绝对阈命中按 `measured` 分桶：**实测时刻**的命中判 FAIL
-        （强制面的对象就在它声明要治的位点上），**插值时刻**判 UNTESTED（执行侧按纪律
-        拒动刀，不是漏治）。两桶不得合并——合并即把"没能力补"报成"没补好"，
-        反过来也一样。
+        为 None 时按读数自算。绝对阈命中按 `measured` 分桶：**实测时刻**且执行侧
+        **没有拒插记录**的命中判 FAIL（强制面的对象就在它声明要治的位点上）；
+        **插值时刻**判 UNTESTED（执行侧按纪律拒动刀，不是漏治）；**实测时刻但执行侧
+        落了拒插记录**的判 UNTESTED（2026-11-08）——闸门量到切点是说话声，插进去即
+        在语音里开洞，那正是用户点名的"额外杂音"，故"没补"是裁定结果而非漏治。
+        三桶不得合并——合并会把"没能力补"报成"没补好"，反过来也一样。
+
+        拒插集合只认执行侧落盘的 `manifest.pause_intra.declined_idx`（经审计面
+        `summary.insert_declined` 传上来），**不得由"该点没被补"反推**：反推会把
+        "这一轮根本没跑强制面"洗成"主动拒插"，而前者必须继续判 FAIL。
+        旧 manifest 无该键的场单独计数（`declined_scenes_without_record`），不按 0 条拒插读。
         """
+        declined_info = (((audit or {}).get("summary") or {}).get("insert_declined") or {})
+        declined = set()
+        for p in declined_info.get("points") or []:
+            try:
+                declined.add((str(p.get("scene_id")), int(p.get("index"))))
+            except (TypeError, ValueError):
+                continue
+        measured_hits = [r for r in absolute_rows if r.get("measured")]
+        interp_hits = [r for r in absolute_rows if not r.get("measured")]
+
+        def _point_key(r):
+            if r.get("index") is None:
+                return None
+            return (str(r.get("scene_id")), int(r["index"]))
+
+        declined_hits = [r for r in measured_hits if _point_key(r) in declined]
+        unfixed_hits = [r for r in measured_hits if _point_key(r) not in declined]
         if verdict is None:
-            measured_hits = [r for r in absolute_rows if r.get("measured")]
-            interp_hits = [r for r in absolute_rows if not r.get("measured")]
-            if measured_hits:
+            if unfixed_hits:
                 verdict = "FAIL"
-            elif interp_hits or skipped or broken:
+            elif declined_hits or interp_hits or skipped or broken:
                 verdict = "UNTESTED"
             else:
                 verdict = "PASS"
         record = {"at": datetime.now().isoformat(), "verdict": verdict,
                   "absolute_hits": len(absolute_rows),
-                  "measured_hits": sum(1 for r in absolute_rows if r.get("measured")),
-                  "interpolated_hits": sum(1 for r in absolute_rows if not r.get("measured")),
+                  "measured_hits": len(unfixed_hits),
+                  "declined_hits": len(declined_hits),
+                  "declined_scenes_without_record": int(
+                      declined_info.get("scenes_without_record") or 0),
+                  "interpolated_hits": len(interp_hits),
                   "scenes_unaudited": len(skipped), "broken": list(broken)[:3]}
+        if declined_hits:
+            record["declined_ctx"] = [
+                f"s{r.get('scene_id')}『…{r.get('ctx', '')}…』" for r in declined_hits[:6]]
         if audit is not None:
             record["floor_seconds"] = (audit.get("summary") or {}).get("absolute_floor_seconds")
         self.state.data["pause_gate"] = record
@@ -2001,16 +2029,30 @@ class PipelineRunner:
             return True
         if verdict == "NOT_APPLICABLE":
             return True
+        if declined_hits:
+            # 执行侧逐条落了拒插读数（切点量到语音）：这既不是"跑干净了"也不是"漏治"，
+            # 必须在放行行里点名，否则读数一放行就只剩"已放行"三个字。
+            print(f"  [PAUSE-GATE] 拒插位点 {len(declined_hits)} 处：执行侧量到切点是说话声，"
+                  "插入即在语音里开洞（＝成片里的断口/杂音），故按未测归因：")
+            for _line in record.get("declined_ctx") or []:
+                print(f"    · {_line}")
+            if len(declined_hits) > len(record.get("declined_ctx") or []):
+                print(f"    · …其余 {len(declined_hits) - len(record['declined_ctx'])} 处见 _pause_audit.json")
+            if record["declined_scenes_without_record"]:
+                print(f"    另 {record['declined_scenes_without_record']} 场的 manifest 无拒插记录"
+                      "（旧记录）——那部分不按拒插读")
         if verdict == "UNTESTED" and self.accept_pause_untested:
             record["decision"] = "untested_accepted"
             record["accept_flag"] = "--accept-pause-untested"
             print(f"  [PAUSE-GATE] UNTESTED 已放行（--accept-pause-untested）："
-                  f"插值位点 {record['interpolated_hits']}、未量场 {record['scenes_unaudited']}"
+                  f"插值位点 {record['interpolated_hits']}、拒插位点 {record['declined_hits']}、"
+                  f"未量场 {record['scenes_unaudited']}"
                   f"——放行只覆盖未测面，FAIL 永不可放行")
             return True
         why = {"FAIL": "实测时刻的低于下限位点仍在——句内停顿强制面没把它治好"
                        f"（{record['measured_hits']} 处，逐条见 _pause_audit.json）",
                "UNTESTED": f"无从裁定：插值时刻 {record['interpolated_hits']} 处"
+                           f"／拒插 {record['declined_hits']} 处"
                            f"／未走 asr_forced 的场 {record['scenes_unaudited']} 个"
                            f"／取数断链 {len(broken)} 条"}[verdict]
         print(f"  [PAUSE-GATE] {verdict}：{why}")

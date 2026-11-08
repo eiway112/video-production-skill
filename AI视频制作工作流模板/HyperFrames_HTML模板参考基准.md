@@ -408,6 +408,66 @@ function flushCuePlan(){                        // 在构造时间轴的 script 
 
 **是否加机算门禁：不加**（对齐 2026-10-10 常设裁定"不为观感问题新增代码门禁"，且本节三条都是 HTML 写法层判据，静态可判但收益低于一次预览截图自查）。翻转前置＝若再次出现"cue 时刻全部合格而观众报'没反应'"且预览自查已无法兜住，则把"脉冲形态（`yoyo:true` 且 `duration < 0.5`）挂在与 `C[...]` 同一元素上"这一形态接进 `preflight_check` 只报不拦，先积累一轮读数再定档。
 
+#### 3.6.2 保持区间：亮住之后画面还得在动（焦点轨，2026-11-08 观感批）
+
+**与上一节的分工**：§3.6.1 管"该亮的亮没亮住"，本节管"亮住之后到下一句之间，画面是不是一动不动"。两节都合格才叫节奏跟得上旁白。
+
+**病灶是实测的，不是推断**：一支 395s 的成片，用户报"TTS 一直在进行，却长时间停在某个画面上不动"。逐帧复核：在动占比 **10.2%**、最长连续静止 **7.9s**、>5s 的静止段 3 处；而该 HTML 里每个元素都有入场动画。**入场动画是一次性的，旁白是持续的**——入场 0.5s 跑完、这句还要念 8 秒，中间那 7.5 秒没有任何语句在推进。把脉冲只铺到保持区间前 3 秒的中间版本读数 0.21／12.9s（更差），说明不是"有没有脉冲"而是"铺没铺满"。
+
+**写法**：每个 cue 不只负责点亮，还负责**把焦点保持到下一锚**。保持区间用**有限次**的轻微呼吸铺满，时刻由 `CUE-MAP` 实测值驱动（§3.6）：
+
+```javascript
+window.__cuePlan = [];
+function cueHi(sel, key, base, enterAt){
+  var el = document.querySelector(sel);
+  if (!el || typeof C[key] !== 'number') return;
+  var sk = String(key).split(':')[0];
+  var winEnd = SX[sk] ? (SX[sk].end - 0.15) : (base + 12);   // 不跨场
+  window.__cuePlan.push({ el: el, at: base + C[key], enterAt: enterAt || 0, winEnd: winEnd });
+}
+function flushCuePlan(){                                     // 构造时间轴的 script 末尾调用一次
+  var plan = window.__cuePlan.slice();
+  for (var q = 0; q < plan.length; q++) plan[q].eff = Math.max(plan[q].at, plan[q].enterAt);
+  plan.sort(function(a, b){ return a.eff - b.eff; });        // 排序按 eff，不按 at
+  for (var i = 0; i < plan.length; i++){
+    var cur = plan[i], cs = getComputedStyle(cur.el);
+    var bs = cs.boxShadow; if (!bs || bs === 'none') bs = '0px 0px 0px rgba(0,0,0,0)';
+    var on  = { boxShadow:'0px 8px 22px rgba(47,94,168,0.20)', borderColor:'#2f5ea8', backgroundColor:'#f4f8ff' };
+    var off = { boxShadow: bs, borderColor: cs.borderColor, backgroundColor: cs.backgroundColor };
+    var onAt = cur.eff, offAt = cur.winEnd;
+    for (var j = i + 1; j < plan.length; j++){                // 交棒给下一条 eff > onAt+0.6 的锚
+      if (plan[j].eff > onAt + 0.6){ offAt = Math.min(cur.winEnd, plan[j].eff); break; }
+    }
+    if (offAt - onAt < 0.5) offAt = Math.min(cur.winEnd, onAt + 0.5);
+    tl.fromTo(cur.el, { scale: 0.99 }, { scale: 1, duration: 0.42,
+              ease: 'back.out(1.6)', transformOrigin: '50% 50%' }, onAt);   // 入场强调
+    var hold = offAt - onAt - 0.42;
+    if (hold > 0.5){                                          // 呼吸铺满保持区间
+      var reps = Math.max(1, Math.ceil(hold / 0.7));
+      var seg  = hold / reps;                                 // seg×reps == hold：铺满到下一锚
+      tl.fromTo(cur.el, { scale: 1 }, { scale: 1.032, duration: seg, ease: 'sine.inOut',
+                yoyo: true, repeat: reps - 1, transformOrigin: '50% 50%' }, onAt + 0.42);
+    }
+    tl.fromTo(cur.el, off, Object.assign({}, on, { duration: 0.22, ease: 'power2.out' }), onAt);
+    if (offAt > onAt + 0.35)
+      tl.to(cur.el, Object.assign({}, off, { duration: 0.45, ease: 'power2.inOut' }), offAt - 0.45);
+  }
+}
+```
+
+**四条必须照做的原因**：
+
+1. **有限次，不是 `repeat:-1`**。渲染是 seek-and-capture 逐帧求值，无限循环在帧网格上仍可求值，但**它不计入推进型覆盖率**（踩坑清单 §2.1 第 2 条②：含循环的覆盖率 p50 恒 1.000，是假量），写完等于没写。有限次循环有明确终点、可被静态解析计入。
+2. **`seg×reps==hold` 铺满到下一锚**，不是"补一段脉冲就完事"。单段 ≤0.7s 是频率下限——2s 一次的呼吸读作"静止"（观感上不构成变化）；1.032 是幅度上限，`scale` 会把内容顶进字幕预留带（先跑 `instant_preview.py`，同 §2.1 A1 风险①）。
+3. **排序与交棒都用 `eff = max(at, enterAt)`**。句级降级锚可能落在元素入场之前（§3.6.1 约束 1），按 `at` 排序会让"还没出现的元素"抢走焦点、提前熄灭上一组；按 `eff` 排序才与观众看到的顺序一致。
+4. **保持区间的终点是"下一个 `eff`"或"本场窗口末 −0.15s"，取小**。不封顶会跨场长亮；`winEnd` 从 `SX` 读，不写死秒数。
+
+**一条写法提醒**：空档节拍（旁白在某处停留 6s 以上而中间没有新元素要亮）要**重亮既有元素**，不是新造元素。本轮 10 场里补了 13 处这样的节拍（例：讲到"5.06 倍"时重亮公式卡、讲"结论不变"时重亮换算图），声明挂在承载元素的**子元素**上——挂在容器上在容器带 `.rv{opacity:0}` 时会命中 §7b 形态①/③ 那条"入场只打子元素"的门禁。
+
+**读数（两腿，都不裁定）**：
+- 静态面（零渲染）：`choreography_profile.measure` 的 `cue_beats` —— `interval_median` / `interval_max` ＝同一场内相邻 cue 的平均/最长间隔。本片现读（81 个 cue／10 场）中位 **4.44s**、最大 **11.38s**，长间隔落在 s4 的两段。**长间隔不等于静止**（那两段有卡片位移微动与呼吸兜住，产出面最长静止仍只有 7.2s），但它是"该去看那段有没有别的推进"的定位器——两腿对着读，别单看一个数下结论。它同时是下界：辅助函数里的变量锚它看不见。
+- 产出面（渲染后像素）：`frame_occupancy.measure_motion` 的 `motion`（在动占比、最长静止）与 **`static_windows`**（最长 3 段静止窗口的起点秒＋持续秒）。只报最长值不能定位，静止窗口给的是"停在哪"，可直接对着旁白时间轴找那一句。
+
 ---
 
 ## 四、场景设计模式

@@ -212,10 +212,12 @@ VIDEO_TYPE = ""         # config "video_type"：视频类型声明（如 product
 TTS_ENABLED = True      # config "tts_enabled"：false = 纯BGM无旁白路径（默认 true，既有项目零变化）
 BGM_SOURCE = None       # config "bgm_source" 解析后的外部 BGM 文件 Path（纯BGM路径必填）
 AUDIO_BITRATE = "256k"  # config "audio_bitrate"：成片 AAC 码率（现状默认 256k 不变）
+VIDEO_CRF = 18          # config "video_crf"：字幕烧录重编码质量（默认 18＝历史行为）
 # 时长与码率的模块缺省（与上面 _DEFAULT_VOICE 同判据）：load_config 每次从这里取，
 # 不读"上一次 load 的结果"——否则同进程第二个项目会继承上一个项目的时长与码率。
 _DEFAULT_VIDEO_DURATION = VIDEO_DURATION
 _DEFAULT_AUDIO_BITRATE = AUDIO_BITRATE
+_DEFAULT_VIDEO_CRF = VIDEO_CRF
 
 # === 停顿声明（2026-10-13 停顿可控性接入批；裁定真身住 pause_marks.py）===
 # PAUSE_DECLARATIONS：{str(scene_id): [{"after": 锚词, "ms": 毫秒}, ...]}，由
@@ -600,6 +602,61 @@ def _parse_bitrate_value(raw):
     return value if value > 0 else None
 
 
+def _insert_gate_state():
+    """插入面能量闸门的开关与阈值（单一出口，执行侧与归因侧同读）。
+
+    存在理由住 audio_sync_rules.json → insert_gap_gate.description：强制面只信 ASR
+    时刻，边界落在词中间时 gap≈0，下刀点只能取那条缝——等于在字上开洞。闸门要求
+    **切点处本来就是静音**才允许插。fail-closed：规则缺节/残键/读盘失败一律
+    enabled=False 并在归因里点明（"读不到判据"不得退化成"照插"）。
+    """
+    try:
+        sec = _load_audio_sync_rules().get('insert_gap_gate')
+    except Exception as e:  # noqa: BLE001 —— 读盘失败与缺节分开点名
+        return False, 0.0, 0.0, f"判据断链：audio_sync_rules 读不回（{type(e).__name__}）"
+    if not isinstance(sec, dict):
+        return False, 0.0, 0.0, "规则缺节 insert_gap_gate（切点不做能量确认）"
+    try:
+        floor = float(sec.get('floor_db_max'))
+        sep = float(sec.get('side_sep_db_min'))
+    except (TypeError, ValueError):
+        return False, 0.0, 0.0, "insert_gap_gate 残键（floor_db_max/side_sep_db_min 不可解析）"
+    return bool(sec.get('enabled_by_default', True)), floor, sep, ""
+
+
+def _cut_is_quiet(audio, sr, cut, floor_db, sep_db):
+    """切点处是否**本来就是静音**：True=是谷／False=不是谷／None=无从裁定。
+
+    `False` 必须与 `None` 分开：False 是"量到了，那里是说话声"（插进去就是开洞），
+    None 是"这一段太短量不了"（同样不插，但不该记成缺陷）。
+    """
+    import numpy as np
+    near = max(64, int(0.012 * sr))
+    side = max(near + 1, int(0.08 * sr))
+
+    def _rms(a, b):
+        a, b = max(0, a), min(len(audio), b)
+        if b - a < 64:
+            return None
+        seg = audio[a:b].astype(np.float64) / 32768.0
+        v = float(np.sqrt(np.mean(seg * seg)))
+        return -180.0 if v <= 0 else 20 * np.log10(v + 1e-12)
+
+    f = _rms(cut - near, cut + near)
+    sides = [x for x in (_rms(cut - side, cut - near), _rms(cut + near, cut + side))
+             if x is not None]
+    if f is None or not sides:
+        return None
+    if f > floor_db:
+        return False            # 切点本身就是说话声：插进去即开洞
+    loud = max(sides)
+    if loud <= floor_db:
+        # 两侧也都安静＝切点深在一段停顿里（引擎长停顿时 ±80ms 可能全是静音）：
+        # 没有"与语音的落差"可量，但**插进去同样安全**，不得因此拒插。
+        return True
+    return bool((loud - f) >= sep_db)
+
+
 def _silence_cut_point(audio, sr, gap_lo, gap_hi):
     """在 [gap_lo, gap_hi] 这段**字间隙**内取下刀点（采样索引）。
 
@@ -617,8 +674,19 @@ def _silence_cut_point(audio, sr, gap_lo, gap_hi):
         return min(len(audio), max(0, lo))
     env = np.abs(audio[lo:hi].astype(np.int32)).sum(axis=1).astype(np.float64)
     win = max(1, int(0.015 * sr))
-    env = np.convolve(env, np.ones(win) / win, mode="same")
-    return lo + int(np.argmin(env))
+    if win % 2 == 0:
+        win += 1
+    # 边缘感知平滑（2026-11-08 修正）：`mode="same"` 会拿越界的 0 当邻居，短间隙里
+    # 平滑包络因此在**窗口两端**出现低谷 → 下刀点恒落在"语音/静音交界"，随后的能量
+    # 闸门必然判它不是谷（±12ms 里含语音），该补的停顿全被拒。改用边缘填充 + valid
+    # 卷积，并跳过两端各一个平滑窗（那里仍受边缘影响），谷底取在间隙内部。
+    padded = np.pad(env, (win // 2, win // 2), mode="edge")
+    sm = np.convolve(padded, np.ones(win) / win, mode="valid")
+    if len(sm) > 2 * win:
+        k = win + int(np.argmin(sm[win:len(sm) - win]))
+    else:
+        k = int(np.argmin(sm))
+    return lo + k
 
 
 def _splice_silence(audio, sr, n_ch, cut, n_ins):
@@ -690,7 +758,7 @@ def _shift_chars_for_inserted_silence(chars, cut_t, inserted):
     return out
 
 
-def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
+def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None, stats=None):
     """段间停顿强制——波形层根治（2026-07-28，skill-promo 句间零停顿事故）。
 
     根因：TTS 引擎整段合成时句间停顿由内部韵律决定，同一段音频里
@@ -705,6 +773,10 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
     复检，无需重跑 ASR）。插入后仍不达标 → RuntimeError，禁止静默放行。
 
     Returns (modified, sentences, total_inserted_seconds, chars)
+        `stats`（可选字典）回填本轮的跳过读数：`not_gap`＝切点处量到是说话声而**拒插**的
+        段数、`un_measured`＝切点太短无从裁定而拒插的段数、`not_gap_ctx`＝前者的点名。
+        调用方据此把"没补"与"不需要补"分开登记，不得静音跳过。
+
         `chars` 是入参 `chars` 经同一批插入点平移后的新列表；入参为 None（旧调用方
         或未做字符级对齐的场景）则原样回 None。调用方**必须**回写它——句级与字符级
         共用同一次平移，只回写句子即等于让 cue 时刻停在插入点之前。
@@ -720,9 +792,17 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
 
     audio, sr = _read_wav_int16(hq_file)
     n_ch = audio.shape[1]
+    gate_on, gate_floor, gate_sep, _gate_why = _insert_gate_state()
+    if stats is not None:
+        stats.setdefault('not_gap', 0)
+        stats.setdefault('un_measured', 0)
+        stats.setdefault('not_gap_ctx', [])
+        if _gate_why:
+            stats['gate_off_reason'] = _gate_why
 
     sentences = [dict(s) for s in sentences]
     total_inserted = 0.0
+    skipped = set()
     for i in deficits:
         gap = sentences[i + 1]['rel_start'] - sentences[i]['rel_end']
         deficit = min_pause - gap
@@ -731,6 +811,23 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
         # （句界 / 句内标点），下刀与拼接两条腿各写一遍即分叉，故收成共用函数。
         cut = _silence_cut_point(audio, sr, float(sentences[i]['rel_end']),
                                  float(sentences[i + 1]['rel_start']))
+        # 能量闸门（2026-11-08）：切点必须本来是静音。ASR 把段界落在词中间时
+        # gap≈0、下刀点只能取那条缝，插进去就是在说话声里开一个 0.4s 的洞——
+        # 成片听感是"断口/杂音"，不是停顿。量到不是谷即拒插并点名，量不到也拒插。
+        if gate_on or _gate_why:
+            # 判据读不回时 gate_on=False：必须按**拒插**处理。退回旧行为＝继续开洞，
+            # 而这条闸门的存在理由就是那些洞——"读不到判据"不能读成"可以插"。
+            quiet = (_cut_is_quiet(audio, sr, cut, gate_floor, gate_sep)
+                     if gate_on else False)
+            if quiet is not True:
+                skipped.add(i)
+                if stats is not None:
+                    k = 'not_gap' if quiet is False else 'un_measured'
+                    stats[k] += 1
+                    if quiet is False and len(stats['not_gap_ctx']) < 6:
+                        stats['not_gap_ctx'].append(
+                            f"段{i + 1}→{i + 2} 界 @{cut / sr:.2f}s")
+                continue
         audio = _splice_silence(audio, sr, n_ch, cut, int(round(deficit * sr)))
         inserted = int(round(deficit * sr)) / sr
         cut_t = cut / sr
@@ -752,14 +849,22 @@ def _enforce_sentence_pauses(hq_file, sentences, min_pause, chars=None):
                 s['rel_end'] = round(s['rel_end'] + inserted, 3)
         total_inserted += inserted
 
-    # 验证闭环：插入后所有间隔必须达标，否则炸给调用方（不写回残波形）
+    # 验证闭环：**试过插入的**段界必须达标，否则炸给调用方（不写回残波形）。
+    # 闸门拒插的段界不在此列——它们是"那里没有静音可扩"，由 stats 点名，
+    # 拿它判失败等于逼着实现去开洞。
     for i in range(len(sentences) - 1):
+        if i in skipped:
+            continue
         gap = sentences[i + 1]['rel_start'] - sentences[i]['rel_end']
         if gap < min_pause - 0.05:
             raise RuntimeError(
                 f"sentence-pause enforce 失败：{hq_file.name} 段 {i}→{i+1} 插入后间隔仍为 "
                 f"{gap:.3f}s < {min_pause}s，拒绝静默放行")
 
+    if total_inserted <= 0:
+        # 全部位点被闸门拒插：波形一字节不动（"拒插"必须可从字节面复核，
+        # 否则调用方只能靠返回值自述）。
+        return False, sentences, 0.0, chars
     _write_wav_int16(hq_file, audio, sr, n_ch)
     return True, sentences, total_inserted, chars
 
@@ -813,9 +918,17 @@ def _enforce_punctuation_pauses(hq_file, text, sentences, chars, min_pause):
 
     Returns (modified, sentences, inserted_seconds, chars, res)
         `res` = {"points": 低于下限的标点位数, "hits": 实际补了几处,
-                 "interpolated": 因时刻是插值而拒动刀几处, "broken": [归因…]}
+                 "interpolated": 因时刻是插值而拒动刀几处,
+                 "declined_idx": 闸门拒插的位点索引（裁定侧据此判"主动不补"）,
+                 "broken": [归因…]}
     """
-    res = {"points": 0, "hits": 0, "interpolated": 0, "broken": []}
+    res = {"points": 0, "hits": 0, "interpolated": 0, "not_gap": 0,
+           "un_measured": 0, "not_gap_ctx": [], "broken": [],
+           # 被闸门拒插的位点索引（标点行 index）——裁定侧据此把"主动不补"与
+           # "补了没治好"分开：前者只能判未测，后者才是 FAIL。缺这条记录时
+           # 裁定侧退回旧语义（实测命中即 FAIL），故它必须是**执行侧落盘的读数**，
+           # 不能由审计侧按"点没被补"反推——反推会把"漏跑"洗成"主动拒插"。
+           "declined_idx": []}
     if min_pause <= 0:
         return False, sentences, 0.0, chars, res
     if not chars:
@@ -835,11 +948,13 @@ def _enforce_punctuation_pauses(hq_file, text, sentences, chars, min_pause):
         return False, sentences, 0.0, chars, res
     actionable = [r for r in targets if r["measured"]]
     res["interpolated"] = len(targets) - len(actionable)
+    skipped_idx = set()
     if not actionable:
         return False, sentences, 0.0, chars, res
 
     audio, sr = _read_wav_int16(hq_file)
     n_ch = audio.shape[1]
+    gate_on, gate_floor, gate_sep, _gate_why = _insert_gate_state()
     sentences = [dict(s) for s in sentences]
     chars = [list(c) for c in chars]
     total = 0.0
@@ -852,6 +967,20 @@ def _enforce_punctuation_pauses(hq_file, text, sentences, chars, min_pause):
         if deficit <= 0:
             continue
         cut = _silence_cut_point(audio, sr, gap_lo, gap_hi)
+        # 与句界面同一闸门：切点本来就是静音才插（理由见 _cut_is_quiet）。
+        if gate_on or _gate_why:
+            # 判据读不回时 gate_on=False：必须按**拒插**处理。退回旧行为＝继续开洞，
+            # 而这条闸门的存在理由就是那些洞——"读不到判据"不能读成"可以插"。
+            quiet = (_cut_is_quiet(audio, sr, cut, gate_floor, gate_sep)
+                     if gate_on else False)
+            if quiet is not True:
+                skipped_idx.add(r["index"])
+                res['declined_idx'].append(r["index"])
+                res['not_gap' if quiet is False else 'un_measured'] += 1
+                if quiet is False and len(res['not_gap_ctx']) < 6:
+                    res['not_gap_ctx'].append(
+                        f"『…{r['ctx']}…』@{cut / sr:.2f}s")
+                continue
         n_ins = int(round(deficit * sr))
         audio = _splice_silence(audio, sr, n_ch, cut, n_ins)
         inserted = n_ins / sr
@@ -862,12 +991,17 @@ def _enforce_punctuation_pauses(hq_file, text, sentences, chars, min_pause):
         res["hits"] += 1
 
     still = [x for x in npp.punctuation_gap_rows(chars, spoken, after)
-             if x["punct"] and x["measured"] and x["gap"] < min_pause - 0.05]
+             if x["punct"] and x["measured"] and x["gap"] < min_pause - 0.05
+             and x["index"] not in skipped_idx]
     if still:
         raise RuntimeError(
             f"punctuation-pause enforce 失败：{Path(hq_file).name} 补后仍有 "
             f"{len(still)} 处低于 {min_pause}s（首处『…{still[0]['ctx']}…』），拒绝静默放行")
 
+    if total <= 0:
+        # 全部位点被闸门拒插：波形一字节不动（与句界面同一条纪律——"拒插"必须能
+        # 从字节面复核，不能只靠返回值自述）。
+        return False, sentences, 0.0, chars, res
     _write_wav_int16(hq_file, audio, sr, n_ch)
     return True, sentences, round(total, 3), chars, res
 
@@ -1100,7 +1234,16 @@ ALIGN_ALGO_VERSION = "v3"
 # 不 bump 的后果与该常量设立时同族——存量 v2 波形已按"只有句界"的逻辑处理过、戳记
 # 写着 v2，缓存照常命中，新面只对空波形生效，即"改了判据而存量项目静默不生效"。
 # bump 后 v2 波形在下一轮从原始 TTS（本地 mp3，零网络）重建并重走两腿。
-PAUSE_ENFORCE_VERSION = "v3"
+# v4（2026-11-08 用户口播反馈）：发音字符口径与强制对齐统一（小数点/百分号不再算
+# 发音字符）——旧口径下数字密集场原文与对齐字符数不等，句内强制面整场跳过，逗号/顿号
+# 停顿长短不齐由引擎自行决定。代次必须 bump：存量 v3 波形是"该补未补"的那一代，
+# 不重建就永远看不到修复。
+# v5（2026-11-08 同日第二轮，使用者把症状重新描述为"额外杂音"）：v4 修的是"该补没补"，
+# 但两个强制面都会在 **ASR 边界落在词中间（gap≈0）** 时把静音插进连续语音里——成片实测
+# 8 处 0.24~0.4s 数字零两侧 20ms 均为 -15~-25dB 说话电平（原始引擎音频里数字零段为 0）。
+# 现加能量闸门（insert_gap_gate）：切点本来就是静音才插，否则拒插并点名。代次必须 bump：
+# v4 波形里已经开过的洞不会因为"间隙已达标"被复检检出，只有从原始 TTS 重建才能消掉。
+PAUSE_ENFORCE_VERSION = "v5"
 _ENF_STAMP_RAW = "raw"
 # 修剪面上线后**已入桶位点处**的静音被物理删除，旧波形上没有"该剪未剪"的复检信号，
 # 故启用时戳记另加后缀：v2 → 与 v2+trim 不是同一份波形代次，必须从原始 TTS 重建后重走
@@ -1359,8 +1502,19 @@ def _build_timeline_manifest(temp_dir):
         # 自动消费新值。unaligned 场景无可靠边界，不强制（对齐失败已有告警）。
         if entry.get('method') == 'asr_forced' and entry.get('sentences'):
             _chars = entry.get('chars')
+            _sp_stats = {}
             modified, new_sents, ins, new_chars = _enforce_sentence_pauses(
-                hq_file, entry['sentences'], pause_min, chars=_chars)
+                hq_file, entry['sentences'], pause_min, chars=_chars, stats=_sp_stats)
+            # 闸门拒插照常落读数（"没补"与"不需要补"是两个读数，A06 同族）
+            entry['pause_sentence_gate'] = {k: _sp_stats.get(k, 0)
+                                            for k in ('not_gap', 'un_measured')}
+            if _sp_stats.get('not_gap'):
+                entry['pause_sentence_gate']['not_gap_ctx'] = _sp_stats.get('not_gap_ctx', [])
+                print(f"  Scene {scene_id}: [INSERT-GATE] {_sp_stats['not_gap']} 处段界"
+                      f"量到是说话声——**拒插**（在字上开洞＝成片里的断口/杂音）："
+                      f"{'；'.join(_sp_stats.get('not_gap_ctx', []))}")
+            if _sp_stats.get('gate_off_reason'):
+                entry['pause_sentence_gate']['gate_off_reason'] = _sp_stats['gate_off_reason']
             if modified:
                 entry['sentences'] = new_sents
                 # 插静音把插入点之后的语音整体后移，字符级流必须由同一个函数
@@ -1387,7 +1541,10 @@ def _build_timeline_manifest(temp_dir):
                 e_mod, e_sents, e_ins, e_chars, e_res = _enforce_punctuation_pauses(
                     hq_file, text, entry['sentences'], entry.get('chars'), enf_min)
                 entry['pause_intra'] = {k: e_res[k] for k in
-                                        ("points", "hits", "interpolated")}
+                                        ("points", "hits", "interpolated",
+                                         "not_gap", "un_measured", "declined_idx")}
+                if e_res.get('not_gap_ctx'):
+                    entry['pause_intra']['not_gap_ctx'] = e_res['not_gap_ctx']
                 if e_res["broken"]:
                     entry['pause_intra_broken'] = e_res["broken"]
                 if e_mod:
@@ -1408,6 +1565,10 @@ def _build_timeline_manifest(temp_dir):
                 elif e_res["interpolated"]:
                     print(f"  Scene {scene_id}: [INTRA-ENFORCE] {e_res['interpolated']} 处低于下限"
                           f"但两侧字符时刻为插值——**拒动刀**（在虚构坐标上插静音等于切进字里）")
+                if e_res.get('not_gap'):
+                    print(f"  Scene {scene_id}: [INTRA-ENFORCE] {e_res['not_gap']} 处"
+                          f"标点位点量到是说话声——**拒插**（插进去即开洞）："
+                          f"{'；'.join(e_res.get('not_gap_ctx', []))}")
             # 修剪面（缺省关闭）：跑在插入面**之后**，量的是插入完成后将要交付的那份波形。
             # 顺序反过来就会在旧波形上剪、再被插入面把时刻挪一次——两腿共用同一条
             # "返回新时间戳"的路径才只有一份真相。
@@ -1547,7 +1708,7 @@ def load_config(config_path):
     global PAUSE_DECLARATIONS, PAUSE_AUTO_ENABLED
     global SUBTITLE_DISPLAY_REPLACEMENTS, TTS_INSTRUCTION
     global VIDEO_TYPE, TTS_ENABLED, BGM_SOURCE, AUDIO_BITRATE
-    global SUBTITLE_STYLE
+    global SUBTITLE_STYLE, VIDEO_CRF
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     
@@ -1571,6 +1732,14 @@ def load_config(config_path):
     VIDEO_TYPE = str(cfg.get('video_type', '') or '')
     TTS_ENABLED = _coerce_bool(cfg.get('tts_enabled', True))
     AUDIO_BITRATE = str(cfg.get('audio_bitrate') or _DEFAULT_AUDIO_BITRATE)
+    _crf_raw = cfg.get('video_crf')
+    try:
+        VIDEO_CRF = _DEFAULT_VIDEO_CRF if _crf_raw is None else int(_crf_raw)
+        if not 0 <= VIDEO_CRF <= 51:
+            raise ValueError
+    except (TypeError, ValueError):
+        print(f"  [WARN] config video_crf 非法（{_crf_raw!r}），回退 {_DEFAULT_VIDEO_CRF}")
+        VIDEO_CRF = _DEFAULT_VIDEO_CRF
     BGM_SOURCE = None
     if cfg.get('bgm_source'):
         # bgm_source 解析：绝对路径 → 工作流根目录相对 → HTML 项目目录。
@@ -3623,7 +3792,7 @@ def step6_burn_subtitles(video_path, subtitle_path, temp_dir):
         "-vf", f"subtitles='{srt_str}':force_style='{style}'",
         "-c:v", "libx264",
         "-preset", "medium",
-        "-crf", "18",
+        "-crf", str(VIDEO_CRF),
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(temp_output)

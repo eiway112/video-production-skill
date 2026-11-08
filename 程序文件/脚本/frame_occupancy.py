@@ -146,6 +146,29 @@ def _longest_run(mask):
     return best
 
 
+def _static_windows(mask, limit=None):
+    """连续静止段（起点秒 + 持续秒），按长度降序取前 limit 条。
+
+    只给 `max_static_seconds` 时，读的人知道"最长停了多久"，不知道**停在哪**——
+    2026-11-08 观感批判据这一步是靠一次性探针补的（逐帧差分在 395s 里找连续段），
+    这种"每次要看就得现写一段脚本"的取数面不算公共能力。窗口清单把定位写进同一次读数。
+    """
+    limit = MOTION_WINDOWS_MAX if limit is None else limit
+    runs, start = [], None
+    for i, m in enumerate(mask):          # mask=True 即"该 0.1s 静止"
+        if m:
+            if start is None:
+                start = i
+        elif start is not None:
+            runs.append((start, i - start))
+            start = None
+    if start is not None:
+        runs.append((start, len(mask) - start))
+    runs.sort(key=lambda t: t[1], reverse=True)
+    return [{"start_s": round(s / float(MOTION_FPS), 1),
+             "seconds": round(c / float(MOTION_FPS), 1)} for s, c in runs[:limit]]
+
+
 def _ffprobe_size(video_path):
     import subprocess
     r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -186,6 +209,7 @@ MOTION_EVENT_MIN = 0.1      # 逐帧 mean|Δ|（0-255 灰度标度）超过此�
 
 MOTION_CALIBER = {"fps": MOTION_FPS, "w": MOTION_W, "h": MOTION_H,
                   "event_min": MOTION_EVENT_MIN}
+MOTION_WINDOWS_MAX = 3      # 静止窗口清单最多列几条：定位用，不是"全片静止清单"
 
 
 def _extract_motion(video_path):
@@ -236,7 +260,8 @@ def measure_motion(video_path):
                 "diff_p90": round(float(np.percentile(d, 90)), 3),
                 "moving_share": round(float(moving.mean()), 3),
                 "static_share": round(float((~moving).mean()), 3),
-                "max_static_seconds": round(_longest_run(~moving) / float(MOTION_FPS), 1)}
+                "max_static_seconds": round(_longest_run(~moving) / float(MOTION_FPS), 1),
+                "static_windows": _static_windows(~moving)}
     except Exception as e:                              # noqa: BLE001
         return {"untested": f"活跃度度量异常（{type(e).__name__}: {str(e)[:80]}）"}
 
@@ -262,6 +287,13 @@ def format_line(m):
                       f"最长连续静止 {mo['max_static_seconds']}s"
                       f"（逐帧差分中位 {mo['diff_median']}，"
                       f"{mo['caliber']['fps']}fps×{mo['caliber']['w']}）")
+        # 静止窗清单：读数要能顺着它回片子里定位，否则"最长 7.2s"仍得现写探针去查在哪
+        _sw = mo.get("static_windows")
+        if _sw is None:
+            motion_txt += "｜静止窗 未取数（键缺席，须重跑本面）"
+        elif _sw:
+            motion_txt += "｜静止窗 " + "／".join(
+                f"{w['start_s']}s 起 {w['seconds']}s" for w in _sw)
     return (f"[FRAME-OCCUPANCY] 描述面（不裁定）：主体区占用 中位 {m['median']} "
             f"p10 {m['p10']} 最低 {m['min']}｜低占用(<{LOW_SHARE_OF_BLANK}) "
             f"{m['low_blank_seconds']}s／{m['frames']}s｜最长连续低占用 "

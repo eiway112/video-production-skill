@@ -146,16 +146,16 @@ def align_model_cache_ready():
     return True, str(weights[0])
 
 
-# 归一化：对齐只看"发音承载字符"（汉字/字母/数字），标点与空白剔除
-_NORM_KEEP_RE = re.compile(r'[\u4e00-\u9fffA-Za-z0-9]')
-
-
+# 归一化：对齐只看"发音承载字符"（汉字/字母/数字），标点与空白剔除。
+# 保留集与停顿强制面同源（narration_pause_precheck.SPOKEN_KEEP_RE）——两处各写一份
+# 即两份"发音字符"，数字密集场会被判成长度不等而整场跳过（2026-11-08 实测 7/10 场）。
 def _normalize_chars(text):
     """返回 (norm_chars, orig_index_map)：剔除非发音字符，保留原文索引映射。"""
+    import narration_pause_precheck as _npp
     chars = []
     index_map = []
     for i, ch in enumerate(text):
-        if _NORM_KEEP_RE.match(ch):
+        if _npp.SPOKEN_KEEP_RE.match(ch):
             chars.append(ch.lower())
             index_map.append(i)
     return ''.join(chars), index_map

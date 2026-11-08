@@ -85,9 +85,14 @@ from _script_env import ROOT, QUALITY_DIR, HTML_BASE, TEMP_BASE  # noqa: E402
 RULES_FILE = QUALITY_DIR / "narration_prosody_rules.json"
 SYNC_RULES_FILE = QUALITY_DIR / "audio_sync_rules.json"
 
-# 度量时不计入"发音字符"的字符（标点与空白）。数字与拉丁字母算发音字符，
-# 与对齐字符数不等时该场音频面会被点名跳过。
+# 度量时不计入"发音字符"的字符（标点与空白）。数字与拉丁字母算发音字符。
 NON_SPOKEN = set("，。、；：！？…—－–~～（）()〔〕《》〈〉“”‘’\"' \n\t\r　")
+
+# 发音承载字符＝强制对齐侧的同一口径（`_forced_align._normalize_chars` 从这里取，
+# 单源）：汉字/拉丁字母/数字。小数点、百分号、中点这类符号既不是发音字符，也不是
+# 停顿请求——把它们算成发音字符会让发音流比对齐流长，整场被判"取数断链"跳过；
+# 反过来把它们算成停顿标点，又会把刀插进 "2.03" / "8.4%" 里面。两半都不成立。
+SPOKEN_KEEP_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 
 
 class Broken(Exception):
@@ -193,14 +198,21 @@ def text_face(narration: list, rules: dict, split) -> tuple[list, dict]:
 
 
 def spoken_and_after(text: str):
+    """返回 (spoken, after)：spoken 只含发音承载字符（`SPOKEN_KEEP_RE`，与强制对齐同源），
+    after[i] 是 spoken[i] **之前**的那串停顿标点。
+
+    非发音、非停顿的符号（`.` `%` `·` `×` 等）两侧都不计：计入 spoken 会与对齐字符流
+    不等长而整场跳过（数字密集项目实测 7/10 场）；计入停顿请求则会把静音插进
+    "2.03""8.4%" 里面——两种读法都会把该补的停顿放掉或把刀落进数字里。
+    """
     spoken, after, buf = [], [], ""
     for ch in text:
-        if ch in NON_SPOKEN:
-            buf += ch
-        else:
+        if SPOKEN_KEEP_RE.match(ch):
             spoken.append(ch)
             after.append(buf)
             buf = ""
+        elif ch in NON_SPOKEN:
+            buf += ch
     after.append(buf)  # 句尾残留标点
     return spoken, after
 
@@ -486,6 +498,12 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
     comp_rows: list = []       # 标点位点的精停构成（交付间隙／精确零／带噪／声明／账本）
     comp_unmeasured: list = []
     comp_decl_broken: list = []
+    # 执行侧「主动不补」的位点（manifest.pause_intra.declined_idx）：裁定侧要把
+    # "闸门量到语音而拒插"与"补了没治好"分开，故这两条腿由**执行侧落盘的读数**回答。
+    # 旧 manifest 无该键＝当时没有这条裁定语义，按"无记录"计数，不得按 0 条拒插读。
+    declined_points: list = []
+    declined_scenes_without_record = 0
+    declined_scenes: set = set()
     _booked_by_scene: dict = {}   # 场 → 本轮账本补入秒数（缺键＝未记账，不是 0）
     for entry in manifest.get("scenes", []):
         sid = str(entry.get("scene_id"))
@@ -559,6 +577,15 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
                 silent_rows.append({**row, "scene_id": sid})
         # 第三桶：无标点处出现的可听停顿（判据与修剪面同源，见 _intra_bucket_rows）
         res, err = _intra_bucket_rows(sid, spoken, after, chars, entry, wav_dir)
+        _pi = entry.get("pause_intra")
+        if isinstance(_pi, dict) and "points" in _pi:
+            # 本场插入了面跑过：有 declined_idx＝本批之后落盘的读数；缺键＝旧记录。
+            if "declined_idx" in _pi:
+                for _idx in _pi.get("declined_idx") or []:
+                    declined_points.append({"scene_id": sid, "index": int(_idx)})
+                    declined_scenes.add(sid)
+            else:
+                declined_scenes_without_record += 1
         if err:
             intra_broken.append(f"s{sid}：{err}")
         elif res:
@@ -644,6 +671,17 @@ def audio_face(narration: list, manifest: dict, rules: dict, wav_dir=None):
             "rows": comp_rows,
             "unmeasured": comp_unmeasured,
             "declaration_broken": comp_decl_broken,
+        },
+        # ---- 拒插位点（2026-11-08 真实项目反馈批）----
+        # 执行侧幂等闸门量到"切点是说话声"时**主动不插**（插进去＝成片里多一个断口/杂音，
+        # 用户点名的"额外杂音"即此）。这类位点不是"没测"也不是"补了没治好"，
+        # 而是**没有安全的自动修法**；裁定侧据此把它们归未测并逐条点名。
+        # 三类读数分列：执行侧落盘的位点 / 跑过但无该键的场（旧 manifest）/
+        # 完全没跑的面（不在本键内，由裁定侧按 FAIL 保底）。
+        "insert_declined": {
+            "points": declined_points,
+            "scenes": len(declined_scenes),
+            "scenes_without_record": declined_scenes_without_record,
         },
         # ---- 语义停顿分层（2026-11-06 用户口播反馈批，描述面）----
         # 用途是回答「该不该有气口」，**不是**「把某处调到多少秒」：实测同一位置换

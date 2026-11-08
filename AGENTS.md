@@ -142,6 +142,8 @@ preflight → tts → timeline → render
 
 **预览驱动迭代**：修订任务修改 HTML 后，必须先跑 `instant_preview.py`（秒级出图）确认画面生效且无溢出，确认后才进入渲染；**禁止把全量渲染当预览用**。场景级增量渲染由 render 步**自动尝试**（基线齐备即触发，不再需要开关）：仅场景 div 内容变化时走 PATCH，样式/脚本/时间轴/旁白有变则降级全量；显式退出用 `--no-scene-patch`（旧 `--scene-patch` 已降为兼容 no-op）。
 
+**观感类修订的取数顺序（2026-11-08）**：节奏/动效类修订按 静态面（`choreography_profile.py`，零渲染，出推进覆盖率与 cue 节拍）→ 预览（字幕安全区）→ **渲染产物**（`--step render` 只出 `temp/render_raw.mp4`，不落交付槽位、不进入交付态）→ 对 `render_raw.mp4` 跑 `generate_completion_report.py --project-name X --video-file <render_raw.mp4>` 读 `frame_occupancy`（在动占比与静止窗清单）决定是否继续 → 再走完整链。**不要把 `--resume` 当"只跑到渲染看看"**：链跑到 postprocess 就会落交付槽位并进入交付态，那个中间构建即是一次交付。反过来说，观感迭代轮次一开头就按最终交付名命名。
+
 **错误恢复纪律**：
 1. 步骤失败后**先定点诊断，禁止直接 `--fresh`** 全量重置——优先 `--resume`（自动回退到最早失效步）或 `--quick-fix`；长视频（≥300s）或有渲染产物时，`--fresh` 必须显式追加 `--confirm-fresh` 并确认破坏清单
 2. 每个子步骤的完整输出落盘至 `过程产物/日志/{config}_{step}_*.log`，失败时 `pipeline_state.json` 记录 `log_path`，完工报告 issues 同步引用
