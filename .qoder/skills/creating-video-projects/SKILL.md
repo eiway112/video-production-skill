@@ -82,7 +82,7 @@ python config_manager.py
 ### 阶段B：分镜设计（AI 导演判断 + 用户确认节点）
 
 1. 按分镜设计模板输出：场景划分、每场景画面构成、**场间承接**（每场从上一场哪个图元／命名／位置长出来）、时间分配（窗口 = TTS + 场景余量 + 转场，**TTS 占比是派生量不是设计目标**，口径见踩坑清单 §八·补）、素材引用表（场景号→文件名→展示方式）。
-2. 旁白撰写约束：数值一律阿拉伯数字（`narration_digits_rules.json` 管理例外）；语义完整不碎片化；过一遍分镜模板「叙事链自检」四项（判据住该节，此处不复述）。
+2. 旁白撰写约束：数值一律阿拉伯数字（`narration_digits_rules.json` 管理例外）；语义完整不碎片化；过一遍分镜模板「叙事链自检」四项与「画面节奏自检」四项（每句至少一个焦点／长句与空档要有第二拍／入场≠持续／焦点保持到下一句；判据住该节，此处不复述）。
 3. **用户确认节点（阻塞）**：按踩坑清单 §6.2 一次性提交分镜表待确认——图文匹配、时间节奏、遗漏素材。这是全流程唯一的强制人工节点，其余环节不中断用户。
 
 ### 阶段C：项目文件制作（AI 手写）
@@ -90,9 +90,10 @@ python config_manager.py
 产出物落在 `程序文件/源码/hyperframes/<项目名>/`（项目名用英文短横线风格）：
 
 1. `narration.json` — 场景单一权威源。结构参照现有成功项目（如 `wall-crack-remedy/narration.json`）：scene_id/title/start/end/duration/type(cover|gsap|static)/narration。
-2. 流水线配置 JSON → `程序文件/配置/config/pipelines/<项目名>.json`。参照 `wall-crack-remedy.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（qwen 引擎音色如 `longanling_v3`，默认即 qwen 无需声明 tts_engine；禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen 引擎，TTS 步会报错拒收；需要情感起伏时用 Instruct 音色 longanyang/longanhuan + `tts_instruction`，见 AGENTS.md TTS 引擎纪律）、fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 检查13会实测回比）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。
+2. 流水线配置 JSON → `程序文件/配置/config/pipelines/<项目名>.json`。参照 `wall-crack-remedy.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（**缺省引擎是 ElevenLabs**：不写 `tts_engine` 即用它，需 `ELEVENLABS_API_KEY`，`voice` 传 voice_id；qwen 须显式 `tts_engine: "qwen"` 并选配套音色，禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen；ElevenLabs 不支持 SSML `<break>`，带 `pause_marks` 的项目改用该引擎时须删声明，详见 AGENTS.md TTS 引擎纪律）、fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 检查13会实测回比）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。
 3. `index.html` — 手写 HTML+GSAP。**完成后逐项核对踩坑清单"阶段C检查表"全部条目**（占位符、subtitle-safe 高度、装饰层 opacity、字号分层、无 >3s 静止、动画必须挂在主 timeline `tl` 上等），并对照 HTML 模板参考基准。
 4. 场景 div 必须声明 `data-scene-id` / `data-scene-entry` / `data-scene-subtitle-safe`（AGENTS.md HTML 契约）。
+5. 节奏面：每个 cue 不只负责点亮，还要把焦点保持到下一句（`cueHi` + `flushCuePlan`，骨架与四条原因住模板基准 §3.6.2；保持区间用有限次呼吸铺满，不得用 `repeat:-1`）。入场动画是一次性的（约 0.5s），旁白是持续的——入了场就不再变化，会被观众读成"画面卡住"。
 
 ### 阶段D：流水线执行 + 交付（代码执行）
 
@@ -104,7 +105,7 @@ python config_manager.py
    门禁自动继承：preflight → tts → timeline → preview（硬阻断）→ render → verify → visual_check → postprocess。**禁止用 --force 绕过门禁**。
    - TTS 生成并发数由 `程序文件/配置/config/system/hyperframes_config.json` 的 `tts_concurrency` 控制（默认 3，硬上限 5，设 1 为串行；读取失败回退 3 并告警）；并发仅作用于 TTS 网络生成阶段，失败场景自动串行兜底重试一次。
    - 渲染期间的 `[RENDER]` 前缀进度/心跳日志来自旁路观察者线程，纯观测输出，不改变渲染控制流与退出码。
-2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。渲染成本受预算门禁治理：全量渲染尝试次数达到 `render_rules.json render_budget.max_full_renders`（默认 3）后自动阻断——超限通常意味着问题不在渲染本身，先定点诊断；确需继续用 `--accept-over-render` 显式放行留痕。**增量渲染不需要显式开启**（2026-09-03 起）：只要存在基线 `render_raw.mp4` + `scene_fingerprints.json`，render 步自动调用分类器裁定 PATCH/FULL，`--scene-patch` 已废弃为空操作，`--no-scene-patch` 才是退出开关；PATCH 成功落地与 `--quick-fix` 均不计入预算，裁定结果留痕 `state.scene_patch` + `scene_patch_verdict.json`。已登记交付的成片不得被任何模式覆盖（拦截点：render 前置 + postprocess 写入点），修订须改 `_修订NN` 文件名，确需覆盖用 `--force`。
+2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。渲染成本受预算门禁治理：全量渲染尝试次数达到 `render_rules.json render_budget.max_full_renders`（默认 5，2026-10-21 上调）后自动阻断——超限通常意味着问题不在渲染本身，先定点诊断；确需继续用 `--accept-over-render` 显式放行留痕。**增量渲染不需要显式开启**（2026-09-03 起）：只要存在基线 `render_raw.mp4` + `scene_fingerprints.json`，render 步自动调用分类器裁定 PATCH/FULL，`--scene-patch` 已废弃为空操作，`--no-scene-patch` 才是退出开关；PATCH 成功落地与 `--quick-fix` 均不计入预算，裁定结果留痕 `state.scene_patch` + `scene_patch_verdict.json`。已登记交付的成片不得被任何模式覆盖（拦截点：render 前置 + postprocess 写入点），修订须改 `_修订NN` 文件名，确需覆盖用 `--force`。
 3. 交付验收：
    ```
    python generate_completion_report.py --project-name "<项目名>" --video-file "<成片绝对路径>" --subtitle-file "<字幕绝对路径>" --state-file "<项目temp>/pipeline_state.json" --output-file "<报告绝对路径>" --audit --config-file "<项目配置绝对路径>"
