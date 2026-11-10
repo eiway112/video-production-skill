@@ -4,15 +4,16 @@
   "fps": 25,
   "resolution": "1920x1080",
   "bgm_enabled": false,
-  "tts_engine": "qwen",
-  "voice": "longanling_v3",
-  "rate": "+5%",
-  "pitch": "+0Hz",
+  "tts_engine": "elevenlabs",
+  "voice": "xQsp9uyB3OResmXFYuFx",
   "narration_source": "./narration.json",
   "paths": {
     "video_name": "quickstart-demo.mp4",
     "subtitle_name": "quickstart-demo.srt",
     "temp_subdir": "quickstart-demo_audio",
     "html_project": "quickstart-demo"
+  },
+  "eleven_voice_settings": {
+    "speed": 1.05
   }
 }

@@ -190,18 +190,20 @@ preflight → tts → timeline → render
 
 ---
 
-## TTS 引擎纪律（Tier 3，2026-08-06；2026-11-07 增 ElevenLabs）
+## TTS 引擎纪律（Tier 3，2026-08-06；2026-11-07 增 ElevenLabs；2026-11-10 切主引擎）
 
-**原则**：全仓统一 Qwen（DashScope CosyVoice）为主引擎；Edge-TTS 仅限存量项目已声明的配置保留，新项目禁止声明 `tts_engine: "edge"`。禁止跨引擎自动降级（音色不一致）——失败即报错，修复后重跑。
+**原则**：全仓统一 **ElevenLabs 为主引擎**（2026-11-10 用户裁定，缺省值住 `_script_env.DEFAULT_TTS_ENGINE`）；Qwen（DashScope CosyVoice）与 Edge-TTS 仅限存量项目按 config 显式声明保留，新项目禁止声明 `tts_engine: "qwen"` / `"edge"`。禁止跨引擎自动降级（音色不一致）——失败即报错，修复后重跑。
 
-**elevenlabs（2026-11-07 接入，按项目 opt-in）**：需 `ELEVENLABS_API_KEY`（落 `程序文件/配置/openmontage.env.local`，该文件已 gitignore）；`voice` 传 voice_id，缺省 Arthur（`xQsp9uyB3OResmXFYuFx`，技术讲解主音色），Gavin（`YGeNjTKY1wBaKygyl4y8`）为案例/叙事备选。模型缺省 `eleven_v4`（单请求上限 10000 字符，超限报错不分片）。三条边界：①**不支持 SSML `<break>`**——项目若声明 `pause_marks`，`pause_marks.plan_scene` 按既有语义直接抛 `PausePlanError`，不静默忽略（波形层的句间 0.4s / 句内 0.25s 强制与引擎无关，照常生效）；②术语误读修在**送引擎的文本**上，唯一权威源 `config/quality/tts_pronunciation.json`（只收真人听感确认过的词条，修法优先"只改切分不换字形"的零宽分隔），旁白原文/字幕/ASR 对齐/词级 cue 全部沿用原文；③该表、模型、`eleven_voice_settings` 与术语表字节指纹**都进 TTS 缓存键**，换任一项即重合成。未知引擎名一律抛错——`generate_tts` 不再"不是 qwen 就落到 edge"。**pause_marks 的处置（2026-11-07 用户裁定）**：带停顿声明的项目切 elevenlabs 时**删掉该项目的 `pause_marks`**（弃声明、接受引擎自身韵律），不另建"文本切分＋补静音"机制——那会与现有声明面并存成两套真相，且破坏整段韵律。
+**为什么改主引擎（2026-11-10 实测留痕）**：此前缺省虽已切 elevenlabs，但**项目 config 全部显式声明 qwen**、`scene_config_generator.py` 与 `scene_compiler.py` 两处生成路径又各自写死 `qwen`/`longanling_v3`，三道口子叠在一起 → 真实项目 100% 走 Qwen，ElevenLabs 从未实跑过一次（历史日志 `TTS engine: elevenlabs` 命中 0）。改主引擎必须同时改三处：①存量 config 的显式声明；②两条 config 生成路径的引擎缺省与缺省音色；③本节与 README 的口径。**只改缺省值是无效动作**——显式声明永远覆盖缺省。
 
-**默认链**（实测验证，见 `enhance_video_audio.py`）：
-- 默认：`cosyvoice-v3-flash` + `longanling_v3`（2026-08-06 从 cosyvoice-v2/longanling 升级，v3 韵律更自然；旧注释“v3 需专属域名”实测不成立）
-- 模型-音色严格配对（官方约束）：未显式声明 `qwen_model` 时由 `_infer_qwen_model` 按音色推断；存量 v2 音色（如 `longanling`）自动匹配 `cosyvoice-v2`，既有项目零变化
-- 情感控制：仅 Instruct 音色有效（`longanyang`/`longanhuan`），通过 config `tts_instruction`（或 `audio.instruction`）声明，格式严格遵循官方（如“你现在说话的角色是一个旁白，你说话的情感是neutral。”）；非 Instruct 音色声明指令会告警
+**elevenlabs（2026-11-07 接入，2026-11-10 转为主引擎）**：需 `ELEVENLABS_API_KEY`（落 `程序文件/配置/openmontage.env.local`，该文件已 gitignore）；`voice` 传 voice_id，缺省 Arthur（`xQsp9uyB3OResmXFYuFx`，技术讲解主音色），Gavin（`YGeNjTKY1wBaKygyl4y8`）为案例/叙事备选。模型缺省 `eleven_v4`（单请求上限 10000 字符，超限报错不分片）。三条边界：①**不支持 SSML `<break>`**——项目若声明 `pause_marks`，`pause_marks.plan_scene` 按既有语义直接抛 `PausePlanError`，不静默忽略（波形层的句间 0.4s / 句内 0.25s 强制与引擎无关，照常生效）；②术语误读修在**送引擎的文本**上，唯一权威源 `config/quality/tts_pronunciation.json`（只收真人听感确认过的词条，修法优先"只改切分不换字形"的零宽分隔），旁白原文/字幕/ASR 对齐/词级 cue 全部沿用原文；③该表、模型、`eleven_voice_settings` 与术语表字节指纹**都进 TTS 缓存键**，换任一项即重合成。未知引擎名一律抛错——`generate_tts` 不再"不是 qwen 就落到 edge"。**pause_marks 的处置（2026-11-07 用户裁定）**：带停顿声明的项目切 elevenlabs 时**删掉该项目的 `pause_marks`**（弃声明、接受引擎自身韵律），不另建"文本切分＋补静音"机制——那会与现有声明面并存成两套真相，且破坏整段韵律。**语速参数**：ElevenLabs 不读 Edge 语速语法，`rate`/`pitch` 声明了不生效（加载时告警）；调语速用 `eleven_voice_settings.speed`（标度 1.0 为原速，`+5%` ≈ `1.05`）。config 里不要写 `rate`/`pitch`——那会每次加载都告警且让人误以为语速已生效。
+
+**qwen 存量保留面**：存量项目可继续声明 `tts_engine: "qwen"`，音色 `longanling_v3` + `cosyvoice-v3-flash`（2026-08-06 从 cosyvoice-v2/longanling 升级，v3 韵律更自然；旧注释"v3 需专属域名"实测不成立）。模型-音色严格配对（官方约束）：未显式声明 `qwen_model` 时由 `_infer_qwen_model` 按音色推断；存量 v2 音色（如 `longanling`）自动匹配 `cosyvoice-v2`，既有项目零变化。情感控制：仅 Instruct 音色有效（`longanyang`/`longanhuan`），通过 config `tts_instruction`（或 `audio.instruction`）声明，格式严格遵循官方（如"你现在说话的角色是一个旁白，你说话的情感是neutral。"）；非 Instruct 音色声明指令会告警。
+
+**全引擎共通**：
 - 断句/句间停顿：TTS 内部韵律不可控，已由 `_enforce_sentence_pauses` 波形层强制（最小停顿 0.4s，见 `config/quality/audio_sync_rules.json` sentence_pause）
-- rate/pitch 沿用 Edge 语法声明（如 `+5%`/`+0Hz`），qwen 分支自动换算为 float（实测 rate 生效）
+- rate/pitch 沿用 Edge 语法声明（如 `+5%`/`+0Hz`），qwen/edge 分支消费；elevenlabs 分支不消费（见上）
+- 引擎进 TTS 缓存键（`_tts_cache_key`）：换引擎即换键，旧音频不会被当作新引擎的产物复用（部分重渲会造成场次间音色不一致）
 
 ---
 

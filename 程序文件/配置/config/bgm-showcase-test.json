@@ -1,5 +1,5 @@
 {
-  "tts_engine": "qwen",
+  "tts_engine": "elevenlabs",
   "video_type": "product_showcase",
   "tts_enabled": false,
   "bgm_enabled": true,

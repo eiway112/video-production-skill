@@ -53,6 +53,31 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent
 ROOT = SCRIPT_DIR.parent.parent
 
+# TTS 引擎缺省（单一权威源）：与 _script_env.DEFAULT_TTS_ENGINE 同源。
+# 本脚本自建 ROOT 推导（不 import _script_env，避免循环与路径口径分叉），
+# 故直接读同一个权威文件的同名常量——读文件而非复制字面量：
+# 复制一份就等于新增第二真相源，改缺省时漏改这里，生成出来的 config 会
+# 带着旧引擎去跑（AGENTS.md 单一权威源原则）。
+def _default_tts_engine():
+    try:
+        env_file = ROOT / "程序文件" / "脚本" / "_script_env.py"
+        for line in env_file.read_text(encoding='utf-8').splitlines():
+            if line.strip().startswith('DEFAULT_TTS_ENGINE'):
+                return line.split('=', 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return "elevenlabs"
+
+
+DEFAULT_TTS_ENGINE = _default_tts_engine()
+# 各引擎的缺省音色（与 enhance_video_audio / scene_config_generator 一致）
+_VOICE_BY_ENGINE = {
+    'elevenlabs': "xQsp9uyB3OResmXFYuFx",   # Arthur（技术讲解主音色）
+    'qwen': "longanling_v3",
+    'edge': "zh-CN-YunxiNeural",
+}
+DEFAULT_TTS_VOICE = _VOICE_BY_ENGINE.get(DEFAULT_TTS_ENGINE, _VOICE_BY_ENGINE['qwen'])
+
 # ═══════════════════════════════════════════════════════════════
 #  主题系统 v2 (Theme System — 含语义角色色)
 # ═══════════════════════════════════════════════════════════════
@@ -2085,13 +2110,17 @@ def compile_sdl(sdl_data, output_dir, dry_run=False, auto_enrich=True):
 </html>'''
 
     # ── Step 7: Generate Pipeline Config ──
-    # TTS 默认对齐全仓主引擎 Qwen（AGENTS.md TTS 引擎纪律）：
-    # 旧默认 zh-CN-YunxiNeural 属 Edge-TTS，与 qwen 引擎搭配会被一致性门禁拒收。
+    # TTS 缺省对齐全仓主引擎（_script_env.DEFAULT_TTS_ENGINE，当前 elevenlabs）：
+    # 旧默认 qwen + longanling_v3 是 2026-08 的 Qwen 时代残留，
+    # 2026-11-07 用户裁定切 ElevenLabs 后若此处不改，编译出来的 config 仍会
+    # 带着 qwen 引擎去跑 —— 新项目一出生就是旧引擎（AGENTS.md 单一权威源原则）。
+    # voice 缺省随引擎配套：elevenlabs 用 Arthur 的 voice_id，qwen 用 longanling_v3。
+    # 项目 yaml 显式声明 tts_engine/voice 时以其为准（存量项目不改音色）。
     config = {
         'video_duration': video_duration,
         'cover_duration': cover_dur,
-        'tts_engine': video.get('tts_engine', 'qwen'),
-        'voice': video.get('voice', 'longanling_v3'),
+        'tts_engine': video.get('tts_engine', DEFAULT_TTS_ENGINE),
+        'voice': video.get('voice', DEFAULT_TTS_VOICE),
         'rate': video.get('rate', '+5%'),
         'pitch': video.get('pitch', '+0Hz'),
         'scenes': [],
@@ -2109,6 +2138,17 @@ def compile_sdl(sdl_data, output_dir, dry_run=False, auto_enrich=True):
             'end': round(scene_starts[i] + scene_durations[i], 1),
             'narration': sdata.get('narration', ''),
         })
+
+    # 语速参数按引擎各自的语法落地（与 scene_config_generator 同口径）：
+    # edge/qwen 读 Edge 语法 rate/pitch；elevenlabs 只认 voice_settings.speed。
+    # 不产出"声明了却不生效"的键——每次加载都会告警，且作者会误以为语速已生效。
+    if config['tts_engine'] == 'elevenlabs':
+        _m = re.match(r'^([+-]?\d+(?:\.\d+)?)%$', str(config.get('rate', '')).strip())
+        if _m:
+            config['eleven_voice_settings'] = {
+                "speed": round(1.0 + float(_m.group(1)) / 100.0, 4)}
+        config.pop('rate', None)
+        config.pop('pitch', None)
 
     if dry_run:
         print(f'  [DRY RUN] validation passed')

@@ -90,7 +90,17 @@ _load_env_files()
 #   - "edge"：Edge-TTS（旧默认，无需 Key，仅存量项目显式声明保留）
 # 引擎不自动 fallback — AGENTS.md 明令禁止跨引擎自动降级（造成音色不一致）。
 TTS_ENGINE = DEFAULT_TTS_ENGINE
-VOICE = "longanling_v3"       # engine=qwen 时的缺省音色：龙安灵V3（思维灵动女，cosyvoice-v3-flash）
+# 缺省音色必须与缺省引擎配套（2026-11-10 用户裁定切 ElevenLabs 主引擎后同步）：
+# 缺省引擎是 elevenlabs，缺省音色却仍是 qwen 的 longanling_v3 —— 两者错配。
+# 后果不是"音色不好听"，而是**直接报错退出**：elevenlabs 分支的一致性门禁见到
+# 非 voice_id 的音色即 sys.exit(1)——未声明 voice 的项目连跑都跑不起来。
+# 缺省音色按缺省引擎派生，换引擎只需改 _script_env 一处（单一权威源）。
+_VOICE_BY_ENGINE = {
+    'elevenlabs': "xQsp9uyB3OResmXFYuFx",   # Arthur（技术讲解主音色，voice_id）
+    'qwen': "longanling_v3",                # 龙安灵V3（思维灵动女，cosyvoice-v3-flash）
+    'edge': "zh-CN-YunxiNeural",
+}
+VOICE = _VOICE_BY_ENGINE.get(TTS_ENGINE, _VOICE_BY_ENGINE['qwen'])
 # QWEN_MODEL 留空 = 按音色自动推断（_infer_qwen_model）；config 显式声明 qwen_model 为权威。
 # 2026-08-06 实测：v3 系列走标准 dashscope 端点即可（旧注释"需专属域名"不成立）。
 QWEN_MODEL = ""

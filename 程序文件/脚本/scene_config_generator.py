@@ -54,13 +54,67 @@ SCRIPTS = ROOT / "程序文件" / "脚本"
 TEMP_BASE = ROOT / "过程产物" / "临时产物"
 SAMPLE_RATE = 44100
 
-# Default voice parameters (aligned with enhance_video_audio.py — Qwen 主引擎)
-# 旧默认 zh-CN-YunxiNeural 属 Edge-TTS，与全仓 TTS 引擎纪律不符（AGENTS.md）。
-DEFAULT_VOICE = "longanling_v3"
+# Default voice parameters — 缺省与全仓 TTS 缺省同源（_script_env.DEFAULT_TTS_ENGINE）。
+# 旧默认 zh-CN-YunxiNeural 属 Edge-TTS，与全仓 TTS 引擎纪律不符（AGENTS.md）；
+# 再改为 longanling_v3（qwen 音色）同样与缺省引擎脱节：生成器按音色反推引擎，
+# 而 _script_env 的缺省引擎已是 elevenlabs（2026-11-07 用户裁定），
+# 于是"缺省音色 → 缺省引擎"这条唯一无歧义的路径被生成器自己掐断。
+# 缺省音色改为按缺省引擎派生，两个缺省永远配套，换引擎只需改 _script_env 一处。
+from _script_env import DEFAULT_TTS_ENGINE
+
+# ElevenLabs voice_id 形态：16 位以上字母数字（与 enhance_video_audio 的门禁同判据）
+_ELEVEN_VOICE_RE = re.compile(r'^[A-Za-z0-9]{16,}$')
+_EDGE_VOICE_RE = re.compile(r'^[a-z]{2}-[A-Z]{2}-\w+Neural$')
+
+# 各引擎的缺省音色（与 enhance_video_audio 的缺省一致）
+_VOICE_BY_ENGINE = {
+    # ElevenLabs 主音色 Arthur（清晰讲解男声，2026-11-07 用户逐条听感选定）
+    'elevenlabs': "xQsp9uyB3OResmXFYuFx",
+    # qwen 缺省：龙安灵V3（思维灵动女，cosyvoice-v3-flash）
+    'qwen': "longanling_v3",
+    # edge 缺省：云希（存量兼容用）
+    'edge': "zh-CN-YunxiNeural",
+}
+DEFAULT_VOICE = _VOICE_BY_ENGINE.get(DEFAULT_TTS_ENGINE, _VOICE_BY_ENGINE['qwen'])
 DEFAULT_RATE = "+5%"
 DEFAULT_PITCH = "+0Hz"
 
-_EDGE_VOICE_RE = re.compile(r'^[a-z]{2}-[A-Z]{2}-\w+Neural$')
+
+def resolve_engine(voice):
+    """由音色形态反推引擎——不再写死 edge/qwen 二分，也不用"缺省引擎"兜底。
+
+    判定纯按音色形态（音色是唯一可判据的输入）：
+      1. Edge 音色格式（zh-CN-*Neural）→ edge（存量兼容，唯一保留的 edge 入口）
+      2. ElevenLabs voice_id 形态（16 位以上字母数字）→ elevenlabs
+      3. 其余（qwen 音色名如 longanling_v3）→ qwen
+
+    不用缺省引擎兜底：qwen 音色名落到 elevenlabs 会被上游拒（404：该音色不在
+    本工作区），拿一个必然失败的组合当兜底毫无意义。缺省引擎与缺省音色的配套
+    关系由 DEFAULT_VOICE 按引擎派生保证。
+    """
+    v = (voice or '').strip()
+    if _EDGE_VOICE_RE.match(v):
+        return 'edge'
+    if _ELEVEN_VOICE_RE.match(v):
+        return 'elevenlabs'
+    return 'qwen'
+
+
+def _rate_to_speed(rate):
+    """把 Edge 语速语法（"+5%"）翻译成 ElevenLabs 的 speed 标度（1.05）。
+
+    rate 是 Edge 语法，ElevenLabs 只认 voice_settings.speed；直接照搬 rate 会让
+    生成器产出的 config 带着一个不生效的键（enhance 侧会告警）。此函数只做
+    语义翻译，不新增第二套语速定义：+N% ↔ speed=1+N/100。
+    解析不了的 rate 返回 None（调用方保留原值并让 enhance 侧出声，不静默改写）。
+    """
+    s = (rate or '').strip()
+    if not s:
+        return None
+    m = re.match(r'^([+-]?\d+(?:\.\d+)?)%$', s)
+    if not m:
+        return None
+    return round(1.0 + float(m.group(1)) / 100.0, 4)
 
 
 def get_duration(filepath):
@@ -72,21 +126,29 @@ def get_duration(filepath):
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
-def tts_cache_key(text, voice, rate, pitch):
-    """Compute short hash from narration text + voice params for cache keying."""
+def tts_cache_key(text, voice, rate, pitch, engine=None):
+    """Compute short hash from narration text + voice params for cache keying.
+
+    引擎进键：切换引擎后旧音频不得被当成新引擎的产物复用（同一项目部分重渲
+    会造成场次间音色不一致）。engine 缺省时按音色反推，与实际合成同一条判定
+    （resolve_engine），避免"合成用 A 引擎、缓存键算 B 引擎"这类错配。
+    """
     normalized = re.sub(r'\s+', '', text.strip())
-    cache_input = f"{normalized}|{voice}|{rate}|{pitch}"
+    eng = engine or resolve_engine(voice)
+    cache_input = f"{normalized}|{eng}|{voice}|{rate}|{pitch}"
     return hashlib.sha256(cache_input.encode('utf-8')).hexdigest()[:10]
 
 
 async def generate_tts(text, output_path, voice, rate, pitch):
     """复用 enhance_video_audio 的统一合成实现（单一权威源：重试/门禁/缓存逻辑不双写）。
 
-    引擎按音色格式判定：zh-CN-*Neural → edge（存量兼容），其余 → qwen。
+    引擎按音色形态反推（resolve_engine）：Edge 格式 → edge，voice_id 格式 → elevenlabs，
+    其余 → qwen。合成与产出的 config 必须同引擎，否则窗口按 qwen 时长算、实际却用
+    elevenlabs 音频渲染 —— 音画错位。
     """
     import enhance_video_audio as eva
     eva.VOICE, eva.RATE, eva.PITCH = voice, rate, pitch
-    eva.TTS_ENGINE = 'edge' if _EDGE_VOICE_RE.match(voice or '') else 'qwen'
+    eva.TTS_ENGINE = resolve_engine(voice)
     eva.QWEN_MODEL = ''  # 由 _qwen_tts 内部按音色推断
     await eva.generate_tts(text, output_path)
 
@@ -127,7 +189,7 @@ async def generate_all_tts(narrations, voice, rate, pitch, temp_dir):
 
     for i, text in enumerate(narrations):
         scene_id = i + 1
-        h = tts_cache_key(text, voice, rate, pitch)
+        h = tts_cache_key(text, voice, rate, pitch, engine=resolve_engine(voice))
         hq_file = tts_dir / f"tts_{h}_hq.wav"
 
         if hq_file.exists():
@@ -208,11 +270,9 @@ def build_config(narrations, tts_results, voice, rate, pitch,
 
     config = {
         "video_duration": total_duration,
-        # 显式声明引擎，与实际合成所用引擎一致（按音色格式判定，同 generate_tts）
-        "tts_engine": "edge" if _EDGE_VOICE_RE.match(voice or '') else "qwen",
+        # 显式声明引擎，与实际合成所用引擎一致（按音色形态判定，同 resolve_engine）
+        "tts_engine": resolve_engine(voice),
         "voice": voice,
-        "rate": rate,
-        "pitch": pitch,
         "cover_duration": cover_duration,
         "scenes": scenes,
         "paths": {
@@ -222,6 +282,18 @@ def build_config(narrations, tts_results, voice, rate, pitch,
             "html_project": html_project
         }
     }
+
+    # 语速参数按引擎各自的语法落地（不产出"声明了却不生效"的键）：
+    #   edge/qwen 读 Edge 语法 rate/pitch；elevenlabs 只认 voice_settings.speed。
+    engine = config["tts_engine"]
+    if engine == 'elevenlabs':
+        _speed = _rate_to_speed(rate)
+        if _speed is not None:
+            config["eleven_voice_settings"] = {"speed": _speed}
+        # rate/pitch 不写进 config：ElevenLabs 不读，写了只会每次加载都告警
+    else:
+        config["rate"] = rate
+        config["pitch"] = pitch
 
     return config, margin
 

@@ -220,13 +220,19 @@ python 程序文件/脚本/render_env_sentinel.py --check-render-env       # 现
 
 ### API Key 配置（可选）
 
-如需使用 qwen（CosyVoice）TTS，将真实 Key 写入 `程序文件/配置/openmontage.env.local`（已被 `.gitignore` 保护，**切勿**写入 `openmontage.env` 提交入库）：
+**主引擎是 ElevenLabs**（2026-11-10 用户裁定）。将真实 Key 写入 `程序文件/配置/openmontage.env.local`（已被 `.gitignore` 保护，**切勿**写入 `openmontage.env` 提交入库）：
+
+```
+ELEVENLABS_API_KEY=<ElevenLabs 控制台获取的 API Key>
+```
+
+存量项目若继续用 qwen（CosyVoice），另配：
 
 ```
 DASHSCOPE_API_KEY=<阿里云百炼控制台获取的 API Key>
 ```
 
-不配置 Key 时，可在项目 config 显式声明 `"tts_engine": "edge"`，用免费的 Edge-TTS 跑通全流程自检。流水线禁止跨引擎自动降级（音色会不一致），正式交付仍以 qwen（CosyVoice）主引擎为准。
+不配置 Key 时，可在项目 config 显式声明 `"tts_engine": "edge"`，用免费的 Edge-TTS 跑通全流程自检。流水线禁止跨引擎自动降级（音色会不一致），正式交付仍以 **ElevenLabs** 主引擎为准（qwen / edge 仅限存量项目按 config 显式声明保留）。
 
 ## 目录结构
 
