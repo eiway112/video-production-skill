@@ -2613,6 +2613,72 @@ class PipelineRunner:
         for line in pc.format_lines(data):
             print("  " + line)
 
+    def _record_vacuum_head(self, entry: Dict[str, Any]) -> None:
+        """场头读数留痕唯一写盘点（OBSERVED/UNTESTED 均写，与 _record_presence 同族）。"""
+        entry.setdefault("at", datetime.now().isoformat(timespec="seconds"))
+        self.state.data["vacuum_head_check"] = entry
+        self.state.save()
+
+    def _vacuum_head_note(self) -> None:
+        """全量渲染前跑一次场头低占用观测，只读数不阻断（2026-11-11 复盘批）。
+
+        存在理由：深色底片"场头只有标题、正文 stagger 未起"在裸片上即黑场，终检
+        no_black_frame_with_subtitle 会 FAIL，但那是约 20 分钟渲染之后；既有两条
+        零渲染腿（主模式两点取样 / --boundaries 的"占用恰为 0"）都看不见该形态
+        （实测帧占用 0.0149 非 0）。本面把场头 0~4s 占用前移到渲染前供作者对照入场锚。
+
+        为何不是门禁：占用量无跨项目一致语义（深色底与浅色底在同一 pix_th 下不可比），
+        与 frame_occupancy / choreography_profile 同档；升格前置沿用 2026-10-10 常设裁定。
+
+        指纹面：刻意不进 render 步输入——它不改渲染产物（与 _vacuum_precheck_ok 同理）。
+        """
+        detail: Dict[str, Any] = {"source": "content_vacuum_precheck.py --heads"}
+        script = SCRIPTS / "content_vacuum_precheck.py"
+        html = self.source_dir / "index.html"
+        if not script.exists() or not html.exists():
+            detail.update({"verdict": "UNTESTED", "reason": "script-or-html-missing"})
+            self._record_vacuum_head(detail)
+            print("  [VACUUM-HEAD] UNTESTED — 脚本或 HTML 不在位，本读数未执行（不得读成已验证）")
+            return
+        r = None
+        # 超时上限 900s：13 场 × 9 帧 = 117 次 Chrome 截图，实测空闲约 1 分钟、
+        # 与另一条线的全量渲染并发时超过 300s（旧上限在此判 UNTESTED，读数白丢）。
+        try:
+            r = subprocess.run(
+                [str(VENV_PYTHON), str(script), str(html), "--heads", "--json"],
+                cwd=str(SCRIPTS), env=self.env, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=900)
+            data = json.loads(r.stdout[r.stdout.index("{"):])
+        except subprocess.TimeoutExpired:
+            detail.update({"verdict": "UNTESTED",
+                           "reason": "head-probe-timeout: 场头采样超过 900s 未返回"
+                                     "（机器并发负载下截图变慢；本读数未执行）"})
+            self._record_vacuum_head(detail)
+            print("  [VACUUM-HEAD] UNTESTED — %s（不阻断，不得读成已验证）"
+                  % detail["reason"])
+            return
+        except Exception as e:  # noqa: BLE001
+            # 断链原因须点名断在哪条腿：只报解析异常会把真实 stderr 顶替掉
+            tail = ((r.stderr or "").strip().splitlines() or [""])[-1][:120] if r else ""
+            detail.update({"verdict": "UNTESTED",
+                           "reason": "launch-or-parse-failed: %s | rc=%s | %s"
+                                     % (str(e)[:60], getattr(r, "returncode", "n/a"), tail)})
+            self._record_vacuum_head(detail)
+            print("  [VACUUM-HEAD] UNTESTED — 取数断链：%s（不阻断，不得读成已验证）"
+                  % detail["reason"])
+            return
+        detail.update({"verdict": data.get("status"),
+                       "min_cov_median": data.get("min_cov_median"),
+                       "lowest": data.get("lowest", []),
+                       "latest_rise": data.get("latest_rise", []),
+                       "untested": data.get("untested", [])})
+        if data.get("reason"):
+            detail["reason"] = data["reason"]
+        self._record_vacuum_head(detail)
+        import content_vacuum_precheck as cv
+        for line in cv.format_head_lines(data):
+            print("  " + line)
+
     # ── 技能版本身份（2026-10-10 根因批）────────────────────────────────
     # 存在理由：本仓所有对齐判据（--drift / 发布回执 / 双端点 ls-remote）都住在开发仓，
     # 消费者侧一个都没有——"我用的是哪一版技能"在消费者侧从未被定义，因此"落后"不可见，
@@ -2923,6 +2989,9 @@ class PipelineRunner:
             #    空窗预判量"点亮行占比"，本读数量"该出现的内容到底有没有出现过"——
             #    _修订01 六维审计与终检全绿却 60 处内容不存在，缺的正是这一位点。
             self._presence_note()
+            # ── 场头低占用读数（2026-11-11 复盘批）：深色底"场头只有标题"＝终检
+            #    黑场-字幕重叠的同一形态，前移到渲染前；只读数不阻断。
+            self._vacuum_head_note()
             # ── 渲染中断恢复（P1 整改，prefab 复盘根因5）：全量重渲前备份上一版
             #    render_raw——prefab 两次渲染中止于 87%/53% 后毫无恢复路径，只能
             #    从零再来。备份在手：新渲染失败/中断时可回退基线走 --quick-fix。
@@ -3577,11 +3646,72 @@ class PipelineRunner:
             }
             self.state.save()
         if not allowed:
+            self._quarantine_failed_slot(video_path, result)
             self._fail("postprocess", reason, VERIFY_FAILED)
             return False
         if reason:
             print(f"  [MEDIA-QA] {reason}")
         return True
+
+    def _quarantine_failed_slot(self, video_path, result):
+        """终检 FAIL 时把**无交付背书**的槽位成片移入 temp 隔离区（2026-11-11 复盘批）。
+
+        存在理由（三次实证）：`enhance_video_audio` 在其内部门禁通过后即落槽，而本
+        runner 的 20 项终检在其后跑；终检 FAIL 时槽位已持有该片且无登记背书
+        （r03 `_修订03` 19:29 与 20:25 各一次）。`[ORPHAN-SLOT]` 告警排在 postprocess
+        之后，postprocess 一失败即永不运行 ⇒ 该形态此前没有任何位点处置，用户会在
+        成果目录里把 FAIL 片误认成已交付。本方法只移动、不删除：隔离区在 temp 内、
+        附 manifest 记录来源与实测值，可还原。
+
+        三条边界：①已登记交付的成片一律不动（交付物保护优先于止损）；②登记表
+        **读不动**（corrupt）时不动——空表回退会把已交付读成无背书（A10 同族）；
+        missing（从未登记）则可隔离；③只在裁定为 FAIL 时动，UNTESTED 未放行不动
+        （"没测成"不等于"片坏了"）；移动失败只告警，不改变终检裁定。
+
+        指纹面：本方法住 pipeline_runner（不在任何步骤指纹面）⇒ 零缓存冲击。
+        """
+        path = Path(video_path)
+        if not path.exists() or result.get("verdict") != "FAIL":
+            return
+        _data, status = self._registry_load()
+        if status == self.REGISTRY_CORRUPT:
+            print("  [SLOT-QUARANTINE] 跳过 — 交付登记表读不动，"
+                  "不得把已交付读成无背书（不移动）")
+            return
+        if self._registry_entry(path.name):
+            return
+        dest_dir = self.temp_dir / "_failed_qa"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / path.name
+            if dest.exists():
+                dest = dest_dir / (path.stem + "_"
+                                   + datetime.now().strftime("%H%M%S") + path.suffix)
+            size = path.stat().st_size
+            shutil.move(str(path), str(dest))
+        except OSError as e:
+            print(f"  [SLOT-QUARANTINE] 移动失败（不改变终检裁定）: {e}")
+            return
+        entry = {"from": str(path), "to": str(dest),
+                 "bytes": size,
+                 "verdict": result.get("verdict"),
+                 "errors": result.get("errors", []),
+                 "at": datetime.now().isoformat(timespec="seconds")}
+        manifest = dest_dir / "_quarantine_manifest.json"
+        try:
+            prior = json.loads(manifest.read_text(encoding="utf-8")) \
+                if manifest.exists() else []
+            if not isinstance(prior, list):
+                prior = []
+            prior.append(entry)
+            manifest.write_text(json.dumps(prior, ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+        except OSError as e:
+            print(f"  [SLOT-QUARANTINE] manifest 写入失败（不影响隔离）: {e}")
+        self.state.data["slot_quarantine"] = entry
+        self.state.save()
+        print(f"  [SLOT-QUARANTINE] 终检 FAIL 且无交付背书 → 已移入隔离区 {dest}"
+              "（只移动不删除，还原见 _quarantine_manifest.json）")
 
     def step_delivery(self):
         """交付验收与清理审计（最终交付关卡）。

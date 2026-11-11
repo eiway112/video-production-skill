@@ -839,18 +839,26 @@ def _cue_unconsumed_keys(html_text: str):
     而预检/终检/审计全绿。这类缺陷只能靠人读脚本才发现。
 
     取数口径刻意取宽，宁漏不误报：
-      · 页面存在 `cue(...)` / `cueGlow(...)` 包装消费时，key 是运行期拼接
-        （scene + ':' + word），静态无法逐键判定——有包装就不再逐键报；
+      · **包装消费按结构判，不按函数名判**：CUE-MAP 变量被**非字面量**下标读取
+        （`C[key]`／`C[s+':'+w]`）即说明键在运行期拼接，静态无法逐键判定——
+        有包装就不再逐键报。旧实现钉死 `cue(`／`cueGlow(` 两个名字，于是
+        某交付片的 `cueHi(sel,key,…)`（内部 `C[key]`）认不出来，
+        42 个**活声明**被报成死声明并建议"删除声明比留着更清楚"——照做即删掉
+        正在生效的词级 cue。名字是开放集合，结构不是（2026-11-11 复盘批）。
+      · 变量名从块内 `var X = {` 取，不硬编码 `C`（写入侧单源在 `cue_resolve`）。
       · 没有 CUE-MAP 块（首次项目，timeline 尚未写入）时无从判定，返回空。
     """
     m = re.search(r'CUE-MAP-START([\s\S]*?)CUE-MAP-END', html_text)
     if not m:
         return [], False, False
-    keys = re.findall(r'"([^"]+)"\s*:', m.group(1))
-    has_wrapper = bool(re.search(r'\b(?:cue|cueGlow)\s*\(', html_text))
+    block = m.group(1)
+    keys = re.findall(r'"([^"]+)"\s*:', block)
+    vm = re.search(r'(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\{', block)
+    esc = re.escape(vm.group(1) if vm else 'C')
+    has_wrapper = bool(re.search(r'\b' + esc + r'\[\s*(?![\'"])', html_text))
     if has_wrapper:
         return [], True, True
-    literal = set(re.findall(r'C\[\s*["\']([^"\']+)["\']\s*\]', html_text))
+    literal = set(re.findall(esc + r'\[\s*["\']([^"\']+)["\']\s*\]', html_text))
     return [k for k in keys if k not in literal], False, True
 
 
@@ -945,7 +953,7 @@ def check_cue_declarations(html_path: Path, cfg: dict, r: PreflightResult):
             _unconsumed, _wrapper, _has_map = [], False, False
         if _has_map and not _wrapper and _unconsumed:
             r.warn(f"cue 消费面：CUE-MAP 有 {len(_unconsumed)} 个键在脚本里没有字面引用"
-                   f"（页面也没有 cue()/cueGlow() 包装消费）-> "
+                   f"（也没有按变量下标读该 map 的包装函数）-> "
                    + ", ".join(_unconsumed[:6])
                    + ("…" if len(_unconsumed) > 6 else "")
                    + "。只报不拦；若该 cue 本就不需要动画，删除声明比留着更清楚",
@@ -2164,6 +2172,103 @@ def check_scene_insert(html_path: Path, r: PreflightResult):
              check_id="scene_insert")
 
 
+VISUAL_FORMS = ("cover", "cards", "flow", "stack", "cycle", "bars",
+                "counters", "split", "text")
+
+
+def check_visual_form(html_path: Path, cfg: dict, config_path, r: PreflightResult):
+    """[7f] 承载形态声明闭环（**只 WARN 不阻断**，2026-11-11 复盘批）。
+
+    存在理由（两次同一反馈，不是审美偏好）：2026-10-17 与 2026-11-11 用户先后点名
+    "画面缺乏流程图等结构化表达"。第一次整改只写了形态库文档（HTML 基准 §4.8），
+    未改默认骨架、未加填写位、未加声明-产出对撞，24 天后原样复发：复发片 11 个内容场
+    8 场是卡片阵列，分镜声明的"循环图/计数器跳数"在 HTML 里分别是卡片与静态数字。
+    本检查把**声明**（narration.json 逐场 `visual_form`，单一权威源）与**自报**
+    （场景 div `data-form`）对撞，缺任一侧或两侧不一致即点名；并给出卡片阵列场占比。
+
+    刻意 WARN 而非 ERROR：形态属观感取向（2026-10-10 常设裁定不为观感新增门禁），
+    且存量项目无该字段，ERROR 会当场判红全部既有交付。占比只描述不裁定——
+    与 frame_occupancy／choreography_profile 同一取舍。
+    """
+    print("\n[7f] Visual form declaration (narration visual_form ↔ data-form)")
+    try:
+        content = html_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        r.warn(f"承载形态核对取数断链：HTML 读不回（{e}）——不得读成已核对",
+               check_id="visual_form")
+        return
+    try:
+        import cue_resolve as _cr
+    except ImportError as e:
+        r.warn(f"承载形态核对取数断链：cue_resolve 模块取不回（{e}）——场景 id 归一无单源，"
+               f"不得读成已核对", check_id="visual_form")
+        return
+    echoed, is_cover = {}, set()
+    for m in re.finditer(r'<div\b([^>]*?)>', content):
+        attrs = m.group(1)
+        sid = re.search(r'data-scene-id="(s\d+)"', attrs)
+        if not sid:
+            continue
+        key = _cr.normalize_scene_id(sid.group(1))
+        fm = re.search(r'data-form="([^"]*)"', attrs)
+        echoed[key] = fm.group(1) if fm else None
+        if re.search(r'data-scene-entry="cover"', attrs):
+            is_cover.add(key)
+    try:
+        scenes, _src = _script_env.resolve_narration_scenes(cfg or {}, config_path)
+    except RuntimeError as e:
+        r.warn(f"承载形态核对取数断链：narration 指针解析失败（{str(e)[:120]}）",
+               check_id="visual_form")
+        scenes = None
+    declared = {}
+    if scenes:
+        for s in scenes:
+            declared[_cr.normalize_scene_id(s.get("scene_id"))] = s.get("visual_form")
+    if scenes is None and not echoed:
+        r.warn("承载形态核对取数断链：narration 与 HTML 两侧都取不到——不得读成已核对",
+               check_id="visual_form")
+        return
+
+    problems, census = [], {}
+    # narration 的 scene_id 可以是数字（0 基或 1 基），HTML 写 sN——两侧都归一后才对得上
+    def _order(k):
+        return (0, int(k)) if k.isdigit() else (1, k)
+
+    for sid in sorted(set(declared) | set(echoed), key=_order):
+        label = f"s{sid}" if sid else "<无 scene_id>"
+        d, e = declared.get(sid), echoed.get(sid)
+        if sid in is_cover or d == "cover" or e == "cover":
+            continue
+        if d is None and e is None:
+            problems.append(f"{label} 两侧都未声明承载形态（分镜阶段须先答\"这场画的是什么形\"）")
+            continue
+        elif d is None:
+            problems.append(f"{label} HTML 自报 {e} 但 narration 无 visual_form（声明面缺位）")
+        elif e is None:
+            problems.append(f"{label} narration 声明 {d} 但场景 div 无 data-form（产出面未自报）")
+        elif d != e:
+            problems.append(f"{label} 声明 {d} ≠ 自报 {e}（分镜写的形与画出来的形不一致）")
+        for v in (d, e):
+            if v is not None and v not in VISUAL_FORMS:
+                problems.append(f"{label} 形态名 {v} 不在合法集 {VISUAL_FORMS}")
+        census[e or d] = census.get(e or d, 0) + 1
+    for p in problems:
+        r.warn(p, check_id="visual_form")
+    n_content = sum(census.values())
+    n_cards = census.get("cards", 0)
+    share = round(n_cards / n_content, 3) if n_content else None
+    r.counts["visual_form"] = {"scenes": n_content, "cards": n_cards,
+                               "cards_share": share, "distribution": census,
+                               "problems": len(problems)}
+    dist = "／".join(f"{k}×{v}" for k, v in sorted(census.items())) or "无"
+    if problems:
+        print(f"  [WARN] {len(problems)} 处形态声明缺口；分布 {dist}；卡片阵列占比 {share}")
+    else:
+        r.ok(f"形态声明闭环：{n_content} 场，分布 {dist}，卡片阵列占比 {share}"
+             f"（描述面，不裁定；占比高≠不合格，但须能在分镜审核时说出理由）",
+             check_id="visual_form")
+
+
 def check_design_rules(html_path: Path, r: PreflightResult):
     """Check for known design anti-patterns that cause visual quality issues."""
     print("\n[8/12] Design Rules")
@@ -3126,6 +3231,7 @@ def main():
     check_chapter_bar(html_path, r)
     check_text_punctuation(html_path, r)
     check_scene_insert(html_path, r)
+    check_visual_form(html_path, cfg or pre_cfg, config_path, r)
     check_incremental_eligibility(html_path, cfg or pre_cfg, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)

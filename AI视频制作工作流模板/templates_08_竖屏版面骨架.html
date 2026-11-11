@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<!--
+  竖屏版面骨架 1080×1920（templates_08）
+  ─────────────────────────────────────────────────────────────
+  定位：竖屏（视频号 / 抖音 / 移动端口播）项目的**版面起点**，不是某个片子的成片。
+  消费时机：阶段 C 写 HTML 时，竖屏项目从本文件起步；横屏项目仍走
+            `HyperFrames_HTML模板参考基准.md`（两份不互相覆盖，画幅不同）。
+
+  本骨架解决的两件实测事故（不是审美偏好）：
+    ① 文字塌成竖排。消费者副本已交付件 `Cross-Review交叉评审推广.mp4`（1080×1920）
+       正文被挤成每行 3 字的竖排列，而仓内全部判据（字幕安全区、视觉边界、
+       画面内容终检）都没抓到——它们管"越界"和"空场"，不管"字框过窄"。
+       防范手段：全部尺寸走 `calc(var(--cw) * 比例)`，任何文本容器宽度不得小于
+       `var(--min-cpl) × 当前字号`（**判据侧阈值住 程序文件/配置/config/quality/video_quality_rules.json
+       → text_fit.min_chars_per_line，本变量是同一规则的设计侧实现**；两处数值由回归用例87 G 段
+       锁相等，改阈值须同步改本行）。
+    ② 竖屏字幕压画面。窄屏档 libass 放大约 6 倍、三行字幕实占约 390px，
+       而内容一直铺到画布底部。防范手段：`.subtitle-safe` 在本骨架里是
+       **真实占位的空带**（高度＝字幕带），内容层 `.sc` 的下边界由它顶住，
+       不靠"记得留白"。
+
+  与既有契约的关系（不得偏离）：
+    - `#root` 的 data-width/height/duration/cover-duration、`.scene > .sc + .subtitle-safe`
+      结构、T-block/S-block 单一权威源、封面 scene0 不入 T-block —— 全部沿用
+      `HyperFrames_HTML模板参考基准.md`，本文件只改画幅与版面，不改契约。
+    - GSAP 走**本地真库副本** `gsap.min.js`（CDN 路线已被实测推翻：渲染器
+      Node-fetch 拉 CDN 失败仍会渲出纯色片并记 passed）。
+    - 浅色纸底 + 章级常驻标识 ＝ `分镜设计模板_AI导演模式.md`「常设观感默认」表内
+      两条默认的竖屏落地形态。数值只住那张表与本文件的 CSS 变量，注释不重抄。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>竖屏版面骨架 1080×1920</title>
+<script src="gsap.min.js"></script>
+<style>
+/* ── 尺度系统：一切按画布宽/高推导，换画幅即整体等比，不出现"横屏能看竖屏塌" ── */
+:root{
+  --cw: 1080px;                 /* 画布宽（与 #root data-width 一致） */
+  --ch: 1920px;                 /* 画布高（与 #root data-height 一致） */
+
+  /* 字号档：竖屏靠"少档差、大字号"建立层级，最多 4 档，多一档即噪声 */
+  --fs-num:   calc(var(--cw) * 0.150);   /* 大号数字锚点 */
+  --fs-h1:    calc(var(--cw) * 0.086);   /* 场景主标题 */
+  --fs-body:  calc(var(--cw) * 0.040);   /* 正文/行内说明 */
+  --fs-chip:  calc(var(--cw) * 0.030);   /* 筹码/标签/水印 */
+
+  /* 版心与留白 */
+  --pad-x:    calc(var(--cw) * 0.074);
+  --pad-top:  calc(var(--ch) * 0.070);
+  --gap:      calc(var(--ch) * 0.026);
+
+  /* 常驻层高度 */
+  --chrome-h: calc(var(--ch) * 0.052);
+  --chapter-h: calc(var(--ch) * 0.058);
+
+  /* 字幕安全区＝窄屏档 libass 三行实占（约画布高 20.4%；1920×0.204≈392px）。
+     变量名与写法沿用仓内既有惯例（`--safe-zone-height: <px>`，被 preflight 的
+     check_safe_zone_variable 按正则取数，且 `.subtitle-safe` 引用它）：
+     自造一个新变量名＝该检查项永远 WARN，惯例存在而不被引用属我这侧的缺口。
+     换画幅时只改这一个值（横屏 1080p 项目用 130–140px，见既有项目）。 */
+  --safe-zone-height: 392px;
+
+  /* 防塌陷下限：容器宽 ÷ 字号 不得小于该字数（中文）。判据侧阈值读 config/quality/video_quality_rules.json → text_fit（本变量是设计侧实现，两处数值由用例87 锁相等）。 */
+  --min-cpl: 6;
+
+  /* ── 色板：暖纸底 + 一组低饱和土色 + 唯一强强调色 ──
+     强调色只允许一处职责（划重点/大数字），第二处使用即属噪声 */
+  --paper:  #f6f2e9;
+  --paper-2:#efe8db;
+  --ink:    #0f172a;
+  --ink-2:  #4b5563;
+  --accent: #2f54eb;
+  --n1:#d9a441; --n2:#8fae86; --n3:#c8735a; --n4:#7d93b2; --n5:#4a4458;
+  --night:#2b3247;
+  --line: rgba(15,23,42,.18);
+}
+
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{width:var(--cw);height:var(--ch);background:var(--paper);overflow:hidden;
+  font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;color:var(--ink);}
+#root{position:relative;width:var(--cw);height:var(--ch);overflow:hidden;background:var(--paper);}
+
+/* ── 场景容器（沿用横屏契约，只改画幅） ── */
+.scene{position:absolute;top:0;left:0;width:var(--cw);height:var(--ch);overflow:hidden;}
+.sc{position:absolute;top:var(--pad-top);left:var(--pad-x);right:var(--pad-x);
+     bottom:calc(var(--safe-zone-height) + var(--gap));      /* 下界由字幕带顶住，非手调魔法数 */
+     display:flex;flex-direction:column;gap:var(--gap);
+     overflow:hidden;}   /* 缺这一项时超长文案会溢进字幕带（preflight check_safe_zone 告警项） */
+.subtitle-safe{position:absolute;bottom:0;left:0;width:100%;height:var(--safe-zone-height);
+     pointer-events:none;}   /* 真实占位空带：内容不得进入，字幕由 libass 烧在此带内 */
+
+/* ── 常驻层 1：窗口 chrome（"整片住在一个应用窗口里"是这套风格的容器隐喻） ── */
+.chrome{position:absolute;top:0;left:0;width:100%;height:var(--chrome-h);
+  display:flex;align-items:center;padding:0 var(--pad-x);gap:calc(var(--cw)*0.018);
+  border-bottom:1px solid var(--line);z-index:900;pointer-events:none;}
+.chrome .dot{width:calc(var(--cw)*0.022);height:calc(var(--cw)*0.022);border-radius:50%;opacity:.75;}
+.chrome .wm{margin-left:auto;font-size:var(--fs-chip);letter-spacing:.14em;color:var(--ink-2);
+  opacity:.65;white-space:nowrap;}   /* 不换行：chrome 是单行带，折行即压到场景标题上沿 */
+
+/* ── 常驻层 2：章级标识
+   落位：住在 chrome 行内、靠左，与右侧水印同行分列（各占一侧＝互不遮挡的唯一免费解；
+   曾试"chrome 下方左置"，实测与场景主标题同一带、直接压字）。
+   自带浅色托板（pill）：夜景档下章级文字仍是深色，而常驻层在所有场景之外、拿不到
+   `.ns` 场景作用域，靠"根级 class 反推颜色"又破坏 seek 一致性 —— 托板让它在昼/夜两档
+   都可读，且不引入任何 class 变更。
+   形态约束：每章一个**预建的叠放 item**，切换只用 opacity —— 不用 tl.call 改 textContent。
+   理由：预览器与留白预判器都靠 `tl.seek()` 取帧，seek 回退时 call 回调不重放，
+   截图上的章名会是上一拍的（＝人眼看到的和判据看到的不是同一张画面）。 */
+.chrome .chapter{position:relative;flex:0 0 auto;width:calc(var(--cw) * 0.46);
+  height:100%;margin-left:calc(var(--cw)*0.020);}
+.chrome .item{position:absolute;left:0;top:50%;transform:translateY(-50%);
+  display:flex;align-items:center;gap:calc(var(--cw)*0.016);opacity:0;white-space:nowrap;
+  padding:calc(var(--ch)*0.004) calc(var(--cw)*0.020);border-radius:99px;
+  background:rgba(255,255,255,.72);border:1px solid var(--line);}
+.chapter .no{font-size:var(--fs-chip);font-weight:800;color:var(--accent);letter-spacing:.06em;}
+.chapter .nm{font-size:var(--fs-chip);font-weight:600;color:var(--ink);}
+.chapter .ticks{display:flex;gap:calc(var(--cw)*0.010);}
+.chapter .tk{width:calc(var(--cw)*0.036);height:calc(var(--cw)*0.009);border-radius:99px;
+  background:var(--line);}
+.chapter .tk.on{background:var(--accent);}
+
+/* ── 常驻层 3：真人口播 inset（人味不靠切全屏镜头，靠一枚常驻小窗） ── */
+.speaker{position:absolute;right:var(--pad-x);bottom:calc(var(--safe-zone-height) + var(--gap));
+  width:calc(var(--cw) * 0.30);aspect-ratio:3/4;border-radius:calc(var(--cw)*0.030);
+  overflow:hidden;border:2px solid rgba(15,23,42,.10);background:var(--paper-2);z-index:880;
+  opacity:0;}                     /* 不用时留在原位但不可见：入场/退场同样只走 opacity */
+.speaker .ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+  font-size:var(--fs-chip);color:var(--ink-2);}
+
+/* ── 文本容器：全部 min-width 而非固定 width（防塌第一原则） ── */
+.h1{font-size:var(--fs-h1);font-weight:900;line-height:1.18;letter-spacing:-0.01em;}
+.h1 .sub{display:block;font-size:var(--fs-body);font-weight:600;color:var(--ink-2);
+  letter-spacing:0;margin-top:calc(var(--ch)*0.010);}
+.lead{font-size:var(--fs-body);line-height:1.55;color:var(--ink-2);max-width:100%;}
+
+/* 马克笔划重点：斜切色块压在字下，不用整行底色 */
+.marker{position:relative;display:inline-block;padding:0 calc(var(--cw)*0.016);}
+.marker::before{content:"";position:absolute;left:0;right:0;bottom:calc(var(--ch)*0.004);
+  height:calc(var(--ch)*0.028);background:var(--accent);opacity:.22;transform:skewX(-9deg);
+  border-radius:calc(var(--cw)*0.006);}
+.marker > span{position:relative;}
+
+/* ① 输入行堆叠（"五层架构"那类：编号筹码 + 名 + 问句，逐行入场、当前行高亮） */
+.rowfield{display:flex;flex-direction:column;gap:calc(var(--gap)*0.55);}
+.rf-row{display:flex;align-items:center;gap:calc(var(--cw)*0.022);
+  min-height:calc(var(--ch)*0.072);padding:0 calc(var(--cw)*0.026);
+  background:#fff;border:1px solid var(--line);border-radius:calc(var(--cw)*0.014);
+  box-shadow:0 2px 0 rgba(15,23,42,.05);}
+.rf-row .chip{flex:0 0 auto;font-size:var(--fs-chip);font-weight:800;color:var(--ink);
+  background:var(--paper-2);border:1px solid var(--line);
+  padding:calc(var(--ch)*0.004) calc(var(--cw)*0.020);border-radius:99px;white-space:nowrap;}
+.rf-row .nm{flex:0 0 auto;font-size:var(--fs-body);font-weight:800;white-space:nowrap;}
+.rf-row .q{flex:1 1 auto;font-size:var(--fs-body);color:var(--ink-2);
+  text-align:right;min-width:calc(var(--min-cpl) * var(--fs-body));}  /* ← 防塌下限 */
+.rf-row.on{background:#e7ecff;border-color:var(--accent);}
+.rf-row.on .chip{background:var(--accent);color:#fff;border-color:var(--accent);}
+
+/* ② 筹码组（标签云/流程节点名，允许换行但不允许被压成竖排） */
+.chips{display:flex;flex-wrap:wrap;gap:calc(var(--cw)*0.018);}
+.chip-s{font-size:var(--fs-chip);font-weight:700;padding:calc(var(--ch)*0.006) calc(var(--cw)*0.024);
+  border-radius:99px;border:1px solid var(--line);background:#fff;white-space:nowrap;}
+
+/* ③ 进度药丸轨（流水线/异常点：一串状态位，红点即例外，视觉上一眼数得清） */
+.pilltrack{display:flex;align-items:center;gap:calc(var(--cw)*0.018);
+  padding:calc(var(--ch)*0.012) calc(var(--cw)*0.024);background:#fff;
+  border:1px solid var(--line);border-radius:99px;}
+.pk{flex:1 1 0;min-width:calc(var(--cw)*0.052);aspect-ratio:1/1;border-radius:50%;
+  background:var(--n2);opacity:.85;}
+.pk.bad{background:var(--n3);box-shadow:0 0 0 calc(var(--cw)*0.010) rgba(200,115,90,.22);}
+.bell{font-size:var(--fs-body);text-align:center;color:var(--n1);}
+
+/* ④ 卡片堆（并列要点，竖屏最多 2 列，3 列即每列 6 字以下＝塌陷边缘） */
+.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:calc(var(--gap)*0.6);}
+.card{background:#fff;border:1px solid var(--line);border-radius:calc(var(--cw)*0.016);
+  padding:calc(var(--ch)*0.016) calc(var(--cw)*0.024);display:flex;flex-direction:column;gap:calc(var(--ch)*0.006);}
+.card .t{font-size:var(--fs-body);font-weight:800;}
+.card .d{font-size:var(--fs-chip);color:var(--ink-2);line-height:1.5;}
+
+/* ⑤ 大号数字锚点（每拍一个，层级靠它建立；同时只允许一个） */
+.bignum{display:flex;align-items:baseline;gap:calc(var(--cw)*0.020);}
+.bignum .v{font-size:var(--fs-num);font-weight:900;line-height:.92;color:var(--accent);
+  font-variant-numeric:tabular-nums;}
+.bignum .u{font-size:var(--fs-h1);font-weight:900;}
+
+/* ⑥ 手绘层（连线/箭头/圈注）：SVG 描边动画，stroke-dasharray 由 JS 逐条收。
+   两类用法分开：`.doodle` 是**覆盖层**（absolute，画装饰连线，不占版面）；
+   `.figure` 是**在流内的主图**（网络图/漏斗等承载内容的图形）。
+   混用的后果实测过：主图挂 .doodle 会被 inset:0 拉成整屏覆盖层，viewBox 按 meet
+   适配后缩到画面中部一小块，下方留大片空——留白判据（content_vacuum）会抓到，
+   但预览阶段就该是对的形状。 */
+.doodle{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+/* 连接件（把 A 指到 B 的箭头/弧线）**必须在流内**，不得用 .doodle 覆盖层画：
+   覆盖层按画布硬坐标绘制，而它要连的两个元素落在哪，由字号、字数、换行与 flex 共同决定，
+   两者互不知情——本骨架第一版实测就是这条弧直接穿过"旁注"框（用户 2026-10-12 验收指出）。
+   流内连接件的位置由版面给，改字号/改文案都不会失配；`.doodle` 只留给不指向任何内容
+   位置的纯装饰笔触（背景斜线、角标圈点）。 */
+.connector{display:block;width:min(100%, calc(var(--cw) * 0.52));
+  height:calc(var(--ch) * 0.052);flex:0 0 auto;}
+.connector path{fill:none;stroke:var(--ink);stroke-width:3;stroke-linecap:round;opacity:.68;}
+.figure{display:block;width:100%;flex:1 1 auto;min-height:0;pointer-events:none;}
+.doodle path,.doodle line,.doodle circle,.figure path,.figure line,.figure circle{
+  fill:none;stroke:var(--ink);stroke-width:3;stroke-linecap:round;opacity:.7;}
+.node{fill:var(--n1);stroke:none;opacity:.9;}
+
+/* ⑦ 便签批注（红字旁注，一屏最多一处） */
+.note{align-self:flex-start;font-size:var(--fs-chip);color:var(--n3);font-weight:700;
+  border:1px dashed var(--n3);border-radius:calc(var(--cw)*0.012);
+  padding:calc(var(--ch)*0.006) calc(var(--cw)*0.020);background:rgba(200,115,90,.06);}
+
+/* ⑧ 上下文翻转装置（转场不靠切镜头，靠同一批对象换背景状态）
+   实现约束：夜色是一层 **opacity 驱动的遮罩**，不是给 #root 挂 class——同章级标识的理由，
+   class 变更在 seek 回退时不重放，预览帧与真实帧会不是同一张画面。夜景内的文字色由该场
+   自带 `.ns` 作用域给，不靠根级状态反推（反推即"状态在场"的另一处写法）。 */
+#night-veil{position:absolute;inset:0;background:var(--night);opacity:0;z-index:0;
+  pointer-events:none;}
+.ns .h1,.ns .bignum .u{color:#f4f1ea;}
+.ns .lead{color:#c8cede;}
+.ns .rf-row{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.18);}
+.ns .rf-row .nm{color:#f4f1ea;}
+.ns .rf-row .q{color:#c8cede;}
+.ns .rf-row .chip{background:rgba(255,255,255,.12);color:#f4f1ea;
+  border-color:rgba(255,255,255,.22);}
+.stars{position:absolute;inset:0;opacity:0;pointer-events:none;z-index:1;}
+.star{position:absolute;width:5px;height:5px;border-radius:50%;background:#fff;}
+
+/* 通用入场初态（编译器同款约定：待揭示元素初始 opacity:0） */
+.rv{opacity:0;}
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="main" data-width="1080" data-height="1920"
+     data-start="0" data-duration="74" data-cover-duration="3">
+
+  <!-- ═══ 常驻层（不属于任何场景，跨拍在场） ═══
+       层序即职责序：夜色遮罩(0) < 星点(1) < 场景(1..5，各自带纸底) < 口播窗(880) < chrome/章级(900)。
+       夜景场（scene4）背景设 transparent，故星点与夜色从它身后透出；其余场景自带不透明纸底。 -->
+  <div id="night-veil"></div>
+  <div class="stars" id="stars"></div>
+  <div class="chrome">
+    <i class="dot" style="background:#ff5f57"></i>
+    <i class="dot" style="background:#febc2e"></i>
+    <i class="dot" style="background:#28c840"></i>
+    <div class="chapter" id="chapter"><!-- 每章一个 item，载入时按 CHAPTERS 建好，时间轴只切 opacity --></div>
+    <span class="wm">示例 / 竖屏版面骨架</span>
+  </div>
+  <div class="speaker" id="speaker"><div class="ph">真人口播位</div></div>
+
+  <!-- ═══ scene0 封面：不入 T-block，窗口由 data-cover-duration 固定 ═══ -->
+  <div id="scene0" class="scene" data-scene-id="s0" data-scene-entry="cover"
+       data-scene-subtitle-safe="true" style="z-index:999;">
+    <div class="sc" style="justify-content:center;gap:calc(var(--gap)*1.2);">
+      <div class="h1 rv" id="s0-t">示例标题<br><span class="marker"><span>一句话主张</span></span></div>
+      <div class="lead rv" id="s0-l">封面行只放一句钩子，第二行放限定条件；两行以内读完。</div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+
+  <!-- ═══ scene1 输入行堆叠 + 大数字锚点 ═══ -->
+  <div id="scene1" class="scene" data-scene-id="s1" data-scene-entry="gsap"
+       data-scene-subtitle-safe="true" style="z-index:1;opacity:0;background:var(--paper);">
+    <div class="sc">
+      <div class="h1 rv" id="s1-t">五段结构<span class="sub">从上往下，各答一个问题</span></div>
+      <div class="bignum rv" id="s1-b"><span class="v" id="s1-n">0</span><span class="u">段</span></div>
+      <div class="rowfield" id="s1-rf">
+        <div class="rf-row rv"><span class="chip">①</span><span class="nm">总控</span><span class="q">谁来对接？</span></div>
+        <div class="rf-row rv"><span class="chip">②</span><span class="nm">判断</span><span class="q">值不值得做？</span></div>
+        <div class="rf-row rv"><span class="chip">③</span><span class="nm">链路</span><span class="q">用什么跑？</span></div>
+        <div class="rf-row rv"><span class="chip">④</span><span class="nm">生产</span><span class="q">怎么做出来？</span></div>
+        <div class="rf-row rv" id="s1-last"><span class="chip">⑤</span><span class="nm">底座</span><span class="q">谁来兜底？</span></div>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+
+  <!-- ═══ scene2 进度药丸轨（流水线 + 例外点） ═══ -->
+  <div id="scene2" class="scene" data-scene-id="s2" data-scene-entry="gsap"
+       data-scene-subtitle-safe="true" style="z-index:2;opacity:0;background:var(--paper);">
+    <div class="sc" style="justify-content:center;">
+      <div class="h1 rv" id="s2-t">一屏跑到底<span class="sub">只在报错处亮红灯</span></div>
+      <div class="bell rv" id="s2-bell">▲</div>
+      <div class="pilltrack rv" id="s2-pk">
+        <i class="pk"></i><i class="pk"></i><i class="pk"></i>
+        <i class="pk bad"></i><i class="pk"></i><i class="pk"></i><i class="pk"></i>
+      </div>
+      <div class="chips rv" id="s2-cp">
+        <span class="chip-s">执行位 A</span><span class="chip-s">执行位 B</span><span class="chip-s">治理位</span>
+      </div>
+      <!-- 连接件在流内（见 CSS ⑥ 的规则）：它把"治理位"指到下面的旁注，位置随版面走 -->
+      <svg class="connector rv" id="s2-conn" viewBox="0 0 420 96" preserveAspectRatio="xMinYMid meet" aria-hidden="true">
+        <path id="s2-arc" d="M 14 84 C 120 10, 300 10, 400 80"/>
+        <path d="M 400 80 l -20 -4 M 400 80 l -6 -19"/>
+      </svg>
+      <div class="note rv" id="s2-n">旁注：例外只有一处</div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+
+  <!-- ═══ scene3 节点网络（SVG 描边生长） ═══ -->
+  <div id="scene3" class="scene" data-scene-id="s3" data-scene-entry="gsap"
+       data-scene-subtitle-safe="true" style="z-index:3;opacity:0;background:var(--paper);">
+    <div class="sc">
+      <div class="h1 rv" id="s3-t">多点对多点<span class="sub">交接不靠人转述</span></div>
+      <svg class="figure" id="s3-net" viewBox="0 0 1080 1100" preserveAspectRatio="xMidYMid meet">
+        <g id="s3-links">
+          <line x1="540" y1="180" x2="200" y2="520"/><line x1="540" y1="180" x2="540" y2="520"/>
+          <line x1="540" y1="180" x2="880" y2="520"/><line x1="200" y1="520" x2="540" y2="860"/>
+          <line x1="880" y1="520" x2="540" y2="860"/><line x1="540" y1="520" x2="540" y2="860"/>
+        </g>
+        <g id="s3-nodes">
+          <circle class="node" cx="540" cy="180" r="34" style="fill:var(--n5)"/>
+          <circle class="node" cx="200" cy="520" r="30" style="fill:var(--n1)"/>
+          <circle class="node" cx="540" cy="520" r="30" style="fill:var(--n2)"/>
+          <circle class="node" cx="880" cy="520" r="30" style="fill:var(--n4)"/>
+          <circle class="node" cx="540" cy="860" r="34" style="fill:var(--n3)"/>
+        </g>
+      </svg>
+      <div class="chips rv" id="s3-cp">
+        <span class="chip-s">入口</span><span class="chip-s">分工</span><span class="chip-s">并行</span><span class="chip-s">汇总</span>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+
+  <!-- ═══ scene4 上下文翻转（同一批对象，背景状态由昼转夜） ═══ -->
+  <div id="scene4" class="scene ns" data-scene-id="s4" data-scene-entry="gsap"
+       data-scene-subtitle-safe="true" style="z-index:4;opacity:0;background:transparent;">
+    <div class="sc" style="justify-content:center;">
+      <div class="bignum rv" id="s4-b"><span class="v">7×24</span><span class="u">在线</span></div>
+      <div class="lead rv" id="s4-l">换的是背景状态，不是画面：读者仍知道自己在看同一件事。</div>
+      <div class="rowfield" id="s4-rf">
+        <div class="rf-row"><span class="chip">A</span><span class="nm">在岗</span><span class="q">随时接活</span></div>
+        <div class="rf-row"><span class="chip">B</span><span class="nm">在岗</span><span class="q">随时接活</span></div>
+      </div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+
+  <!-- ═══ scene5 纵向滚动收尾（卡片堆 + 结论行） ═══ -->
+  <div id="scene5" class="scene" data-scene-id="s5" data-scene-entry="gsap"
+       data-scene-subtitle-safe="true" style="z-index:5;opacity:0;background:var(--paper);">
+    <div class="sc">
+      <div class="h1 rv" id="s5-t">两件事先定<span class="sub">其余按序展开</span></div>
+      <div class="cards" id="s5-c">
+        <div class="card"><span class="t">先定边界</span><span class="d">哪些必须人判，哪些可交出去</span></div>
+        <div class="card"><span class="t">再定验收</span><span class="d">交付标准写在开工之前</span></div>
+      </div>
+      <div class="lead rv" id="s5-l">结论行：一句话说清“所以呢”，不复述前文。</div>
+    </div>
+    <div class="subtitle-safe"></div>
+  </div>
+</div>
+
+<script>
+/* ── 单一权威源：场景起点只在 T-block 出现一次（数值由 adjust_timeline 按 TTS 实测改写） ── */
+var T = { s1: 3.0, s2: 14.0, s3: 26.0, s4: 40.0, s5: 52.0 };
+// ── 可选：词级 cue 锚点（说到哪个词，画面哪个才亮）───────────────────────
+// 竖屏片元素密度低、单场判断句少，正是这套锚点收益最高的版面，故骨架在此点名它。
+// 写法＝在场景 div 内给要点亮的元素挂 data-cue-at 属性，值取该场旁白里的原词。
+// 挂上后 timeline 步会按音频实测写出一个 CUE-MAP 定界块（变量 C，勿手改、勿自己填秒数），
+// 其值是「场内相对秒」，故引用一律写成 T.sN + C[键] 这种与 §3.0 同形的拼接。
+// 本骨架刻意不预置任何声明：无声明即零字节动作，从本文件起的新项目默认不受影响。
+// 语法细节、四条边界（词须逐字在旁白里／必须落在带 data-scene-id 的 div 内／同词多次
+// 出现取首次／旧记录缺字符级数据时自动降级句级锚点）、preflight 判据与渲染前自查命令，
+// 一律见 HyperFrames_HTML模板参考基准.md §3.6 —— 本注释不复述判据，只负责让作者知道有这条路。
+// ─────────────────────────────────────────────────────────────────────────
+var S = [
+  {"cover": true, "start": 0, "end": 3, "dur": 3},
+  {"scene_id": "s1", "start": 3.0, "end": 14.0, "dur": 11.0, "type": "content"},
+  {"scene_id": "s2", "start": 14.0, "end": 26.0, "dur": 12.0, "type": "content"},
+  {"scene_id": "s3", "start": 26.0, "end": 40.0, "dur": 14.0, "type": "content"},
+  {"scene_id": "s4", "start": 40.0, "end": 52.0, "dur": 12.0, "type": "content"},
+  {"scene_id": "s5", "start": 52.0, "end": 74.0, "dur": 22.0, "type": "content"}
+];
+
+var tl = gsap.timeline({paused: true});
+
+var CHAPTERS = [
+  {at: T.s1, no: "01", nm: "结构"},
+  {at: T.s2, no: "02", nm: "流水线"},
+  {at: T.s3, no: "03", nm: "协作"},
+  {at: T.s4, no: "04", nm: "在线"},
+  {at: T.s5, no: "05", nm: "先定两件事"}
+];
+
+/* 章级标识：章名与刻度由本章场景驱动（常驻、只用 opacity 切换，不加第三类动画范式）。
+   本段必须在 `tl` 声明之后——`var tl` 提升只带来 undefined，提前调用即整段脚本炸。 */
+(function buildChapter(){
+  var host = document.getElementById('chapter');
+  CHAPTERS.forEach(function (c, i) {
+    var item = document.createElement('div');
+    item.className = 'item'; item.id = 'chitem' + i;
+    var ticks = '';
+    for (var k = 0; k < CHAPTERS.length; k++) {
+      ticks += '<i class="tk' + (k <= i ? ' on' : '') + '"></i>';   /* 刻度走到本章为止 */
+    }
+    item.innerHTML = '<span class="no">' + c.no + '</span>' +
+                     '<span class="nm">' + c.nm + '</span>' +
+                     '<span class="ticks">' + ticks + '</span>';
+    host.appendChild(item);
+    /* 切换＝两枚叠放 item 的 opacity 交接，锚在本章 T 起点；不新增第三类动画范式 */
+    tl.to('#chitem' + i, {opacity: 1, duration: 0.24, ease: 'power1.out'}, c.at + 0.18);
+    if (i > 0) tl.to('#chitem' + (i - 1), {opacity: 0, duration: 0.18}, c.at);
+  });
+})();
+
+/* 星点（夜色档装饰，出生即随机布位，不参与裁定） */
+(function buildStars(){
+  var host = document.getElementById('stars');
+  for (var i = 0; i < 46; i++) {
+    var s = document.createElement('i'); s.className = 'star';
+    s.style.left = (Math.random() * 100) + '%';
+    s.style.top  = (Math.random() * 62) + '%';
+    s.style.opacity = (0.25 + Math.random() * 0.55).toFixed(2);
+    host.appendChild(s);
+  }
+})();
+
+/* 封面：两行入场，2.5s 起收（封面窗口 0–3s 是唯一允许的字面量时间位） */
+tl.fromTo('#s0-t', {y: 46, opacity: 0}, {y: 0, opacity: 1, duration: 0.8, ease: 'power3.out'}, 0.3);
+tl.fromTo('#s0-l', {y: 26, opacity: 0}, {y: 0, opacity: 1, duration: 0.6, ease: 'power2.out'}, 1.0);
+tl.to('#scene0', {opacity: 0, duration: 0.5, ease: 'power2.inOut'}, 2.5);
+
+/* s1：标题 → 大数字 count-up（整数吸附，编译器同款精度约定）→ 五行逐条 → 末行高亮 */
+tl.to('#scene1', {opacity: 1, duration: 0.4}, T.s1);
+tl.fromTo('#s1-t', {y: 40, opacity: 0}, {y: 0, opacity: 1, duration: 0.7, ease: 'power3.out'}, T.s1 + 0.3);
+tl.fromTo('#s1-b', {scale: 0.86, opacity: 0}, {scale: 1, opacity: 1, duration: 0.6, ease: 'back.out(1.6)'}, T.s1 + 1.0);
+(function countUp(){
+  var el = document.getElementById('s1-n'), o = {v: 0};
+  tl.to(o, {v: 5, duration: 1.0, ease: 'power1.out', snap: {v: 1},
+    onUpdate: function () { el.textContent = Math.round(o.v); }}, T.s1 + 1.0);
+})();
+tl.fromTo('#s1-rf .rf-row', {y: 28, opacity: 0}, {y: 0, opacity: 1, duration: 0.5, stagger: 0.55, ease: 'power2.out'}, T.s1 + 2.0);
+tl.to('#s1-last', {backgroundColor: '#e7ecff', borderColor: '#2f54eb', duration: 0.35}, T.s1 + 9.0);
+
+/* s2：标题 → 药丸轨逐位点亮 → 红点脉冲 + 铃 → 筹码 → 旁注 → 手绘弧线描边收
+   每场在下一场起点前退场：叠放场景若不退，透明底的夜景场会从旧纸底上"透出"上一层。 */
+tl.to('#scene1', {opacity: 0, duration: 0.35}, T.s2 - 0.3);
+tl.to('#scene2', {opacity: 1, duration: 0.4}, T.s2);
+tl.fromTo('#s2-t', {y: 40, opacity: 0}, {y: 0, opacity: 1, duration: 0.7, ease: 'power3.out'}, T.s2 + 0.3);
+tl.fromTo('#s2-pk', {y: 26, opacity: 0}, {y: 0, opacity: 1, duration: 0.5}, T.s2 + 1.2);
+tl.fromTo('#s2-pk .pk', {scale: 0.4, opacity: 0}, {scale: 1, opacity: 0.85, duration: 0.28, stagger: 0.22}, T.s2 + 1.6);
+tl.fromTo('#s2-bell', {y: -14, opacity: 0}, {y: 0, opacity: 1, duration: 0.4}, T.s2 + 3.4);
+tl.to('#s2-pk .pk.bad', {scale: 1.18, duration: 0.28, yoyo: true, repeat: 3, ease: 'power2.inOut'}, T.s2 + 3.6);
+tl.fromTo('#s2-cp', {opacity: 0}, {opacity: 1, duration: 0.4}, T.s2 + 5.2);
+tl.fromTo('#s2-n', {opacity: 0, y: 12}, {opacity: 1, y: 0, duration: 0.4}, T.s2 + 6.4);
+tl.fromTo('#s2-conn', {opacity: 0}, {opacity: 1, duration: 0.01}, T.s2 + 6.8);
+tl.fromTo('#s2-arc', {strokeDasharray: 900, strokeDashoffset: 900}, {strokeDashoffset: 0, duration: 1.4, ease: 'power2.inOut'}, T.s2 + 6.8);
+
+/* s3：连线逐条生长 → 节点弹出 → 筹码 */
+tl.to('#scene2', {opacity: 0, duration: 0.35}, T.s3 - 0.3);
+tl.to('#scene3', {opacity: 1, duration: 0.4}, T.s3);
+tl.fromTo('#s3-t', {y: 40, opacity: 0}, {y: 0, opacity: 1, duration: 0.7, ease: 'power3.out'}, T.s3 + 0.3);
+tl.fromTo('#s3-links line', {strokeDasharray: 700, strokeDashoffset: 700},
+  {strokeDashoffset: 0, duration: 0.7, stagger: 0.35, ease: 'power2.inOut'}, T.s3 + 1.2);
+tl.fromTo('#s3-nodes circle', {scale: 0, transformOrigin: 'center', opacity: 0},
+  {scale: 1, opacity: 0.92, duration: 0.4, stagger: 0.3, ease: 'back.out(1.8)'}, T.s3 + 1.6);
+tl.fromTo('#s3-cp', {y: 20, opacity: 0}, {y: 0, opacity: 1, duration: 0.5}, T.s3 + 5.0);
+
+/* s4：上下文翻转——旧场淡出前先让背景状态切换（对象不换、背景换），星点淡入 */
+tl.to('#scene3', {opacity: 0, duration: 0.45}, T.s4 - 0.4);
+tl.to('#night-veil', {opacity: 1, duration: 0.6, ease: 'power1.inOut'}, T.s4 - 0.1);
+tl.fromTo('#stars', {opacity: 0}, {opacity: 1, duration: 0.9}, T.s4 - 0.1);
+tl.to('#scene4', {opacity: 1, duration: 0.45}, T.s4);
+tl.fromTo('#s4-b', {scale: 0.88, opacity: 0}, {scale: 1, opacity: 1, duration: 0.7, ease: 'back.out(1.5)'}, T.s4 + 0.4);
+tl.fromTo('#s4-l', {y: 24, opacity: 0}, {y: 0, opacity: 1, duration: 0.6}, T.s4 + 1.6);
+tl.fromTo('#s4-rf .rf-row', {x: -30, opacity: 0}, {x: 0, opacity: 1, duration: 0.5, stagger: 0.5}, T.s4 + 2.6);
+
+/* s5：纵向滚动换拍（旧内容整体上移出场，新内容从下方逐层落位）+ 真人口播 inset 在场 */
+tl.to('#scene4', {y: -160, opacity: 0, duration: 0.5, ease: 'power2.in'}, T.s5 - 0.3);
+tl.to('#scene3', {opacity: 0, duration: 0.01}, T.s5 - 0.3);   /* 夜景场退出后其身后层不得复现 */
+tl.to('#night-veil', {opacity: 0, duration: 0.5, ease: 'power1.inOut'}, T.s5);
+tl.fromTo('#stars', {opacity: 1}, {opacity: 0, duration: 0.5}, T.s5);
+tl.to('#speaker', {opacity: 1, duration: 0.5, ease: 'power1.out'}, T.s5 + 0.3);
+tl.to('#scene5', {opacity: 1, duration: 0.45}, T.s5 + 0.1);
+tl.fromTo('#s5-t', {y: 46, opacity: 0}, {y: 0, opacity: 1, duration: 0.7, ease: 'power3.out'}, T.s5 + 0.4);
+tl.fromTo('#s5-c .card', {y: 60, opacity: 0}, {y: 0, opacity: 1, duration: 0.6, stagger: 0.6, ease: 'power2.out'}, T.s5 + 1.6);
+tl.fromTo('#s5-l', {y: 24, opacity: 0}, {y: 0, opacity: 1, duration: 0.6}, T.s5 + 4.0);
+
+/* 供预览器 seek：instant_preview / content_vacuum_precheck 以 ?t= 注入后调用 */
+window.__seek = function (t) { tl.pause(t); };
+window.__timeline = tl;
+tl.play();
+</script>
+</body>
+</html>

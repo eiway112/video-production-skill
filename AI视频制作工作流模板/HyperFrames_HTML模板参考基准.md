@@ -31,7 +31,7 @@
 <!-- 封面场景 scene0：z-index:999，确保 t=0 时顶层可见 -->
 <div id="scene0" class="scene" style="z-index:999;">
   <!-- 装饰层 -->
-  <div class="sc" style="align-items:center;justify-content:center;text-align:center;padding-bottom:150px;">
+  <div class="sc" style="align-items:center;justify-content:center;text-align:center;padding-bottom:240px;">
     <!-- 封面内容 -->
   </div>
   <div class="subtitle-safe"></div>
@@ -71,11 +71,11 @@ body { width:1920px; height:1080px; overflow:hidden;
 
 /* 内容容器 */
 .sc { display:flex; flex-direction:column; justify-content:flex-start;
-      width:100%; height:100%; padding:50px 100px 160px; position:relative; }
+      width:100%; height:100%; padding:50px 100px 220px; position:relative; }
 
-/* 字幕安全区 */
+/* 字幕安全区（高度＝预留带，由安全线推导，见 §2.2） */
 .subtitle-safe { position:absolute; bottom:0; left:0; width:100%;
-                 height:140px; z-index:100; pointer-events:none;
+                 height:220px; z-index:100; pointer-events:none;
                  background:linear-gradient(to bottom,
                    rgba(15,23,42,0) 0%,
                    rgba(15,23,42,0.85) 40%,
@@ -86,12 +86,17 @@ body { width:1920px; height:1080px; overflow:hidden;
 
 | 参数 | 推荐值 | 允许范围 | 说明 |
 |------|:---:|:---:|------|
-| subtitle-safe height | 130-140px | 120-150px | 深色主题；浅色主题 120-140px |
-| .sc padding-bottom | 150-160px | 150-170px | ≥ safe-height + 20px |
+| 字幕预留带 | 220px（1080 画布） | 由安全线推导 | **权威源 `visual_boundary_check.subtitle_safety_line`**：1080→y860、1920→y1529，即预留带＝画布高×220/1080。不得反推 |
+| subtitle-safe height | ＝预留带 | 同预留带 | 渐变只是视觉实现；**它的高度不是内容上限的依据**（旧表由它＋20px 推 padding，得出的上限落在安全线之下 60–80px） |
+| .sc padding-bottom | ＝预留带 | ≥预留带 | 内容盒下界即安全线；小于它＝把内容放进字幕带 |
 | .sc padding-top | 50-80px | 50-80px | 封面 50px，内容 60-80px |
 | .sc padding-x | 100-120px | 80-120px | 信息密集取大值 |
 | .sc gap | 28-40px | 24-44px | 元素间距 |
 | 内容 max-width | 1400px | 1200-1760px | 卡片网格可达 1760px |
+
+**内容场 `.sc` 不得写 `justify-content:center`**（封面可以）。居中容器的高度由内容自然高决定，内容少就上下各空一半，"把卡片做大"治不了它。2026-11-11 同口径实测（墨迹盒裁到画布、分母＝主体区 1920×860、每场取 start+0.95×窗长）：某交付片居中版式高度占比中位 **0.513**；只加大卡片 min-height＋两场换图形 ⇒ **0.558**；另一条线全片改绝对定位、逐场把底沿顶到 y779—845 ⇒ **0.897**（最小场 0.762）。差别在**版面坐标系**不在元素大小：顶对齐＋余高由 `flex:1` 的图形区吸收（或 `space-between` 把底沿顶住），高度才由容器决定。可跑起点见 `templates_09_横屏多形态骨架.html`。渲染前读数：`instant_preview.py` 的 `[LAYOUT-FULLNESS]` 行给**主体区填充率**中位与最低三场（描述面、不裁定）；同批三线实测 0.436／0.496／0.786，能区分被投诉片与观感合格片——审核节点第 7 项对照它改版面，而不是等交付后投诉。
+
+**深色底项目：场头 1.0s 内必须有正文墨迹**（左上标题不算）。2026-11-11 实测：某深色底候选片每个场起点后 0.5–3.2s 只有标题、正文 stagger 尚未起，`blackdetect`（pix_th 0.10）在**裸片**上量出 7 段暗场（最长 2.56s），其中一段与字幕重叠 1.7s＞终检阈 1.0s ⇒ `no_black_frame_with_subtitle` FAIL，三轮全量渲染各约 20 分钟才暴露。深色底（亮度低于 pix_th 的 25.5）上"没有亮内容"即被判黑——与浅色底的"留白"是同一形态的两个名字。修法在**入场锚**：首条正文 tween 锚到 `T.sN+0.2` 以内，或让上一场正文保留到本场正文起（跨场保留须按转场判据，不得双曝）。机算面现状：终检 FAIL 在渲染**后**；渲染前的 `content_vacuum_precheck` 两点取样覆盖不到场头，前移判据（场头低占用带）属下一批，本条先作撰写侧约束。
 
 ### 2.3 组件样式库
 
@@ -178,6 +183,8 @@ tl.fromTo("#s2-title", {...}, {...}, 26.1);         // ❌ 绝对数字
 ```
 
 **为什么必须是引用**：`adjust_timeline.py` 在存在 T-block 时只改写 `var T = {...};` 这一个块（`adjust_t_block`，`adjust_timeline.py:679-684`），并**短路**逐行正则兜底路径。写成绝对数字的时间位因此不随场景窗口位移，与引用系分叉。
+
+**禁止手写第二份场景 end/duration 映射**（2026-11-11 复盘登记）：`var SX = { s1:{end:29}, … }` 这类对象是 T-block 的副本，违反单一权威源。写入侧 `adjust_timeline.adjust_s_block` 只维护 **`var S = [ {...} ]`（名为 S 的数组）** 这一种形态；其它名字或容器形状它**匹配不到且不出声**（`[S-BLOCK-UNSYNCED]` 只在"匹配到但解析不进"时打印），而 `scene_patch_render.extract_scene_times` 的时间源见证按全脚本 `end:` 字面量取数，**仍会读到这份没人维护的旧值** ⇒ 该项目每轮被判 `S-block-end != data-duration` 降级全量渲染。实测 80 个项目里 1 份此形态（SX 对象停在 310s 旧轴而片长 275.6s）。需要场景结束时刻时**从 T 块派生**（`T.sN+1` 或末场取 `data-duration`），不要另存一份；确需声明就用写入侧认得的形态。**注释里也不要留 `end:` 字面量**：见证对全部 `<script>` 体原样扫 `\bend:`、不剥注释，实测 `skill-promo` 的 T-BLOCK 注释里一句 `end: 145.1` 与 `data-duration=146.9` 差 1.8s，即让该项目永久降级全量。预检 check（增量资格 WARN）会点名后果，但归因到"名字/形状不在写入侧取数面"或"注释被当成声明"要靠本条。
 
 真实代价（2026-09-26 实测）：scene2 转场写成字面量 `28.0`，而 T-block 声明 `s2: 25.3`——转场比场景边界晚 2.7s，预览在该窗口采样时画面仍停在转场中途（内容被推到 y1079），`instant_preview` 连续两轮报安全区溢出 FAIL，而根因不在布局、在时间轴。这类失败在预览报告上长得像排版问题，按排版去改会白改两轮。
 
@@ -472,6 +479,12 @@ function flushCuePlan(){                                     // 构造时间轴�
 
 ## 四、场景设计模式
 
+> **横屏项目从 `templates_09_横屏多形态骨架.html` 起步，不从本节骨架起步。** 本节 §4.1–4.7 的骨架默认是卡片网格／条形行——它们装得下"有哪些东西"，装不下"它们怎么连起来"。2026-11-11 复盘实测：顺读抄本节骨架的交付片 11 个内容场 8 场是卡片阵列，而结构化形态在 §4.8、此前只以旁注形式存在，作者不主动跳转就拿不到。**先答分镜逐场表「承载形态」那一格（取值 cover/cards/flow/stack/cycle/bars/counters/split/text），再回本节或 §4.8 取对应骨架**；答不出即回分镜阶段，不要先写 HTML。
+>
+> **形态自报契约**：每个场景 div 除 `data-scene-id`／`data-scene-entry`／`data-scene-subtitle-safe` 外，须带 `data-form="<承载形态>"`，与 `narration.json` 该场 `visual_form` 同值（后者为机器权威源）。预检 check 7f 对撞两处，缺任一侧或不等即 WARN 点名，并给出卡片阵列场占比（描述面，不裁定）。
+>
+> **图形一律分步揭示，不得整幅淡入**：整幅 `<svg>` 挂一个 `.rv`＋一条 `fromTo` 淡入，在观众眼里等于贴了一张静态图（实测某交付片两场架构图共 52.9s，SVG 子元素动画 0 条，全片最长无推进段 26.9s 恰等于该场窗口减那一次淡入）。用 templates_09 的 `svgFlow`（作者以 `data-step` 声明揭示顺序，实体先立住、连线随后描画、箭头在线走完后才出现）／`countUp`／`growBar`／`growLayer`。
+
 ### 4.1 封面场景（scene0）
 
 **先读这条再动手——竖屏封面的宽度预算是两处相乘，不是取小**（2026-11-06 两支竖屏项目实测）：
@@ -495,7 +508,7 @@ function flushCuePlan(){                                     // 构造时间轴�
   <!-- 2-3 个大光晕 -->
   <div class="glow" style="width:800px;height:800px;background:rgba(245,158,11,0.15);top:-200px;right:-100px;"></div>
   <div class="glow" style="width:600px;height:600px;background:rgba(96,165,250,0.12);bottom:-150px;left:-100px;"></div>
-  <div class="sc" style="align-items:center;justify-content:center;text-align:center;padding-bottom:150px;">
+  <div class="sc" style="align-items:center;justify-content:center;text-align:center;padding-bottom:240px;">
     <div style="max-width:1400px;">
       <p style="font-size:24px;color:#94a3b8;letter-spacing:0.12em;margin-bottom:24px;">ENGLISH SUBTITLE</p>
       <h1 style="font-size:96px;font-weight:900;line-height:1.1;letter-spacing:-0.04em;">
@@ -599,6 +612,8 @@ function flushCuePlan(){                                     // 构造时间轴�
 > 本节两种是**列表型**步骤（条目之间不强调"必须依次通过"）。要画"依次通过的关卡 + 不合格退回"的**节点流程图与回流环**（含 SVG 描画动效）见 §4.8 形态一，实现与时间位纪律住那里。
 
 ### 4.6 数据/统计场景
+
+> 本节默认是静态数字卡片网格。**数字被念到的那一刻应当跳数**（`countUp`，templates_09），否则观众读到的是排版而不是"实测结果"；若这场的关系是"过去 vs 现在"的同量纲对照，改用 §4.8 形态三（对比条形）而非并排卡片。2026-11-11 复发片分镜声明"计数器逐枚跳数"、HTML 却是静态文本，全片 count-up 0 处——声明与产出之间此前没有对撞位点。
 
 ```html
 <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:20px;">
@@ -862,8 +877,10 @@ tl.to("#cursor",      { opacity:0, duration:0.4 },                              
 - [ ] `<div id="root">` 的 data-duration 和 data-cover-duration 正确
 - [ ] scene0 有 z-index:999
 - [ ] 每个场景有 `<div class="subtitle-safe"></div>`
-- [ ] subtitle-safe height 在 120-150px
-- [ ] .sc padding-bottom ≥ safe-height + 20px
+- [ ] subtitle-safe height 与 .sc padding-bottom 按 §2.2 由安全线推导（不由渐变高度反推）
+- [ ] 内容场 .sc 未写 justify-content:center（居中＝留白对称摊到上下，见 §2.2）
+- [ ] 深色底项目首条正文 tween 锚 ≤ T.sN+1.0s（场头只有标题＝终检黑场 FAIL，见 §2.2）
+- [ ] 预览 [LAYOUT-FULLNESS] 最低三场已对照审核节点第 7 项看过（描述面，不裁定）
 - [ ] 无 `[Image]`、`placeholder`、`src=""` 占位符
 - [ ] 所有 `<img src>` 引用真实文件
 - [ ] 字号分层符合规范

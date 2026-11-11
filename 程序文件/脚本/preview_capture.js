@@ -296,6 +296,128 @@ async function measureBarOverflow(page, fallbackWindows) {
     };
 }
 
+/**
+ * 主体区填充率取数面（2026-11-11 复盘批；**描述面，不裁定**）。
+ *
+ * 为什么加这一条：既有几何判据（字幕安全区、text_fit、bar_overflow）全是"越界/塌陷"
+ * 方向——内容越多越贴线越易判红，内容少则永远安全，压力是单向的。于是"少放、居中"
+ * 成为过门最省力策略，留白在门禁全绿下出厂、以交付后投诉的形式到达。本腿把"够不够满"
+ * 在渲染之前量出来，供 instant_preview.layout_fullness_lines 出读数（不设阈值）。
+ *
+ * 取数口径（三线 A/B 实测定稿，读数见 操作日志.md [2026-11-11] 复盘批）：
+ *  ① 内容＝**可见墨迹**：有字的叶节点、img/canvas/video、svg 的可见子元素墨迹。
+ *     刻意不用"卡片类名闭表"——同批 A/B 实测闭表选法与纯结构选法在三线上读数逐场相同
+ *     （中位 0.640/0.495/0.411），闭表只是把项目专属类名钉进通用工具，无收益。
+ *     也刻意不量"底沿空占比"：该口径在三线上是 18%/17%/21%，**无区分力**。
+ *  ② svg 取可见子元素屏幕盒的并集，不取 svg 元素盒（viewBox letterbox 的空边会被
+ *     算成内容），也不取整幅 getBBox（尚未揭示的子元素会被算进来）。
+ *  ③ 场景根须**在画布内**（交集 ≥50%）：用画布外位移做转场的项目里 parked 场景
+ *     opacity 恒 1，只按 opacity 判在场会把停在场外的整版内容算进本场。
+ *  ④ 时刻复用 computeSampleState（各场稳态，含封面中点），逐场回报**全部采样**，
+ *     由 Python 侧取最大值——聚合方向属口径，不属取数。
+ *
+ * 本函数只回几何盒与画布尺寸：主体区分母（字幕安全线）由 Python 侧单源给出，
+ * 此处不写 860/1529 之类数值，也不做四态裁定。
+ */
+async function measureLayoutFill(page, fallbackWindows) {
+    const sampling = await computeSampleState(page, fallbackWindows);
+    if (sampling.timeSrc === 'none') {
+        return { status_hint: 'no_time_source', samples: 0, measured_nodes: 0, nodes: [] };
+    }
+
+    const acc = {};
+    for (const t of sampling.times) {
+        const rows = await page.evaluate(({ time }) => {
+            if (typeof tl !== 'undefined' && tl && tl.seek) {
+                tl.seek(time, false);
+                if (typeof gsap !== 'undefined') gsap.ticker.tick();
+            }
+            const CW = window.innerWidth, CH = window.innerHeight;
+            const chainOpacity = (el) => {
+                let o = 1, n = el;
+                while (n && n !== document.body) {
+                    const cs = getComputedStyle(n);
+                    o *= parseFloat(cs.opacity || '1');
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return 0;
+                    n = n.parentElement;
+                }
+                return o;
+            };
+            const box = (el) => {
+                const r = el.getBoundingClientRect();
+                return { x: r.left, y: r.top, w: r.width, h: r.height };
+            };
+            const clip = (b, x2, y2) => {
+                const x1 = Math.max(0, b.x), y1 = Math.max(0, b.y);
+                const xx = Math.min(x2, b.x + b.w), yy = Math.min(y2, b.y + b.h);
+                return (xx - x1 > 1 && yy - y1 > 1)
+                    ? { x: x1, y: y1, w: xx - x1, h: yy - y1 } : null;
+            };
+            const union = (bs) => {
+                if (!bs.length) return null;
+                let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+                for (const b of bs) {
+                    x1 = Math.min(x1, b.x); y1 = Math.min(y1, b.y);
+                    x2 = Math.max(x2, b.x + b.w); y2 = Math.max(y2, b.y + b.h);
+                }
+                return { x: +x1.toFixed(1), y: +y1.toFixed(1),
+                         w: +(x2 - x1).toFixed(1), h: +(y2 - y1).toFixed(1) };
+            };
+            const out = [];
+            for (const root of document.querySelectorAll('[data-scene-id]')) {
+                const cs = getComputedStyle(root);
+                if (parseFloat(cs.opacity || '1') < 0.05 || cs.visibility === 'hidden') continue;
+                const rb = box(root);
+                const on = clip(rb, CW, CH);
+                const frac = on ? (on.w * on.h) / (rb.w * rb.h || 1) : 0;
+                if (frac < 0.5) continue;
+                const bs = [];
+                for (const el of root.querySelectorAll('*')) {
+                    const tag = el.tagName.toLowerCase();
+                    if (chainOpacity(el) < 0.05) continue;
+                    if (tag === 'svg') {
+                        const parts = [];
+                        for (const c of el.querySelectorAll('rect,line,path,text,circle,polygon,polyline')) {
+                            if (chainOpacity(c) < 0.05) continue;
+                            const b = clip(box(c), CW, CH);
+                            if (b) parts.push(b);
+                        }
+                        const u = union(parts);
+                        if (u && u.w > 1) bs.push(u);
+                        continue;
+                    }
+                    if (el.ownerSVGElement) continue;
+                    const leaf = !el.querySelector('*:not(br)');
+                    const txt = (el.textContent || '').trim().length > 0;
+                    const media = tag === 'img' || tag === 'canvas' || tag === 'video';
+                    if (!((leaf && txt) || media)) continue;
+                    const b = clip(box(el), CW, CH);
+                    if (b) bs.push(b);
+                }
+                out.push({ key: root.getAttribute('data-scene-id'),
+                           canvas: { w: CW, h: CH }, ink: union(bs), at: time });
+            }
+            return out;
+        }, { time: t });
+        for (const row of rows) {
+            if (!acc[row.key]) acc[row.key] = { key: row.key, canvas: row.canvas, readings: [] };
+            acc[row.key].readings.push({ at: row.at, ink: row.ink });
+        }
+    }
+
+    const nodes = Object.values(acc)
+        .sort((a, b) => String(a.key).localeCompare(String(b.key)));
+    return {
+        time_src: sampling.timeSrc,
+        has_timeline: sampling.hasTimeline,
+        timeline_duration: sampling.timelineDuration,
+        samples: sampling.times.length,
+        sample_times: sampling.times.slice(0, 40),
+        measured_nodes: nodes.length,
+        nodes: nodes.slice(0, 200),
+    };
+}
+
 async function main() {
     const args = process.argv.slice(2);
     if (args.length < 3) {
@@ -589,6 +711,23 @@ async function main() {
             console.error(`  [BAR-OVERFLOW] 取数异常: ${(e && e.message) || e}`);
         }
 
+        // ── 主体区填充率取数：只取数，分母与读数归 instant_preview.py ──
+        // 不传阈值：本面是描述面（2026-10-10 常设裁定：不为观感新增门禁），
+        // 全量回报逐场几何盒，安全线分母由 Python 侧单源推导。
+        const fillStarted = Date.now();
+        try {
+            const fill = await measureLayoutFill(page, fitWindows);
+            manifest.layout_fill = fill;
+            console.log(`  [LAYOUT-FILL] 时刻源=${fill.time_src || 'none'} `
+                + `采样 ${fill.samples} 次，在场场景 ${fill.measured_nodes} 个`
+                + `（${((Date.now() - fillStarted) / 1000).toFixed(1)}s）`);
+        } catch (e) {
+            manifest.layout_fill = { status_hint: 'measure_failed',
+                                     error: String((e && e.message) || e),
+                                     samples: 0, measured_nodes: 0, nodes: [] };
+            console.error(`  [LAYOUT-FILL] 取数异常: ${(e && e.message) || e}`);
+        }
+
         // Write manifest
         const manifestPath = path.join(outputDir, 'capture_manifest.json');
         fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -617,5 +756,5 @@ if (require.main === module) {
     });
 }
 
-module.exports = { measureTextFit, measureBarOverflow, computeSampleState };
+module.exports = { measureTextFit, measureBarOverflow, measureLayoutFill, computeSampleState };
 

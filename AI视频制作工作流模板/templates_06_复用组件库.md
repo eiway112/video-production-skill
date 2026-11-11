@@ -50,7 +50,7 @@ window.__timelines["main"] = tl;
 |---|---|---|
 | `data-duration` | 视频总时长（含封面 3s） | config JSON `video_duration` |
 | `data-cover-duration` | 封面持续秒数，固定 3 | 所有项目统一 |
-| `padding-bottom` | `.sc` 必须 ≥ 150px（字幕安全区） | 强制校验 |
+| `padding-bottom` | `.sc` 须为字幕安全区留量，由 `visual_boundary_check.subtitle_safety_line(画布高)` 推导（1080→y860 ⇒ 预留带 220px），推荐 **240px**（220＋20 设计余量） | 门禁判据＝`content_bottom <= 安全线`。**旧「≥150px 强制校验」已退役**（2026-10-16 撤 `html_template_validator`、2026-11-11 撤 postprocess Step 0 同口径代理判据）——它在用户验收通过的项目上判 FAIL |
 
 ### S-02 封面场景 (scene0)
 
@@ -373,7 +373,7 @@ tl.set("body", {}, /* COVER_DURATION */);
 - 每个组件附带一个使用示例，确保下次使用时能直接跑通。
 - 从旧项目移植组件时，必须做参数化改造，不直接复制粘贴。
 - 转场必须交替使用 Push Slide / Vertical Push，避免连续使用同一类型。
-- 每个场景必须有 `.subtitle-safe` 且 `.sc` padding-bottom ≥ 150px。
+- 每个场景必须有 `.subtitle-safe`，且 `.sc` padding-bottom 按字幕安全线推导（1080 画布推荐 240px，权威源 `visual_boundary_check.subtitle_safety_line`）；**不得沿用已退役的「≥150px」口径**。
 # 复用组件库
 
 每做完一条视频，把可复用的动效组件注册到这里。做得越多，后面越快。

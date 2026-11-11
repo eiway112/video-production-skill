@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<!--
+  横屏多形态骨架 1920×1080（templates_09）
+  ─────────────────────────────────────────────────────────────
+  定位：横屏信息片的**版面起点**，与 templates_08（竖屏）成对。
+  消费时机：阶段 C 写 HTML 时，横屏项目从本文件起步，而不是从
+            `HyperFrames_HTML模板参考基准.md` §4.1–4.7 的卡片骨架起步。
+
+  为什么要有这份文件（两条实测事故，不是审美偏好）：
+    ① **默认路径指向卡片**。基准 §4.2/4.4/4.5/4.6 四张骨架全是卡片网格，
+       结构化形态在 §4.8，而 §4.4/4.5 只留一句旁注"见 §4.8"。作者顺读抄骨架
+       拿到的就是卡片。实测某交付片 11 个内容场里 8 场是卡片/盒子阵列。
+    ② **图形整块淡入＝观众读作贴图**。同片两场架构图是手写内联 SVG
+       （50 / 46 个子元素、有箭头有回流线），但整幅 <svg> 只挂一个 `.rv`、
+       时间轴只有一条 0.6s 淡入 ⇒ SVG 子元素动画 0 条。该片全片最长无推进段
+       26.9s，恰等于那场窗口 29.0s 减去这一次淡入。几何是矢量，行为是静态。
+    ③ **垂直居中的容器把留白对称摊到上下**，"把卡片做大"治不了它。
+       同口径实测（墨迹盒裁到画布、分母＝主体区 1920×860、每场取 start+0.95×窗长）：
+       已交付片 `.sc{justify-content:center}` 高度占比中位 **0.513**；
+       只把卡片 min-height 加大＋两场换图形 ⇒ **0.558**（+0.045，几乎没动）；
+       另一条线全片改绝对定位、逐场把内容底沿顶到 y779—845 ⇒ **0.897**（最小场 0.762）。
+       差别不在元素大小，在**版面坐标系**：居中容器的高度由内容自然高决定，
+       内容少就上下各空一半；顶对齐＋余高由 `.grow` 吸收（或 space-between 把底沿顶住），
+       高度才由容器决定。故本骨架 `.sc` **不写 justify-content:center**。
+  本骨架的六个内容场**各用一种承载形态**，且图形一律分步揭示、连线一律描画。
+
+  与既有契约的关系（不得偏离）：
+    - `#root` 的 data-*、`.scene > .sc + .subtitle-safe` 结构、T-block/S-block
+      单一权威源、`window.__timelines` 注册、封面 scene0 不入 T-block ——
+      全部沿用 `HyperFrames_HTML模板参考基准.md`，本文件只改版面与动效词汇。
+    - GSAP 走本地真库副本 `gsap.min.js`（CDN 路线已被实测推翻）。
+    - **安全区是硬约束**：1080 画布的字幕安全线 y=860（预留带 220px），
+      故 `.sc` 下内边距取 `--pad-bottom`＝240px（预留带 220 ＋ 20px 设计余量），
+      内容盒＝y∈[50,840]。饱满度要在**这 790px 内**争取，不得靠侵占字幕带换取。
+      门禁判据是 `content_bottom <= 860`（零余量也过），20px 余量是设计侧选择、不是门禁要求。
+      判据侧权威源 `visual_boundary_check.subtitle_safety_line`，本变量是其设计侧实现。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>横屏多形态骨架 1920×1080</title>
+<script src="gsap.min.js"></script>
+<style>
+:root{
+  --cw: 1920px;
+  --ch: 1080px;
+  --pad-x: 90px;
+  --pad-top: 50px;
+  --pad-bottom: 240px;          /* 预留带 220 ＋ 20px 设计余量；内容下边界由它顶住 */
+  --gap: 20px;
+  --min-cpl: 6;                 /* 与 video_quality_rules.json → text_fit.min_chars_per_line 同源 */
+
+  --fs-h1: 42px;
+  --fs-h2: 26px;
+  --fs-body: 19px;
+  --fs-chip: 15px;
+  --fs-num: 62px;
+
+  --ink: #0f172a;
+  --ink-2: #475569;
+  --ink-3: #94a3b8;
+  --paper: #f8fafc;
+  --line: #e2e8f0;
+  --blue: #2563eb;
+  --blue-deep: #1e3a5f;
+  --green: #059669;
+  --amber: #d97706;
+  --red: #dc2626;
+  --violet: #7c3aed;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{width:var(--cw);height:var(--ch);overflow:hidden;background:var(--paper);
+     font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;color:var(--ink);}
+.scene{position:absolute;top:0;left:0;width:var(--cw);height:var(--ch);overflow:hidden;}
+#scene0{z-index:999;background:var(--paper);}
+#scene1{z-index:1;background:var(--paper);opacity:0;}
+#scene2{z-index:2;background:var(--paper);opacity:0;}
+#scene3{z-index:3;background:var(--paper);opacity:0;}
+#scene4{z-index:4;background:var(--paper);opacity:0;}
+#scene5{z-index:5;background:var(--paper);opacity:0;}
+#scene6{z-index:6;background:var(--paper);opacity:0;}
+
+/* 内容层：纵向撑满安全区。`flex:1` 的行会吃掉剩余高度，
+   于是"内容少"表现为卡片变高而不是下方悬空——这是留白的结构解法。 */
+.sc{display:flex;flex-direction:column;width:100%;height:100%;
+    padding:var(--pad-top) var(--pad-x) var(--pad-bottom);position:relative;overflow:hidden;gap:var(--gap);}
+.sc > .grow{flex:1;min-height:0;}
+.subtitle-safe{position:absolute;bottom:0;left:0;width:100%;height:var(--pad-bottom);
+               z-index:100;pointer-events:none;
+               background:linear-gradient(to bottom,rgba(248,250,252,0) 0%,rgba(248,250,252,0.9) 45%,rgba(248,250,252,0.97) 100%);}
+.glow{position:absolute;border-radius:50%;pointer-events:none;filter:blur(120px);}
+.rv{opacity:0;}
+
+.tag{font-family:Consolas,monospace;font-size:var(--fs-chip);font-weight:600;
+     letter-spacing:0.08em;text-transform:uppercase;color:var(--ink-3);}
+.h1{font-size:var(--fs-h1);font-weight:900;color:var(--ink);}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;
+      padding:24px 28px;box-shadow:0 2px 10px rgba(0,0,0,0.04);}
+svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
+
+/* 形态二：分层色带。一层一色阶，主层实底渐变、约束栏虚线框（语义不得互换） */
+.stack{display:flex;flex-direction:column;gap:12px;height:100%;}
+.layer{flex:1;display:flex;align-items:center;gap:22px;padding:0 30px;border-radius:12px;
+       border:1px solid var(--line);background:#fff;}
+.layer .lv{font-size:var(--fs-chip);font-weight:800;color:var(--ink-3);width:52px;flex-shrink:0;}
+.layer .lt{font-size:var(--fs-h2);font-weight:800;}
+.layer .ld{font-size:var(--fs-body);color:var(--ink-2);margin-left:auto;}
+.layer.main{background:linear-gradient(135deg,#1d4ed8,#3b82f6);border-color:transparent;}
+.layer.main .lv,.layer.main .ld{color:#bfdbfe;}
+.layer.main .lt{color:#fff;}
+.side-card{border:2px dashed #93c5fd;border-radius:12px;padding:20px 22px;background:rgba(59,130,246,0.04);}
+
+/* 形态三：同量纲对比条形。轨道先出、填充后长 */
+.bar-row{display:flex;align-items:center;gap:24px;}
+.bar-row .lab{width:300px;font-size:var(--fs-h2);font-weight:700;flex-shrink:0;}
+.bar-row .track{flex:1;height:46px;background:#eef2f7;border-radius:10px;overflow:hidden;}
+.bar-row .fill{height:100%;border-radius:10px;}
+.bar-row .val{width:210px;text-align:right;font-size:var(--fs-h2);font-weight:800;flex-shrink:0;}
+
+/* 形态四：等宽代码块隐喻。色标语义固定 注入=蓝／失败=红／校验=绿 */
+.term{font-family:Consolas,"Courier New",monospace;font-size:23px;line-height:2.1;
+      background:#0f172a;border-radius:14px;padding:30px 34px;color:#e2e8f0;}
+.term .ln-k{color:#60a5fa;} .term .ln-r{color:#f87171;} .term .ln-g{color:#34d399;}
+
+/* 形态五：中轴延伸 */
+.claim{position:relative;text-align:center;}
+.claim::before,.claim::after{content:"";position:absolute;left:50%;width:2px;height:30px;background:rgba(37,99,235,0.35);}
+.claim::before{top:-46px;} .claim::after{bottom:-46px;}
+
+#chapter-bar{position:absolute;top:24px;left:36px;z-index:900;display:flex;align-items:center;gap:10px;opacity:0;}
+#chapter-bar .ch-num{font-size:14px;font-weight:800;color:var(--blue);background:rgba(37,99,235,0.10);padding:3px 10px;border-radius:6px;}
+#chapter-bar .ch-name{font-size:14px;font-weight:600;color:var(--ink-2);}
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="main" data-width="1920" data-height="1080"
+     data-start="0" data-duration="123" data-cover-duration="3">
+<div id="chapter-bar"><span class="ch-num" id="ch-num">01</span><span class="ch-name" id="ch-name">关系与结构</span></div>
+
+<!-- ══ s0 封面 · 形态五 中轴延伸 ══ -->
+<div id="scene0" class="scene" data-scene-id="s0" data-scene-entry="cover" data-scene-subtitle-safe="true">
+<div class="sc" style="justify-content:center;align-items:center;padding-bottom:var(--pad-bottom);">
+<div class="claim">
+  <div id="s0-k" class="rv tag" style="margin-bottom:22px;">HORIZONTAL MULTI-FORM SKELETON</div>
+  <div id="s0-t" class="rv" style="font-size:78px;font-weight:900;letter-spacing:-0.02em;">六个场景，六种形状</div>
+  <div id="s0-s" class="rv" style="font-size:30px;font-weight:700;color:var(--blue);margin-top:26px;">内容是什么关系，画面就画什么形</div>
+</div>
+<div id="s0-line" class="rv" style="width:520px;height:4px;margin-top:52px;border-radius:2px;background:linear-gradient(90deg,#1e40af,#3b82f6,#93c5fd,transparent);"></div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+<!-- ══ s1 形态一 · 横向节点流程图 + 回流环（依次通过的关卡 + 不合格退回） ══ -->
+<div id="scene1" class="scene" data-scene-id="s1" data-scene-entry="gsap" data-scene-subtitle-safe="true">
+<div class="glow" style="width:520px;height:520px;top:-80px;right:-60px;background:rgba(37,99,235,0.06);"></div>
+<div class="sc">
+<div class="tag rv" id="s1-tag">SEQUENTIAL GATES</div>
+<div class="h1 rv" id="s1-title">四道闸：依次通过，不合格退回</div>
+<div class="grow rv" id="s1-wrap" style="display:flex;flex-direction:column;justify-content:center;">
+<svg id="s1-svg" viewBox="0 0 1740 810" style="width:100%;height:100%;" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="m1" markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7" fill="#1e3a5f"/></marker>
+    <marker id="m1a" markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7" fill="#d97706"/></marker>
+  </defs>
+  <g data-step="1">
+    <circle cx="200" cy="80" r="27" fill="rgba(37,99,235,0.10)"/>
+    <text x="200" y="89" text-anchor="middle" font-size="24" font-weight="800" fill="#2563eb">1</text>
+    <rect x="20" y="150" width="360" height="180" rx="14" fill="#fff" stroke="#2563eb" stroke-width="2.5"/>
+    <text x="200" y="228" text-anchor="middle" font-size="32" font-weight="800" fill="#2563eb">约束确认</text>
+    <text x="200" y="276" text-anchor="middle" font-size="20" fill="#64748b">先把适用条件问清</text>
+  </g>
+  <g data-step="2">
+    <line x1="380" y1="240" x2="452" y2="240" stroke="#1e3a5f" stroke-width="2.5" marker-end="url(#m1)"/>
+    <circle cx="640" cy="80" r="27" fill="rgba(124,58,237,0.10)"/>
+    <text x="640" y="89" text-anchor="middle" font-size="24" font-weight="800" fill="#7c3aed">2</text>
+    <rect x="460" y="150" width="360" height="180" rx="14" fill="#fff" stroke="#7c3aed" stroke-width="2.5"/>
+    <text x="640" y="228" text-anchor="middle" font-size="32" font-weight="800" fill="#7c3aed">方案生成</text>
+    <text x="640" y="276" text-anchor="middle" font-size="20" fill="#64748b">按判据推出候选</text>
+  </g>
+  <g data-step="3">
+    <line x1="820" y1="240" x2="892" y2="240" stroke="#1e3a5f" stroke-width="2.5" marker-end="url(#m1)"/>
+    <circle cx="1080" cy="80" r="27" fill="rgba(217,119,6,0.10)"/>
+    <text x="1080" y="89" text-anchor="middle" font-size="24" font-weight="800" fill="#d97706">3</text>
+    <rect x="900" y="150" width="360" height="180" rx="14" fill="#fff" stroke="#d97706" stroke-width="2.5"/>
+    <text x="1080" y="228" text-anchor="middle" font-size="32" font-weight="800" fill="#d97706">独立校验</text>
+    <text x="1080" y="276" text-anchor="middle" font-size="20" fill="#64748b">换角色重算一遍</text>
+  </g>
+  <g data-step="4">
+    <line x1="1260" y1="240" x2="1332" y2="240" stroke="#1e3a5f" stroke-width="2.5" marker-end="url(#m1)"/>
+    <circle cx="1520" cy="80" r="27" fill="rgba(30,58,95,0.10)"/>
+    <text x="1520" y="89" text-anchor="middle" font-size="24" font-weight="800" fill="#1e3a5f">4</text>
+    <rect x="1340" y="150" width="360" height="180" rx="14" fill="#1e3a5f"/>
+    <text x="1520" y="228" text-anchor="middle" font-size="32" font-weight="800" fill="#fff">结论交付</text>
+    <text x="1520" y="276" text-anchor="middle" font-size="20" fill="#93c5fd">结论＋依据＋整改</text>
+  </g>
+  <!-- 回流环：必须在"讲完四道闸"之后才描画，否则观众先看见结论再听见理由 -->
+  <g data-step="5">
+    <path id="s1-loop" d="M1520,330 C1520,560 200,560 200,330" fill="none" stroke="#d97706" stroke-width="3" marker-end="url(#m1a)"/>
+    <text x="860" y="600" text-anchor="middle" font-size="26" font-weight="700" fill="#d97706">证据不齐 → 退回上一道闸</text>
+  </g>
+  <g data-step="6">
+    <rect x="20" y="660" width="1700" height="130" rx="14" fill="#eff6ff" stroke="#bfdbfe" stroke-width="2"/>
+    <text x="860" y="712" text-anchor="middle" font-size="26" font-weight="800" fill="#1e3a5f">一次提问 ＝ 可执行结论 ＋ 依据 ＋ 整改路径</text>
+    <text x="860" y="756" text-anchor="middle" font-size="20" fill="#475569">四道闸任一不过，结论不出门</text>
+  </g>
+</svg>
+</div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+<!-- ══ s2 形态二 · 分层色带（自上而下的栈 + 外围约束） ══ -->
+<div id="scene2" class="scene" data-scene-id="s2" data-scene-entry="gsap" data-scene-subtitle-safe="true">
+<div class="sc">
+<div class="tag rv" id="s2-tag">LAYERED STACK</div>
+<div class="h1 rv" id="s2-title">五层参考架构：栈内分层，栈外约束</div>
+<div class="grow" style="display:grid;grid-template-columns:1fr 400px;gap:24px;">
+  <div class="stack">
+    <div class="layer rv" id="s2-l1"><span class="lv">L1</span><span class="lt">入口与编排</span><span class="ld">识别题面 · 分派任务</span></div>
+    <div class="layer rv" id="s2-l2"><span class="lv">L2</span><span class="lt">领域技能</span><span class="ld">部品系统 · 专项计算</span></div>
+    <div class="layer main rv" id="s2-l3"><span class="lv">L3</span><span class="lt">物理内核</span><span class="ld">可复算的数值求解</span></div>
+    <div class="layer rv" id="s2-l4"><span class="lv">L4</span><span class="lt">证据与契约</span><span class="ld">来源 · 定位 · 失效动作</span></div>
+    <div class="layer rv" id="s2-l5"><span class="lv">L5</span><span class="lt">交付与复核</span><span class="ld">结论五件 · 独立校验</span></div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:18px;justify-content:center;">
+    <div class="side-card rv" id="s2-c1"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--blue);">标准版本索引</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">约束各层读同一套版本，不进入生成链路</div></div>
+    <div class="side-card rv" id="s2-c2"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--blue);">红线注册表</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">越线即拦截，与层级高低无关</div></div>
+    <div class="side-card rv" id="s2-c3"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--blue);">接口契约</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">层与层之间只按契约交接</div></div>
+  </div>
+</div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+<!-- ══ s3 形态三 · 同量纲横向对比条形（只有一个可变量的对照） ══ -->
+<div id="scene3" class="scene" data-scene-id="s3" data-scene-entry="gsap" data-scene-subtitle-safe="true">
+<div class="glow" style="width:520px;height:520px;bottom:-120px;left:-60px;background:rgba(5,150,105,0.06);"></div>
+<div class="sc">
+<div class="tag rv" id="s3-tag">SAME-UNIT COMPARISON</div>
+<div class="h1 rv" id="s3-title">同一件事，两种耗时</div>
+<div class="grow" style="display:flex;flex-direction:column;justify-content:center;gap:48px;">
+  <div class="bar-row rv" id="s3-r1">
+    <span class="lab" style="color:var(--ink-2);">过去 · 跨 3 个专业</span>
+    <div class="track" style="height:88px;"><div class="fill" id="s3-f1" style="background:#94a3b8;width:100%;"></div></div>
+    <span class="val" style="color:var(--ink-2);">约 2 天</span>
+  </div>
+  <div class="bar-row rv" id="s3-r2">
+    <span class="lab" style="color:var(--blue);">现在 · 一句话</span>
+    <div class="track" style="height:88px;"><div class="fill" id="s3-f2" style="background:var(--blue);width:3.2%;min-width:18px;"></div></div>
+    <span class="val" style="color:var(--blue);">约 10 分钟</span>
+  </div>
+  <div class="rv" id="s3-delta" style="display:flex;align-items:center;justify-content:center;gap:30px;padding:26px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);">
+    <span style="font-size:76px;font-weight:900;color:var(--green);">≈288×</span>
+    <span style="font-size:var(--fs-h2);color:var(--ink-2);max-width:760px;">同一件事的耗时比。两条量的是同一量纲（时长换算后），故可并置；不同量纲并置即假对比</span>
+  </div>
+</div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+<!-- ══ s4 循环图 · 四节点闭环（§4.8 五类之外的独立形态，本骨架补齐） ══ -->
+<div id="scene4" class="scene" data-scene-id="s4" data-scene-entry="gsap" data-scene-subtitle-safe="true">
+<div class="sc">
+<div class="tag rv" id="s4-tag">CLOSED LOOP</div>
+<div class="h1 rv" id="s4-title">知识自进化：缺口被发现，更新可复现</div>
+<div class="grow" style="display:grid;grid-template-columns:330px 1fr 330px;gap:20px;align-items:center;">
+  <div style="display:flex;flex-direction:column;gap:18px;">
+    <div class="card rv" id="s4-a1" style="border-color:rgba(220,38,38,0.3);"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--red);">触发</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">标准状态变化自动触发复核，不靠人记得</div></div>
+    <div class="card rv" id="s4-a2" style="border-color:rgba(37,99,235,0.3);"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--blue);">留痕</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">每次改判都带来源与条文定位</div></div>
+  </div>
+  <svg id="s4-svg" viewBox="180 30 640 500" style="width:100%;height:100%;" xmlns="http://www.w3.org/2000/svg">
+    <defs><marker id="m4" markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7" fill="#2563eb"/></marker></defs>
+    <g data-step="1">
+      <rect x="420" y="60" width="160" height="60" rx="12" fill="#fff" stroke="#dc2626" stroke-width="2.5"/>
+      <text x="500" y="97" text-anchor="middle" font-size="22" font-weight="800" fill="#dc2626">缺口登记</text>
+    </g>
+    <g data-step="2">
+      <path d="M595,115.5 A190,190 0 0 1 664.5,185" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#m4)"/>
+      <rect x="610" y="250" width="160" height="60" rx="12" fill="#fff" stroke="#2563eb" stroke-width="2.5"/>
+      <text x="690" y="287" text-anchor="middle" font-size="22" font-weight="800" fill="#2563eb">官方取证</text>
+    </g>
+    <g data-step="3">
+      <path d="M664.5,375 A190,190 0 0 1 595,444.5" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#m4)"/>
+      <rect x="420" y="440" width="160" height="60" rx="12" fill="#fff" stroke="#059669" stroke-width="2.5"/>
+      <text x="500" y="477" text-anchor="middle" font-size="22" font-weight="800" fill="#059669">落盘改判</text>
+    </g>
+    <g data-step="4">
+      <path d="M405,444.5 A190,190 0 0 1 335.5,375" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#m4)"/>
+      <rect x="230" y="250" width="160" height="60" rx="12" fill="#fff" stroke="#7c3aed" stroke-width="2.5"/>
+      <text x="310" y="287" text-anchor="middle" font-size="22" font-weight="800" fill="#7c3aed">冻结基准</text>
+    </g>
+    <g data-step="5">
+      <path d="M335.5,185 A190,190 0 0 1 405,115.5" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#m4)"/>
+      <text x="500" y="272" text-anchor="middle" font-size="21" font-weight="800" fill="#1e3a5f">闭环</text>
+      <text x="500" y="302" text-anchor="middle" font-size="17" fill="#64748b">旧知识不回流</text>
+    </g>
+  </svg>
+  <div style="display:flex;flex-direction:column;gap:18px;">
+    <div class="card rv" id="s4-a3" style="border-color:rgba(217,119,6,0.3);"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--amber);">检出</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">门禁比对冻结基准，漂移即拦</div></div>
+    <div class="card rv" id="s4-a4" style="border-color:rgba(5,150,105,0.3);"><div style="font-size:var(--fs-h2);font-weight:800;color:var(--green);">裁决</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:10px;">口径冲突有单一裁决处</div></div>
+  </div>
+</div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+<!-- ══ s5 形态四 · 等宽代码块隐喻 + 数字跳数 ══ -->
+<div id="scene5" class="scene" data-scene-id="s5" data-scene-entry="gsap" data-scene-subtitle-safe="true">
+<div class="sc">
+<div class="tag rv" id="s5-tag">EXECUTABLE MECHANISM</div>
+<div class="h1 rv" id="s5-title">门禁不是建议，是执行序列</div>
+<div class="grow" style="display:grid;grid-template-columns:1fr 560px;gap:26px;align-items:center;">
+  <div class="term rv" id="s5-term">
+    <div id="s5-t1"><span class="ln-k">[注入]</span> 新增判据，先故意植入缺陷</div>
+    <div id="s5-t2"><span class="ln-r">[确认]</span> 报错才允许合入</div>
+    <div id="s5-t3"><span class="ln-g">[对照]</span> 判定前先跑已知有问题的对象</div>
+    <div id="s5-t4"><span class="ln-k">[复位]</span> 按哈希核对，逐字还原</div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+    <div class="card rv" id="s5-k1" style="text-align:center;"><div class="num" id="s5-n1" style="font-size:var(--fs-num);font-weight:900;color:var(--blue);">0</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:8px;">技能</div></div>
+    <div class="card rv" id="s5-k2" style="text-align:center;"><div class="num" id="s5-n2" style="font-size:var(--fs-num);font-weight:900;color:var(--violet);">0</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:8px;">标准</div></div>
+    <div class="card rv" id="s5-k3" style="text-align:center;"><div class="num" id="s5-n3" style="font-size:var(--fs-num);font-weight:900;color:var(--amber);">0</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:8px;">门禁</div></div>
+    <div class="card rv" id="s5-k4" style="text-align:center;"><div class="num" id="s5-n4" style="font-size:var(--fs-num);font-weight:900;color:var(--green);">0.0</div><div style="font-size:var(--fs-body);color:var(--ink-2);margin-top:8px;">可用率（%）</div></div>
+  </div>
+</div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+<!-- ══ s6 收尾 · 形态五 中轴延伸 ══ -->
+<div id="scene6" class="scene" data-scene-id="s6" data-scene-entry="gsap" data-scene-subtitle-safe="true">
+<div class="glow" style="width:600px;height:600px;top:-140px;left:35%;background:rgba(37,99,235,0.05);"></div>
+<div class="sc" style="justify-content:space-between;align-items:center;">
+<div class="claim" style="margin-top:80px;">
+  <div id="s6-t" class="rv" style="font-size:60px;font-weight:900;">形状对了，关系才看得见</div>
+  <div id="s6-s" class="rv" style="font-size:26px;color:var(--ink-2);margin-top:28px;">卡片是容器，它装得下关系，但不表达关系</div>
+</div>
+<div id="s6-line" class="rv" style="width:300px;height:1px;background:var(--line);margin:40px 0;"></div>
+<div id="s6-f" class="rv tag">SKELETON · templates_09</div>
+</div>
+<div class="subtitle-safe"></div>
+</div>
+
+</div>
+<script>
+/* ══════════════════════════════════════════════════════════════
+   动态图形原语（可整段复制进项目）
+   存在的理由：手写 HTML 的动效词汇长期只有一个动词——
+   `y:30→0 + opacity:0→1 + 0.6s + power2.out`。实测某交付片 122 条
+   时间轴语句里 77 条逐字同形，图形整块淡入，观众读作贴图。
+   下面四个原语把"图形怎么动"变成可声明的事，而不是每次凭手感重写。
+   ══════════════════════════════════════════════════════════════ */
+window.__timelines = window.__timelines || {};
+var tl = gsap.timeline({paused:true});
+
+/* 单条路径描画。箭头 marker 在描画期间先摘掉、走完再装回——
+   marker 不受 stroke-dashoffset 影响，不摘即"线还没到箭头先出现"。
+   用 tl.set(attr) 而非 tl.call：后者反向 seek 不回放，渲染器逐帧 seek 会丢箭头。 */
+function _strokeDraw(p, at, dur){
+  var L = 0;
+  try { L = p.getTotalLength(); } catch(e){ L = 0; }
+  if(!(L > 0)){ tl.fromTo(p, {opacity:0}, {opacity:1, duration:0.35}, at); return; }
+  var mk = p.getAttribute('marker-end');
+  if(mk){ p.removeAttribute('marker-end'); tl.set(p, {attr:{'marker-end':mk}}, at + dur); }
+  p.style.strokeDasharray = L;
+  tl.fromTo(p, {strokeDashoffset:L}, {strokeDashoffset:0, duration:dur, ease:'power1.inOut'}, at);
+}
+
+/* 原语一：SVG 分步揭示。作者给每组元素加 data-step="1|2|3…" 声明揭示顺序；
+   同组内"实体先立住、连线随后生长"（反过来等于先看见结论再看见关系）。
+   返回结束时刻，便于把后续语句接在其后。 */
+function svgFlow(sel, at, opt){
+  opt = opt || {};
+  var svg = document.querySelector(sel);
+  if(!svg) return at;
+  var step = opt.step != null ? opt.step : 0.8;
+  var draw = opt.draw != null ? opt.draw : 0.75;
+  var pop  = opt.pop  != null ? opt.pop  : 0.45;
+  var gs = Array.prototype.slice.call(svg.querySelectorAll('[data-step]'));
+  if(!gs.length) return at;
+  gs.sort(function(a,b){ return (+a.getAttribute('data-step')) - (+b.getAttribute('data-step')); });
+  gsap.set(svg, {opacity:1, visibility:'visible'});
+  var t = at;
+  for(var i=0;i<gs.length;i++){
+    var kids = Array.prototype.slice.call(gs[i].children);
+    var strokes = [], solids = [];
+    for(var j=0;j<kids.length;j++){
+      var el = kids[j], tag = el.tagName.toLowerCase();
+      var isLine = (tag==='line' || tag==='path' || tag==='polyline');
+      var st = el.getAttribute('stroke'), fi = el.getAttribute('fill');
+      if(isLine && st && st!=='none' && (!fi || fi==='none')) strokes.push(el); else solids.push(el);
+    }
+    if(solids.length){
+      tl.fromTo(solids, {opacity:0, scale:0.94, transformOrigin:'50% 50%'},
+        {opacity:1, scale:1, duration:pop, ease:'back.out(1.5)'}, t);
+    }
+    for(var k=0;k<strokes.length;k++) _strokeDraw(strokes[k], t + pop*0.6, draw);
+    t += step;
+  }
+  return t;
+}
+
+/* 原语二：数字跳数。精度按值吸附——整数走 round，小数走 toFixed，
+   否则 2.5 会被渲成 3（专业参数失真，编译器侧同判据）。 */
+function countUp(sel, to, at, dur, prec){
+  var el = document.querySelector(sel);
+  if(!el) return;
+  prec = prec || 0;
+  var snap = prec > 0 ? Math.pow(10, -prec) : 1;
+  var o = {v:0};
+  el.textContent = prec > 0 ? (0).toFixed(prec) : '0';
+  tl.to(o, {v:to, duration:(dur||1.0), ease:'power1.out', snap:{v:snap},
+    onUpdate:function(){ el.textContent = prec > 0 ? o.v.toFixed(prec) : String(Math.round(o.v)); }}, at);
+}
+
+/* 原语三：条形生长。用 scaleX 不改布局高度，故不引发布局跳动。
+   两条对比条必须分别对齐各自被说出的时刻，禁止同时伸长。 */
+function growBar(sel, at, dur){
+  tl.fromTo(sel, {scaleX:0, transformOrigin:'left center'},
+    {scaleX:1, duration:(dur||0.9), ease:'power2.out'}, at);
+}
+
+/* 原语四：逐层展开。分层色带用 scaleY 自上而下长出来，配 transformOrigin 顶边。 */
+function growLayer(sel, at, dur){
+  tl.fromTo(sel, {scaleY:0.6, opacity:0, transformOrigin:'50% 0%'},
+    {scaleY:1, opacity:1, duration:(dur||0.55), ease:'power2.out'}, at);
+}
+
+/* ── T-block／S-block：单一权威源，由 timeline 步按音频实测改写 ── */
+var T = { s1: 3.0, s2: 23.0, s3: 43.0, s4: 63.0, s5: 83.0, s6: 103.0 };
+var S = [
+ {"scene_id":"s1","start":3.0,"end":23.0,"duration":20.0},
+ {"scene_id":"s2","start":23.0,"end":43.0,"duration":20.0},
+ {"scene_id":"s3","start":43.0,"end":63.0,"duration":20.0},
+ {"scene_id":"s4","start":63.0,"end":83.0,"duration":20.0},
+ {"scene_id":"s5","start":83.0,"end":103.0,"duration":20.0},
+ {"scene_id":"s6","start":103.0,"end":123.0,"duration":20.0}
+];
+
+/* ── 封面 ── */
+tl.fromTo("#s0-k",{opacity:0},{opacity:1,duration:0.5},0.2);
+tl.fromTo("#s0-t",{y:34,opacity:0},{y:0,opacity:1,duration:0.8,ease:"power3.out"},0.4);
+tl.fromTo("#s0-s",{y:18,opacity:0},{y:0,opacity:1,duration:0.6},1.0);
+tl.fromTo("#s0-line",{scaleX:0,opacity:0,transformOrigin:"left center"},{scaleX:1,opacity:1,duration:0.9,ease:"power2.out"},1.4);
+tl.to("#scene0",{opacity:0,duration:0.4,ease:"power2.inOut"},2.6);
+tl.set("#scene0",{visibility:"hidden"},3.0);
+tl.fromTo("#chapter-bar",{opacity:0},{opacity:1,duration:0.4},T.s1+0.3);
+
+/* ── s1 流程图：四道闸逐段推进，回流环最后描画 ── */
+tl.set("#scene1",{opacity:1,visibility:"visible"},T.s1);
+tl.fromTo("#s1-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s1+0.3);
+tl.fromTo("#s1-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s1+0.6);
+tl.fromTo("#s1-wrap",{opacity:0},{opacity:1,duration:0.3},T.s1+1.2);
+svgFlow("#s1-svg", T.s1+1.4, {step:2.6, draw:0.9, pop:0.5});
+tl.set("#scene1",{visibility:"hidden"},T.s2);
+
+/* ── s2 分层色带：逐层长出，主层稍慢，约束栏最后 ── */
+tl.set("#scene2",{opacity:1,visibility:"visible"},T.s2);
+tl.fromTo("#s2-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s2+0.3);
+tl.fromTo("#s2-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s2+0.6);
+growLayer("#s2-l1",T.s2+1.6);
+growLayer("#s2-l2",T.s2+3.4);
+growLayer("#s2-l3",T.s2+5.2,0.75);
+growLayer("#s2-l4",T.s2+7.4);
+growLayer("#s2-l5",T.s2+9.2);
+tl.fromTo("#s2-c1",{x:26,opacity:0},{x:0,opacity:1,duration:0.55,ease:"power2.out"},T.s2+11.4);
+tl.fromTo("#s2-c2",{x:26,opacity:0},{x:0,opacity:1,duration:0.55,ease:"power2.out"},T.s2+13.0);
+tl.fromTo("#s2-c3",{x:26,opacity:0},{x:0,opacity:1,duration:0.55,ease:"power2.out"},T.s2+14.6);
+tl.set("#scene2",{visibility:"hidden"},T.s3);
+
+/* ── s3 对比条形：两条分别对齐各自被说出的时刻 ── */
+tl.set("#scene3",{opacity:1,visibility:"visible"},T.s3);
+tl.fromTo("#s3-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s3+0.3);
+tl.fromTo("#s3-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s3+0.6);
+tl.fromTo("#s3-r1",{y:22,opacity:0},{y:0,opacity:1,duration:0.55},T.s3+1.8);
+growBar("#s3-f1",T.s3+2.4,1.4);
+tl.fromTo("#s3-r2",{y:22,opacity:0},{y:0,opacity:1,duration:0.55},T.s3+7.6);
+growBar("#s3-f2",T.s3+8.2,0.9);
+tl.fromTo("#s3-delta",{y:20,opacity:0},{y:0,opacity:1,duration:0.6},T.s3+12.0);
+tl.set("#scene3",{visibility:"hidden"},T.s4);
+
+/* ── s4 循环图：四节点逐跳，弧箭头描画，闭合后旁注 ── */
+tl.set("#scene4",{opacity:1,visibility:"visible"},T.s4);
+tl.fromTo("#s4-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s4+0.3);
+tl.fromTo("#s4-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s4+0.6);
+svgFlow("#s4-svg", T.s4+1.6, {step:2.4, draw:0.85, pop:0.5});
+tl.fromTo("#s4-a1",{x:-24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+2.0);
+tl.fromTo("#s4-a2",{x:-24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+6.4);
+tl.fromTo("#s4-a3",{x:24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+11.0);
+tl.fromTo("#s4-a4",{x:24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+14.4);
+tl.set("#scene4",{visibility:"hidden"},T.s5);
+
+/* ── s5 代码块逐行 + 数字跳数 ── */
+tl.set("#scene5",{opacity:1,visibility:"visible"},T.s5);
+tl.fromTo("#s5-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+0.3);
+tl.fromTo("#s5-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s5+0.6);
+tl.fromTo("#s5-term",{y:22,opacity:0},{y:0,opacity:1,duration:0.6},T.s5+1.4);
+tl.fromTo("#s5-t1",{x:-18,opacity:0},{x:0,opacity:1,duration:0.45},T.s5+2.0);
+tl.fromTo("#s5-t2",{x:-18,opacity:0},{x:0,opacity:1,duration:0.45},T.s5+4.0);
+tl.fromTo("#s5-t3",{x:-18,opacity:0},{x:0,opacity:1,duration:0.45},T.s5+6.0);
+tl.fromTo("#s5-t4",{x:-18,opacity:0},{x:0,opacity:1,duration:0.45},T.s5+8.0);
+tl.fromTo("#s5-k1",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+10.4);
+countUp("#s5-n1",15,T.s5+10.8,1.1);
+tl.fromTo("#s5-k2",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+12.2);
+countUp("#s5-n2",94,T.s5+12.6,1.2);
+tl.fromTo("#s5-k3",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+14.0);
+countUp("#s5-n3",26,T.s5+14.4,1.0);
+tl.fromTo("#s5-k4",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+15.8);
+countUp("#s5-n4",85.7,T.s5+16.2,1.3,1);
+tl.set("#scene5",{visibility:"hidden"},T.s6);
+
+/* ── s6 收尾 ── */
+tl.set("#scene6",{opacity:1,visibility:"visible"},T.s6);
+tl.fromTo("#s6-t",{y:30,opacity:0},{y:0,opacity:1,duration:0.8,ease:"power3.out"},T.s6+0.5);
+tl.fromTo("#s6-s",{y:18,opacity:0},{y:0,opacity:1,duration:0.6},T.s6+2.4);
+tl.fromTo("#s6-line",{scaleX:0,opacity:0},{scaleX:1,opacity:1,duration:0.7},T.s6+4.2);
+tl.fromTo("#s6-f",{opacity:0},{opacity:1,duration:0.6},T.s6+5.4);
+tl.to("#chapter-bar",{opacity:0,duration:0.5},T.s6+6.0);
+
+window.__timelines["main"] = tl;
+</script>
+</body>
+</html>

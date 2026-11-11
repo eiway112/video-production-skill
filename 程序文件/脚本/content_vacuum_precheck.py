@@ -24,6 +24,7 @@ start+3.0 / end-2.0，覆盖不到这两个时刻，故不能替代本工具。
   --boundaries 模式：0=观测完成（读数不改变退出码），2=无从观测。
 """
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -453,6 +454,205 @@ def run_boundaries(html_src: Path, verbose: bool):
     return code
 
 
+# ── 场头低占用描述面（--heads，2026-11-11 复盘批；**不是门禁**）──────────
+# 存在理由（实测，非取舍声明）：某深色底候选片每个场起点后 0.5–3.2s 只有左上标题、
+# 正文 stagger 尚未起，blackdetect 在**裸片**上量出 7 段暗场（最长 2.56s），其中一段
+# 与字幕重叠 1.7s 超终检阈 1.0s ⇒ no_black_frame_with_subtitle FAIL，三轮全量渲染
+# 各约 20 分钟才暴露。两条既有零渲染腿都看不见它：主模式取样在 +7.5s / +0.85×窗长，
+# 覆盖不到场头；--boundaries 的判据是"占用恰为 0"，而那些帧占用 0.0149（标题还在）。
+# 本面只把场头 0~4s 的像素占用摆到渲染之前：逐场最低值、最低三场、+1.0s 处占用
+# （该时刻与终检黑场-字幕重叠阈同源，只作读数时刻、不作阈值）。不裁定、不设阈值、
+# 退出码不随读数变化——与 frame_occupancy / choreography_profile 同档（2026-10-10 常设裁定）。
+HEAD_POST = 4.0
+HEAD_STEP = 0.5
+HEAD_READ_T = 1.0
+HEAD_RISE_FRAC = 0.5
+
+
+def head_rise_offset(frames, start):
+    """场头「正文起量时刻」＝自 +HEAD_READ_T 起首个占用 ≥ 窗末占用一半的采样偏移。
+
+    为何需要它（实测，不是推演）：min 读数在修前修后都可能是同一个值——r03 修前
+    13 场里 11 场 min 同为 0.0149（场头那一瞬只有标题），病灶场 s8 混在并列里，
+    「最低三场」按序取前三个根本点不到它。改用窗末占用做**自参照**后，s8 由
+    +3.50s 变 +1.50s（并发线把 st1 锚 3.2→1.40），而未被改的 s9 前后同为 +1.50s。
+    两条口径陷阱都由实测排除：①参照取窗内 **max** 不行——+0.0s 那帧是上一场
+    尚未退场的画面（实测 0.3662／0.4689），max 恒被它占据，"首个≥半 max" 恒为
+    +0.00s＝零区分力；②搜索起点必须 ≥ +HEAD_READ_T，否则同样被那帧污染。
+    窗末占用 ≤0 或窗内始终未达半值 → None（无从读数，不得写成 0）。
+    本量是描述面口径常数，不是阈值：不裁定、不阻断、不进退出码。
+    """
+    if not frames:
+        return None
+    ref = frames[-1][1]
+    if ref is None or ref <= 0:
+        return None
+    for t, cov in frames:
+        if t - start >= HEAD_READ_T - 1e-9 and cov >= HEAD_RISE_FRAC * ref:
+            return round(t - start, 2)
+    return None
+
+
+def format_head_window() -> str:
+    """取样窗的唯一复述处：数值由常量插值，文案不写死秒数。"""
+    return (f"窗＝场起点 ~ 起点+{HEAD_POST:g}s，步长 {HEAD_STEP:g}s；"
+            f"另单列 +{HEAD_READ_T:g}s 处占用（读数时刻，非阈值）")
+
+
+def head_window(start: float, total=None):
+    """某场起点后的采样时刻表（含两端；上界不超过组合总时长）。"""
+    lo = round(max(0.0, start), 3)
+    hi = round(start + HEAD_POST, 3)
+    if total is not None:
+        hi = min(hi, round(float(total), 3))
+    out, i = [], 0
+    while True:
+        t = round(lo + i * HEAD_STEP, 3)
+        if t > hi + 1e-9:
+            break
+        out.append(t)
+        i += 1
+    return out
+
+
+def probe_head(chrome, probe, sid, start, work, total, verbose):
+    """一场起点的场头窗内逐帧占用读数 → 该场行（min 与 +1.0s 读数同源）。"""
+    frames = []
+    for t in head_window(start, total):
+        img = work / f"{sid}_h{int(round(t * 1000)):07d}.png"
+        shoot(chrome, probe, t, img)
+        raw = vbc.measure_content_coverage(img)
+        frames.append((round(t, 2), raw))
+        if verbose:
+            print(f"    t={t:6.2f}s cov={raw:.4f}")
+    row = {"sid": sid, "start": start, "frames": frames}
+    if frames:
+        t_min, cov_min = min(frames, key=lambda f: f[1])
+        row["min_cov"], row["min_t"] = cov_min, t_min
+        mark = round(start + HEAD_READ_T, 2)
+        at = [v for t, v in frames if abs(t - mark) < 1e-6]
+        row["cov_at_mark"] = at[0] if at else None
+        row["rise_t"] = head_rise_offset(frames, start)
+        shown = f"{row['cov_at_mark']:.4f}" if row["cov_at_mark"] is not None else "n/a"
+        rise = f"+{row['rise_t']:.2f}s" if row["rise_t"] is not None else "未达"
+        print(f"  {sid:6s} T={start:6.2f}s  帧 {len(frames):2d}  "
+              f"min={cov_min:.4f}@{t_min:.2f}s  +{HEAD_READ_T:g}s={shown}  起量={rise}")
+    else:
+        row["min_cov"], row["min_t"], row["cov_at_mark"] = None, None, None
+        row["rise_t"] = None
+        print(f"  {sid:6s} T={start:6.2f}s  帧 0（窗长非正或已被总时长截空）")
+    return row
+
+
+def format_head_lines(data):
+    """读数行的唯一生成点（CLI 与 pipeline_runner 共用，禁止各写一份文案）。"""
+    if data.get("status") != "OBSERVED":
+        return ["[VACUUM-HEAD] UNTESTED — " + str(data.get("reason") or "场头取数未成")
+                + "（不阻断；不得读成已验证）"]
+    low = "／".join(f"{r['sid']} {r['min_cov']:.4f}@{r['min_t']:.2f}s"
+                   for r in data.get("lowest", []))
+    late = "／".join(
+        f"{r['sid']} " + (f"+{r['rise_t']:.2f}s" if r.get("rise_t") is not None else "未达")
+        for r in data.get("latest_rise", []))
+    lines = [
+        f"[VACUUM-HEAD] 描述面不裁定：{data['scenes']} 个场起点 / {data['frames']} 帧，"
+        f"场头 0~{HEAD_POST:g}s 最低占用中位 {data['min_cov_median']:.4f}；最低三场 {low}",
+        f"[VACUUM-HEAD] 正文起量最晚三场 {late}"
+        f"（起量＝自 +{HEAD_READ_T:g}s 起首个占用 ≥ 窗末占用 {HEAD_RISE_FRAC:g} 倍的采样偏移；"
+        "未达＝窗内始终未到该值）",
+        "    读法：" + format_head_window() + "。深色底上『场头只有标题』与终检"
+        "黑场-字幕重叠是同一形态；**起量时刻比 min 更能指向病灶**——min 在多场并列时"
+        "点不到被改的那一场（实测 r03 修前 11 场 min 同为 0.0149）。本读数供渲染前对照入场锚"
+        "（首条正文 tween 锚 ≤ T.sN+1.0s，见 HyperFrames_HTML模板参考基准.md §2.2）。"
+        "不设阈值、不阻断。",
+    ]
+    if data.get("untested"):
+        lines.append("[VACUUM-HEAD] UNTESTED: " + str(len(data["untested"]))
+                     + " 个起点无采样帧 -> " + ", ".join(data["untested"]))
+    return lines
+
+
+def summarize_heads(rows):
+    """场头观测汇总 → (exit_code, lines, data)。退出码只答观测完成与否（0/2）。"""
+    if not rows or not any(r["frames"] for r in rows):
+        data = {"status": "UNTESTED", "scenes": len(rows), "frames": 0,
+                "reason": "没有任何场起点进入场头窗采样（无从观测，"
+                          "不得由「没有读数」读成「场头干净」）",
+                "lowest": [], "latest_rise": [],
+                "untested": [r["sid"] for r in rows]}
+        return 2, format_head_lines(data), data
+    ok = [r for r in rows if r.get("min_cov") is not None]
+    vals = sorted(r["min_cov"] for r in ok)
+    med = vals[len(vals) // 2]
+    lowest = [{"sid": r["sid"], "min_cov": r["min_cov"], "min_t": r["min_t"],
+               "cov_at_mark": r.get("cov_at_mark")}
+              for r in sorted(ok, key=lambda r: r["min_cov"])[:3]]
+    # 起量最晚＝正文来得最迟的场；None（窗内未达半值）比任何秒数都晚，排最前
+    latest_rise = [{"sid": r["sid"], "rise_t": r.get("rise_t"),
+                    "min_cov": r["min_cov"]}
+                   for r in sorted(ok, key=lambda r: (r.get("rise_t") is not None,
+                                                      -(r.get("rise_t") or 0.0),
+                                                      r["sid"]))[:3]]
+    data = {"status": "OBSERVED", "scenes": len(rows),
+            "frames": sum(len(r["frames"]) for r in rows),
+            "min_cov_median": med, "lowest": lowest, "latest_rise": latest_rise,
+            "untested": [r["sid"] for r in rows if not r["frames"]]}
+    return 0, format_head_lines(data), data
+
+
+def head_untested(reason: str, as_json: bool, scenes: int = 0):
+    """--heads 未测出口的单点：stderr 点名 ＋（--json 时）同因的机器可读对象。
+
+    存在理由（实测）：消费侧 pipeline_runner 按 stdout 首个 '{' 解析，未测出口
+    若只写 stderr，它报出的就是自己的解析异常 "substring not found" —— 真实断链
+    原因被顶替，作者无从知道断在哪条腿（A06 同族：取数断链须点名）。
+    """
+    print(f"UNTESTED: {reason}", file=sys.stderr)
+    if as_json:
+        print(json.dumps({"status": "UNTESTED", "scenes": scenes, "frames": 0,
+                          "reason": reason, "lowest": [], "untested": []},
+                         ensure_ascii=False))
+    return 2
+
+
+def run_heads(html_src: Path, verbose: bool, as_json: bool = False):
+    """--heads 入口：取 T 块场起点 → 逐场采场头窗 → 描述面读数。"""
+    try:
+        html_text = html_src.read_text(encoding="utf-8")
+        ordered, starts = scene_starts(html_text)
+    except RuntimeError as e:
+        return head_untested(str(e), as_json)
+    if not ordered:
+        return head_untested("T 块未给出任何场起点，场头采样无对象", as_json)
+    total = composition_duration(html_text)
+    work = BASE_DIR / f"head_{html_src.parent.name}"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        chrome = find_chrome()
+        probe, missing = make_probe(html_src, work)
+        print(f"场头低占用零渲染采样（描述面，不设门禁）: {html_src.parent.name}")
+        print(f"  {format_head_window()}")
+        if missing:
+            print(f"  ⚠ HTML 引用了但未能带入工作目录的资源 {len(missing)} 项 -> "
+                  + ", ".join(missing[:8])
+                  + ("…" if len(missing) > 8 else "")
+                  + "（该场头占用仍会偏低，属被测件引用问题）")
+        rows = [probe_head(chrome, probe, sid, starts[sid], work, total, verbose)
+                for sid in ordered]
+    except (RuntimeError, OSError) as e:
+        return head_untested(str(e), as_json, len(ordered))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    code, lines, data = summarize_heads(rows)
+    for line in lines:
+        print(line)
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False))
+    return code
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("html", help="项目 index.html 路径")
@@ -461,15 +661,24 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="不打印点亮行区段")
     ap.add_argument("--boundaries", action="store_true",
                     help="场边界零渲染采样（观测面，不设门禁；忽略场景清单参数）")
+    ap.add_argument("--heads", action="store_true",
+                    help="场头低占用描述面（场起点后 0~4s；不设门禁；忽略场景清单参数）")
+    ap.add_argument("--json", action="store_true",
+                    help="--heads 末尾追加机器可读 JSON（供 pipeline_runner 消费）")
     args = ap.parse_args()
 
     html_src = Path(args.html).resolve()
     if not html_src.is_file():
+        if args.heads:
+            return head_untested(f"找不到 {html_src}", args.json)
         print(f"UNTESTED: 找不到 {html_src}", file=sys.stderr)
         return 2
 
     if args.boundaries:
         return run_boundaries(html_src, not args.quiet)
+
+    if args.heads:
+        return run_heads(html_src, not args.quiet, args.json)
 
     if args.scenes:
         triples = []

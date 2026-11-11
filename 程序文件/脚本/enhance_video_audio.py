@@ -9,8 +9,8 @@ HyperFrames 视频后处理工作流 — TTS旁白 + BGM + 字幕烧录
   3. get_paths() 中的文件名
 
 前置条件:
-  - HTML 模板每个场景必须包含 <div class="subtitle-safe"></div>
-  - .sc 的 padding-bottom >= 150px（为字幕预留空间）
+  - 字幕安全区由预览与渲后像素面裁定（visual_boundary_check.subtitle_safety_line 单源）；
+    本脚本不做 padding 代理判据（2026-11-11 撤 Step 0：150px 第二口径曾误杀验收通过交付）
   - 字幕样式参数见 step6_burn_subtitles() 中的 style 变量
 """
 
@@ -2018,196 +2018,6 @@ def get_paths(config_cfg=None):
 
 
 _html_override_path = None
-
-def step0_validate_html_template():
-    """Pre-check: HTML template must have subtitle-safe divs in every scene"""
-    print("=== Step 0: Validate HTML Template ===")
-    root = WF_ROOT
-    html_path = _html_override_path or (root / "程序文件" / "源码" / "hyperframes" / "crm-video" / "index.html")
-
-    if not html_path.exists():
-        print(f"  WARNING: HTML template not found at {html_path}")
-        print("  Skipping validation. Subtitle overlap may occur.\n")
-        return True
-
-    content = html_path.read_text(encoding="utf-8")
-
-    # Count scenes and subtitle-safe divs
-    import re as _re
-    scene_count = len(_re.findall(r'id="scene\d+"', content))
-    safe_count = len(_re.findall(r'class="subtitle-safe"', content))
-
-    # Parse S-block for authoritative metadata (cover duration, scene count)
-    script_match_early = _re.search(r'<script>(.*?)</script>', content, _re.DOTALL)
-    s_map = {}
-    if script_match_early:
-        s_map = parse_scene_map(script_match_early.group(1))
-
-    # Check padding-bottom — try explicit padding-bottom first, then shorthand
-    padding_ok = False
-    # 1. Try explicit "padding-bottom:NNNpx"
-    pb_explicit = _re.search(r'\.sc\s*\{[^}]*padding-bottom\s*:\s*(\d+)px', content)
-    if pb_explicit:
-        padding_ok = int(pb_explicit.group(1)) >= 150
-    if not padding_ok:
-        # 2. Try shorthand "padding:T R B" or "padding:T R B L" — last value = bottom
-        sc_match = _re.search(r'\.sc\s*\{[^}]*padding\s*:[^}]*\}', content)
-        if sc_match:
-            px_values = _re.findall(r'(\d+)px', sc_match.group())
-            if len(px_values) >= 3:
-                bottom_padding = int(px_values[2])  # 3-value: T R B; 4-value: T R B L
-                padding_ok = bottom_padding >= 150
-    if not padding_ok:
-        # 3. calc(var(--xxx) + NNpx) 形态（safe-zone 变量驱动的模板）：
-        #    从 :root 解析变量值后求和，避免对合规模板误报。
-        calc_match = _re.search(
-            r'\.sc\s*\{[^}]*padding(?:-bottom)?\s*:[^};]*calc\(\s*var\(\s*(--[\w-]+)\s*\)\s*\+\s*(\d+)px\s*\)',
-            content)
-        if calc_match:
-            var_name, extra_px = calc_match.group(1), int(calc_match.group(2))
-            var_def = _re.search(
-                _re.escape(var_name) + r'\s*:\s*(\d+)px', content)
-            if var_def:
-                padding_ok = int(var_def.group(1)) + extra_px >= 150
-
-    issues = []
-    if safe_count < scene_count:
-        issues.append(f"  Only {safe_count}/{scene_count} scenes have .subtitle-safe div")
-    if not padding_ok:
-        issues.append("  .sc padding-bottom < 150px — subtitle may overlap content")
-
-    # Auto-detect cover duration — prefer S-block (authoritative), fall back to data-cover-duration
-    global COVER_DURATION
-    if s_map and s_map.get('cover_duration'):
-        COVER_DURATION = s_map['cover_duration']
-        # S-block already excludes cover from scene_count
-        scene_count = s_map['scene_count']
-    else:
-        cover_match = _re.search(r'data-cover-duration="([\d.]+)"', content)
-        if cover_match:
-            COVER_DURATION = float(cover_match.group(1))
-            # Exclude cover scene from scene_count for validation accuracy
-            if _re.search(r'id="scene0"', content):
-                scene_count -= 1
-
-    # --- Timeline validation: detect known anti-patterns in GSAP code ---
-    # Parse T-block from script section (before comment stripping)
-    script_match = _re.search(r'<script>(.*?)</script>', content, _re.DOTALL)
-    t_map = {}
-    if script_match:
-        t_map = parse_t_block(script_match.group(1))
-
-    # Strip JS comments to avoid matching patterns inside /* ... */ and // ...
-    js_code = _re.sub(r'/\*[\s\S]*?\*/', '', content)
-    js_code = _re.sub(r'//[^\n]*', '', js_code)
-
-    # Check 1: Independent gsap.timeline() not controlled by HyperFrames seek-and-capture
-    for m in _re.finditer(r'gsap\.timeline\s*\(', js_code):
-        start = max(0, m.start() - 80)
-        ctx = js_code[start:m.end() + 20]
-        # Only flag if NOT the main timeline (paused:true assigned to var tl)
-        if 'paused' in ctx and ('var tl' in ctx or 'let tl' in ctx or 'const tl' in ctx):
-            continue
-        issues.append(
-            "  [TIMELINE] Independent gsap.timeline() detected — not controlled by "
-            "HyperFrames seek-and-capture, will cause frame flashing. "
-            "Merge all tweens into the main tl."
-        )
-
-    # Check 2: Scene1 content animations starting before cover fully fades out
-    if COVER_DURATION > 0:
-        for m in _re.finditer(
-            r'(?:fromTo|to)\s*\(\s*"#(s1[a-zA-Z][a-zA-Z0-9]*)"', js_code
-        ):
-            el_id = m.group(1)
-            # Skip non-content elements (glow/bg effects: s1g1, s1g2, s1gh, etc.)
-            if _re.match(r'^s1g', el_id, _re.IGNORECASE):
-                continue
-            # Find the timeline position on this line (T-block or numeric literal)
-            line_end = js_code.find('\n', m.end())
-            if line_end < 0:
-                line_end = min(m.end() + 120, len(js_code))
-            line = js_code[m.start():line_end]
-            anim_start = resolve_line_time(line, t_map)
-            if anim_start is not None and anim_start < COVER_DURATION:
-                issues.append(
-                    f"  [TIMING] #{el_id} animation starts at T={anim_start}s "
-                    f"before cover fades at T={COVER_DURATION}s — text overlap. "
-                    f"Delay to T>={COVER_DURATION}s."
-                )
-
-    # Check 3: Opacity crossfade transitions between scenes (flicker in seek-and-capture)
-    fade_outs = []  # (time, scene_id)
-    fade_ins = []   # (time, scene_id)
-    for m in _re.finditer(
-        r'tl\.(to|fromTo)\s*\(\s*"#scene(\d+)"[^}]*opacity\s*:\s*([\d.]+)', js_code
-    ):
-        func_name = m.group(1)
-        scene_num = int(m.group(2))
-        opacity_val = float(m.group(3))
-        line_end = js_code.find('\n', m.end())
-        if line_end < 0:
-            line_end = min(m.end() + 120, len(js_code))
-        line = js_code[m.start():line_end]
-        time_pos = resolve_line_time(line, t_map)
-        if time_pos is None:
-            continue
-        if func_name == 'to' and opacity_val == 0:
-            fade_outs.append((time_pos, scene_num))
-        elif func_name == 'fromTo' and opacity_val == 0:
-            fade_ins.append((time_pos, scene_num))
-    for t_out, s_out in fade_outs:
-        for t_in, s_in in fade_ins:
-            if s_in != s_out and abs(t_out - t_in) < 2.0:
-                issues.append(
-                    f"  [TRANSITION] Opacity crossfade between scene{s_out} and scene{s_in} "
-                    f"at T={t_out}s/{t_in}s — flickers in seek-and-capture. "
-                    f"Use transform-based transition (Push Slide / Vertical Push)."
-                )
-
-    # Check 4: end-fade must not fire long before data-duration.
-    # quickstart-demo 事故：#scene-end-fade 按"收缩后窗口"手算写死 T.s5+5.8，
-    # 而 S-block 窗口未收缩 → 收尾 ~4s 黑场配音频。静态拦截声明脱钩：
-    # 淡出触发时刻距 data-duration 超过 dead-air 阈值 → 拒绝渲染。
-    dur_attr = _re.search(r'data-duration="([\d.]+)"', content)
-    if dur_attr:
-        _data_dur = float(dur_attr.group(1))
-        m_fade = _re.search(r'tl\.to\s*\(\s*"#scene-end-fade"[^\n]*', js_code)
-        if m_fade:
-            _fade_t = resolve_line_time(m_fade.group(0), t_map)
-            _max_dead = float(_load_audio_sync_rules().get("dead_air", {})
-                              .get("max_seconds_per_scene", 3.0))
-            # 尾部推导惯用形态：从权威 S-block 末场景 end 算触发时刻
-            # （adjust_timeline 重写 S-block 时自动同步，构造上不会脱钩）。
-            _tail_derived = bool(_re.search(
-                r'S\s*\[\s*S\.length\s*-\s*1\s*\]\s*\.\s*end', js_code))
-            if _fade_t is not None and _fade_t < _data_dur - _max_dead:
-                issues.append(
-                    f"  [END-FADE] #scene-end-fade fires at T={_fade_t:.1f}s but "
-                    f"data-duration={_data_dur}s — {_data_dur - _fade_t:.1f}s of black "
-                    f"screen while audio/subtitles may still play. Shrink the last "
-                    f"scene window (adjust_timeline --shrink) or move the fade to the tail."
-                )
-            elif _fade_t is None and not _tail_derived:
-                issues.append(
-                    "  [END-FADE] #scene-end-fade trigger time is not statically "
-                    "resolvable and not derived from the S-block tail — use "
-                    "`S[S.length - 1].end - fadeDur` so adjust_timeline keeps it in sync."
-                )
-
-    if issues:
-        print("  HTML template validation FAILED:")
-        for issue in issues:
-            print(issue)
-        print("  Fix: add <div class=\"subtitle-safe\"></div> to each scene")
-        print("  Fix: set .sc padding-bottom >= 150px\n")
-        return False
-
-    cover_info = f", cover={COVER_DURATION}s" if COVER_DURATION > 0 else ""
-    print(f"  OK: {scene_count} scenes, {safe_count} subtitle-safe zones, padding adequate{cover_info}")
-    print()
-    return True
-
 
 def run_ffmpeg(cmd, desc=""):
     result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
@@ -4511,11 +4321,6 @@ async def main():
             sys.exit(1)
         print(f"=== Quick-Fix: clean input = {render_raw.name}; "
               f"delivery slot written only on success ===\n")
-
-    # Pre-check: HTML template must have subtitle safe zones
-    if not step0_validate_html_template():
-        print("WARNING: HTML template missing subtitle-safe zones.")
-        print("Subtitles may overlap with scene content.\n")
 
     # Step 1: TTS — 任何模式都不可跳过。
     # quick-fix 省的是"视频重渲染"，不是 TTS：文本未变时 step1 全部缓存命中

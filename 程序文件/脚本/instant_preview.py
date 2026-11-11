@@ -334,6 +334,88 @@ def check_preview_safety(manifest_entries, temp_dir):
     return violations
 
 
+def layout_fullness_lines(section):
+    """主体区填充率的**描述面**（2026-11-11 复盘批）：只读数、不裁定、不影响退出码。
+
+    存在理由：安全门只裁 `content_bottom <= 安全线`——内容越多越贴线越易 FAIL，
+    内容少则永远安全，压力是单向的。于是"少放、居中"成为过门最省力策略，留白在
+    门禁全绿下出厂、以交付后投诉的形式到达（同题材两片实测填充率 0.411 对 0.640）。
+    本行把"够不够满"在**渲染之前**摆到纸上，供作者与分镜模板审核节点第 7 项对照。
+
+    口径：填充率＝可见内容墨迹的**外接盒**裁到主体区后的面积 ÷ 主体区面积
+    （画布宽 × 字幕安全线）。安全线由 `visual_boundary_check.subtitle_safety_line`
+    单源给出，本函数与取数侧都不另写数值。取数在 `preview_capture.js`（只回几何盒
+    与画布尺寸），分母、裁剪与聚合在此——与 text_fit／bar_overflow 同一分工。
+    逐场跨采样取**最大**填充率（与 presence_check 取峰值同纪律：晚揭示的场不得被
+    入场中途的读数读成空）。
+
+    为何不用"底沿空占比"（本批第一版口径，已废）：同一批快照字节、同一批时刻的
+    三线 A/B 实测该口径**无区分力**——r03／本线／rev02 中位 18%／17%／21%，
+    而被投诉的 rev02 与观感合格的 r03 在外接盒面积口径下是 0.411 对 0.640。
+    底沿口径会把"内容窄条铺到底"读成满，恰是本批要防的形态。
+
+    不设阈值、不点名合格与否（2026-10-10 常设裁定：不为观感新增门禁）。
+    """
+    head = "  [LAYOUT-FULLNESS] "
+    if not isinstance(section, dict):
+        return [head + "UNTESTED — 捕获脚本未产出 layout_fill 段"
+                "（取数没跑成，不得读成已检查）"]
+    nodes = section.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return [head + "UNTESTED — layout_fill 无逐场读数（status_hint="
+                f"{section.get('status_hint')!r}）；取数断链不得读成已检查"]
+    try:
+        from visual_boundary_check import subtitle_safety_line
+    except ImportError as e:
+        return [head + f"UNTESTED — 安全线判据模块不可用：{e}（不另写数值兜底）"]
+
+    rows = []
+    for nd in nodes:
+        if not isinstance(nd, dict):
+            continue
+        canvas = nd.get("canvas")
+        if not isinstance(canvas, dict):
+            continue
+        w, h = canvas.get("w"), canvas.get("h")
+        if not (isinstance(w, (int, float)) and isinstance(h, (int, float))
+                and w > 0 and h > 0):
+            continue
+        body_b = subtitle_safety_line(h)
+        denom = w * body_b
+        if not denom:
+            continue
+        best = None
+        for rd in nd.get("readings") or []:
+            ink = rd.get("ink") if isinstance(rd, dict) else None
+            if not isinstance(ink, dict):
+                fill = 0.0          # 该采样无可见墨迹＝空，是合法读数不是断链
+            else:
+                x1, y1 = max(0.0, ink.get("x", 0)), max(0.0, ink.get("y", 0))
+                x2 = min(w, ink.get("x", 0) + ink.get("w", 0))
+                y2 = min(body_b, ink.get("y", 0) + ink.get("h", 0))
+                fill = max(0.0, x2 - x1) * max(0.0, y2 - y1) / denom
+            if best is None or fill > best:
+                best = fill
+        if best is not None:
+            rows.append((str(nd.get("key")), best, w, body_b))
+    if not rows:
+        return [head + "UNTESTED — layout_fill 有段但无一场可算"
+                "（画布尺寸缺项或非法，取数断链）"]
+
+    rows.sort(key=lambda r: r[1])
+    vals = sorted(r[1] for r in rows)
+    med = vals[len(vals) // 2]
+    low = "／".join(f"{sid} {v:.0%}" for sid, v, _, _ in rows[:3])
+    return [
+        head + f"描述面不裁定：主体区 {rows[0][2]}×{rows[0][3]}（安全线同源），"
+        f"填充率中位 {med:.0%}；最低三场 {low}",
+        "    读法：填充率＝可见内容墨迹外接盒 ÷ 主体区面积，逐场取各采样最大值。"
+        "安全门只裁不越线、裁不了够不够满；留白须在这里被看见，而不是交付后被投诉。"
+        "居中容器与无余高吸收区是两种常见成因"
+        "（见 HyperFrames_HTML模板参考基准.md §2.2）。",
+    ]
+
+
 def _numeric_scene_ids(items, key="scene_id"):
     """场景条目 → 数字 id 集合（兼容 scene_id 为 3 或 "s3" 两种写法）。"""
     ids = set()
@@ -996,6 +1078,7 @@ def main():
 
     # --- Phase 2: Chrome Screenshots via puppeteer-core (unless --density-only) ---
     safety_violations = []
+    fullness_lines = []
     capture_count = 0
     capture_gap = []
     # Phase 2 整体包在 try/except 里（node 崩/截图复制失败都不得把脚本炸掉）。但"吞掉异常"
@@ -1176,6 +1259,12 @@ def main():
                     for line in bar_lines:
                         print(line)
 
+                    # 留白描述面（不裁定）：同一次 node 调用取回的几何盒，
+                    # 分母与聚合在此。缺段由 layout_fullness_lines 自己点名。
+                    fullness_lines = layout_fullness_lines(manifest.get("layout_fill"))
+                    for line in fullness_lines:
+                        print(line)
+
                     screenshots = []
                     for entry in manifest.get("scenes", []):
                         png_path = capture_dir / entry["file"]
@@ -1280,6 +1369,11 @@ def main():
         bar_record_path = None
         print(f"  [BAR-OVERFLOW] 留痕写入失败（不影响裁定，影响追溯）: {e}")
 
+    if not fullness_lines:
+        fullness_lines = layout_fullness_lines(None)
+        for line in fullness_lines:
+            print(line)
+
     # --- Phase 3: Generate Report ---
     print("\n--- Phase 3: Preview Report ---")
     report_lines = []
@@ -1360,6 +1454,12 @@ def main():
                            f"{bar_decision}）" if bar_decision else ""))
     if bar_record_path is not None:
         report_lines.append(f"  留痕: {bar_record_path}")
+
+    # Layout fullness（描述面，2026-11-11 复盘批）：留白在渲染前可见，不裁定
+    if fullness_lines:
+        report_lines.append("")
+        report_lines.append("== Layout Fullness (主体区填充率 · 描述面不裁定) ==")
+        report_lines.extend(ln.strip() for ln in fullness_lines)
 
     # Overall assessment
     report_lines.append("")
