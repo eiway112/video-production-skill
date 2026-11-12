@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="AI视频制作工作流模板/logo.png" width="160" alt="AI 视频制作工作流 LOGO">
   <h1>AI 视频制作工作流</h1>
   <p>文档 / 旁白脚本 / HTML → 成片的一体化生产流水线</p>
   <p>
