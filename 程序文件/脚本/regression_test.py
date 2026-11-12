@@ -19935,7 +19935,7 @@ def test_bar_overflow_gate_adjudicates_container_overflow() -> RegressionTestCas
 
 
 def test_stream_wrapper_keepalive_chain() -> RegressionTestCase:
-    """流包装保活链：重绑 sys.stdout/stderr 必须「持旧 + 持新」，级联关闭不得复发。
+    """用例105：流包装保活链：重绑 sys.stdout/stderr 必须「持旧 + 持新」，级联关闭不得复发。
 
     存在理由（机制实测，非推演）：TextIOWrapper 引用归零即 finalize（无需
     gc.collect），其析构关闭各代共享的底层 buffer——此后任何仍活着的 wrapper
@@ -22407,6 +22407,301 @@ def test_pause_insert_energy_gate() -> RegressionTestCase:
     return tc
 
 
+def test_transition_occlusion_gate() -> RegressionTestCase:
+    """用例137：预检 7g 场景根 fromTo 的 t=0 遮挡与揭示不持久两形态（2026-11-12 demo 批）。
+
+    存在理由：GSAP fromTo 的 immediateRender 默认真，from 段非零 opacity 且无离屏
+    偏移时该场景建表即不透明，按 z-index 盖住低层场景（L1）；其镜像形态是
+    immediateRender:false 且 opacity 只在 from 段——HyperFrames 运行时在 tween 窗外
+    恢复基样式，场景滑入后回到 CSS opacity:0（L2，同日第二次白渲换来：纯 Chrome
+    seek 探针 opacity=1 而渲染产物 s2–s8 覆盖率 0%）。预览/presence 两形态都量不到。
+    本用例锁两腿判据、豁免、注释/变量选择器不入判、接线与阻断档。
+    """
+    tc = RegressionTestCase(
+        "transition_occlusion_gate",
+        "验证 7g 遮挡与揭示不持久两腿判据、豁免、取数边界、接线与 render/audit 两档"
+    )
+    try:
+        import ast
+        import preflight_check as pf
+
+        def run(body):
+            html = ("<html><body><div id='root'></div><script>" + body + "</script></body></html>")
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "index.html"
+                p.write_text(html, encoding="utf-8")
+                r = pf.PreflightResult(mode="render")
+                pf.check_transition_occlusion(p, r)
+                return r
+
+        danger = 'tl.fromTo("#scene8", { scale:0.85, opacity:1 }, { scale:1, duration:0.7 }, T.s8);'
+        r = run(danger)
+        tc.assert_equal(len(r.errors), 1, "A1 危险形态判 ERROR 恰一条")
+        tc.assert_equal(r.counts["transition_occlusion"]["violations"], 1, "A1b 计数自报 1")
+        r = run(danger.replace("{ scale:1, duration:0.7 }",
+                               "{ scale:1, opacity:1, duration:0.7, immediateRender:false }"))
+        tc.assert_equal(len(r.errors), 0, "A2 显式 immediateRender:false＋to 段 opacity 豁免（L1）")
+        r = run('tl.fromTo("#scene2", { x:1920, opacity:1 }, { x:0, duration:0.7 }, T.s2);')
+        tc.assert_equal(len(r.errors), 0, "A3 离屏推移豁免")
+        r = run('tl.fromTo("#scene2", { opacity:0 }, { opacity:1, duration:0.7 }, T.s2);')
+        tc.assert_equal(len(r.errors), 0, "A4 from 透明（淡入）豁免")
+        r = run('tl.to("#scene1", { opacity:0, duration:0.5 }, 2.5);')
+        tc.assert_equal(r.counts["transition_occlusion"]["scene_root_fromto"], 0,
+                        "A5 无场景根 fromTo 时计数 0（不适用而非通过）")
+        tc.assert_equal(len(r.errors), 0, "A5b 不适用不判红")
+        r = run('/* tl.fromTo("#scene9", { opacity:1 }, { opacity:1 }, 9); */')
+        tc.assert_equal(r.counts["transition_occlusion"]["scene_root_fromto"], 0,
+                        "A6 注释里的字面不入判（剥注释后切语句）")
+        r = run('tl.fromTo(sel, { opacity:1 }, { opacity:1 }, 9);')
+        tc.assert_equal(r.counts["transition_occlusion"]["scene_root_fromto"], 0,
+                        "A7 变量选择器解析不到场景根不入判（不猜）")
+
+        src = (Path(__file__).parent / "preflight_check.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        main_fn = next(n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "main")
+        called = {n.func.id for n in ast.walk(main_fn)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_transition_occlusion" in called, "B1 main() 接线在位")
+        tc.assert_true("transition_occlusion" in pf.RENDER_CRITICAL_CHECKS,
+                        "B2 入 render 阻断集")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "index.html"
+            p.write_text("<html><body><script>" + danger + "</script></body></html>", encoding="utf-8")
+            ra = pf.PreflightResult(mode="audit")
+            pf.check_transition_occlusion(p, ra)
+        tc.assert_true(len(ra.errors) == 0 and len(ra.warnings) == 1,
+                        "B3 audit 档降 warning（render 档才阻断）")
+        safe7 = "".join(
+            f'tl.fromTo("#scene{i}", {{ scale:0.85, opacity:1 }}, '
+            f'{{ scale:1, opacity:1, duration:0.7, immediateRender:false }}, T.s{i});'
+            for i in range(2, 9))
+        r7 = run(safe7)
+        tc.assert_true(r7.counts["transition_occlusion"]["scene_root_fromto"] == 7
+                        and r7.counts["transition_occlusion"]["violations"] == 0,
+                        "C1 七条缩放穿越转场全豁免（合成正证据，不依赖在制项目）")
+        # ---- D 段：L2 揭示不持久（2026-11-12 第二次白渲） ----
+        broken = 'tl.fromTo("#scene8", { scale:0.85, opacity:1 }, { scale:1, duration:0.7, immediateRender:false }, T.s8);'
+        r = run(broken)
+        tc.assert_equal(len(r.errors), 1, "D1 ir:false 且 opacity 只在 from 段判 ERROR 恰一条")
+        tc.assert_equal(r.counts["transition_occlusion"]["reveal_not_persistent"], 1,
+                        "D1b L2 计数自报 1")
+        r = run(broken.replace("{ scale:1, duration:0.7, immediateRender:false }",
+                               "{ scale:1, opacity:1, duration:0.7, immediateRender:false }"))
+        tc.assert_equal(len(r.errors), 0, "D2 to 段补 opacity:1 即豁免")
+        tc.assert_equal(r.counts["transition_occlusion"]["reveal_not_persistent"], 0,
+                        "D2b 豁免后 L2 计数 0")
+        r = run('tl.set("#scene8", { opacity:1 }, T.s8);' + broken)
+        tc.assert_equal(len(r.errors), 0, "D3 另写 tl.set 揭示豁免（set 终值进基快照）")
+        r = run('tl.fromTo("#scene8", { opacity:0 }, { scale:1, duration:0.7, immediateRender:false }, T.s8);')
+        tc.assert_equal(len(r.errors), 0, "D4 from 透明时 L2 不入判（与 L1 同前提）")
+        r = run(danger)
+        tc.assert_equal(r.counts["transition_occlusion"]["reveal_not_persistent"], 0,
+                        "D5 L1 形态不计入 L2 计数（两腿分开自报）")
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"用例137 执行异常: {e}")
+    return tc
+
+
+def test_atomic_write_and_heartbeat_survive_reader_race() -> RegressionTestCase:
+    """用例136：原子写对 Windows 读者竞争有界重试；心跳不因瞬态写失败永久停跳。
+
+    存在理由（2026-11-12 全盘审计受控实验）：4 个并发读者持有锁文件句柄时
+    os.replace 抛 PermissionError(WinError 5)；旧 _beat 一次失败即 return，
+    心跳永久停 → stale_after 后锁被下一进程接管＝并发守卫静默失效。
+    旧归因「CPU 争抢」已被 8 线程 CPU 负载下 6/6 通过证伪；本用例锁真因与修法。
+    """
+    tc = RegressionTestCase(
+        "atomic_write_and_heartbeat_survive_reader_race",
+        "验证原子写瞬态竞争有界重试、心跳瞬态失败不停跳、持久失败仍 fail-loud"
+    )
+    try:
+        import ast
+        import threading
+        import time
+        import types
+        import script_interface as si
+        import pipeline_runner as pr
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            target = td / "authority.json"
+            real_replace = os.replace
+
+            # ── A：_replace_with_retry 的重试语义 ──
+            calls = {"n": 0}
+
+            def flaky_replace(a, b):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise PermissionError(5, "拒绝访问（模拟读者竞争）")
+                return real_replace(a, b)
+
+            saved_os = si.os
+
+            def stub_os(fn):
+                return types.SimpleNamespace(replace=fn, fsync=os.fsync)
+
+            raised_a = False
+            try:
+                si.os = stub_os(flaky_replace)
+                try:
+                    si.atomic_write_json(target, {"v": 1})
+                except PermissionError:
+                    raised_a = True
+            finally:
+                si.os = saved_os
+            tc.assert_true(not raised_a,
+                            "A1 瞬态 PermissionError 后重试成功（不向外抛）")
+            tc.assert_equal(calls["n"], 3, "A1b 恰在第三次尝试成功（前两次被竞争打掉）")
+            tc.assert_true(target.exists()
+                            and json.loads(target.read_text(encoding="utf-8"))["v"] == 1,
+                            "A1c 重试成功后目标内容正确")
+
+            calls["n"] = 0
+
+            def always_denied(a, b):
+                calls["n"] += 1
+                raise PermissionError(5, "拒绝访问（模拟持久竞争）")
+
+            tmp_left = None
+            try:
+                si.os = stub_os(always_denied)
+                try:
+                    si.atomic_write_json(target, {"v": 2})
+                    raised = False
+                except PermissionError:
+                    raised = True
+            finally:
+                si.os = saved_os
+            tc.assert_true(raised, "A2 持久竞争在有界重试后仍 fail-loud（不静默吞）")
+            tc.assert_equal(calls["n"], len(si._REPLACE_RETRY_DELAYS) + 1,
+                            "A2b 重试次数有界＝延迟表长＋首次")
+            tc.assert_true(not (td / "authority.json.tmp").exists(),
+                            "A3 持久失败后半截临时名被清掉")
+            tc.assert_true(target.exists()
+                            and json.loads(target.read_text(encoding="utf-8"))["v"] == 1,
+                            "A3b 持久失败不顶替目标（目标仍是上一版完整内容）")
+
+            calls["n"] = 0
+
+            def other_error(a, b):
+                calls["n"] += 1
+                raise OSError("非竞争类错误")
+
+            try:
+                si.os = stub_os(other_error)
+                try:
+                    si.atomic_write_json(target, {"v": 3})
+                except OSError:
+                    pass
+            finally:
+                si.os = saved_os
+            tc.assert_equal(calls["n"], 1, "A4 非 PermissionError 不重试（只救竞争这一形态）")
+
+            # ── B：_beat 的存活语义 ──
+            def make_lock(interval=0.05):
+                return pr.PipelineLock(td, rules={"state_lock": {
+                    "heartbeat_interval_seconds": interval,
+                    "stale_after_seconds": 90.0}}, config_name="c136.json", pid=770136)
+
+            def hb(lock):
+                return json.loads((td / lock.NAME).read_text(encoding="utf-8"))["heartbeat_at"]
+
+            lk = make_lock()
+            lk.acquire()
+            real_write = lk._write
+            state = {"fail_next": 1}
+
+            def transient_write(step=None):
+                if state["fail_next"] > 0:
+                    state["fail_next"] -= 1
+                    raise PermissionError(5, "拒绝访问（模拟一次竞争）")
+                return real_write(step)
+
+            lk._write = transient_write
+            h0 = hb(lk)
+            time.sleep(1.5)
+            h1 = hb(lk)
+            tc.assert_true(h1 > h0 and lk._thread.is_alive(),
+                            "B1 一次瞬态写失败后心跳仍续写（旧形态此处线程已死）")
+            state["fail_next"] = 1
+            time.sleep(1.5)
+            tc.assert_true(lk._thread.is_alive(),
+                            "B3 失败计数在成功一次后归零（不累计误杀）")
+            for _ in range(4):
+                state["fail_next"] = 1
+                time.sleep(0.35)
+            tc.assert_true(lk._thread.is_alive(),
+                            "B4 间隔出现的单次失败不累计致死（成功即归零）")
+            lk.release()
+
+            lk2 = make_lock()
+            lk2.acquire()
+
+            def dead_write(step=None):
+                raise PermissionError(5, "拒绝访问（模拟持久竞争）")
+
+            lk2._write = dead_write
+            import contextlib
+            import io as _io
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                time.sleep(1.5)
+            tc.assert_true(not lk2._thread.is_alive(),
+                            "B2 连续 5 次写失败后有界放弃（不无限空转）")
+            tc.assert_true("心跳连续 5 次写失败" in buf.getvalue(),
+                            "B2b 放弃时点名留痕（不静默死亡）")
+            lk2.release()
+
+            # ── C：真实并发读者下的心跳存活（生产腿）──
+            lk3 = make_lock()
+            lk3.acquire()
+            stop = threading.Event()
+
+            def reader():
+                while not stop.is_set():
+                    try:
+                        (td / lk3.NAME).read_text(encoding="utf-8")
+                    except OSError:
+                        pass
+                    time.sleep(0.001)
+
+            readers = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+            for t in readers:
+                t.start()
+            g0 = hb(lk3)
+            time.sleep(3.0)
+            g1 = hb(lk3)
+            alive = lk3._thread.is_alive()
+            stop.set()
+            time.sleep(0.2)
+            tc.assert_true(g1 > g0 and alive,
+                            "C1 四个并发读者下心跳仍前进且线程存活（审计复现腿）")
+            lk3.release()
+
+        # ── D：接线与单源 ──
+        si_src = (Path(__file__).parent / "script_interface.py").read_text(encoding="utf-8")
+        tree = ast.parse(si_src)
+        via = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "_atomic_write_via")
+        called = {n.func.id for n in ast.walk(via)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("_replace_with_retry" in called and "replace" not in called,
+                        "D1 原子写唯一实现走重试入口（不得回落裸 os.replace）")
+        pr_src = (Path(__file__).parent / "pipeline_runner.py").read_text(encoding="utf-8")
+        beat = next(n for n in ast.walk(ast.parse(pr_src))
+                    if isinstance(n, ast.FunctionDef) and n.name == "_beat")
+        beat_src = ast.get_source_segment(pr_src, beat)
+        tc.assert_true("misses >= 5" in beat_src and "misses = 0" in beat_src,
+                        "D2 _beat 以连续失败计数有界放弃且成功归零（非一次即 return）")
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed(f"用例136 执行异常: {e}")
+    return tc
+
+
 def test_layout_fullness_descriptive_face() -> RegressionTestCase:
     """用例134：预览期主体区填充率描述面（2026-11-11 复盘批）。
 
@@ -23016,6 +23311,8 @@ class RegressionTestRunner:
             test_visual_form_declaration_collision,
             test_failed_qa_slot_quarantined,
             test_layout_fullness_descriptive_face,
+            test_atomic_write_and_heartbeat_survive_reader_race,
+            test_transition_occlusion_gate,
         ]
         self.results = []
     

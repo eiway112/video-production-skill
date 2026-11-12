@@ -2,6 +2,8 @@
 pathlib2>=2.3.7
 pydantic>=2.0.0
 python-dotenv>=1.0.0
+# --sdl 入口与 scene_compiler/unified_validator 直接 import yaml（此前靠传递依赖顺带装上）
+PyYAML>=5.3
 
 # 视频处理
 Pillow>=10.0.0
@@ -12,7 +14,7 @@ websocket-client>=1.5.0
 
 # TTS
 edge-tts>=6.0.0
-# Qwen / CosyVoice TTS via 阿里云百炼 DashScope（HyperFrames 默认引擎）
+# Qwen / CosyVoice TTS via 阿里云百炼 DashScope（存量项目按 config 显式声明保留；主引擎为 ElevenLabs，走 stdlib urllib 无额外依赖）
 dashscope>=1.25.17
 
 # 字幕-语音强制对齐（_forced_align.py，本地离线 ASR，P0-a）

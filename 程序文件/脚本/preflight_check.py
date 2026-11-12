@@ -97,6 +97,10 @@ RENDER_CRITICAL_CHECKS = {
     # （t=0 常驻）、旧场退场锚没前移（新场永不退场）、z-index 没重排（层序错位），
     # 三处里只有"窗口重叠"会被既有检查抓到。
     "scene_insert",
+    # check 7g（2026-11-12 demo 批）：场景根 fromTo 的 from 段非零 opacity 且无离屏
+    # 偏移、未关 immediateRender → t=0 即不透明盖住低层场景。预览/presence 都量不到
+    # 兄弟场景遮挡，只有全量渲完才暴露（一次白渲实证）。落地当轮全仓 0 命中＝无错杀。
+    "transition_occlusion",
 }
 
 
@@ -1857,6 +1861,89 @@ TEXT_PUNCT_CJK_CTX = re.compile(
     r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
 
 
+def check_transition_occlusion(html_path: Path, r: PreflightResult):
+    """CRITICAL (结构级): 场景根 fromTo 的 from 段带非零 opacity 且无离屏偏移、
+    又未声明 immediateRender:false → 该场景在 t=0 即不透明，按 z-index 盖住全部低层场景。
+
+    存在理由（2026-11-12 demo 展示片批，一次白渲换来）：GSAP `fromTo` 的
+    immediateRender 默认为真，from 段在**建表时刻**即生效。缩放穿越型转场
+    （from 只有 scale/opacity、无 x/y 离屏量）会让最高 z 的场景从第 0 帧就以
+    缩放后的不透明矩形盖住全场——预览安全区/文字塌陷/柱溢出量的是元素自身盒，
+    presence 量的是元素自身 opacity，**都量不到兄弟场景遮挡**，只有全量渲完才暴露。
+    实证：9 场片预览网格 s1–s7 内容只剩左右边缘，中部被 1920×0.85 的 scene8 背景盖住。
+
+    判据（零渲染）：剥注释后按 `;` 切语句，取 `tl.fromTo("<场景根选择器>", {from}, {to}, …)`；
+    from 段含非零 opacity/autoAlpha ∧ from 段无 |x|≥1920/|y|≥1080 离屏量 ∧
+    to 段无 immediateRender:false → ERROR 点名。三条豁免各对应一种合法写法：
+    离屏推移（from 在屏外）、显式关立即渲染、from 本身透明（淡入）。
+    变量选择器解析不到场景根 → 不入判（不猜）。
+
+    L2（2026-11-12 同日第二次白渲换来，L1 的镜像形态）：to 段声明了
+    immediateRender:false ∧ from 段带非零 opacity ∧ **to 段没有 opacity/autoAlpha**
+    ∧ 全脚本没有对该场景根的 `tl.set(…, opacity:1…)` → ERROR。成因：HyperFrames
+    运行时在 tween 活跃窗之外恢复元素基样式，而 immediateRender:false 使 from 段
+    不进基快照 ⇒ 揭示只活在转场那 0.7s 里，窗一过场景回到 CSS opacity:0。
+    实证：同一份 HTML 在纯 Chrome `tl.seek(40)` 下 scene3 计算 opacity=1（预览/空窗/
+    presence 三条零渲染腿全绿），渲染产物 s2–s8 覆盖率 0%、源片码率 138kbps 被终检
+    码率门禁拦下；to 段补 opacity:1 后 1fps png-sequence 探针同刻内容在场。
+    豁免＝另写 tl.set 揭示（set 的终值进基快照，s1 即此写法且渲染正常）。
+    定档依据：落地当轮全仓 448 条场景根 fromTo 中本形态命中恰为病灶 7 条、其余 79 份
+    项目 0 命中，无错杀对象，故与 L1 同档 ERROR。
+
+    定档依据：落地当轮全仓 80 份 index.html 真危险形态 **0 命中**（含已交付项目），
+    无错杀对象，故升 ERROR 并入 RENDER_CRITICAL_CHECKS；若未来存量出现命中，
+    按 presence_check 同纪律降档并留翻转前置，不得静默放宽。
+
+    check_id: transition_occlusion。
+    """
+    print("\n[7g/12] Transition occlusion (scene-root fromTo immediateRender / reveal persistence)")
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id="transition_occlusion")
+        return
+    content = html_path.read_text(encoding='utf-8')
+    scripts = "".join(re.findall(r'<script[^>]*>(.*?)</script>', content, re.DOTALL))
+    scripts = re.sub(r'/\*.*?\*/|//[^\n]*', '', scripts, flags=re.DOTALL)
+    pat = re.compile(r'tl\.fromTo\(\s*["\'](#scene\d+|#s\d+)["\']\s*,\s*\{([^}]*)\}\s*,\s*\{([^}]*)\}',
+                     re.DOTALL)
+    zero = re.compile(r'(?:opacity|autoAlpha)\s*:\s*(?!0(?:\.0+)?\s*(?:[,}]|$))[\d.]+')
+    n_root, violations, n_l2 = 0, 0, 0
+    set_reveal = set(re.findall(
+        r'tl\.set\(\s*["\'](#scene\d+|#s\d+)["\']\s*,\s*\{[^}]*?(?:opacity|autoAlpha)\s*:\s*1(?:\.0+)?\s*[,}]',
+        scripts))
+    for stmt in scripts.split(";"):
+        m = pat.search(stmt)
+        if not m:
+            continue
+        n_root += 1
+        fv, tv = m.group(2), m.group(3)
+        if not zero.search(fv):
+            continue
+        ir_off = 'immediateRender:false' in tv.replace(' ', '')
+        if not ir_off:
+            if re.search(r'\b[xy]\s*:\s*-?(?:1920|1080)\b', fv):
+                continue
+            violations += 1
+            r.error(f"转场遮挡：{m.group(1)} 的 fromTo from 段带非零 opacity 且无离屏偏移、"
+                    f"未声明 immediateRender:false —— 该场景 t=0 即不透明并按 z-index 盖住低层场景；"
+                    f"修法：to 段加 immediateRender:false，或 from 段加离屏 x/y",
+                    check_id="transition_occlusion")
+            continue
+        if re.search(r'(?:opacity|autoAlpha)\s*:', tv) or m.group(1) in set_reveal:
+            continue
+        n_l2 += 1
+        violations += 1
+        r.error(f"揭示不持久：{m.group(1)} 的 fromTo 声明 immediateRender:false 但 opacity 只在 from 段 ——"
+                f"运行时在 tween 窗外恢复基样式，场景滑入后回到 CSS opacity:0（预览 seek 看不见此形态）；"
+                f"修法：to 段补 opacity:1，或另写 tl.set({m.group(1)}, {{opacity:1}}, 锚)",
+                check_id="transition_occlusion")
+    r.counts["transition_occlusion"] = {"scene_root_fromto": n_root, "violations": violations,
+                                        "reveal_not_persistent": n_l2}
+    if n_root == 0:
+        r.ok("无场景根 fromTo 转场（本检查不适用）", check_id="transition_occlusion")
+    elif violations == 0:
+        r.ok(f"场景根 fromTo {n_root} 条均无 t=0 遮挡与揭示不持久形态", check_id="transition_occlusion")
+
+
 def check_text_punctuation(html_path: Path, r: PreflightResult):
     """CRITICAL (文本级): 画面文本中文语境夹半角标点（半角引号为主要形态）。
 
@@ -3231,6 +3318,7 @@ def main():
     check_chapter_bar(html_path, r)
     check_text_punctuation(html_path, r)
     check_scene_insert(html_path, r)
+    check_transition_occlusion(html_path, r)
     check_visual_form(html_path, cfg or pre_cfg, config_path, r)
     check_incremental_eligibility(html_path, cfg or pre_cfg, r)
     check_design_rules(html_path, r)

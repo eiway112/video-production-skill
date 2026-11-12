@@ -833,12 +833,19 @@ class PipelineLock:
 
     def _beat(self):
         # 观察者纪律：心跳故障绝不改变流水线裁定——宁可有界陈旧后由下一个运行接管，
-        # 也不因写锁失败把一次正常交付判死。
+        # 也不因写锁失败把一次正常交付判死。但瞬态写失败（Windows 读者竞争）不得
+        # 一次即永久停跳：那会让守卫在 stale_after 后静默失效，正是它要防的形态。
+        misses = 0
         while not self._stop.wait(self.interval):
             try:
                 self._write()
+                misses = 0
             except Exception:
-                return
+                misses += 1
+                if misses >= 5:
+                    print("  [LOCK] 心跳连续 5 次写失败，停止续写"
+                          "（锁将在超期后由下一个运行接管）")
+                    return
 
     def release(self):
         self._stop.set()

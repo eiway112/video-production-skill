@@ -91,8 +91,8 @@ python config_manager.py
 
 产出物落在 `程序文件/源码/hyperframes/<项目名>/`（项目名用英文短横线风格）：
 
-1. `narration.json` — 场景单一权威源。结构参照现有成功项目（如 `wall-crack-remedy/narration.json`）：scene_id/title/start/end/duration/type(cover|gsap|static)/narration。
-2. 流水线配置 JSON → `程序文件/配置/config/pipelines/<项目名>.json`。参照 `wall-crack-remedy.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（**缺省引擎是 ElevenLabs**：不写 `tts_engine` 即用它，需 `ELEVENLABS_API_KEY`，`voice` 传 voice_id；qwen 须显式 `tts_engine: "qwen"` 并选配套音色，禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen；ElevenLabs 不支持 SSML `<break>`，带 `pause_marks` 的项目改用该引擎时须删声明，详见 AGENTS.md TTS 引擎纪律）、fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 检查13会实测回比）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。
+1. `narration.json` — 场景单一权威源。结构参照随包夹具（如 `quickstart-demo/narration.json`）：scene_id/title/start/end/duration/type(cover|gsap|static)/narration。
+2. 流水线配置 JSON → `程序文件/配置/config/<项目名>.json`（随包示例：`quickstart-demo.json`；`config/pipelines/` 是开发仓历史落点，不随包）。参照 `quickstart-demo.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（**缺省引擎是 ElevenLabs**：不写 `tts_engine` 即用它，需 `ELEVENLABS_API_KEY`，`voice` 传 voice_id；qwen 须显式 `tts_engine: "qwen"` 并选配套音色，禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen；ElevenLabs 不支持 SSML `<break>`，带 `pause_marks` 的项目改用该引擎时须删声明，详见 AGENTS.md TTS 引擎纪律）、fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 检查13会实测回比）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。
 3. `index.html` — 手写 HTML+GSAP。**完成后逐项核对踩坑清单"阶段C检查表"全部条目**（占位符、subtitle-safe 高度、装饰层 opacity、字号分层、无 >3s 静止、动画必须挂在主 timeline `tl` 上等），并对照 HTML 模板参考基准。
 4. 场景 div 必须声明 `data-scene-id` / `data-scene-entry` / `data-scene-subtitle-safe`（AGENTS.md HTML 契约）。
 5. 节奏面：每个 cue 不只负责点亮，还要把焦点保持到下一句（`cueHi` + `flushCuePlan`，骨架与四条原因住模板基准 §3.6.2；保持区间用有限次呼吸铺满，不得用 `repeat:-1`）。入场动画是一次性的（约 0.5s），旁白是持续的——入了场就不再变化，会被观众读成"画面卡住"。

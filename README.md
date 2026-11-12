@@ -16,6 +16,7 @@
 ## 目录
 
 - [这是什么](#这是什么)
+- [效果预览](#效果预览)
 - [能力地图](#能力地图)
 - [一次任务怎么走](#一次任务怎么走)
 - [流水线十步](#流水线十步)
@@ -50,6 +51,16 @@
 | 执行层 | `程序文件/脚本/pipeline_runner.py` | 十步流水线、断点续跑、缓存与增量渲染 |
 | 裁定层 | `程序文件/脚本/` 下的门禁脚本 ＋ `程序文件/配置/config/quality/*.json` | 每一道检查的四态裁定与留痕 |
 
+## 效果预览
+
+下面这支展示片由本流水线**自己产出**：十步全过、六维审计全过、零放行开关。画面为矢量 / CSS / GSAP 动画，不含任何业务项目名与客户素材；片尾三计数是该片刻完工报告的实测读数。
+
+[![效果预览封面：四态门禁场](AI视频制作工作流模板/demo_poster.jpg)](https://github.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261112)
+
+- **完整视频（2 分 11 秒）**：[GitHub Release 附件](https://github.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261112) ｜ [Gitee 镜像附件](https://gitee.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261112)
+- 该 release **只承载展示片，不承载安装对象**；安装请回默认分支 `main`。
+- 片中依次展示：痛点 → 十步流水线 → 单一权威源 → 四态门禁 → 增量渲染 → 波形对齐 → 交付守卫 → 片尾自证。复核方式见[门禁与证据体系](#门禁与证据体系)。
+
 ## 能力地图
 
 ```mermaid
@@ -68,7 +79,7 @@ flowchart TD
 
     PIPE --> OUT["成片 mp4 · 字幕 srt · 交付说明 · 完工报告"]
     GOV[("AGENTS.md<br/>质量规则 JSON")] --- PIPE
-    LEDGER[("交付登记.json")] --- P9
+    LEDGER[("交付登记.json")] --- P10
 ```
 
 ## 一次任务怎么走
@@ -101,13 +112,13 @@ sequenceDiagram
 |---|---|---|---|
 | ① | 静态预检 | 设计产物、HTML 场景结构、时间轴注册、章级条、画面标点、cue 声明 | 阻断，零渲染 |
 | ② | TTS 预生成 | 分场景合成、产物七层验证、句界停顿与缓存复用 | 阻断 |
-| ③ | 时间轴收敛 | 按 TTS 实测时长收敛场景窗口、时长预算检查 | soft 需显式放行，hard 直接失败 |
-| ④ | 瞬时预览 | 秒级截图，检查字幕安全区、文字塌陷、柱状图纵向溢出 | 阻断，避免用全量渲染试错 |
+| ③ | 时间轴调整 | 按 TTS 实测时长收敛场景窗口、时长预算检查 | soft 需显式放行，hard 直接失败 |
+| ④ | 瞬时预览（场景缩略图+动画密度） | 秒级截图，检查字幕安全区、文字塌陷、柱状图纵向溢出 | 阻断，避免用全量渲染试错 |
 | ⑤ | 渲染 | HyperFrames 全量渲染或场景级增量渲染；卡死看门狗与渲染成本预算 | 阻断或自动降级全量 |
-| ⑥ | 时长验证 | 成片实测时长与声明时长一致性 | 留痕，偏差超限即失败 |
+| ⑥ | 渲染后时长验证 | 成片实测时长与声明时长一致性 | 留痕，偏差超限即失败 |
 | ⑦ | 视觉边界 | 字幕安全区与画面边界判定（画面占用只作报告读数，不设门禁） | 阻断 |
-| ⑧ | 音视频后处理 | 混音、ASR 强制对齐、字幕烧录与样式分档、成片终检 | 阻断 |
-| ⑨ | 交付验收 | 交付槽位写入、交付登记、清理审计 | 阻断 |
+| ⑧ | 音频/字幕后处理 | 混音、ASR 强制对齐、字幕烧录与样式分档、成片终检、交付槽位写入 | 阻断 |
+| ⑨ | 交付验收与清理审计 | 交付对象校验、清理审计（槽位写入在⑧、交付登记在⑩） | 阻断 |
 | ⑩ | 完工报告 | 数据驱动报告 ＋ 六维审计 | 非 VALIDATED 即不视为交付 |
 
 任一步失败都会把日志路径与错误码写进 `pipeline_state.json`；输入变化后由指纹自动判定需要重跑的最小步骤集，无需手工推断。
@@ -137,8 +148,8 @@ python 程序文件/脚本/regression_test.py --run-all
 
 | 类别 | 随包 | 不随包 |
 |---|---|---|
-| 流水线与门禁 | `程序文件/脚本/**`、`程序文件/配置/**` | — |
-| 模板与规范 | `AI视频制作工作流模板/**`、`AGENTS.md` | — |
+| 流水线与门禁 | 流水线与门禁脚本及其质量规则配置（开发侧治理件不随包） | — |
+| 模板与规范 | 随包模板与规范文档、`AGENTS.md`（开发仓内部文档不随包） | — |
 | Skill 定义 | `.qoder/skills/creating-video-projects/` | — |
 | 示例夹具 | `程序文件/源码/hyperframes/quickstart-demo/`、`bgm-showcase-test/`，以及夹具样例 `成果文件/交付说明_quickstart-demo.md` | — |
 | 业务交付物 | — | 成片、字幕、交付说明、交付登记（`成果文件/**` 除夹具样例与 `.gitkeep` 外默认拒绝） |
@@ -184,7 +195,13 @@ python 程序文件/脚本/render_env_sentinel.py --check-render-env
 # 6. 跑回归测试验证环境
 python 程序文件/脚本/regression_test.py --run-all
 
-# 7. 端到端渲染示例项目
+# 7. 配置主引擎 Key（quickstart-demo.json 声明 tts_engine=elevenlabs，TTS 默认开）
+#    新建 程序文件/配置/openmontage.env.local，写入一行：
+#    ELEVENLABS_API_KEY=<你的 Key>
+#    无 Key 只想验证环境：跑纯 BGM 夹具（tts_enabled=false，零 Key、零扣费）：
+#    python 程序文件/脚本/pipeline_runner.py --config bgm-showcase-test.json --fresh
+
+# 8. 端到端渲染示例项目（首次克隆可直接跑；重跑需追加 --confirm-fresh）
 python 程序文件/脚本/pipeline_runner.py --config quickstart-demo.json --fresh
 ```
 
@@ -199,9 +216,12 @@ python 程序文件/脚本/pipeline_runner.py --config quickstart-demo.json --fr
 | Node.js | ≥ 18 LTS | 官方安装包 | 渲染器由 npx 调用 |
 | hyperframes 渲染器 | **0.7.52（钉住）** | `npm install -g hyperframes@0.7.52` | 全局 npm 包；流水线经 `npx hyperframes render` 调用。**不要装 0.8.x**，原因见下节。 |
 | Chrome | 稳定版 | 官方安装包 | 预览与渲染载体 |
-| DashScope API Key | — | 用户自备（可选） | qwen（CosyVoice）TTS 主引擎，正式交付必需；无 Key 时可显式声明 Edge-TTS 做零成本自检 |
-| GSAP | 3.14.2 | 随仓携带，无需安装 | 位于 `程序文件/源码/hyperframes/quickstart-demo/gsap.min.js`，许可见文件头（GreenSock Standard License） |
+| ElevenLabs API Key | — | 用户自备（正式交付必需） | 主引擎 ElevenLabs，需 `ELEVENLABS_API_KEY`，写入 `程序文件/配置/openmontage.env.local` |
+| DashScope API Key | — | 用户自备（可选） | 仅存量项目显式声明 `"tts_engine": "qwen"`（CosyVoice）时需要；无 Key 可显式声明 `"tts_engine": "edge"` 做零成本自检 |
+| GSAP | 3.14.2 | 随仓携带，无需安装 | 两支夹具目录各带一份（`quickstart-demo/gsap.min.js`、`bgm-showcase-test/gsap.min.js`），许可见文件头（GreenSock Standard License） |
 | 环境变量 `VIDEO_WORKFLOW_ROOT` | — | 可选 | 非同构目录部署时显式指定仓根；根探测失败会直接报错，不静默降级 |
+
+> 表中 Python / Node / FFmpeg 为实测可用组合的下界声明；渲染器版本是钉住值，由回归用例与权威源对撞。
 
 ### 为什么渲染器钉在 0.7.52
 
@@ -218,7 +238,7 @@ python 程序文件/脚本/render_env_sentinel.py --check-render-env       # 现
 
 版本权威值是 `程序文件/配置/config/quality/render_rules.json` → `upgrade_sentinel.pinned_version`，上表是它的同形复述，由回归用例对撞。
 
-### API Key 配置（可选）
+### API Key 配置（正式交付必需，自检可免）
 
 **主引擎是 ElevenLabs**（2026-11-10 用户裁定）。将真实 Key 写入 `程序文件/配置/openmontage.env.local`（已被 `.gitignore` 保护，**切勿**写入 `openmontage.env` 提交入库）：
 
@@ -276,6 +296,7 @@ DASHSCOPE_API_KEY=<阿里云百炼控制台获取的 API Key>
 
 ```bash
 python 程序文件/脚本/pipeline_runner.py --config <项目名>.json --fresh
+# 重跑（工作树已有渲染/交付产物）时裸 --fresh 会被拦，须追加 --confirm-fresh
 ```
 
 首次跑完建议先看完工报告的实测读数，再决定是否需要调整分镜或时间轴；不要凭观感直接重跑全量渲染。

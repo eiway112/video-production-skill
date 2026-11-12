@@ -36,6 +36,24 @@ import hashlib
 
 
 # === 权威源落盘 ===
+# Windows 共享模式：读者持有目标句柄时 os.replace 抛 PermissionError（WinError 5）。
+# 这是瞬态竞争而非持久故障；一次失败即放弃会让调用方（如锁心跳线程）永久静默死亡。
+_REPLACE_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.4)
+
+
+def _replace_with_retry(tmp, path):
+    delays = (0.0,) + _REPLACE_RETRY_DELAYS
+    for i, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == len(delays) - 1:
+                raise
+
+
 def _atomic_write_via(path, write_fn):
     """temp 名 + os.replace 的唯一实现；write_fn(f) 负责将内容写入句柄。
 
@@ -49,7 +67,7 @@ def _atomic_write_via(path, write_fn):
             write_fn(f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         # 半截临时名留着无用（下次写会重建并截断），且会在权威源目录里
         # 长期驻留成噪声；目标文件从未被打开过，仍是上一版完整内容。

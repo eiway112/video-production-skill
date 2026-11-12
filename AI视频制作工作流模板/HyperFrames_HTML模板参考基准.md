@@ -237,11 +237,23 @@ tl.fromTo("#sceneN+1", { y:1080, opacity:1 }, { y:0, duration:1.0, ease:"power2.
 tl.set("#sceneN", { visibility:"hidden" }, T + 1.2);
 ```
 
+**缩放穿越（Scale Through）**：
+```javascript
+// 无离屏 x/y，故必须关立即渲染（否则 t=0 盖住全场，预检 7g L1）；
+// 关了之后 opacity 必须同时写进 to 段（预检 7g L2）：运行时在 tween 窗外恢复基样式，
+// from 段不进基快照 ⇒ 只写 from 会让场景滑入后回到 CSS opacity:0（预览 seek 看不见）。
+tl.to("#sceneN", { scale:1.25, opacity:0, duration:0.7, ease:"power2.in" }, T);
+tl.fromTo("#sceneN+1", { scale:0.85, opacity:1 },
+          { immediateRender:false, opacity:1, scale:1, duration:0.7, ease:"power2.out" }, T);
+tl.set("#sceneN", { visibility:"hidden" }, T + 0.9);
+```
+
 **转场规范**：
 - 两种转场交替使用（水平→垂直→水平→...）
 - 转场时长 0.8-1.0s
 - 转场结束后（+0.2s buffer）设置 visibility:hidden
 - 转场时间计入场景窗口（如场景窗口 0-10s，转场在 10s 开始）
+- **场景根揭示的 opacity 必须落在 to 段或一条 `tl.set(根, {opacity:1}, 锚)` 上**：只写在 from 段且配 `immediateRender:false` 时，HyperFrames 运行时在转场窗结束后把场景恢复成 CSS 的 opacity:0——纯 Chrome `tl.seek()` 探针（预览/空窗/presence）量不出来，只有渲染产物或 `render --fps 1 --format png-sequence` 探针能看见（2026-11-12 两次白渲实证，预检 7g 两腿拦截）
 
 ### 3.4 内容入场动画
 
