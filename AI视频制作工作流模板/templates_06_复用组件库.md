@@ -26,7 +26,10 @@ body{width:1920px;height:1080px;overflow:hidden;background:/* 主题色 */;
      font-family:"Noto Sans SC","Montserrat",sans-serif;color:/* 文字色 */;}
 .scene{position:absolute;top:0;left:0;width:1920px;height:1080px;overflow:hidden;}
 .sc{display:flex;flex-direction:column;width:100%;height:100%;
-    padding:60px 100px 200px;position:relative;}
+    padding:60px 100px 240px;position:relative;}
+/* padding-bottom 与 subtitle-safe height 都不许手抄数字当口径：按字幕安全线推导
+   （1080→y860 ⇒ 预留带 220px，padding 取 220＋20 设计余量＝240px），
+   权威源 `visual_boundary_check.subtitle_safety_line`，推导式与两行分工见 HTML 基准 §2.1-§2.2 */
 /* .subtitle-safe 必须在每个场景中存在 */
 </style>
 </head>
@@ -80,26 +83,28 @@ tl.set("#scene0", { visibility: "hidden" }, 3.0);
 
 ### S-03 字幕安全区 (subtitle-safe)
 
-每个 `<div id="sceneN">` 内必须包含此元素，否则 step0 校验失败。
+每个 `<div id="sceneN">` 内必须包含此元素（封面除外）——浅底上字幕带无遮罩时白字直接读不出。**现役判据是预览与渲后的像素面**（`instant_preview` 字幕安全区 ＋ `visual_boundary_check`），"step0 的 ≥150px 代理判据"已于 2026-11-11 撤除，不得再按它校验。
 
 ```html
 <div class="subtitle-safe"></div>
 ```
 
-CSS（浅色主题 / 深色主题二选一）：
+CSS（浅色主题 / 深色主题二选一，`height` 一律取字幕预留带＝由安全线推导，1080 画布 220px；两档只差渐变色标，不差高度）：
 ```css
 /* 浅色主题 */
-.subtitle-safe{position:absolute;bottom:0;left:0;width:100%;height:200px;
+.subtitle-safe{position:absolute;bottom:0;left:0;width:100%;height:220px;
   background:linear-gradient(to bottom,rgba(BG_R,BG_G,BG_B,0) 0%,
   rgba(BG_R,BG_G,BG_B,0.85) 50%,rgba(BG_R,BG_G,BG_B,0.95) 100%);
   z-index:100;pointer-events:none;}
 
 /* 深色主题 */
-.subtitle-safe{position:absolute;bottom:0;left:0;width:100%;height:130px;
+.subtitle-safe{position:absolute;bottom:0;left:0;width:100%;height:220px;
   background:linear-gradient(to bottom,rgba(26,31,46,0) 0%,
   rgba(26,31,46,0.85) 40%,rgba(26,31,46,0.95) 100%);
   z-index:100;pointer-events:none;}
 ```
+
+> **两个量不得混用**：`subtitle-safe height` ＝ 预留带（视觉遮罩范围，不构成内容上限的依据）；`.sc padding-bottom` ≥ 预留带＋20px 设计余量（它才是内容下界）。竖屏（1080×1920）按同一比例推导（安全线 y1529 ⇒ 预留带 391px），不抄横屏数字。
 
 ### S-04 结尾渐黑 (end-fade)
 
@@ -219,9 +224,17 @@ tl.to("#scene-end-fade", { opacity: 1, duration: 1.5, ease: "power2.inOut" }, en
 
 ## 转场组件
 
-### T-01 Push Slide（水平推）
+> 判据与写法口径的权威源＝`agents.md`「转场（场景切换）取边界瞬间硬切」节；可抄代码与 `visibility:hidden` 时刻的取值式＝`HyperFrames_HTML模板参考基准.md` §3.3。本组件库只登记组件、不重抄判据。
 
-当前场景向左滑出，下一场景从右滑入。最常用转场。
+### T-00 边界硬切（**默认件**）
+
+场景根在边界瞬间 `tl.set` 切换在场状态，画面变化交给元素入场承担。**所有新项目缺省用它。**
+
+写法直接指 `HyperFrames_HTML模板参考基准.md` §3.3「默认写法：边界瞬间硬切」，本处不复制代码（复制即造第二份真相，改判据时两处会漂移）。
+
+### T-01 Push Slide（水平推）——**例外件，非默认**
+
+当前场景向左滑出，下一场景从右滑入。仅在确有横向视觉承接（流程推进、时间线前进）且经用户确认时使用。
 
 ```javascript
 /* TRANSITION N->N+1: Push Slide (T=Xs) */
@@ -231,9 +244,9 @@ tl.fromTo("#sceneN+1", { x: 1920, opacity: 1 },
 tl.set("#sceneN", { visibility: "hidden" }, T + 1.7);
 ```
 
-### T-02 Vertical Push（垂直推）
+### T-02 Vertical Push（垂直推）——**例外件，非默认**
 
-当前场景向上滑出，下一场景从下滑入。交替使用避免单调。
+当前场景向上滑出，下一场景从下滑入。仅在确有纵向视觉承接（层级下降、清单滚动）且经用户确认时使用；与 T-01 不得连续同类。
 
 ```javascript
 /* TRANSITION N->N+1: Vertical Push (T=Xs) */
@@ -350,9 +363,10 @@ tl.set("body", {}, /* COVER_DURATION */);
 
 | 组件名 | 效果描述 | 来源项目 | 参数 | 适用场景 |
 |---|---|---|---|---|
-| Push Slide | 水平推移切换场景 | 所有项目 | direction, duration | 场景间过渡（奇数→偶数） |
-| Vertical Push | 垂直推移切换场景 | hotel/hospital | direction, duration | 场景间过渡（偶数→奇数） |
-| 封面渐隐 | scene0 z-index:999 渐隐 | 所有项目 | cover_duration | 视频开头 |
+| 边界硬切 | 边界瞬间 `tl.set` 切换在场状态 | 本仓已交付片 `_修订03`（2026-11-06 三候选零渲染帧 A/B 后选定） | — | **默认件**，写法见 HTML 基准 §3.3 |
+| Push Slide | 水平推移切换场景 | 所有项目 | direction, duration | 场景间过渡（例外件，须有横向承接且经用户确认） |
+| Vertical Push | 垂直推移切换场景 | hotel/hospital | direction, duration | 场景间过渡（例外件，须有纵向承接且经用户确认，不与 Push Slide 连续同类） |
+| 封面渐隐 | scene0 z-index:999 渐隐 | 所有项目 | cover_duration | 视频开头（封面退场保留极短淡出，是硬切契约内的豁免） |
 | 结尾渐黑 | 全屏黑色叠层渐显 | 所有项目 | duration | 视频结尾 |
 
 ## 标注组件
@@ -364,80 +378,6 @@ tl.set("body", {}, /* COVER_DURATION */);
 | 遮罩文字条 | 纯色底遮挡文字（悬念效果） | crm-video | text, bg_color | 悬念制造、信息延迟揭示 |
 
 ---
-
-## 复用规则
-
-- 新组件必须先在这里注册，再在新项目中使用。
-- 组件代码必须自包含，不依赖特定项目的路径或变量。
-- 参数必须明确，不允许硬编码颜色、尺寸、文案。
-- 每个组件附带一个使用示例，确保下次使用时能直接跑通。
-- 从旧项目移植组件时，必须做参数化改造，不直接复制粘贴。
-- 转场必须交替使用 Push Slide / Vertical Push，避免连续使用同一类型。
-- 每个场景必须有 `.subtitle-safe`，且 `.sc` padding-bottom 按字幕安全线推导（1080 画布推荐 240px，权威源 `visual_boundary_check.subtitle_safety_line`）；**不得沿用已退役的「≥150px」口径**。
-# 复用组件库
-
-每做完一条视频，把可复用的动效组件注册到这里。做得越多，后面越快。
-
-## 注册规范
-
-每个组件必须记录以下信息，确保下次使用时不需要重新理解或重写。
-
-## 文字动效组件
-
-| 组件名 | 效果描述 | 来源项目 | 代码位置 | 参数 | 适用场景 |
-|---|---|---|---|---|---|
-| 痛点数据卡 | 行业痛点数据卡片+解决方案对比，暖色卡片逐个弹出 | hotel-partition-wall | index.html #scene1 | pain_points[], solution | 行业切入、问题引出 |
-
-示例：
-```
-逐字高亮 | 文字逐字变色，配合口播节奏 | Loop Engineer | src/effects/text-highlight.js | text, color, speed | 关键概念、术语解释
-故障字效果 | CRT扫描线+文字闪烁 | Loop Engineer | src/effects/glitch-text.js | text, intensity | 赛博风/科技感场景
-数字滚动 | 数字从0滚动到目标值 | 创始人手册 | src/effects/number-roll.js | target, duration, prefix | 金额、参数、百分比
-```
-
-## 卡片组件
-
-| 组件名 | 效果描述 | 来源项目 | 代码位置 | 参数 | 适用场景 |
-|---|---|---|---|---|---|
-| 产品参数面板 | 左侧产品图+右侧核心参数逐个弹出 | hotel-partition-wall | index.html #scene2 | image, params[], title | 产品展示、规格说明 |
-| 墙体截面分层构建 | 从内到外逐层展示墙体结构，每层标注材料和厚度 | hotel-partition-wall | index.html #scene3 | layers[], durations[] | 产品构造展示、材料层分析 |
-| 密封工艺特写 | CSS/SVG绘制型材截面+密封条安装动画 | hotel-partition-wall | index.html #scene4 | profile_type, seal_type | 技术细节展示、工艺说明 |
-| 安装流程卡片 | 四步安装流程编号+图标+描述 | hotel-partition-wall | index.html #scene5 | steps[] | 施工流程、系统讲解 |
-| 管线分离示意 | 龙骨空腔内管线走线图+可拆卸面板演示 | hotel-partition-wall | index.html #scene6 | pipe_routes[], removable | 管线分离、维护便利展示 |
-| 隔声频段曲线 | 简化版隔声频率响应曲线CSS绘制 | hotel-partition-wall | index.html #scene7 | freq_bands[], values[] | 声学性能展示 |
-| 价值主张卡片 | 三大价值对比卡（更快/更轻/更安静） | hotel-partition-wall | index.html #scene8 | values[], icons[] | 品牌收尾、核心卖点总结 |
-
-示例：
-```
-产品参数卡 | 左侧产品图+右侧参数列表 | 辅材产品视频 | src/components/product-card.html | image, params[], title | 产品展示、材料对比
-成本拆解卡 | 横向条形图+金额标注 | 旧改案例视频 | src/components/cost-breakdown.html | items[], total | 报价说明、成本分析
-工艺流程卡 | 步骤编号+图标+描述 | 装配式培训视频 | src/components/process-flow.html | steps[] | 施工流程、系统讲解
-```
-
-## 背景组件
-
-| 组件名 | 效果描述 | 来源项目 | 代码位置 | 参数 | 适用场景 |
-|---|---|---|---|---|---|
-|  |  |  |  |  |  |
-
-## 转场组件
-
-| 组件名 | 效果描述 | 来源项目 | 代码位置 | 参数 | 适用场景 |
-|---|---|---|---|---|---|
-| 封面渐隐过渡 | scene0 z-index:999封面2.5s渐隐露出scene1 | hotel-partition-wall | index.html #scene0 | cover_duration | 视频开头封面过渡 |
-| 场景推送切换 | transform translateX/Y push slide场景间切换 | hotel-partition-wall | index.html | direction, duration | 场景间过渡 |
-
-## 标注组件
-
-| 组件名 | 效果描述 | 来源项目 | 代码位置 | 参数 | 适用场景 |
-|---|---|---|---|---|---|
-| 照片轮播标注 | 施工照片轮播+动态标注框 | hotel-partition-wall | index.html #scene1/5 | photos[], labels[] | 施工现场展示、案例展示 |
-
-示例：
-```
-红框标注 | 在图片上添加红色矩形框 | 施工工艺视频 | src/components/red-box.html | x, y, w, h, label | 施工节点、细节放大
-箭头指引 | 动态箭头指向关键区域 | 招商培训视频 | src/components/arrow.html | from, to, color | 流程指引、重点标注
-```
 
 ## 观感组件（2026-10-21 审计批，可复制）
 
@@ -454,37 +394,9 @@ tl.set("body", {}, /* COVER_DURATION */);
 - 同组元素只亮当前项，前一项在后续项亮起时退到"已读"态（组让位）；
 - 首元素设建立拍上限（默认 2.2s），避免整场等第一个词。
 
-最小实现（约 25 行，与 `prefab-agent-intro/index.html` 的 `cueGlow` 同形）：
-
-```js
-function cueGlow(sel, key, base, opts) {
-  opts = opts || {};
-  if (!window.C || typeof C[key] !== "number") return;
-  var el = document.querySelector(sel);
-  if (!el) return;
-  var at = base + C[key];
-  // 1) 说到即亮
-  tl.to(el, {opacity: 1, y: 0, duration: opts.duration || 0.35,
-             ease: "power2.out"}, at);
-  // 2) 组让位：同组其他元素退到已读态
-  (opts.group || []).forEach(function (other) {
-    if (other === sel) return;
-    tl.to(other, {opacity: 0.55, duration: 0.25}, at + 0.05);
-  });
-  // 3) 入场保护：首元素不超过建立拍上限
-  if (opts.first) {
-    var at2 = Math.min(at, base + (opts.establish || 2.2));
-    tl.set(el, {opacity: 1, y: 0}, at2);
-  }
-}
-```
-
-用法：
-
-```js
-cueGlow("#s3-card2", "s3:第二条判据", T.s3,
-        {first: true, group: ["#s3-card1", "#s3-card2"]});
-```
+> 实现与调用形态不在此复制。`cueGlow` 的可复制实现（含三条配套约束：`enterAt` 不早亮、同组向前扫描让位、`onAt + 8` 封顶）唯一权威源＝`HyperFrames_HTML模板参考基准.md` §3.6.1。
+>
+> 本节原有约 25 行简化版，缺这三条约束——复制它会得到「该亮的没亮／该灭的不灭」的形态，故本批收敛为指针；旧形态可从 git 历史读回（本批只去重，未删除任何已验收内容）。
 
 出处：`prefab-agent-intro/index.html`（§3.6.1 的首次实现，40 条声明）；
 `build-expert-overview` 的 83 个 cue 点只用"入场跟随语音"这一层，没有组让位，
@@ -537,6 +449,8 @@ cueGlow("#s3-card2", "s3:第二条判据", T.s3,
 | 模拟指针 | 把"点开一个构件"演出来，替代旁白解释 | §4.8 手段三 | 同上（s1／s3／s5／s7 四场） |
 | 同一内容换形态 | 界面形态→数据形态→结构形态的三段递进 | §4.8 手段一 | 参考片（**本仓无实物**；跨场不成立，首选同一场内三段） |
 
+---
+
 ## 复用规则
 
 - 新组件必须先在这里注册，再在新项目中使用。
@@ -544,3 +458,5 @@ cueGlow("#s3-card2", "s3:第二条判据", T.s3,
 - 参数必须明确，不允许硬编码颜色、尺寸、文案。
 - 每个组件附带一个使用示例，确保下次使用时能直接跑通。
 - 从旧项目移植组件时，必须做参数化改造，不直接复制粘贴。
+- 默认边界硬切（T-00）；确需推移（T-01/T-02）时须写明视觉承接理由并经用户确认，且不得连续同类。
+- 每个场景必须有 `.subtitle-safe`，且 `.sc` padding-bottom 按字幕安全线推导（1080 画布推荐 240px，权威源 `visual_boundary_check.subtitle_safety_line`）；**不得沿用已退役的「≥150px」口径**。

@@ -219,9 +219,24 @@ tl.set("#scene0", { visibility:"hidden" }, 3.0);
 tl.set("body", {}, 3);
 ```
 
-### 3.3 场景转场（两种交替使用）
+### 3.3 场景转场（默认边界硬切；推移为例外）
 
-**水平推移（Push Slide）**：
+**为什么默认硬切**：见 `agents.md`「转场（场景切换）取边界瞬间硬切（2026-11-06 用户裁定，2026-11-16 回灌补落）」——本节只给可抄写法，不重述判据。
+
+**默认写法：边界瞬间硬切**
+```javascript
+// 场景 N → N+1：边界瞬间切换，场景根不做 opacity 交叉淡化
+tl.set("#sceneN+1", { opacity: 1, visibility: "visible" }, T);   // 入场：亮切到在场
+tl.set("#sceneN", { opacity: 0, visibility: "hidden" }, T);      // 出场：取消淡化
+// 画面变化交给元素入场动画（§3.4）承担，不交给场景根位移
+```
+- 场景根 CSS 保持 `opacity:0`，由上面那条 `tl.set(根, {opacity:1}, T)` 抬起——与**本节末 7g 判据同向**（该判据不是被硬切取代，而是它的同一件事的另一面）。
+- **封面退场是唯一豁免**：可保留极短淡出以维持封面契约（见 §3.2 的 `#scene0` 两条）。
+- 自查用 `transition_overlap_census.py`（叠印峰值／双可见秒），描述面、不裁定。
+
+**例外写法：推移（须有明确视觉承接且经用户确认，且不得连续同类）**
+
+水平推移（Push Slide）：
 ```javascript
 // 场景 N → N+1，水平推移
 tl.to("#sceneN", { x:-1920, duration:0.8, ease:"power3.inOut" }, T);
@@ -229,7 +244,7 @@ tl.fromTo("#sceneN+1", { x:1920, opacity:1 }, { x:0, duration:0.8, ease:"power3.
 tl.set("#sceneN", { visibility:"hidden" }, T + 1.0);
 ```
 
-**垂直推移（Vertical Push）**：
+垂直推移（Vertical Push）：
 ```javascript
 // 场景 N → N+1，垂直推移
 tl.to("#sceneN", { y:-1080, duration:1.0, ease:"power2.inOut" }, T);
@@ -237,7 +252,7 @@ tl.fromTo("#sceneN+1", { y:1080, opacity:1 }, { y:0, duration:1.0, ease:"power2.
 tl.set("#sceneN", { visibility:"hidden" }, T + 1.2);
 ```
 
-**缩放穿越（Scale Through）**：
+缩放穿越（Scale Through）：
 ```javascript
 // 无离屏 x/y，故必须关立即渲染（否则 t=0 盖住全场，预检 7g L1）；
 // 关了之后 opacity 必须同时写进 to 段（预检 7g L2）：运行时在 tween 窗外恢复基样式，
@@ -249,9 +264,9 @@ tl.set("#sceneN", { visibility:"hidden" }, T + 0.9);
 ```
 
 **转场规范**：
-- 两种转场交替使用（水平→垂直→水平→...）
-- 转场时长 0.8-1.0s
-- 转场结束后（+0.2s buffer）设置 visibility:hidden
+- **默认边界硬切**；确需推移时须在分镜表写明视觉承接理由并经用户确认，且不得连续使用同一类型
+- **时长 0.8-1.0s 只对"例外用推移"存续**——硬切是 `tl.set`，本身没有时长
+- **旧场景 `visibility:hidden` 的时刻，本节是唯一口径来源**：判据＝不得早于该次转场最后一条腿结束，即 `T + max(入场腿末, 出场腿末)`，再按需要留 buffer。上面三个值（水平 T+1.0、垂直 T+1.2、缩放穿越 T+0.9）都由此派生（0.8/1.0/0.7 腿末 ＋ 0.2s buffer），**不是三个独立常量**；`templates_06` 组件里出现的 `T + 1.7` 是同一式的放宽取值（buffer≈0.9），合法但不得反向收紧成判据。硬切写法下该时刻即边界本身（`T`），本条不适用
 - 转场时间计入场景窗口（如场景窗口 0-10s，转场在 10s 开始）
 - **场景根揭示的 opacity 必须落在 to 段或一条 `tl.set(根, {opacity:1}, 锚)` 上**：只写在 from 段且配 `immediateRender:false` 时，HyperFrames 运行时在转场窗结束后把场景恢复成 CSS 的 opacity:0——纯 Chrome `tl.seek()` 探针（预览/空窗/presence）量不出来，只有渲染产物或 `render --fps 1 --format png-sequence` 探针能看见（2026-11-12 两次白渲实证，预检 7g 两腿拦截）
 

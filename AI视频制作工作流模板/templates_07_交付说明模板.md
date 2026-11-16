@@ -38,8 +38,8 @@
 |---|---|
 | 预检 `preflight_check --mode render` | {PASS/FAIL，error/warning 计数与良性项说明} |
 | 词级 cue 声明契约 | {声明条数／是否全部可定位} |
-| 停顿声明（`pause_marks`） | {条数／覆盖场数／是否可执行} |
-| 停顿审计两桶（渲染前实测） | {连读桶 N 条／急促桶 M 条／未裁定位点数；来源 `[PAUSE-AUDIT]` 行，temp 读数不入 git} |
+| 停顿声明（`pause_marks`） | {条数／覆盖场数／是否可执行} — **仅 `tts_engine: qwen` 存量项目适用**；ElevenLabs（现主引擎）不解析 SSML `<break>`，本行填 N/A 并写明引擎。权威源 `AGENTS.md`「TTS 引擎纪律」节 |
+| 停顿审计三桶（渲染前实测） | {连读桶 N 条／急促桶 M 条／无标点断词桶 K 处／未裁定位点数；来源 `[PAUSE-AUDIT]` 行，temp 读数不入 git}（第三桶 2026-11-05 增，判据单源 `intra_pause.classify_points`） |
 | 场景插入三腿（`check_scene_insert`） | {仅在增删/重排场景时填} |
 | 章级条（`check_chapter_bar`） | {章名格／刻度格配对} |
 | 预览 `instant_preview` | {安全区／文字塌陷／柱状溢出／动画密度四判据} |
