@@ -2196,6 +2196,52 @@ async def _qwen_tts(text, output_path):
                 ) from e
 
 
+def _eleven_non_audio_reason(data, ctype, final_url):
+    """ElevenLabs 成功响应的形态判据（尺寸地板 / Content-Type / 音频魔数三腿）。
+
+    返回值是归因文案（str）或 None（形态合法）。**只判形态，不判内容**：
+    三腿任一不符即返回文案，全符合也不等于音频正确。
+
+    存在理由（2026-11-16 复现、2026-11-17 生产二次实证）：区域封锁时服务端对
+    POST 回 302 Location: geo-restriction.elevenlabs.io，urllib 跟随后拿到的是
+    HTTP 200 + text/html 1657 B 的封锁页。旧守卫只有尺寸地板（1657 > 500），于是
+    封锁页被写进 mp3 缓存位、计入 "done: 2/2 scene(s) ok"（假绿），直到下游
+    ffmpeg 才炸，而报错文案（Invalid data found when processing input）不指向网络层。
+    取数面带 final_url：302+跟随后的 HTML 与"服务端直接回 200+HTML"在只报
+    status/ctype/bytes 的形态下同形（本仓据此误判过一整轮），URL 是唯一的区分证据。
+    """
+    def _form_fail(detail):
+        host = (final_url or '').split('//')[-1].split('/')[0] or '未知'
+        geo = 'geo-restriction' in host.lower()
+        lines = [
+            f"ElevenLabs 返回的不是音频：{detail}（{len(data)} B, "
+            f"Content-Type={ctype or '未声明'}, 末端 URL={final_url or '未知'}）。",
+            ("归因：请求被重定向到 geo-restriction 封锁页——出口 IP 在 ElevenLabs "
+             "不支持地区。" if geo else
+             "归因：网络层返回的 HTML/文本被当成合成结果（区域封锁、代理或登录门户"
+             "劫持、出口未接通都是此形态），不是音频合成失败。"),
+            "未落盘、未计入 ok 计数，缓存位不受污染。"
+            "只读判据：GET /v1/user 须回 200 application/json；回 text/html 或"
+            " 302 到 geo-restriction 即出口没接上。",
+            "Windows 上注册表 ProxyServer 写成裸 host:port 时 CPython "
+            "getproxies_registry 会丢弃该值，须显式给 HTTPS_PROXY/HTTP_PROXY。",
+        ]
+        return ' '.join(lines)
+
+    # 腿一：尺寸地板（旧守卫逐字保留，判据不放宽）
+    if len(data) < 500:
+        return _form_fail("响应字节数低于音频下限 500")
+    # 腿二：Content-Type（服务端自报形态）
+    if not (ctype or '').startswith('audio/'):
+        return _form_fail("Content-Type 不是 audio/*")
+    # 腿三：音频魔数（ID3 头或 MPEG 帧同步头 0xFFEx）——不轻信自报
+    has_id3 = data[:3] == b'ID3'
+    has_frame_sync = len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+    if not (has_id3 or has_frame_sync):
+        return _form_fail(f"首字节不是 MP3 魔数（实测 {data[:4]!r}）")
+    return None
+
+
 async def _eleven_tts(text, output_path):
     """Generate TTS using ElevenLabs HTTP API (eleven_v4).
 
@@ -2204,6 +2250,9 @@ async def _eleven_tts(text, output_path):
 
     失败语义：鉴权/音色/模型类错误（401/403/404/400/422）**不重试**——重试也拿不到
     结果，只会把"音色没加入工作区"拖成 5 次等待；只对网络中断、429、5xx 重试。
+    响应形态不符（见 `_eleven_non_audio_reason`）同归"不重试"档，且**先判形态再落盘**：
+    形态错误是确定性的（出口与账号状态决定），重试五次要白付 3+5+10+15＝33s，
+    而真音频写进缓存位才是这次假绿的代价——所以校验与写盘分居 try/else 两侧。
     不降级到其它引擎（AGENTS.md 禁止跨引擎自动降级）。
     """
     import asyncio as aio
@@ -2242,14 +2291,12 @@ async def _eleven_tts(text, output_path):
                     'Accept': 'audio/mpeg',
                 })
                 with urllib.request.urlopen(req, timeout=120) as resp:
-                    return resp.read()
+                    # 三个返回值都是判据对象：只回字节即"200+HTML"与"200+音频"
+                    # 在取数面上同形（2026-11-16 误归因一整轮的同一形态）。
+                    ctype = (resp.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+                    return resp.read(), ctype, resp.geturl()
 
-            data = await aio.to_thread(_call_sync)
-            if len(data) < 500:
-                raise Exception(f"ElevenLabs returned invalid audio ({len(data)} bytes)")
-            with open(output_path, 'wb') as f:
-                f.write(data)
-            return
+            data, ctype, final_url = await aio.to_thread(_call_sync)
         except urllib.error.HTTPError as e:
             body = e.read().decode('utf-8', 'replace')[:300]
             if e.code in (401, 403):
@@ -2279,6 +2326,15 @@ async def _eleven_tts(text, output_path):
                     f"model={ELEVEN_MODEL}, voice={VOICE}, text={text[:40]}..."
                 ) from e
             print(f"  eleven_tts attempt {attempt}/{max_retries} failed: {e}")
+        else:
+            # 校验在 try 之外：else 分支里抛出的异常不会被上面两个 except 接住，
+            # 因此非音频响应一次即止（不烧 33s 重试），且写盘只可能在形态过关后发生。
+            reason = _eleven_non_audio_reason(data, ctype, final_url)
+            if reason:
+                raise RuntimeError(reason)
+            with open(output_path, 'wb') as f:
+                f.write(data)
+            return
         wait = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
         print(f"  Retrying in {wait}s...")
         await aio.sleep(wait)

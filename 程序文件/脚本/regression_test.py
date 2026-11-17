@@ -23313,6 +23313,7 @@ class RegressionTestRunner:
             test_layout_fullness_descriptive_face,
             test_atomic_write_and_heartbeat_survive_reader_race,
             test_transition_occlusion_gate,
+            test_elevenlabs_non_audio_response_guard,
         ]
         self.results = []
     
@@ -28377,6 +28378,360 @@ def test_video_crf_config_knob() -> RegressionTestCase:
     except Exception as e:
         import traceback
         tc.mark_failed("video_crf_config_knob error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+def test_elevenlabs_non_audio_response_guard() -> RegressionTestCase:
+    """用例138：ElevenLabs 非音频响应不得当音频落盘（2026-11-16 复现、11-17 生产二次实证）。
+
+    缺陷本体：区域封锁时 `POST /v1/text-to-speech/...` 回 302 Location:
+    geo-restriction.elevenlabs.io，urllib 跟随后拿到 HTTP 200 + text/html ≈1.6 KB 的
+    封锁页。旧引擎侧守卫只有一条尺寸地板（`len(data) < 500`，1652 > 500 照常过关），
+    于是封锁页被写进 `temp/scene_N_<hash>.mp3` 缓存位、计入 `done: 2/2 scene(s) ok`
+    （假绿），直到下游 ffmpeg 才炸，而报错文案（Invalid data found when processing
+    input）不指向网络层。同形态在开发仓与发布仓共用同一函数，两侧都存在。
+
+    修法不是"再加一条校验"，而是同时补两处：
+      取数面——`_call_sync` 旧形态只回字节，Content-Type 与**最终** URL 从未进入判据
+      （A06 同族，这里是它的镜像：判据面须＝取数面）。302+跟随后的 HTML 与"服务端
+      直接回 200+HTML"在只报 status/ctype/bytes 的形态下同形，本仓据此误判过一整轮
+      （操作日志 [2026-11-17] §一），末端 URL 是唯一的区分证据。
+      判据面——尺寸地板（逐字保留，判据不放宽）＋ Content-Type（服务端自报）＋ MP3
+      魔数（不轻信自报）三腿，任一不符即 fail-loud，且**先判形态再落盘**；校验住在
+      `try/except/else` 的 else 侧，故非音频响应一次即止（不烧 3+5+10+15＝33s 重试）。
+
+    本用例锁的纪律（断言条数与数据无关，不写在逐场循环里）：
+      A 三腿各自承重（含"魔数与 ctype 双向冲突"两例，证两腿都在判而非互相顶替）；
+      B 归因指向网络层，且 geo 重定向与直连 200+HTML 两种形态可区分、带只读判据出口；
+      C 先判后写：非法响应不落盘、一次即止、已有旧缓存件不被半截覆盖；
+      D 非 200（401/403/404/429）的既有语义不因本次改造退化；
+      E 池级假绿面本体：`[TTS-POOL] done: X/Y scene(s) ok` 在非法响应下不得计入 ok；
+      F 结构见证：写盘在守卫之后、守卫不在 try 内、取数面回三元组、判据不复制到第二处、
+        `enhance_video_audio.py` 仍在 tts 步指纹登记面（一次性冲击的依据）；
+      G 旧文案与第二定义点都不复活（形态判据单源）。
+    """
+    tc = RegressionTestCase(
+        "elevenlabs_non_audio_response_guard",
+        "验证 ElevenLabs 非音频响应被形态判据拦下：不落盘、不计入 ok、归因指向网络层"
+    )
+
+    MP3_ID3 = b"ID3\x03\x00\x00" + bytes([0x42] * 600)          # 606 B，正常件（ID3 腿）
+    MP3_FRAME = b"\xff\xfb\x90\x64" + bytes([0x5A] * 600)       # 604 B，正常件（帧同步腿）
+    MP3_SHORT = b"\xff\xfb\x90\x64" + bytes([0x5A] * 396)       # 400 B，低于尺寸地板
+    # 一手凭据的真实尺寸量级（生产实测 1657 B）：必须 >500，否则三腿会塌到地板一条上
+    HTML_BLOCK = (b"<!DOCTYPE html><html><head><title>Access restricted</title></head>"
+                  b"<body>Service temporarily unavailable.</body></html>") * 14   # 1652 B
+    URL_GEO = "https://geo-restriction.elevenlabs.io/"
+    URL_API = "https://api.elevenlabs.io/v1/text-to-speech/x?output_format=mp3_44100_128"
+    TEXT = "本批只把非音频响应挡在缓存位之外。"
+    FIX_KEY = "sk_regression_fixture_not_a_real_key"
+
+    try:
+        import ast
+        import asyncio
+        import contextlib
+        import io
+        import os
+        import sys
+        import tempfile
+        import urllib.error
+        import urllib.request
+        from pathlib import Path
+
+        script_dir = Path(__file__).resolve().parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import enhance_video_audio as eva
+
+        eva_src = (script_dir / "enhance_video_audio.py").read_text(encoding="utf-8")
+        eva_tree = ast.parse(eva_src)
+
+        class FakeResp:
+            """最小响应对象：read / headers / geturl 三项都是判据取数面。"""
+
+            def __init__(self, body, ctype, url):
+                self._body = body
+                self.headers = {} if ctype is None else {"Content-Type": ctype}
+                self._url = url
+
+            def read(self):
+                return self._body
+
+            def geturl(self):
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def _guard(data, ctype, url):
+            return eva._eleven_non_audio_reason(data, ctype, url)
+
+        def _floor(reason):
+            return "低于音频下限" in (reason or "")
+
+        with tempfile.TemporaryDirectory(prefix="case138_") as _td:
+            base = Path(_td)
+            seq = {'n': 0}
+
+            def _apikey_env():
+                """密钥只在夹具生命周期内存在，值不入判据面（E1e 证它不泄进日志）。"""
+                saved = os.environ.get("ELEVENLABS_API_KEY")
+                os.environ["ELEVENLABS_API_KEY"] = FIX_KEY
+
+                def _restore():
+                    if saved is None:
+                        os.environ.pop("ELEVENLABS_API_KEY", None)
+                    else:
+                        os.environ["ELEVENLABS_API_KEY"] = saved
+                return _restore
+
+            def _call_eleven(body, ctype, url, status=None, pre=None):
+                """直调 `_eleven_tts` 真身：返回 (异常, 文案, 落盘字节, 调用次数)。
+
+                落盘读数取字节内容而非存在性——C7（旧缓存件不被半截覆盖）要与 pre 对撞。
+                """
+                calls = []
+
+                def fake_urlopen(req, timeout=None):
+                    calls.append(req)
+                    if status is not None:
+                        raise urllib.error.HTTPError(
+                            url, status, "err", {}, io.BytesIO(b'{"detail":"fixture"}'))
+                    return FakeResp(body, ctype, url)
+
+                async def _noop(_s):
+                    return None
+
+                seq['n'] += 1
+                out = base / f"call{seq['n']}" / "scene_1_hash.mp3"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                if pre is not None:
+                    out.write_bytes(pre)
+                exc, msg = None, ""
+                old_u, old_sleep = urllib.request.urlopen, asyncio.sleep
+                urllib.request.urlopen, asyncio.sleep = fake_urlopen, _noop
+                restore = _apikey_env()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        asyncio.run(eva._eleven_tts(TEXT, str(out)))
+                except BaseException as e:      # noqa: BLE001 —— 异常形态本身是判据对象
+                    exc, msg = e, str(e)
+                finally:
+                    urllib.request.urlopen, asyncio.sleep = old_u, old_sleep
+                    restore()
+                written = out.read_bytes() if out.exists() else None
+                return exc, msg, written, len(calls)
+
+            # ── A 段：三腿各自承重 ────────────────────────────────────────────
+            tc.assert_equal(_guard(MP3_ID3, "audio/mpeg", URL_API), None,
+                            "A1 正常件（ID3 头 + audio/mpeg）不得被误杀")
+            tc.assert_equal(_guard(MP3_FRAME, "audio/mpeg", URL_API), None,
+                            "A2 正常件（MPEG 帧同步头）同判——魔数腿两条入口都在")
+            tc.assert_true(bool(_guard(HTML_BLOCK, "text/html", URL_GEO)),
+                           "A3 一手凭据形态（200 + text/html + 1652 B 封锁页）必须被判非音频")
+            tc.assert_true("不是 MP3 魔数" in (_guard(HTML_BLOCK, "audio/mpeg", URL_GEO) or ""),
+                           "A4 服务端自称音频、正文是 HTML → 由魔数腿点名（不轻信自报）")
+            tc.assert_true("不是 audio/*" in (_guard(MP3_FRAME, "text/html", URL_GEO) or ""),
+                           "A5 正文是合法 MP3、Content-Type 非音频 → 由 Content-Type 腿点名")
+            tc.assert_true(_floor(_guard(MP3_SHORT, "audio/mpeg", URL_API)),
+                           "A6 400 B 的合法形态仍被尺寸地板拦下（旧守卫逐字保留，判据不放宽）")
+            tc.assert_true("不是 audio/*" in (_guard(MP3_FRAME, "", URL_GEO) or ""),
+                           "A7 Content-Type 缺席即判非音频并走同一出口（fail-closed，"
+                           "不得把\"没自报\"读成通过）")
+            tc.assert_equal(_guard(MP3_ID3, "audio/mpeg; codecs=mp3", URL_API), None,
+                            "A8 带参数的 audio/mpeg 仍过关（形态判据不得收紧成字符串全等而误杀）")
+
+            # ── B 段：归因指向网络层（端到端，取数面须真把 URL 带进判据）──────
+            _e1, _m1, _w1, _n1 = _call_eleven(HTML_BLOCK, "text/html", URL_GEO)
+            tc.assert_true("请求被重定向到 geo-restriction" in _m1,
+                           "B1 末端 URL 落在 geo-restriction → 归因写成区域封锁")
+            _e2, _m2, _w2, _n2 = _call_eleven(HTML_BLOCK, "text/html", URL_API)
+            tc.assert_true("网络层" in _m2 and "请求被重定向" not in _m2,
+                           "B2 直连 200+HTML 不得被误归因为区域封锁（两形态由末端 URL 分开，"
+                           "操作日志 [2026-11-17] §一的判据）")
+            tc.assert_true(f"{len(HTML_BLOCK)} B" in _m1,
+                           f"B3 文案携带响应字节数（现读 {len(HTML_BLOCK)} B，供现场对撞）")
+            tc.assert_true(f"末端 URL={URL_GEO}" in _m1,
+                           "B3b 文案携带末端 URL——只报 status/ctype/bytes 的探针会把 302 "
+                           "跟随读成直接 200，取数面丢掉这一项即无从区分（本仓误判过一整轮）")
+            tc.assert_true("GET /v1/user" in _m1 and "HTTPS_PROXY" in _m1,
+                           "B4 文案给出只读判据出口与 Windows 代理处置（指路，而非只说失败）")
+
+            # ── C 段：先判后写、一次即止、不污染缓存位 ────────────────────────
+            exc, msg, written, calls = _call_eleven(HTML_BLOCK, "text/html", URL_GEO)
+            tc.assert_true(isinstance(exc, RuntimeError),
+                           "C1 非法响应必须抛（不返回、不降级到其它引擎）")
+            tc.assert_equal(written, None,
+                            "C2 非法响应未落盘（缓存位不受污染——假绿的代价就是这一位）")
+            tc.assert_equal(calls, 1,
+                            "C3 非法响应一次即止：形态错误是确定性的，重试五次白付 33s")
+            tc.assert_true("after 5 retries" not in msg,
+                           "C4 文案未被重试包装顶替（守卫不得放进 try，否则被泛捕获吞掉真因）")
+            exc, msg, written, calls = _call_eleven(MP3_FRAME, "audio/mpeg", URL_API)
+            tc.assert_true(exc is None and written == MP3_FRAME and calls == 1,
+                           "C5 正常件照旧落盘且字节逐字一致（本次修复不得改变成功路径）")
+            exc, msg, written, calls = _call_eleven(HTML_BLOCK, "audio/mpeg", URL_GEO)
+            tc.assert_true(isinstance(exc, RuntimeError) and "不是 MP3 魔数" in msg,
+                           "C6 端到端：audio/mpeg + HTML 正文被拦且点名魔数")
+            tc.assert_equal(written, None, "C6b 该形态未落盘")
+            exc, msg, written, calls = _call_eleven(HTML_BLOCK, "text/html", URL_GEO,
+                                                    pre=b"OLD-GOOD-AUDIO")
+            tc.assert_equal(written, b"OLD-GOOD-AUDIO",
+                            "C7 已有旧缓存件在非法响应下字节不变（不把已合成音频半截覆盖）")
+            exc, msg, written, calls = _call_eleven(MP3_FRAME, "text/html", URL_GEO)
+            tc.assert_true(isinstance(exc, RuntimeError) and "不是 audio/*" in msg,
+                           "C8 端到端：text/html + 合法 MP3 正文被拦且点名 Content-Type")
+            tc.assert_equal(written, None, "C8b 该形态未落盘")
+            exc, msg, written, calls = _call_eleven(MP3_SHORT, "audio/mpeg", URL_API)
+            tc.assert_true(isinstance(exc, RuntimeError) and _floor(msg),
+                           "C10 端到端：低于尺寸地板的响应仍被拦并点名下限（尺寸腿在生效路径上）")
+
+            # ── D 段：非 200 的既有语义不因改造退化 ───────────────────────────
+            exc, msg, written, calls = _call_eleven(None, None, URL_API, status=401)
+            tc.assert_true(isinstance(exc, RuntimeError) and "鉴权失败" in msg
+                           and calls == 1 and written is None,
+                           "D1 401 → 鉴权档：不重试、不落盘")
+            exc, msg, written, calls = _call_eleven(None, None, URL_API, status=403)
+            tc.assert_true(isinstance(exc, RuntimeError) and "鉴权失败" in msg and calls == 1,
+                           "D2 403 同归鉴权档（与 401 共用出口，不各写一份文案）")
+            exc, msg, written, calls = _call_eleven(None, None, URL_API, status=404)
+            tc.assert_true("找不到音色" in msg and calls == 1,
+                           "D3 404 → 音色档：一次即止且给出 voice_id 归因")
+            exc, msg, written, calls = _call_eleven(None, None, URL_API, status=429)
+            tc.assert_true(calls == 5 and "after 5 retries" in msg and written is None,
+                           "D4 429 仍走重试档（五用尽后抛）——本批只收紧形态判据，没动重试面")
+
+            # ── E 段：池级假绿面本体（done: X/Y scene(s) ok 计数）─────────────
+            def _run_pool(body, ctype, url):
+                old = (eva.SCENES, eva.TTS_ENGINE, eva._load_tts_concurrency, eva.run_ffmpeg)
+                eva.SCENES = [(1, 0.0, 8.0, TEXT)]
+                eva.TTS_ENGINE = "elevenlabs"
+                eva._load_tts_concurrency = lambda cfg_path=None: 2
+                eva.run_ffmpeg = lambda cmd, desc="": False
+                calls = []
+
+                def fake_urlopen(req, timeout=None):
+                    calls.append(req)
+                    return FakeResp(body, ctype, url)
+
+                async def _noop(_s):
+                    return None
+
+                seq['n'] += 1
+                td = base / f"pool{seq['n']}"
+                td.mkdir(parents=True, exist_ok=True)
+                old_u, old_sleep = urllib.request.urlopen, asyncio.sleep
+                urllib.request.urlopen, asyncio.sleep = fake_urlopen, _noop
+                buf, ret, err = io.StringIO(), None, None
+                restore = _apikey_env()
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        ret = asyncio.run(eva.step1_generate_tts(td))
+                except BaseException as e:      # noqa: BLE001 —— 池之后的下游形态不入判
+                    ret, err = "raised", repr(e)[:120]
+                finally:
+                    urllib.request.urlopen, asyncio.sleep = old_u, old_sleep
+                    (eva.SCENES, eva.TTS_ENGINE,
+                     eva._load_tts_concurrency, eva.run_ffmpeg) = old
+                    restore()
+                raw = td / f"scene_1_{eva._tts_cache_key(TEXT, scene_id=1)}.mp3"
+                return ret, buf.getvalue(), raw, calls
+
+            ret, out_txt, raw, calls = _run_pool(HTML_BLOCK, "text/html", URL_GEO)
+            tc.assert_true("done: 0/1 scene(s) ok, 1 failed" in out_txt,
+                           "E1 非法响应下场景数不得计入 ok"
+                           "（`done: 2/2 scene(s) ok` 正是当年的假绿读数）")
+            tc.assert_equal(raw.exists(), False,
+                            "E1b raw 缓存位不在位（串行兜底那次的 unlink 只兜半成品，"
+                            "判据本身不许它被写出来）")
+            tc.assert_equal(ret, False, "E1c 场景失败仍按既有语义让 tts 步返回 False")
+            tc.assert_true("请求被重定向" in out_txt,
+                           "E1d 归因出现在失败清单里（报错不指向网络层＝同一缺陷换层重演）")
+            tc.assert_true(FIX_KEY not in out_txt and "xi-api-key" not in out_txt,
+                           "E1e 密钥值与请求头名不得出现在日志面")
+            ret, out_txt, raw, calls = _run_pool(MP3_FRAME, "audio/mpeg", URL_API)
+            tc.assert_true("done: 1/1 scene(s) ok, 0 failed" in out_txt
+                           and raw.exists() and raw.read_bytes() == MP3_FRAME,
+                           "E2 正对照：正常件在池里计数与落盘照旧（本次修复不改变成功链）")
+
+            # ── F 段：结构见证（位置即判据：校验与写盘分居 try/else 两侧）────
+            fn = next((n for n in eva_tree.body if isinstance(n, ast.AsyncFunctionDef)
+                       and n.name == "_eleven_tts"), None)
+            try_node = next((n for n in ast.walk(fn) if isinstance(n, ast.Try) and n.orelse),
+                            None) if fn is not None else None
+
+            def _guard_calls(node):
+                return [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                        and getattr(n.func, "id", "") == "_eleven_non_audio_reason"] \
+                    if node is not None else []
+
+            def _open_calls(node):
+                return [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                        and getattr(n.func, "id", "") == "open"] \
+                    if node is not None else []
+
+            orelse_node = ast.Module(body=list(try_node.orelse), type_ignores=[]) \
+                if try_node is not None else None
+            body_node = ast.Module(body=list(try_node.body) + list(try_node.handlers),
+                                   type_ignores=[]) if try_node is not None else None
+            g_calls, o_calls = _guard_calls(orelse_node), _open_calls(orelse_node)
+            tc.assert_true(bool(g_calls) and bool(o_calls)
+                           and g_calls[0].lineno < o_calls[0].lineno,
+                           "F1 写盘在形态校验之后（else 分支内顺序即语义，先写后判等于污染缓存位）")
+            tc.assert_equal(len(_guard_calls(body_node)), 0,
+                            "F2 形态校验不在 try/except 覆盖范围内（在里面即被泛捕获重试并改写文案）")
+            gfn = next((n for n in eva_tree.body if isinstance(n, ast.FunctionDef)
+                        and n.name == "_eleven_non_audio_reason"), None)
+            tc.assert_true(gfn is not None and any(
+                isinstance(n, ast.Compare) and any(getattr(c, "value", None) == 500
+                                                   for c in n.comparators)
+                for n in ast.walk(gfn)),
+                "F3 尺寸地板以 500 的比较形式住在守卫函数里（判据单源，不在调用方另算）")
+            inner = next((n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef)
+                          and n.name == "_call_sync"), None) if fn is not None else None
+            cs_src = ast.get_source_segment(eva_src, inner) if inner is not None else ""
+            # 钉的是"三样取数各自真被读出"，不是 return 语句的字面形状：写成三元组字面量
+            # 还是先赋值再 return，契约不变（138-M4 的连带即由形状耦合造成，已按此改写）。
+            # 响应头那一样必须带 `resp.headers.get(` 前缀——请求头字面量 'Content-Type'
+            # 也在 `_call_sync` 里，裸子串判据会把 M6（写死 ctype）洗白成绿。
+            unpack = [n for n in ast.walk(fn)
+                      if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
+                      and len(n.targets[0].elts) == 3
+                      and "_call_sync" in (ast.get_source_segment(eva_src, n.value) or "")]
+            tc.assert_true(all(s in cs_src for s in
+                               ("resp.read()", "resp.headers.get('Content-Type')", "geturl()"))
+                           and len(unpack) == 1,
+                           "F4 取数面把字节/响应头自报形态/末端 URL 三样都交出来，且调用方按三元解包，"
+                           f"实得 {cs_src[:160]!r}")
+            fn_src = ast.get_source_segment(eva_src, fn) if fn is not None else ""
+            tc.assert_true(not any(s in (fn_src or "") for s in
+                                   ("len(data) < 500", "b'ID3'", "startswith('audio/')")),
+                           "F5 调用方不重复形态判据（第二份真相的形态＝在 _eleven_tts 里再写一条腿）")
+            pr_tree = ast.parse((script_dir / "pipeline_runner.py").read_text(encoding="utf-8"))
+            tts_named = set()
+            for node in ast.walk(pr_tree):
+                if isinstance(node, ast.Dict):
+                    for k, v in zip(node.keys, node.values):
+                        if isinstance(k, ast.Constant) and k.value == "tts":
+                            tts_named.update(n.id for n in ast.walk(v) if isinstance(n, ast.Name))
+            tc.assert_true("enhance_script" in tts_named,
+                           "F6 enhance_video_audio.py 仍在 tts 步指纹登记面——本批改其字节，"
+                           "存量项目下轮该步重跑（缓存在位＝零扣费、零渲染）")
+
+            # ── G 段：旧文案与第二定义点都不复活 ──────────────────────────────
+            tc.assert_equal(eva_src.count("returned invalid audio"), 0,
+                            "G1 旧守卫文案（invalid audio，不指向网络层）不得复活")
+            tc.assert_equal(len([n for n in ast.walk(eva_tree)
+                                 if isinstance(n, ast.FunctionDef)
+                                 and n.name == "_eleven_non_audio_reason"]), 1,
+                            "G2 形态判据在仓内只有一个定义点（不得为其它引擎另写一份同族判据）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("elevenlabs_non_audio_response_guard error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
 
