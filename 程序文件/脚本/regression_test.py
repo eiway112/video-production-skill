@@ -3233,6 +3233,11 @@ def test_pre_render_duration_consistency() -> RegressionTestCase:
                 runner.force = force
                 runner.source_dir = src
                 runner.config = {"video_duration": cfg_dur}
+                # 2026-11-17 起 _pre_render_duration_consistent 从 audio_sync_rules
+                # 读容差（fail-closed）——夹具必须携带，否则一致形态也被判"容差
+                # 取不回"而阻断。缺键形态的 fail-closed 本身由用例139 D3 锁定。
+                runner.audio_sync_rules = {"duration_consistency":
+                                           {"pre_render_max_diff_seconds": 0.1}}
                 return runner
 
             # (a) HTML 150s vs config 160.6s → 阻断 + render 标记失败
@@ -23314,6 +23319,7 @@ class RegressionTestRunner:
             test_atomic_write_and_heartbeat_survive_reader_race,
             test_transition_occlusion_gate,
             test_elevenlabs_non_audio_response_guard,
+            test_pointer_mode_duration_single_source,
         ]
         self.results = []
     
@@ -28734,6 +28740,292 @@ def test_elevenlabs_non_audio_response_guard() -> RegressionTestCase:
         tc.mark_failed("elevenlabs_non_audio_response_guard error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
+
+
+def test_pointer_mode_duration_single_source() -> RegressionTestCase:
+    """用例139：指针模式权威总时长单源 + 零调整守卫自洽出口（2026-11-17）
+
+    背景：同一项目总时长被两式各算一遍——HTML 侧 f'{x:.1f}' 单次舍入、config
+    侧 round(round(x-cover,1)+cover,1) 两次舍入——浮点路径在半界两侧方向不同，
+    同轮写出 45.0/44.9；零调整守卫再拿第三种基准（裸 boundaries[-1][1]）比对，
+    把上一轮按 b+o+e 舍入写出的合法值判红；Recover 指令「删 .bak/.hash 重跑」
+    重跑只会再写出同样两个值，循环无解（2026-11-17 生产实证）。
+
+    修法三件（本用例逐件锁定）：
+    ① authoritative_video_duration 单源——HTML/config 写盘与守卫基准同一舍入点；
+    ② 守卫基准＝本轮权威值，守卫红改为自洽写回 data-duration（可终止出口）；
+    ③ 收敛阈 fail-closed 住 audio_sync_rules.json（zero_adjust_resync_seconds /
+    pre_render_max_diff_seconds 两键分面），脚本零容差字面量。
+    """
+    tc = RegressionTestCase(
+        "pointer_mode_duration_single_source",
+        "指针模式总时长单源舍入点 + 零调整守卫自洽写回 + 容差配置单源 fail-closed"
+    )
+    try:
+        import ast
+        import re
+        import subprocess
+        import wave as wave_mod
+
+        script_dir = Path(__file__).parent
+        with open(script_dir / "adjust_timeline.py", "r", encoding="utf-8") as f:
+            at_src = f.read()
+        at_tree = ast.parse(at_src)
+
+        def _calls(name, tree=None):
+            return [n for n in ast.walk(tree or at_tree)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == name]
+
+        def _neg_index(node):
+            # [-1] 在 AST 里是 UnaryOp(USub, Constant(1))，不是 Constant(-1)——
+            # 首版只认 Constant 使该判定对负数下标结构性不命中（139-M3 首跑
+            # B2 SURVIVED 即由此而来，按 121-M5/125-M11 同族登记）。
+            if isinstance(node, ast.Constant):
+                return True
+            return (isinstance(node, ast.UnaryOp)
+                    and isinstance(node.op, ast.USub)
+                    and isinstance(node.operand, ast.Constant))
+
+        def _double_sub(name, tree=None):
+            # `boundaries[-1][1]` 双下标形态（AST 命中代码，注释里的字面不计）
+            return [n for n in ast.walk(tree or at_tree)
+                    if isinstance(n, ast.Subscript)
+                    and _neg_index(n.slice)
+                    and isinstance(n.value, ast.Subscript)
+                    and _neg_index(n.value.slice)
+                    and isinstance(n.value.value, ast.Name)
+                    and n.value.value.id == name]
+
+        # ── A 段：单源函数（定义、语义、三个消费点） ────────────────────────
+        import adjust_timeline as at
+        tc.assert_equal(len([n for n in at_tree.body
+                             if isinstance(n, ast.FunctionDef)
+                             and n.name == "authoritative_video_duration"]), 1,
+                        "A1 单源函数只有一个定义点")
+        tc.assert_equal(at.authoritative_video_duration(
+            [(2.0, 44.9)], [0.0], [0.0]), 44.9,
+            "A2 末场绝对边界 + 本轮累计扩展量、单次舍入（夹具实测形态）")
+        tc.assert_equal(at.authoritative_video_duration(
+            [(2.0, 44.9)], [0.3], [0.2]), 45.4,
+            "A3 含扩展量形态（44.9 + 0.5）")
+        # 分叉形态：cover 0.25（quarter 格）使旧 config 式两次舍入与单次舍入
+        # 恒差 +0.1（IEEE 754 确定性，跨解释器版本稳定）——单次舍入语义可观察。
+        tc.assert_true(
+            at.authoritative_video_duration([(0.25, 40.7)], [0.0], [0.0]) == 40.7
+            and round(round(40.7 - 0.25, 1) + 0.25, 1) == 40.8,
+            "A4 单次舍入与旧两次舍入式在该形态分叉 0.1（本函数取单次值）")
+        tc.assert_equal(len(_calls("authoritative_video_duration")), 3,
+                        "A5 消费点恰三处：update_config 写盘 / 零调整守卫 / main 指针式")
+        ucfg = next(n for n in at_tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "update_config")
+        # 负断言走 AST 形态而非子串：修法注释里复现了旧式字面（自述归因），
+        # 子串判据会被它洗白（105 同族——锚断言被自己的注释洗白）。
+        legacy_round = [n for n in ast.walk(ucfg)
+                        if isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Name) and n.func.id == "round"
+                        and n.args
+                        and isinstance(n.args[0], ast.Subscript)
+                        and isinstance(n.args[0].value, ast.Name)
+                        and n.args[0].value.id == "new_scenes"]
+        tc.assert_true(len(_calls("authoritative_video_duration", ucfg)) == 1
+                       and not legacy_round,
+                       "A6 update_config boundaries 分支经单源函数（旧式"
+                       " round(new_scenes[-1]['end']…) 两次舍入不复活）")
+        main_fn = next(n for n in at_tree.body if isinstance(n, ast.FunctionDef)
+                       and n.name == "main")
+        tc.assert_equal(len(_calls("authoritative_video_duration", main_fn)), 2,
+                        "A7 main 内两处消费（守卫基准 + 指针式 data-duration）")
+
+        # ── B 段：守卫基准＝写入格式 + 自洽写回出口 ──────────────────────────
+        main_src = ast.get_source_segment(at_src, main_fn)
+        guard_seg = main_src[main_src.index("No adjustment needed"):
+                             main_src.index("Adjust GSAP time positions")]
+        tc.assert_equal(guard_seg.count("abs(html_dur - expected_dur) >= resync_tol"), 1,
+                        "B1 守卫比对基准是本轮权威值、容差来自 resync_tol（无字面量）")
+        tc.assert_equal(len(_double_sub("boundaries", main_fn)), 0,
+                        "B2 main 内不再直接索引 boundaries[-1][1]（第三种基准退役；"
+                        "M3 变异把它换回即红）")
+        tc.assert_true(guard_seg.count("html_resynced = True") == 1
+                       and guard_seg.count("if cue_changed or html_resynced:") == 1,
+                       "B3 守卫红走自洽写回（html_resynced 汇入既有落盘条件）")
+        tc.assert_equal(guard_seg.count("Recover: set data-duration"), 1,
+                        "B4 data-duration 缺失形态 fail-loud 且指令可终止"
+                        "（设为权威值后重跑，守卫即绿）")
+        tc.assert_true("循环无解" in guard_seg,
+                       "B5 旧无解 Recover 指令的废弃声明在位（防止只删文案不留归因）")
+
+        # ── C 段：端到端（分叉件 → resync 写回 → 幂等 → 属性缺失出口） ──────
+        # 夹具＝2026-11-17 取证件形态：narration 末场 44.9（两次舍入链落盘值）、
+        # HTML data-duration=45.0（单次舍入链落盘值）、TTS 窗口已对齐（ext 全零）
+        # → 走零调整分支 → 守卫应自洽写回 44.9 而非 GATE_FAILURE。
+        proj_name = f"_regress-tl-resync-{os.getpid()}"
+        proj_dir = script_dir.parent / "源码" / "hyperframes" / proj_name
+
+        def write_silence(path, seconds, rate=8000):
+            with wave_mod.open(str(path), 'w') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(b'\x00\x00' * int(rate * seconds))
+
+        html_divergent = ('<!DOCTYPE html>\n<html lang="zh"><head>'
+                          '<meta charset="utf-8"><title>t139</title></head>\n<body>\n'
+                          '<div id="root" data-duration="45.0" data-cover-duration="2.0">\n'
+                          '  <div class="scene" data-scene-id="s1" data-scene-entry="static" '
+                          'data-scene-subtitle-safe="true"><p>fixture content</p></div>\n'
+                          '</div>\n</body></html>\n')
+
+        def html_duration_raw(html_path):
+            m = re.search(r'data-duration="([\d.]+)"',
+                          html_path.read_text(encoding="utf-8"))
+            return m.group(1) if m else None
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                (proj_dir / "index.html").write_text(html_divergent, encoding="utf-8")
+                (tmpdir / "narration.json").write_text(json.dumps({
+                    "scenes": [
+                        {"scene_id": "s0", "type": "cover", "start": 0.0, "end": 2.0,
+                         "duration": 2.0, "narration": "", "narration_required": False},
+                        {"scene_id": "s1", "type": "content", "start": 2.0, "end": 44.9,
+                         "duration": 42.9, "narration": "测试旁白。",
+                         "narration_required": True}
+                    ]}, ensure_ascii=False), encoding="utf-8")
+                cfg_path = tmpdir / "t139.json"
+                cfg_path.write_text(json.dumps({
+                    "paths": {"html_project": proj_name},
+                    "narration_source": "narration.json",
+                    "video_duration": 44.9,
+                    "scenes": [{"scene_id": "s1", "start": 2.0, "end": 44.9,
+                                "narration": "测试旁白。"}]
+                }, ensure_ascii=False), encoding="utf-8")
+                tts_dir = tmpdir / "tts_44k"
+                tts_dir.mkdir()
+                write_silence(tts_dir / "scene_1_hq.wav", 41.4)
+
+                env = dict(os.environ, PYTHONIOENCODING='utf-8')
+                cmd = [sys.executable, "-X", "utf8",
+                       str(script_dir / "adjust_timeline.py"),
+                       "--config", str(cfg_path), "--tts-dir", str(tts_dir)]
+
+                r1 = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', env=env)
+                tc.assert_equal(r1.returncode, 0, "C1 分叉件 run1 exits 0（不再循环红）")
+                tc.assert_true("[DURATION-RESYNC]" in r1.stdout,
+                               "C2 run1 守卫红改为自洽写回并点名")
+                tc.assert_equal(html_duration_raw(proj_dir / "index.html"), "44.9",
+                                "C3 HTML data-duration 逐字写回权威值（.1f 写入格式）")
+                cfg1 = json.loads(cfg_path.read_text(encoding="utf-8"))
+                nar1 = json.loads((tmpdir / "narration.json").read_text(encoding="utf-8"))
+                tc.assert_equal(cfg1["video_duration"], 44.9,
+                                "C4 config video_duration 与守卫基准同源")
+                tc.assert_equal(nar1["scenes"][-1]["end"], 44.9,
+                                "C5 narration 末场 end 保持 44.9（三方同值）")
+
+                # run2 幂等：守卫绿、零写盘
+                html_before = (proj_dir / "index.html").read_text(encoding="utf-8")
+                cfg_before = cfg_path.read_text(encoding="utf-8")
+                nar_before = (tmpdir / "narration.json").read_text(encoding="utf-8")
+                r2 = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', env=env)
+                tc.assert_equal(r2.returncode, 0, "C6 run2 exits 0（幂等）")
+                tc.assert_true("[DURATION-RESYNC]" not in r2.stdout
+                               and "Config drift detected" not in r2.stdout,
+                               "C7 run2 无写盘（收敛后零动作）")
+                tc.assert_true(
+                    (proj_dir / "index.html").read_text(encoding="utf-8") == html_before
+                    and cfg_path.read_text(encoding="utf-8") == cfg_before
+                    and (tmpdir / "narration.json").read_text(encoding="utf-8") == nar_before,
+                    "C8 run2 三份权威源字节不变")
+
+                # 属性缺失形态：fail-loud 且指令可终止
+                (proj_dir / "index.html").write_text(
+                    html_divergent.replace(' data-duration="45.0"', ''),
+                    encoding="utf-8")
+                for stale in ("index.html.hash", "index.html.bak"):
+                    (proj_dir / stale).unlink(missing_ok=True)
+                r3 = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', env=env)
+                tc.assert_equal(r3.returncode, 4, "C9 data-duration 缺失 → GATE_FAILURE")
+                tc.assert_true("Recover: set data-duration" in r3.stdout,
+                               "C10 缺失形态点名期望值并给可终止指令")
+        finally:
+            shutil.rmtree(proj_dir, ignore_errors=True)
+
+        # ── D 段：容差配置单源 + runner 侧 fail-closed 与阈值消费 ────────────
+        rules_path = (script_dir.parent / "配置" / "config" / "quality"
+                      / "audio_sync_rules.json")
+        rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        dcons = rules["duration_consistency"]
+        tc.assert_true(
+            float(dcons["zero_adjust_resync_seconds"]) > 0
+            and float(dcons["pre_render_max_diff_seconds"]) > 0,
+            "D1 两枚收敛阈在位且为正（timeline 写回线 / 渲染前放行线分键）")
+        tc.assert_equal(at._zero_adjust_resync_tolerance(),
+                        float(dcons["zero_adjust_resync_seconds"]),
+                        "D2 加载器直调等于配置值（脚本零字面量）")
+
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            src = tmpdir / "proj"
+            src.mkdir()
+            html = src / "index.html"
+
+            def make_runner(html_dur, cfg_dur, rules_obj=None, tag=""):
+                if html_dur is not None:
+                    html.write_text(f'<div id="root" data-duration="{html_dur}"></div>',
+                                    encoding="utf-8")
+                state = PipelineState(tmpdir / f"state_{tag}.json")
+                state.mark_started("render")
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = state
+                runner.force = False
+                runner.source_dir = src
+                runner.config = {"video_duration": cfg_dur}
+                if rules_obj is not None:
+                    runner.audio_sync_rules = rules_obj
+                return runner
+
+            # runner fail-closed：容差取不回即阻断（不从「配置断链」读成放行）
+            r_fail = make_runner(150, 160.6, rules_obj=None, tag="nofailclosed")
+            ok = r_fail._pre_render_duration_consistent()
+            tc.assert_true(not ok, "D3 runner 容差取不回 → 阻断（fail-closed）")
+            tc.assert_equal(r_fail.state.data["steps"]["render"]["status"], "failed",
+                            "D4 fail-closed 同步 mark_failed render")
+            # 阈值真被消费（写死 0.1 会让 0.3 差被误拦）
+            r_loose = make_runner(160.9, 160.6,
+                                  rules_obj={"duration_consistency":
+                                             {"pre_render_max_diff_seconds": 0.5}},
+                                  tag="tol05ok")
+            tc.assert_true(r_loose._pre_render_duration_consistent(),
+                           "D5 差 0.3 < 配置容差 0.5 → 放行（阈值自配置）")
+            r_tight = make_runner(161.2, 160.6,
+                                  rules_obj={"duration_consistency":
+                                             {"pre_render_max_diff_seconds": 0.5}},
+                                  tag="tol05block")
+            tc.assert_true(not r_tight._pre_render_duration_consistent(),
+                           "D6 差 0.6 ≥ 配置容差 0.5 → 阻断")
+
+        # ── E 段：runner Recover 指令可终止 + 旧指令不复活 ───────────────────
+        pr_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        tc.assert_true("--resume 重跑 timeline" in pr_src and "循环无解" in pr_src,
+                       "E1 分叉文案给可终止指令（--resume 重跑 timeline 步自洽写回）"
+                       "并保留旧指令的废弃归因")
+        tc.assert_equal(pr_src.count("删除项目目录下的"), 0,
+                        "E2 旧 actionable 指令（删 .bak/.hash）不复活")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("pointer_mode_duration_single_source error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
 
 if __name__ == '__main__':
     main()

@@ -225,6 +225,53 @@ def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrin
     return extensions, offsets, sum(extensions)
 
 
+def authoritative_video_duration(boundaries, offsets, extensions):
+    """权威总时长单源：round(末场绝对边界 + 本轮累计扩展量, 1)，**单次舍入**。
+
+    存在理由（2026-11-17 发布仓 §8.3 生产实证）：同一轮 timeline 的总时长此前由
+    两个式子各算一遍——HTML 侧 update_data_duration 的 `{x:.1f}` 单次舍入，config
+    侧 update_config 的 `round(new_scenes[-1]['end'] + cover_duration, 1)` 两次
+    舍入。浮点路径在 .05 半界两侧方向不同 ⇒ 同一轮写出 45.0 与 44.9 两个互相
+    矛盾的值；下一轮零调整守卫再拿第三种基准（裸 boundaries[-1][1]）比对，把
+    上一轮的合法产物判红，而 Recover 指令（删 .bak/.hash 重跑）重跑只会再写出
+    同样两个值——循环无解。本函数是唯一舍入点：HTML 写盘（main 的 data-duration
+    更新点）、config 写盘（update_config boundaries 分支）、零调整守卫基准三方
+    同式同精度。
+
+    boundaries 取 narration/S-block 的**绝对末场边界**（cover 已含），因此
+    offsets/extensions 以绝对坐标直接叠加，不再经过 cover 相对坐标的往返舍入。
+    """
+    return round(boundaries[-1][1] + offsets[-1] + extensions[-1], 1)
+
+
+def _zero_adjust_resync_tolerance():
+    """零调整分支收敛阈单一权威源：
+    `audio_sync_rules.json → duration_consistency.zero_adjust_resync_seconds`。
+
+    同一收敛面的两个出口共用本值：①指针模式守卫的 resync 触发阈（HTML
+    data-duration 与本轮权威总时差的裁定线）；②config drifted 判定阈。两处
+    各写一份字面量即两份真相——分叉时「HTML 已收敛、config 判定不漂移」。
+
+    fail-closed：取不回（缺文件/缺节/缺键/非正数）返回 None 并点名，调用处
+    阻断——守卫触发阈不得带脚本字面量兜底，兜底值一旦与配置分叉即两份真相
+    （A06 同族：登记面=真实读取路径，断链必须显形而不是悄悄换数）。
+    """
+    try:
+        from _script_env import ROOT
+        rules_path = ROOT / "程序文件" / "配置" / "config" / "quality" / "audio_sync_rules.json"
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            value = float(json.load(f)["duration_consistency"]["zero_adjust_resync_seconds"])
+        if value <= 0:
+            print(f"  ERROR: zero_adjust_resync_seconds = {value!r} 非正数 — 无从裁定，阻断")
+            return None
+        return value
+    except Exception as exc:
+        print(f"  ERROR: audio_sync_rules.json 的 duration_consistency."
+              f"zero_adjust_resync_seconds 取不回（{type(exc).__name__}: {exc}）"
+              f"— 零调整分支无从裁定，阻断")
+        return None
+
+
 def get_offset_for_time(time_val, boundaries, extensions):
     """Get cumulative offset for a given absolute time position.
 
@@ -523,8 +570,11 @@ def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, b
 
     cfg['scenes'] = new_scenes
     if boundaries is not None:
-        # video_duration = last scene absolute end (cover included)
-        cfg['video_duration'] = round(new_scenes[-1]['end'] + cover_duration, 1)
+        # video_duration = 末场绝对 end + 本轮扩展量，经 authoritative_video_duration
+        # 单次舍入。旧式 round(new_scenes[-1]['end'] + cover_duration, 1) 是两次舍入
+        # （scenes 端已在 cover 相对坐标 round 过一次），与 HTML 侧 .1f 在半界上
+        # 分叉出 45.0/44.9（2026-11-17 生产实证）——三方必须同一舍入点。
+        cfg['video_duration'] = authoritative_video_duration(boundaries, offsets, extensions)
     else:
         cfg['video_duration'] = round(float(cfg['video_duration']) + total_ext, 1)
     return cfg
@@ -933,20 +983,38 @@ def main():
 
     if abs(total_ext) < 0.1 and all(abs(e) < 0.1 for e in extensions):
         print("\n  No adjustment needed (all scenes within tolerance).")
+        html_resynced = False
+        resync_tol = _zero_adjust_resync_tolerance()
+        if resync_tol is None:
+            return EXIT_CODE.GATE_FAILURE
         # Pointer mode drift guard: hash-verified HTML should already match
-        # narration boundaries. If data-duration diverges, the HTML was
-        # externally clobbered (e.g. restored from a stale baseline backup);
-        # GSAP times cannot be resynced from here -> fail loud, recover by
-        # deleting index.html.bak/.hash and re-running.
+        # this run's authoritative total. 旧基准是裸 boundaries[-1][1]（未舍入、
+        # 不含 offsets/extensions），上一轮按 b+o+e 舍入写出的合法值在半界上就能
+        # 与它差出 0.05s 被判「外部篡改」；而旧 Recover 指令（删 .bak/.hash 重跑）
+        # 对本守卫无效——守卫直接读 html_content，重跑只会再写出同样两个值，
+        # 循环无解（2026-11-17 生产实证 45.0 vs 44.9）。
+        # 现守卫基准＝本轮应写入的权威值（authoritative_video_duration，与
+        # HTML/config 写盘同源），守卫红改为自洽写回：data-duration 是单标量，
+        # 零调整分支本身已证 GSAP 时间轴与权威边界的偏差 ≤0.1s（偏差大时
+        # extensions 会大、走下方调整分支重写 T 块），收敛它不触碰动画时间轴。
         if narration_path is not None:
+            expected_dur = authoritative_video_duration(boundaries, offsets, extensions)
             dur_m = re.search(r'data-duration="([\d.]+)"', html_content)
-            html_dur = float(dur_m.group(1)) if dur_m else None
-            if html_dur is None or abs(html_dur - boundaries[-1][1]) >= 0.05:
-                print(f"\n  ERROR: HTML data-duration ({html_dur}s) diverges from "
-                      f"narration_source end ({boundaries[-1][1]:.1f}s).\n"
-                      f"  Recover: delete {html_bak.name} + {html_hash_path.name} "
-                      f"in the project dir, then re-run this step.")
+            if dur_m is None:
+                print(f"\n  ERROR: HTML root data-duration attribute missing — "
+                      f"expected {expected_dur:.1f}s.\n"
+                      f"  Recover: set data-duration=\"{expected_dur:.1f}\" on the "
+                      f"#root element, then re-run this step.")
                 return EXIT_CODE.GATE_FAILURE
+            html_dur = float(dur_m.group(1))
+            if abs(html_dur - expected_dur) >= resync_tol:
+                print(f"\n  [DURATION-RESYNC] HTML data-duration ({html_dur}s) diverges "
+                      f"from this run's authoritative total ({expected_dur:.1f}s) "
+                      f"-> rewriting to {expected_dur:.1f}s.")
+                print("  （只收敛这一个标量，GSAP 时间轴不动；旧指令「删 .bak/.hash 重跑」"
+                      "重跑仍写出同样两个值，循环无解，已废弃）")
+                html_content = update_data_duration(html_content, expected_dur)
+                html_resynced = True
         # 零调整分支也必须走 cue 写入面（2026-10-12 词级 cue 批）。这不是"顺手补一处"：
         # 窗口已收敛的项目走的就是这个提前返回，只在下方的调整分支写块＝
         # 收敛后新加的 cue 声明永远不落盘，而预检那条校验已判它合法——
@@ -955,9 +1023,9 @@ def main():
         html_content, cue_changed, cue_problems = resolve_cue_block(html_content, tts_dir)
         if cue_problems:
             return report_cue_problems(cue_problems)
-        if cue_changed:
+        if cue_changed or html_resynced:
             html_path.write_text(html_content, encoding='utf-8')
-            print(f"  Updated HTML (cue 块，零调整分支): {html_path}")
+            print(f"  Updated HTML (零调整分支): {html_path}")
         _write_hash(html_hash_path, html_content)
         # Zero adjustment does NOT imply config is in sync: when the HTML was
         # manually edited (fresh baseline, already-converged S-block) while the
@@ -970,12 +1038,17 @@ def main():
             synced = update_config(dict(cfg), cfg['scenes'], zeros, zeros, 0.0,
                                    cover_duration, boundaries=boundaries)
             if narration_path is not None:
+                # 零调整轮的 video_duration 必须与守卫基准/HTML 写盘同源（含本轮
+                # offsets/extensions 的微量修正）。zeros 调用本身产出的是
+                # round(boundaries[-1][1], 1)，与 expected_dur 可差 <0.1——照抄它
+                # 会把「HTML 45.0 / config 44.9」分叉在零调整轮内自产（同族形态）。
+                synced['video_duration'] = expected_dur
                 # 指针模式：cfg['scenes'] 为绝对时间、synced['scenes'] 为 cover
                 # 相对时间，坐标系不同不可直接比对，仅以 video_duration 判定漂移
-                drifted = abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= 0.05
+                drifted = abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= resync_tol
             else:
                 drifted = (synced['scenes'] != cfg['scenes'] or
-                           abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= 0.05)
+                           abs(float(synced['video_duration']) - float(cfg['video_duration'])) >= resync_tol)
             if drifted:
                 cfg = synced
                 if narration_path is not None:
@@ -1008,10 +1081,11 @@ def main():
     if s_map:
         new_video_duration = s_map['duration'] + total_ext
     elif narration_path is not None:
-        # 指针模式：与 update_config 同源推导（末场景绝对结束时刻）。
-        # 旧值累加会把 config 之外的尾部时长带进 HTML，与 config 的
-        # video_duration（末场景 end + cover）分叉，触发渲染后时长门禁。
-        new_video_duration = boundaries[-1][1] + offsets[-1] + extensions[-1]
+        # 指针模式：经 authoritative_video_duration 单源（末场绝对边界 + 本轮
+        # 扩展量、单次舍入），与 update_config 的 config 写盘、零调整守卫基准
+        # 同一舍入点。旧值是未舍入表达式靠 .1f 格式化收口——与 config 侧两次
+        # 舍入在半界上分叉出 45.0/44.9（2026-11-17 生产实证）。
+        new_video_duration = authoritative_video_duration(boundaries, offsets, extensions)
     else:
         new_video_duration = cfg['video_duration'] + total_ext
     html_content = update_data_duration(html_content, new_video_duration)

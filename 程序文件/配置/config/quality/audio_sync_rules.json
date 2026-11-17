@@ -15,7 +15,11 @@
   },
   "duration_consistency": {
     "max_diff_seconds": 1.0,
-    "description": "后处理前置门禁（pipeline_runner.step_postprocess 早失败检查）：config video_duration 与实际渲染产物时长的绝对偏差超过该值 → 立即拒跑并给出定点修复指引（重跑 adjust_timeline 或对齐 config 后 --quick-fix）。prefab 复盘：617.8s(config) vs 621.72s(render_raw) 的漂移曾拖到 enhance step3 混音门禁才暴露，白白消耗 TTS/BGM 再生成的时间与一次 40 分钟重渲染。"
+    "pre_render_max_diff_seconds": 0.1,
+    "zero_adjust_resync_seconds": 0.05,
+    "description": "后处理前置门禁（pipeline_runner.step_postprocess 早失败检查）：config video_duration 与实际渲染产物时长的绝对偏差超过该值 → 立即拒跑并给出定点修复指引（重跑 adjust_timeline 或对齐 config 后 --quick-fix）。prefab 复盘：617.8s(config) vs 621.72s(render_raw) 的漂移曾拖到 enhance step3 混音门禁才暴露，白白消耗 TTS/BGM 再生成的时间与一次 40 分钟重渲染。",
+    "$pre_render_max_diff_seconds": "渲染前置守卫（pipeline_runner._pre_render_duration_consistent，2026-11-17 从脚本字面量 0.1 收进）：HTML data-duration 与 config video_duration 的绝对偏差放行线。fail-closed：缺键/非法 → 阻断渲染并点名（无从裁定的分叉与真实分叉在渲染代价上等价）。与 max_diff_seconds 分工：本键裁渲染前的 HTML↔config 两侧落盘值，max_diff_seconds 裁渲染产物↔config。",
+    "$zero_adjust_resync_seconds": "零调整分支收敛阈（adjust_timeline._zero_adjust_resync_tolerance，2026-11-17 从脚本字面量 0.05 收进）：①指针模式守卫的 resync 触发阈——HTML data-duration 与本轮权威总时长（authoritative_video_duration，末场绝对边界+扩展量、单次舍入）之差达线即写回同值（自洽出口，替代旧「删 .bak/.hash 重跑」无解指令）；②零调整分支 config drifted 判定阈。取不回（缺文件/缺节/缺键/非正数）→ adjust_timeline 零调整分支整体阻断。存在理由（同日生产实证）：HTML 侧 .1f 单次舍入与 config 侧两次舍入在浮点半界两侧方向不同，同一轮写出 45.0/44.9 两个互斥值，旧守卫再拿第三种基准（裸 boundaries[-1][1]）比对把上一轮合法产物判红，Recover 指令重跑仍写出同样两个值——循环无解；修后 HTML/config/守卫基准三方同一舍入点，守卫红只收敛这一个标量（GSAP 时间轴不动）。"
   },
   "duration_budget": {
     "description": "时长预算门禁（pipeline_runner.step_timeline 末尾检查——权威时长刚确定、渲染尚未开始的最后拦截点）：项目 config 声明 duration_budget: {seconds, enforcement} 即启用；未声明 = 门禁不生效（零副作用，预算属业务声明而非全局默认）。enforcement=soft（默认）：超限阻断，需 --accept-over-budget 显式放行并在 pipeline_state.budget_decision 留痕（超预算≠不合格，属业务决策）；hard：超限直接 FAIL。教训（2026-08-05 wp批次复盘）：4集防水视频2集超240s预算（253.0s/248.9s），当时预算只存在于需求描述、门禁完全无感知，完工报告盖章 VALIDATED 13/13 后才人工发现返工，各耗一次约25分钟全链重跑。"

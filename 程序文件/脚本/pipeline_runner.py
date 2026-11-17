@@ -2280,8 +2280,15 @@ class PipelineRunner:
         教训：run2 的 adjust_timeline 把 HTML 静默回退基线（160.6→150s）后判定
         "零调整"，HTML 与 config 永久分叉，渲染后时长验证才发现，浪费 45 分钟
         全量渲染。渲染预算门禁是最后防线而非预防线——本预检 O(1) 完成，在昂贵
-        渲染启动前拦截分叉。检查项：HTML data-duration == config video_duration
-        （容差 0.1s）；--force 绕过（语义同 HARD_GATES）。
+        渲染启动前拦截分叉。检查项：HTML data-duration == config video_duration；
+        --force 绕过（语义同 HARD_GATES）。
+
+        容差唯一权威源 `audio_sync_rules.json → duration_consistency.
+        pre_render_max_diff_seconds`（2026-11-17：从脚本字面量 0.1 收进配置，
+        与 adjust_timeline 零调整分支的收敛阈 zero_adjust_resync_seconds 同节
+        分键——两侧收敛面不同，0.1 是渲染前放行线、0.05 是 timeline 写回触发线）。
+        fail-closed：规则取不回即阻断并点名，不得由"配置断链"读成放行——
+        无从裁定的分叉与真实分叉在渲染代价上等价。
         """
         if self.force:
             return True
@@ -2297,14 +2304,29 @@ class PipelineRunner:
             cfg_dur = float(self.config.get("video_duration") or 0)
         except (TypeError, ValueError):
             return True
-        if cfg_dur > 0 and abs(html_dur - cfg_dur) >= 0.1:
+        tol = None
+        try:
+            tol = float(self.audio_sync_rules["duration_consistency"]
+                        ["pre_render_max_diff_seconds"])
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            msg = (f"Pre-render duration tolerance unreadable: {exc} — "
+                   f"expected audio_sync_rules.json duration_consistency."
+                   f"pre_render_max_diff_seconds")
+            self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
+            print(f"  BLOCKED: 渲染前时长容差取不回（audio_sync_rules.json → "
+                  f"duration_consistency.pre_render_max_diff_seconds 缺键或非法）")
+            print("  无从裁定的分叉与真实分叉在渲染代价上等价——修复配置后 --resume。")
+            return False
+        if cfg_dur > 0 and abs(html_dur - cfg_dur) >= tol:
             msg = (f"Pre-render duration divergence: HTML data-duration={html_dur}s vs "
                    f"config video_duration={cfg_dur}s — blocked before expensive render")
             self.state.mark_failed("render", msg, error_code=VERIFY_FAILED)
             print(f"  BLOCKED: HTML 总时长 ({html_dur}s) ≠ config video_duration ({cfg_dur}s)")
             print("  渲染是终点验证手段不是调试工具——分叉的时间轴不值得一次全量渲染。")
-            print("  恢复：--resume 重跑 timeline 步；若仍报零调整，删除项目目录的")
-            print(f"  index.html.bak 与 index.html.hash 后重跑。")
+            print("  恢复：--resume 重跑 timeline 步——其零调整守卫会把 data-duration")
+            print("  自洽重写为本轮权威值（与 config 同源同一舍入点），两侧收敛后渲染照常。")
+            print("  （旧指令「删 index.html.bak/.hash 重跑」已废弃：重跑只会再写出")
+            print("  同样两个值，循环无解——2026-11-17 生产实证。）")
             return False
         return True
 
