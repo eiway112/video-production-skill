@@ -19,7 +19,8 @@
   video_bitrate_ok               视频码率下限（双档：fail 拒收 / warn 预警，阈值源 video_quality_rules.json）
   duration_valid                 时长有效（ffprobe 取不到＝未测，测到 0＝违规）
   audio_not_silent               音频非静音（silencedetect）
-  playable                       文件可播放性（ffmpeg 解码试跑）
+  playable                       文件可播放性（全片 -xerror 解码＋首/中/尾三点 seek 帧探针；
+                               解码报错/seek 解不出帧＝FAIL，探测异常/时长不可测＝UNTESTED）
   subtitle_file_exists           字幕文件存在
   subtitle_not_empty             字幕条目非空
   subtitle_times_ordered         字幕时间单调性
@@ -605,6 +606,61 @@ def ffmpeg_detect_speech_onsets(video_path: str, duration: float,
     return onsets
 
 
+def ffmpeg_full_decode(video_path: str, timeout: int = 300) -> Tuple[str, str]:
+    """全片解码探针（-xerror -err_detect explode），返回 (四态, 归因)。
+
+    旧 playable 只解前 1 秒，片中后段编码损坏结构性看不见（取数面没有对象，
+    A06 同族；借鉴 OpenMotion verify-export 的 full-decode 腿）。视频与音频
+    流都解——音轨中段损坏同样会在交付后炸。rc=0 即全片零解码错误
+    （-xerror 保证任一错误非零退出）；探测本身异常（超时/ffmpeg 缺失）
+    判 UNTESTED，不得与"解过且干净"混同（四态契约 A04）。
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
+             '-xerror', '-err_detect', 'explode',
+             '-i', str(video_path), '-map', '0:v:0', '-map', '0:a?',
+             '-f', 'null', '-'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=timeout
+        )
+    except Exception as e:
+        return gs.UNTESTED, f"全片解码探测异常: {e}"
+    if result.returncode != 0:
+        lines = (result.stderr or '').strip().splitlines()
+        detail = lines[-1] if lines else f"exit={result.returncode}"
+        return gs.FAIL, f"全片解码报错: {detail}"
+    return gs.PASS, ""
+
+
+def ffmpeg_seek_frame(video_path: str, at_seconds: float,
+                      timeout: int = 30) -> Tuple[str, str]:
+    """在 at_seconds 处 seek 并解码一帧（framemd5 取数），返回 (四态, 归因)。
+
+    成功须同时满足 rc=0 且 stdout 有 framemd5 数据行——ffmpeg 对"seek 到点
+    却一帧也解不出"的空输出同样回 0，只看退出码会把该形态读成通过。
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
+             '-xerror', '-err_detect', 'explode',
+             '-ss', f'{max(0.0, at_seconds):.3f}', '-i', str(video_path),
+             '-map', '0:v:0', '-frames:v', '1', '-an',
+             '-f', 'framemd5', '-'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=timeout
+        )
+    except Exception as e:
+        return gs.UNTESTED, f"seek@{at_seconds:.2f}s 探测异常: {e}"
+    if result.returncode != 0:
+        lines = (result.stderr or '').strip().splitlines()
+        detail = lines[-1] if lines else f"exit={result.returncode}"
+        return gs.FAIL, f"seek@{at_seconds:.2f}s 解码报错: {detail}"
+    if not re.search(r'^\s*\d+,', result.stdout or '', re.M):
+        return gs.FAIL, f"seek@{at_seconds:.2f}s 解不出帧（framemd5 无数据行）"
+    return gs.PASS, ""
+
+
 def parse_srt(srt_path: str) -> List[Dict[str, Any]]:
     """解析 SRT 字幕文件"""
     entries = []
@@ -950,21 +1006,27 @@ class MediaQAGate:
         else:
             self._mark('audio_not_silent', gs.UNTESTED, "时长不可测")
 
-        # 检查 playable：文件可播放性
-        try:
-            result = subprocess.run(
-                ['ffmpeg', '-t', '1', '-i', str(video_path), '-f', 'null', '-'],
-                capture_output=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                self._mark('playable', gs.PASS)
-            else:
-                self._mark('playable', gs.FAIL)
-                self.errors.append("Video file is not playable or corrupted")
-        except Exception as e:
-            self._mark('playable', gs.UNTESTED, f"可播放性探测异常: {e}")
-            self.warnings.append(f"Could not verify playability: {e}")
+        # 检查 playable：文件可播放性（全片解码＋首/中/尾三点 seek 帧探针）
+        legs = [ffmpeg_full_decode(str(video_path))]
+        if duration > 0:
+            seek_points = sorted({0.0, round(duration / 2.0, 3),
+                                  round(max(0.0, duration - 0.5), 3)})
+            for t in seek_points:
+                legs.append(ffmpeg_seek_frame(str(video_path), t))
+        else:
+            legs.append((gs.UNTESTED, "时长不可测，首/中/尾 seek 点无从选取"))
+        leg_fail = [d for s, d in legs if s == gs.FAIL]
+        leg_untested = [d for s, d in legs if s == gs.UNTESTED]
+        if leg_fail:
+            self._mark('playable', gs.FAIL, "；".join(leg_fail))
+            self.errors.append("Video file is not playable or corrupted: "
+                               + "；".join(leg_fail))
+        elif leg_untested:
+            self._mark('playable', gs.UNTESTED, "；".join(leg_untested))
+            self.warnings.append("Could not fully verify playability: "
+                                 + "；".join(leg_untested))
+        else:
+            self._mark('playable', gs.PASS)
 
         # 字幕相关检查（组清单见模块级 SUBTITLE_CHECK_KEYS，单一权威源）
         if subtitle_path is None:

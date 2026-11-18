@@ -6668,9 +6668,16 @@ def test_media_qa_gate_four_state_report() -> RegressionTestCase:
                 _patch("ffprobe_get_streams", lambda p: streams())
                 _patch("ffprobe_get_duration", lambda p: 10.0)
                 _patch("ffmpeg_detect_silence", lambda p, d=None: 1.0)
-                _patch("subprocess", SimpleNamespace(
-                    run=lambda *a, **k: SimpleNamespace(
-                        returncode=0, stdout="", stderr="")))
+
+                def _clean_run(argv, *a, **k):
+                    # playable 的 seek 探针以 framemd5 数据行为取数（空输出也回
+                    # rc=0），清洁夹具须供一行实测形态，否则该项被判未测
+                    out = ("0,          0,          0,        1, "
+                           "0x1234, d41d8cd98f00b204e9800998ecf8427e\n"
+                           if 'framemd5' in argv else "")
+                    return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+                _patch("subprocess", SimpleNamespace(run=_clean_run))
                 _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: scan["onsets"])
                 _patch("ffmpeg_detect_black_intervals", lambda *a, **k: scan["black"])
                 _patch("ffmpeg_detect_long_silences", lambda *a, **k: scan["long_silences"])
@@ -8420,8 +8427,14 @@ def test_subtitle_timestamp_source_hit_rate_gate() -> RegressionTestCase:
                 _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: onsets)
                 _patch("ffmpeg_detect_black_intervals", lambda *a, **k: [])
                 _patch("ffmpeg_detect_long_silences", lambda *a, **k: [])
-                _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
-                    returncode=0, stdout="", stderr="")))
+                def _clean_run(argv, *a, **k):
+                    # playable 的 seek 探针以 framemd5 数据行为取数（空输出也回
+                    # rc=0），清洁夹具须供一行实测形态，否则该项被判违规
+                    out = ("0,          0,          0,        1, "
+                           "0x1234, d41d8cd98f00b204e9800998ecf8427e\n"
+                           if 'framemd5' in argv else "")
+                    return SimpleNamespace(returncode=0, stdout=out, stderr="")
+                _patch("subprocess", SimpleNamespace(run=_clean_run))
 
                 _rec_n = [0]
 
@@ -23320,6 +23333,7 @@ class RegressionTestRunner:
             test_transition_occlusion_gate,
             test_elevenlabs_non_audio_response_guard,
             test_pointer_mode_duration_single_source,
+            test_playable_full_decode_and_seek_probe,
         ]
         self.results = []
     
@@ -29023,6 +29037,242 @@ def test_pointer_mode_duration_single_source() -> RegressionTestCase:
     except Exception as e:
         import traceback
         tc.mark_failed("pointer_mode_duration_single_source error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_playable_full_decode_and_seek_probe() -> RegressionTestCase:
+    """用例140：playable 取数深度＝全片解码＋首/中/尾三点 seek（2026-11-18）
+
+    背景：旧 playable 只解前 1 秒（`-t 1`），片中后段编码损坏结构性看不见
+    （取数面没有对象，A06 同族）。A/B 实测取证（过程产物/临时产物/_取证/
+    20261118/playable_ab_probe.json）：尾部损坏片旧判据 rc=0 放行，新判据
+    全片解码 FAIL（aac 中段报错）＋尾点 seek FAIL（h264 报错）。借鉴对象＝
+    OpenMotion verify-export 的 full-decode 与三点 seek framemd5 形态。
+    本用例锁定：argv 取数面（A）、两探针四态语义（B，空输出也回 rc=0 是
+    承重腿）、validate 聚合与 seek 点选取（C）、接线与旧形态不复活（D）。
+    真实 framemd5 输出形态已由取证探针在真 ffmpeg 上验证，回归面按模块级
+    stub 解耦 ffmpeg 可用性（与用例52/57 同法）。
+    """
+    tc = RegressionTestCase(
+        "playable_full_decode_and_seek_probe",
+        "验证 playable 全片解码＋三点 seek：损坏不得放行、空输出不得读成通过、探测异常判未测"
+    )
+
+    import ast
+    import json
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    try:
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import media_qa_gate as mq
+        import _gate_status as gs
+
+        gate_src = (script_dir / "media_qa_gate.py").read_text(encoding='utf-8')
+        _saved = {}
+
+        def _patch(name, fn):
+            _saved.setdefault(name, getattr(mq, name))
+            setattr(mq, name, fn)
+
+        def _restore():
+            for k, v in _saved.items():
+                setattr(mq, k, v)
+
+        MD5_LINE = ("0,          0,          0,        1, "
+                    "0x1234, d41d8cd98f00b204e9800998ecf8427e\n")
+
+        try:
+            # ── A. argv 取数面（recorder 桩，直调两探针）──
+            calls = []
+
+            def _rec_run(argv, *a, **k):
+                calls.append(list(argv))
+                return SimpleNamespace(returncode=0, stdout=MD5_LINE, stderr="")
+
+            _patch("subprocess", SimpleNamespace(run=_rec_run))
+            mq.ffmpeg_full_decode("x.mp4")
+            full_argv = calls[-1]
+            mq.ffmpeg_seek_frame("x.mp4", 2.5)
+            seek_argv = calls[-1]
+            tc.assert_true('-xerror' in full_argv
+                           and full_argv[full_argv.index('-err_detect') + 1] == 'explode'
+                           and '-t' not in full_argv,
+                           "A1 全片解码带 -xerror -err_detect explode 且无 -t 截断（旧前1秒形态不复活）")
+            tc.assert_true('0:v:0' in full_argv and '0:a?' in full_argv,
+                           "A2 全片解码视频与音频流都解（音轨中段损坏同样在取数面内）")
+            tc.assert_true(seek_argv.index('-ss') < seek_argv.index('-i')
+                           and seek_argv[seek_argv.index('-frames:v') + 1] == '1'
+                           and seek_argv[seek_argv.index('-f') + 1] == 'framemd5',
+                           "A3 seek 探针 -ss 在 -i 前、只解一帧、framemd5 取数")
+
+            # ── B. 两探针四态语义 ──
+            _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                returncode=0, stdout="", stderr="")))
+            s, _ = mq.ffmpeg_full_decode("x.mp4")
+            tc.assert_equal(s, gs.PASS, "B1 全片解码 rc=0 → PASS")
+            _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                returncode=1, stdout="", stderr="line1\nInvalid data found\n")))
+            s, note = mq.ffmpeg_full_decode("x.mp4")
+            tc.assert_true(s == gs.FAIL and "Invalid data found" in note,
+                           "B2 全片解码 rc≠0 → FAIL 且归因带 stderr 末行")
+
+            import subprocess as _sp
+
+            def _boom(*a, **k):
+                raise _sp.TimeoutExpired(cmd="ffmpeg", timeout=300)
+
+            _patch("subprocess", SimpleNamespace(run=_boom))
+            s, note = mq.ffmpeg_full_decode("x.mp4")
+            tc.assert_true(s == gs.UNTESTED and "异常" in note,
+                           "B3 全片解码探测异常 → UNTESTED（不得读成 PASS 或 FAIL）")
+            _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                returncode=0, stdout=MD5_LINE, stderr="")))
+            s, _ = mq.ffmpeg_seek_frame("x.mp4", 3.0)
+            tc.assert_equal(s, gs.PASS, "B4 seek rc=0 且有 framemd5 数据行 → PASS")
+            _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                returncode=0, stdout="#format: frame checksums\n#stream_index, dts\n",
+                stderr="")))
+            s, note = mq.ffmpeg_seek_frame("x.mp4", 3.0)
+            tc.assert_true(s == gs.FAIL and "无数据行" in note,
+                           "B5 seek rc=0 但只有表头无数据行 → FAIL（空输出也回 0，只看退出码即假绿）")
+            _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                returncode=1, stdout="", stderr="seek failed\n")))
+            s, _ = mq.ffmpeg_seek_frame("x.mp4", 3.0)
+            tc.assert_equal(s, gs.FAIL, "B6 seek rc≠0 → FAIL")
+            _patch("subprocess", SimpleNamespace(run=_boom))
+            s, _ = mq.ffmpeg_seek_frame("x.mp4", 3.0)
+            tc.assert_equal(s, gs.UNTESTED, "B7 seek 探测异常 → UNTESTED")
+
+            # ── C. validate 聚合（两探针按模块级 stub，其余腿清洁夹具同用例52）──
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                video = tmp / "案例成片.mp4"
+                video.write_bytes(b"fake-video-bytes")
+                cfg = tmp / "cfg.json"
+                cfg.write_text(json.dumps({"fps": 25, "resolution": "1920x1080"}),
+                               encoding='utf-8')
+                _patch("ffprobe_get_streams", lambda p: [
+                    {"codec_type": "video", "codec_name": "h264", "bit_rate": "1500000",
+                     "r_frame_rate": "25/1", "width": 1920, "height": 1080},
+                    {"codec_type": "audio", "codec_name": "aac", "bit_rate": "128000"}])
+                _patch("ffprobe_get_duration", lambda p: 10.0)
+                _patch("ffmpeg_detect_silence", lambda p, d=None: 1.0)
+                _patch("ffmpeg_detect_speech_onsets", lambda *a, **k: [1.5, 2.5, 5.5, 6.5, 8.5])
+                _patch("ffmpeg_detect_black_intervals", lambda *a, **k: [])
+                _patch("ffmpeg_detect_long_silences", lambda *a, **k: [])
+                _patch("subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+                    returncode=0, stdout=MD5_LINE, stderr="")))
+
+                state = {"full": (gs.PASS, ""), "seek": (gs.PASS, ""), "seek_calls": []}
+
+                def _full(p, timeout=300):
+                    return state["full"]
+
+                def _seek(p, t, timeout=30):
+                    state["seek_calls"].append(t)
+                    return state["seek"]
+
+                _patch("ffmpeg_full_decode", _full)
+                _patch("ffmpeg_seek_frame", _seek)
+
+                def run_qa():
+                    state["seek_calls"] = []
+                    qa = mq.MediaQAGate()
+                    return qa.validate(str(video), None, visual_check_passed=True,
+                                       config_path=str(cfg))
+
+                _, res = run_qa()
+                tc.assert_true(res['check_statuses']['playable'] == gs.PASS
+                               and res['verdict'] == gs.PASS,
+                               "C1 全腿清洁 → playable PASS 且整体 PASS")
+
+                state["full"] = (gs.FAIL, "全片解码报错: Invalid data found")
+                _, res_c2 = run_qa()
+                tc.assert_true(res_c2['check_statuses']['playable'] == gs.FAIL
+                               and res_c2['verdict'] == gs.FAIL
+                               and any("not playable or corrupted" in e
+                                       for e in res_c2['errors']),
+                               "C2 全片解码 FAIL → playable FAIL、整体 FAIL、errors 点名")
+                ok_c3, _ = mq.adjudicate(res_c2, accept_untested=True)
+                tc.assert_true(not ok_c3,
+                               "C3 --accept-media-untested 不得放行 playable 的 FAIL")
+
+                state["full"] = (gs.PASS, "")
+                state["seek"] = (gs.FAIL, "seek@5.00s 解不出帧")
+                _patch("ffmpeg_seek_frame",
+                       lambda p, t, timeout=30: (gs.FAIL, "seek@5.00s 解不出帧")
+                       if t == 5.0 else (gs.PASS, ""))
+                _, res_c4 = run_qa()
+                tc.assert_equal(res_c4['check_statuses']['playable'], gs.FAIL,
+                                "C4 仅中点 seek FAIL（全片解码 PASS）→ playable FAIL（任一腿 FAIL 即 FAIL）")
+                _patch("ffmpeg_seek_frame", _seek)
+
+                state["full"] = (gs.UNTESTED, "全片解码探测异常: timeout")
+                state["seek"] = (gs.PASS, "")
+                _, res_c5 = run_qa()
+                tc.assert_true(res_c5['check_statuses']['playable'] == gs.UNTESTED
+                               and res_c5['verdict'] == gs.UNTESTED,
+                               "C5 全片解码 UNTESTED → playable UNTESTED、整体 UNTESTED（不得压成通过）")
+                ok_def, _ = mq.adjudicate(res_c5)
+                ok_acc, reason_acc = mq.adjudicate(res_c5, accept_untested=True)
+                tc.assert_true(not ok_def and ok_acc and '--accept-media-untested' in reason_acc,
+                               "C6 UNTESTED 默认阻断、显式放行留痕（只覆盖未测面）")
+
+                _patch("ffprobe_get_duration", lambda p: -1.0)
+                state["full"] = (gs.PASS, "")
+                _, res_c7 = run_qa()
+                tc.assert_true(res_c7['check_statuses']['playable'] == gs.UNTESTED
+                               and any(u.startswith('playable') and '时长不可测' in u
+                                       for u in res_c7['untested'])
+                               and not state["seek_calls"],
+                               "C7 时长不可测 → seek 点无从选取判 UNTESTED 并点名（全片解码 PASS 不得洗白）")
+                _patch("ffprobe_get_duration", lambda p: 10.0)
+
+                state["full"] = (gs.PASS, "")
+                state["seek"] = (gs.PASS, "")
+                run_qa()
+                tc.assert_equal(sorted(state["seek_calls"]), [0.0, 5.0, 9.5],
+                                "C8 duration=10 → seek 点恰为首/中/尾 {0, 5, 9.5} 三点")
+                _patch("ffprobe_get_duration", lambda p: 0.3)
+                run_qa()
+                tc.assert_equal(sorted(state["seek_calls"]), [0.0, 0.15],
+                                "C9 短片 duration=0.3 → 尾点夹到 0 与首点去重，无负值 seek")
+                _patch("ffprobe_get_duration", lambda p: 10.0)
+
+                state["full"] = (gs.FAIL, "全片解码报错: x")
+                state["seek"] = (gs.UNTESTED, "seek 探测异常: y")
+                _, res_c10 = run_qa()
+                tc.assert_equal(res_c10['check_statuses']['playable'], gs.FAIL,
+                                "C10 FAIL 与 UNTESTED 并存 → FAIL 优先（四态裁定优先级）")
+
+            # ── D. 接线与旧形态不复活（AST 语句本体，不认 docstring 提及）──
+            tree = ast.parse(gate_src)
+            validate_fn = next(n for n in ast.walk(tree)
+                               if isinstance(n, ast.FunctionDef) and n.name == 'validate')
+            called = {n.func.id for n in ast.walk(validate_fn)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            tc.assert_true('ffmpeg_full_decode' in called and 'ffmpeg_seek_frame' in called,
+                           "D1 validate 本体确调两探针（AST 证调用，非字符串提及）")
+            emitted = {n.args[0].value for n in ast.walk(tree)
+                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == '_mark' and n.args
+                       and isinstance(n.args[0], ast.Constant)
+                       and isinstance(n.args[0].value, str)}
+            tc.assert_true(gate_src.count("'-t', '1'") == 0 and 'playable' in emitted,
+                           "D2 旧前1秒 argv 零残留且登记名 playable 仍在权威键集（A12 不改名）")
+
+            tc.mark_passed()
+        finally:
+            _restore()
+
+    except Exception as e:
+        import traceback
+        tc.mark_failed("playable_full_decode_and_seek_probe error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
 
