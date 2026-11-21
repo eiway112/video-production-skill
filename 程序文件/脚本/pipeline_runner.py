@@ -1413,6 +1413,10 @@ class PipelineRunner:
                              "gsap_time_utils": gsap_utils,
                              "capture_script": SCRIPTS / "preview_capture.js",
                              "video_quality_rules": quality_dir / "video_quality_rules.json",
+                             # 2026-11-21 观感决策点前移批：preview 报告新增
+                             # [CHOREO-PREVIEW]，判据与文案真身住 choreography_profile.py；
+                             # 不登记即"改了编排口径而预览缓存照常命中"（A06 同族）。
+                             "choreography_profile": SCRIPTS / "choreography_profile.py",
                              "script": SCRIPTS / "instant_preview.py"},
             "render":       {"config": self.config_path, "html": self.html_path,
                              "render_rules": quality_dir / "render_rules.json"},

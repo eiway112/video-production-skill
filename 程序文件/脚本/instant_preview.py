@@ -416,6 +416,61 @@ def layout_fullness_lines(section):
     ]
 
 
+def choreography_preview_lines(html_path):
+    """预览期推进/静止读数（描述面**前移**，2026-11-21 观感决策点前移批；**本面不裁定**）。
+
+    存在理由：卡片点亮节奏与场尾静止的读数此前只在**完工报告**（渲染之后）出现，
+    发现"TTS 在讲、画面停住"时全量渲染已付过一次。本行把同一组读数搬进
+    preview_report，渲染前可见——决策点前移，不新增门禁。
+
+    口径与文案**单源**住 `choreography_profile.measure()` / `format_line()`：
+    本函数只接线，并按 measure 已给出的逐场字段挑覆盖率最低/无推进最长的三场，
+    不复制阈值、不自算覆盖率与中位（同 `frame_occupancy`/`layout_fullness` 的取舍）。
+
+    边界：不设阈值、不进 issues、不改退出码（2026-10-10 常设裁定）。
+    T 块缺失/HTML 读不回时判 UNTESTED 并点名理由——不得写 OK，也不得静默不出行。
+    """
+    head = "  [CHOREO-PREVIEW] "
+    try:
+        import choreography_profile as cp
+    except Exception as e:                              # noqa: BLE001
+        return [head + f"UNTESTED：编排判据模块不可用（{type(e).__name__}: {e}）"]
+    try:
+        m = cp.measure(html_path)
+    except Exception as e:                              # noqa: BLE001
+        return [head + f"UNTESTED：编排面取数异常（{type(e).__name__}: {e}）"]
+    if not isinstance(m, dict) or "untested" in m:
+        why = m.get("untested") if isinstance(m, dict) else "measure 返回非 dict"
+        lines = [head + f"UNTESTED：{why}（不得读成「编排已检查且干净」）"]
+        # 主面无读数而常驻锚子面可能仍有数：子面读数照常随行（模块内 format_line 同判据）
+        try:
+            sub = cp.format_line(m)
+        except Exception:                               # noqa: BLE001
+            sub = None
+        if sub:
+            lines.append("    " + sub)
+        return lines
+
+    line = cp.format_line(m)
+    lines = [head + "描述面不裁定（判据与文案单源＝choreography_profile）：",
+             "    " + line]
+    per = [s for s in (m.get("per_scene") or []) if isinstance(s, dict)]
+
+    def _bottom(key, reverse=False, unit="{:.3f}"):
+        vals = [s for s in per if isinstance(s.get(key), (int, float))]
+        vals.sort(key=lambda s: s[key], reverse=reverse)
+        return "／".join(f"{s.get('scene')} " + unit.format(float(s[key]))
+                         for s in vals[:3])
+
+    low = _bottom("coverage_advance")
+    gap = _bottom("advance_gap_max_s", reverse=True, unit="{:.2f}s")
+    if low:
+        lines.append("    覆盖率最低三场：" + low)
+    if gap:
+        lines.append("    最长无推进三场：" + gap)
+    return lines
+
+
 def _numeric_scene_ids(items, key="scene_id"):
     """场景条目 → 数字 id 集合（兼容 scene_id 为 3 或 "s3" 两种写法）。"""
     ids = set()
@@ -1374,6 +1429,12 @@ def main():
         for line in fullness_lines:
             print(line)
 
+    # 编排读数（描述面前移，2026-11-21）：与留白同取舍——渲染前把"点亮节奏/无推进段"
+    # 摆到纸上。静态解析 T 块＋tl 语句，不依赖截图，--density-only 下同样产出。
+    choreo_lines = choreography_preview_lines(html_path)
+    for line in choreo_lines:
+        print(line)
+
     # --- Phase 3: Generate Report ---
     print("\n--- Phase 3: Preview Report ---")
     report_lines = []
@@ -1460,6 +1521,13 @@ def main():
         report_lines.append("")
         report_lines.append("== Layout Fullness (主体区填充率 · 描述面不裁定) ==")
         report_lines.extend(ln.strip() for ln in fullness_lines)
+
+    # Choreography preview（描述面，2026-11-21 观感决策点前移批）：推进覆盖率/
+    # 无推进段/cue 锚在渲染前可见；判据与文案单源＝choreography_profile，不裁定
+    if choreo_lines:
+        report_lines.append("")
+        report_lines.append("== Choreography Preview (推进/静止 · 描述面不裁定) ==")
+        report_lines.extend(ln.strip() for ln in choreo_lines)
 
     # Overall assessment
     report_lines.append("")

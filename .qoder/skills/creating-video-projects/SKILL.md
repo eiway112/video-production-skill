@@ -85,6 +85,7 @@ python config_manager.py
 1. 按分镜设计模板输出：场景划分、每场景画面构成、**场间承接**（每场从上一场哪个图元／命名／位置长出来）、时间分配（窗口 = TTS + 场景余量 + 转场，**TTS 占比是派生量不是设计目标**，口径见踩坑清单 §八·补）、素材引用表（场景号→文件名→展示方式）、**动效编排声明（逐场必填）**。
    **动效编排声明**：每场在时间分配总表的「持续动效」列写明所用路线（A1 相机微位移 / A2 信息层微动 / A3 粒子层 / B 装饰层呼吸 / 组合），并答一句"入场之后这几秒里什么在动"。写不出＝该场只有静态排版，须补信息层强调形态。刻意静态的场（如纯数据对比表）须写"静态＋理由"。路线定义与可抄骨架住接手简报§五与踩坑清单§八，此处不复述。**缺此列的分镜表不完整，不得提交用户确认节点。**
    **强调形态声明**：同表「强调形态」列逐场必填（`chip`／`callout`／`hud`／组合，未用写 `—`）。取值同值写入 `narration.json` 的 `emphasis_forms` 与场景 div 的 `data-emphasis`，预检 check 7h 对撞（WARN 级）。三件套骨架与契约住 HTML 基准 §4.9；**缺此列的分镜表不完整，不得提交用户确认节点**（与「动效编排声明」同一条门禁）。
+   **点亮锚词声明**：同表「点亮锚词」列逐场必填——枚举类内容（"4 类部件""5 层"这类逐项展开）逐词给锚词，非枚举写 `—`。锚词只进 HTML 的 `data-cue-at`（机制与写法住 HTML 基准 §3.6），CUE-MAP 是唯一权威源，**不得另建 narration 字段**。**缺此列的分镜表不完整，不得提交用户确认节点**（与「强调形态声明」同一条门禁）。
 2. 旁白撰写约束：数值一律阿拉伯数字（`narration_digits_rules.json` 管理例外）；语义完整不碎片化；过一遍分镜模板「叙事链自检」四项与「画面节奏自检」四项（每句至少一个焦点／长句与空档要有第二拍／入场≠持续／焦点保持到下一句；判据住该节，此处不复述）。
 3. **用户确认节点（阻塞）**：按踩坑清单 §6.2 一次性提交分镜表待确认——图文匹配、时间节奏、遗漏素材。这是全流程唯一的强制人工节点，其余环节不中断用户。
 
@@ -96,7 +97,7 @@ python config_manager.py
 2. 流水线配置 JSON → `程序文件/配置/config/<项目名>.json`（随包示例：`quickstart-demo.json`；`config/pipelines/` 是开发仓历史落点，不随包）。参照 `quickstart-demo.json` 结构：paths(html_project/video_name/subtitle_name/temp_subdir)、video_duration、narration_source 指向 `./narration.json`、audio（**缺省引擎是 ElevenLabs**：不写 `tts_engine` 即用它，需 `ELEVENLABS_API_KEY`，`voice` 传 voice_id；qwen 须显式 `tts_engine: "qwen"` 并选配套音色，禁止 Edge 格式音色 zh-CN-*Neural 搭配 qwen；ElevenLabs 不支持 SSML `<break>`，带 `pause_marks` 的项目改用该引擎时须删声明，详见 AGENTS.md TTS 引擎纪律）、fps/resolution 声明必须与渲染器实际输出一致（当前渲染器输出 25fps，media_qa_gate 检查13会实测回比）、delivery（中文业务名，禁止 final/v01/render/raw/tmp）。
 3. `index.html` — 手写 HTML+GSAP。**完成后逐项核对踩坑清单"阶段C检查表"全部条目**（占位符、subtitle-safe 高度、装饰层 opacity、字号分层、无 >3s 静止、动画必须挂在主 timeline `tl` 上等），并对照 HTML 模板参考基准。
 4. 场景 div 必须声明 `data-scene-id` / `data-scene-entry` / `data-scene-subtitle-safe`（AGENTS.md HTML 契约）。
-5. 节奏面：每个 cue 不只负责点亮，还要把焦点保持到下一句（`cueHi` + `flushCuePlan`，骨架与四条原因住模板基准 §3.6.2；保持区间用有限次呼吸铺满，不得用 `repeat:-1`）。入场动画是一次性的（约 0.5s），旁白是持续的——入了场就不再变化，会被观众读成"画面卡住"。
+5. 节奏面：每个 cue 不只负责点亮，还要把焦点保持到下一句（`cueHi` + `flushCuePlan`，骨架与四条原因住模板基准 §3.6.2；保持区间用有限次呼吸铺满，不得用 `repeat:-1`）。入场动画是一次性的（约 0.5s），旁白是持续的——入了场就不再变化，会被观众读成"画面卡住"。**自查**：预览报告 `[CHOREO-PREVIEW]` 的 cue 锚条数与预检 CUE-MAP 条数须与分镜「点亮锚词」列对得上（三处不一致先查锚词是否真写进了 `data-cue-at`）。
 
 ### 阶段D：流水线执行 + 交付（代码执行）
 

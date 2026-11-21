@@ -23336,6 +23336,7 @@ class RegressionTestRunner:
             test_playable_full_decode_and_seek_probe,
             test_emphasis_forms_declared_contract,
             test_scene_root_selector_resolution,
+            test_preview_surfaces_choreography,
         ]
         self.results = []
     
@@ -29708,6 +29709,221 @@ tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);
     except Exception as e:
         import traceback
         tc.mark_failed("scene_root_selector_resolution error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_preview_surfaces_choreography() -> RegressionTestCase:
+    """用例143：预览期推进/静止读数前移（描述面，2026-11-21 观感决策点前移批）。
+
+    存在理由：卡片点亮节奏与场尾静止的读数此前只在完工报告（渲染之后）出现——
+    发现"TTS 在讲、画面停住"时全量渲染已付过一次。本用例锁的是"读数前移到预览且
+    与 choreography_profile 同源"，不是给观感新设阈值：
+
+      A 驱动真实 main(--density-only) → preview_report.txt 出现 [CHOREO-PREVIEW]，
+        且覆盖率中位/最低、最长无推进段中位/最大、>3s 占比、cue 锚条数逐项与直调
+        measure() 相等（数值来自同一生成点，预览侧不得自算第二份）；
+        覆盖率最低三场／最长无推进三场与 measure per_scene 的排序一致；
+        B T 块缺失 / HTML 读不回 → UNTESTED 点名理由，不得写 OK/PASS/FAIL；
+      C AST：本函数确调用 choreography_profile.measure 与 format_line（不认 docstring
+        提及），且函数体内不出现 median/statistics（自算统计会成第二份判据）；
+      D AST：pipeline_runner._step_inputs 的 preview 面登记 choreography_profile.py；
+      E 描述面边界：函数体不引用 gate 裁定/退出码；断链件驱动 main 退出码仍为 0。
+    """
+    tc = RegressionTestCase(
+        "preview_surfaces_choreography",
+        "验证预览报告前移编排读数且与 choreography_profile 同源、断链判 UNTESTED、不裁定"
+    )
+    try:
+        import ast
+        import io
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        ip = _safe_import_rebinding_module("instant_preview")
+        import choreography_profile as cp
+
+        HTML = """<!DOCTYPE html><html><body>
+<div id="root" data-duration="24">
+<div id="scene1" class="scene" data-scene-id="s1"></div>
+<div id="scene2" class="scene" data-scene-id="s2"></div>
+<div id="scene3" class="scene" data-scene-id="s3"></div>
+<div id="scene4" class="scene" data-scene-id="s4"></div>
+</div>
+<script>
+var T={s1:0.0,s2:6.0,s3:12.0,s4:18.0};
+var C={"s2:锚词":1.0};
+tl.to("#a",{opacity:1,duration:5.5},T.s1+0.2);
+tl.to("#b",{opacity:1,duration:1.0},T.s2+0.2);
+tl.to("#c",{opacity:1,duration:2.0},T.s3+0.2);
+tl.to("#d",{opacity:1,duration:0.5},T.s4+0.2);
+tl.to("#e",{opacity:1},T.s2+cue('s2','锚词',1.5));
+</script>
+</body></html>"""
+
+        NO_T = """<!DOCTYPE html><html><body>
+<div id="root"><div id="scene1"></div></div>
+<script>tl.to("#a",{opacity:1,duration:1.0},0.5);</script>
+</body></html>"""
+
+        SCENES = [{"scene_id": f"s{i}", "start": (i - 1) * 6, "end": i * 6}
+                  for i in range(1, 5)]
+
+        def drive(html_text, subdir, extra_ok=True):
+            """驱动真实 main()（--density-only：零截图零渲染），返回 (rc, stdout, report)。"""
+            tmp = Path(tempfile.mkdtemp(dir=td))
+            hp = tmp / "index.html"
+            hp.write_text(html_text, encoding="utf-8")
+            cfg = tmp / "cfg.json"
+            cfg.write_text(json.dumps({
+                "video_duration": 24, "scenes": SCENES,
+                "paths": {"temp_subdir": subdir}}, ensure_ascii=False), encoding="utf-8")
+            argv = ["--html", str(hp), "--config", str(cfg), "--density-only"]
+            if extra_ok:
+                argv += ["--accept-text-fit-untested", "--accept-bar-overflow-untested"]
+            saved_root, saved_argv = ip.ROOT, list(sys.argv)
+            buf, ebuf = io.StringIO(), io.StringIO()
+            try:
+                ip.ROOT = tmp
+                sys.argv = ["instant_preview.py"] + argv
+                with redirect_stdout(buf), redirect_stderr(ebuf):
+                    rc = ip.main()
+            finally:
+                sys.argv = saved_argv
+                ip.ROOT = saved_root
+            rp = tmp / "过程产物" / "临时产物" / subdir / "preview_report.txt"
+            rep = rp.read_text(encoding="utf-8") if rp.exists() else ""
+            return rc, buf.getvalue() + ebuf.getvalue(), rep
+
+        with tempfile.TemporaryDirectory() as td:
+            # ── A 端到端：报告出现且数值与直调 measure 同源 ──
+            rc, out, rep = drive(HTML, "case143_preview")
+            tc.assert_equal(rc, 0, f"A0 报告轮退出码须为 0（描述面不改退出码）：{rc}\n{out[-400:]}")
+            tc.assert_true("[CHOREO-PREVIEW]" in rep,
+                           "A1 预览报告须出现 [CHOREO-PREVIEW]（渲染前可见，决策点前移）")
+            tc.assert_true("== Choreography Preview" in rep,
+                           "A1b 报告须有对应节标题")
+
+            hp = Path(td) / "fixture_direct.html"
+            hp.write_text(HTML, encoding="utf-8")
+            m = cp.measure(hp)
+            tc.assert_true(isinstance(m, dict) and "untested" not in m,
+                           f"A2 夹具须能给出编排读数（否则本用例没有对象）：{m}")
+            tc.assert_true(
+                f"推进型覆盖率 中位 {m['coverage_advance_p50']} 最低 "
+                f"{m['coverage_advance_min']}" in rep,
+                "A3 覆盖率中位/最低须与 measure 相等（预览侧不得自算第二份）")
+            tc.assert_true(
+                f"最长无推进段 中位 {m['advance_gap_p50']}s／全片最大 "
+                f"{m['advance_gap_max']}s" in rep,
+                "A4 无推进段中位/最大须与 measure 相等")
+            tc.assert_true(
+                f">{m['caliber']['still_run_seconds']}s 无推进的场景占比 "
+                f"{m['share_scenes_gap_over_still_run']}" in rep,
+                "A5 >3s 无推进场景占比须与 measure 相等")
+            tc.assert_true(f"cue 锚 {m['tweens_cue_resolved']} 条" in rep,
+                           "A6 cue 锚条数须随行（本夹具恰 1 条 resolved）")
+            tc.assert_equal(m.get("tweens_cue_resolved"), 1,
+                            "A6b 夹具 cue 锚须真被解析（CUE-MAP 命中，非回退）")
+
+            per = [s for s in m.get("per_scene") or [] if isinstance(s, dict)]
+            low = sorted(per, key=lambda s: s["coverage_advance"])[:3]
+            gap = sorted(per, key=lambda s: -s["advance_gap_max_s"])[:3]
+            low_txt = "／".join(f"{s['scene']} {s['coverage_advance']:.3f}" for s in low)
+            gap_txt = "／".join(f"{s['scene']} {s['advance_gap_max_s']:.2f}s" for s in gap)
+            tc.assert_true("覆盖率最低三场：" + low_txt in rep,
+                           f"A7 覆盖率最低三场须按 measure 逐场值点名：期望 {low_txt}")
+            tc.assert_true("最长无推进三场：" + gap_txt in rep,
+                           f"A8 最长无推进三场须按 measure 逐场值点名：期望 {gap_txt}")
+
+            # ── B 断链：UNTESTED 点名，不得写 OK ──
+            rc_b, out_b, rep_b = drive(NO_T, "case143_not_block")
+            tc.assert_equal(rc_b, 0, f"B0 断链不得改变退出码（描述面不裁定）：{rc_b}")
+            b_head = next((ln.strip() for ln in rep_b.splitlines()
+                           if "[CHOREO-PREVIEW]" in ln), "")
+            tc.assert_true("UNTESTED" in b_head and "T-block" in b_head,
+                           f"B1 T 块缺失须在 [CHOREO-PREVIEW] 首行判 UNTESTED 并点名 T-block：{b_head[:300]}")
+            tc.assert_true("OK" not in b_head and "PASS" not in b_head
+                           and "FAIL" not in b_head,
+                           f"B2 UNTESTED 分支不得写裁定词：{b_head[:300]}")
+
+            miss = cp.measure(Path(td) / "不存在" / "index.html")
+            miss_lines = ip.choreography_preview_lines(Path(td) / "不存在" / "index.html")
+            miss_head = next((ln.strip() for ln in miss_lines
+                              if "[CHOREO-PREVIEW]" in ln), "")
+            tc.assert_true("untested" in miss and "不在位" in miss["untested"],
+                           f"B3 HTML 读不回须点名不在位：{miss}")
+            tc.assert_true("UNTESTED" in miss_head and "不在位" in miss_head,
+                           f"B4 首行须显形读不回（子面随行不得替首行洗白）：{miss_head}")
+
+            # measure 抛异常：函数须接住并点名，不炸预览
+            saved_measure = cp.measure
+            try:
+                cp.measure = lambda _p: (_ for _ in ()).throw(RuntimeError("boom"))
+                exc_lines = ip.choreography_preview_lines(hp)
+            finally:
+                cp.measure = saved_measure
+            tc.assert_true(any("UNTESTED" in ln and "取数异常" in ln for ln in exc_lines),
+                           f"B5 measure 抛错须判 UNTESTED 并归因：{exc_lines}")
+
+            # ── E 描述面边界（行为面）：断链件经 main 不碰退出码 ──
+            tc.assert_true(not any(w in "\n".join(miss_lines)
+                                   for w in ("PASS", "FAIL")),
+                           "E1 函数面输出不得含裁定词（只描述不裁定）")
+        # ── C AST：同源调用与排除自算统计 ──
+        src = (script_dir / "instant_preview.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+               and n.name == "choreography_preview_lines"]
+        tc.assert_true(len(fns) == 1, "C0 本函数须恰一个定义")
+        attrs = [n.func.attr for n in ast.walk(fns[0])
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        tc.assert_true("measure" in attrs and "format_line" in attrs,
+                       f"C1 须调用 choreography_profile.measure/format_line：{attrs}")
+        seg = ast.get_source_segment(src, fns[0]) or ""
+        # 判据对象是**函数体语句**而非整段源码：docstring 里合法地写着"不进 issues/
+        # 不自算统计"这类元语言，字面子串判据会被自己的文档洗白（同族教训见用例105/115）
+        body_nodes = [n for n in fns[0].body
+                      if not (isinstance(n, ast.Expr)
+                              and isinstance(n.value, ast.Constant)
+                              and isinstance(n.value.value, str))]
+        body_seg = "\n".join(ast.unparse(n) for n in body_nodes)
+        tc.assert_true("median" not in body_seg and "statistics" not in body_seg,
+                       "C2 函数体不得自算统计量（中位/分布只能来自 measure）")
+        tc.assert_true("coverage_advance_p50" not in body_seg,
+                       "C3 不得自行拼装覆盖率汇总键值（format_line 是唯一文案生成点）")
+
+        # ── D AST：preview 指纹面登记 choreography_profile.py ──
+        pr_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
+        pr_tree = ast.parse(pr_src)
+        step_inputs = [n for n in ast.walk(pr_tree) if isinstance(n, ast.FunctionDef)
+                       and n.name == "_step_inputs"]
+        tc.assert_true(len(step_inputs) == 1, "D0 _step_inputs 须恰一个定义")
+        preview_dict = None
+        for node in ast.walk(step_inputs[0]):
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if (isinstance(k, ast.Constant) and k.value == "preview"
+                            and isinstance(v, ast.Dict)):
+                        preview_dict = v
+        tc.assert_true(preview_dict is not None, "D1 preview 输入面须存在")
+        reg = [v for v in (preview_dict.values if preview_dict else [])
+               if isinstance(v, ast.BinOp)
+               and isinstance(v.right, ast.Constant)
+               and v.right.value == "choreography_profile.py"]
+        tc.assert_true(len(reg) == 1,
+                       "D2 preview 面须恰登记 choreography_profile.py（否则改口径缓存不失效）")
+
+        # ── E 静态：函数体不引用 gate 裁定/退出码 ──
+        tc.assert_true("gs." not in body_seg and "sys.exit" not in body_seg
+                       and "issues" not in body_seg,
+                       f"E2 函数体不得引用四态裁定、issues 或退出码（2026-10-10 常设裁定）：{body_seg[:200]}")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("preview_surfaces_choreography error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
 
