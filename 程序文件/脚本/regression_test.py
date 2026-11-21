@@ -23334,6 +23334,8 @@ class RegressionTestRunner:
             test_elevenlabs_non_audio_response_guard,
             test_pointer_mode_duration_single_source,
             test_playable_full_decode_and_seek_probe,
+            test_emphasis_forms_declared_contract,
+            test_scene_root_selector_resolution,
         ]
         self.results = []
     
@@ -29273,6 +29275,439 @@ def test_playable_full_decode_and_seek_probe() -> RegressionTestCase:
     except Exception as e:
         import traceback
         tc.mark_failed("playable_full_decode_and_seek_probe error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_emphasis_forms_declared_contract() -> RegressionTestCase:
+    """用例141：`preflight_check.check_emphasis_forms`（check 7h，只 WARN）。
+
+    存在理由（2026-11-21 借鉴批）：第三支参考片（参数化科普）的三件廉价写法——
+    关键词白芯片高亮、图形引线标注、参数 HUD 数值联动——若不配验收位点，落进文档后
+    与"没写"等价（2026-10-17 → 11-11 承载形态的教训：文档在位、逐场表无填写位、
+    声明与产出无对撞，24 天后原样复发）。本检查把 narration.json `emphasis_forms`
+    （声明）与场景 div `data-emphasis`（自报）对撞，并核对契约元素落在**该场子树**里、
+    chip 关键词出自本场旁白（口画一致）、hud 数值用 data-drive 指向同场元素。
+
+    本用例锁：
+      A 正向闭环（三形态各一，零 WARN，计数与分布正确）；A2 全场未声明合法；
+      B 声明≠自报 / C 缺自报 / D 缺声明：各点名两侧取值且零 ERROR；
+      E 非法形态名；F 契约元素缺席（F2 放在别的场，证子树作用域）；
+      G hud 绑定三态（缺 .hud-val／缺 data-drive／指向场外）；
+      H chip 关键词不在旁白（口画不一致）；
+      I cover 豁免；J 取数断链（HTML／narration）不得写成 OK；
+      K 挡位与接线（不进 RENDER_CRITICAL_CHECKS、main 确调用、id 归一单源）；
+      L 数字 scene_id 三形态不崩。
+    """
+    tc = RegressionTestCase(
+        "emphasis_forms_declared_contract",
+        "验证强调形态声明-自报对撞、契约元素子树核对、hud 绑定与 chip 口画一致，且只 WARN"
+    )
+    try:
+        import ast
+        import json as _json
+        import tempfile
+        import preflight_check as pfc
+
+        class _Rec:
+            def __init__(self):
+                self.warnings, self.errors, self.oks = [], [], []
+                self.counts = {}
+                self.exc = None
+
+            def warn(self, msg, check_id="unknown", profile_exempt=False):
+                self.warnings.append((check_id, msg))
+
+            def error(self, msg, check_id="unknown"):
+                self.errors.append((check_id, msg))
+
+            def ok(self, msg, check_id="unknown"):
+                self.oks.append((check_id, msg))
+
+            def info(self, msg, check_id="unknown"):
+                pass
+
+        BODY = {
+            "s1": ('<span class="kw">螺旋<span class="kw-chip"></span></span>'
+                   '<div class="callout"><span class="leader"></span>'
+                   '<span class="co-txt">FLAT</span></div>'),
+            "s2": ('<div class="param-hud"><span class="hud-val" '
+                   'data-drive="s2-model">3.0</span></div><div id="s2-model"></div>'),
+            "s3": '<div id="s3-model"></div>',
+        }
+        ECHO = {"s1": "chip,callout", "s2": "hud", "s3": None}
+        DECL = {"s1": ["chip", "callout"], "s2": "hud", "s3": None}
+        NARR = {"s1": "这里就是螺旋的起点", "s2": "每圈扩张 3.0 倍", "s3": "没有强调"}
+
+        def html(echo=None, body=None, cover_echo=None):
+            e = dict(ECHO, **(echo or {}))
+            b = dict(BODY, **(body or {}))
+            rows = ['<div id="scene0" class="scene" data-scene-id="s0" '
+                    'data-scene-entry="cover"'
+                    + (f' data-emphasis="{cover_echo}"' if cover_echo else '')
+                    + '></div>']
+            for sid in ("s1", "s2", "s3"):
+                at = f' data-emphasis="{e[sid]}"' if e.get(sid) else ''
+                rows.append(f'<div id="scene{sid[1:]}" class="scene" data-scene-id="{sid}" '
+                            f'data-scene-entry="gsap"{at}>{b.get(sid, "")}</div>')
+            return ('<!DOCTYPE html><html><body><div id="root" '
+                    'data-composition-id="main" data-duration="60">'
+                    + "".join(rows) + '</div></body></html>')
+
+        def narration(decl=None, narr=None, ids=None):
+            d = dict(DECL, **(decl or {}))
+            n = dict(NARR, **(narr or {}))
+            idmap = ids or {"s1": "s1", "s2": "s2", "s3": "s3"}
+            sc = []
+            sc.append({"scene_id": (ids or {}).get("s0", "s0"), "type": "cover",
+                       "narration": "", "narration_required": False})
+            for sid in ("s1", "s2", "s3"):
+                s = {"scene_id": idmap.get(sid, sid), "type": "content",
+                     "narration": n[sid], "narration_required": True}
+                if d.get(sid):
+                    s["emphasis_forms"] = d[sid]
+                sc.append(s)
+            return {"project": "fixture", "scenes": sc}
+
+        def run_case(td, htm=None, decl=None, narr=None, ids=None,
+                     break_narration=False):
+            sub = Path(tempfile.mkdtemp(dir=td))
+            hp = sub / "index.html"
+            hp.write_text(htm if htm is not None else html(), encoding="utf-8")
+            cp = sub / "cfg.json"
+            cfg = {"narration_source": "./narration.json"}
+            if not break_narration:
+                (sub / "narration.json").write_text(
+                    _json.dumps(narration(decl, narr, ids), ensure_ascii=False),
+                    encoding="utf-8")
+            cp.write_text(_json.dumps(cfg), encoding="utf-8")
+            r = _Rec()
+            try:
+                pfc.check_emphasis_forms(hp, cfg, cp, r)
+            except Exception as e:
+                r.exc = f"{type(e).__name__}: {e}"
+            return r
+
+        with tempfile.TemporaryDirectory() as td:
+            # ── A 正向闭环 ──
+            r = run_case(td)
+            tc.assert_true(r.exc is None, f"A0 正向不得抛异常：{r.exc}")
+            tc.assert_equal(r.errors, [], "A1 正向不得有 error")
+            tc.assert_equal(r.warnings, [], f"A2 正向不得有 WARN：{r.warnings}")
+            tc.assert_true(len(r.oks) == 1, "A3 正向须恰一条 OK")
+            c = r.counts.get("emphasis_form") or {}
+            tc.assert_equal(c.get("scenes"), 3, "A4 内容场计数须为 3（cover 不计）")
+            tc.assert_equal(c.get("declared_scenes"), 2, "A5 声明场计数须为 2")
+            tc.assert_equal(c.get("problems"), 0, "A6 正向 problems 须为 0")
+            tc.assert_equal(c.get("forms"), {"chip": 1, "callout": 1, "hud": 1},
+                            "A7 分布须三形态各一")
+
+            # ── A11 形态名归一（首尾空白/大小写不敏感）──
+            rw = run_case(td, htm=html(echo={"s1": " Chip , callout "}))
+            tc.assert_equal(rw.warnings, [],
+                            f"A11 形态名须去空白并大小写归一，不得假报缺口：{rw.warnings}")
+
+            # ── A2 全场未声明：合法（与 visual_form 的必填不同）──
+            ra = run_case(td, htm=html(echo={k: None for k in ECHO}),
+                          decl={k: None for k in DECL})
+            tc.assert_equal(ra.warnings, [], f"A9 未声明是合法态，不得告警：{ra.warnings}")
+            tc.assert_equal((ra.counts.get("emphasis_form") or {}).get("declared_scenes"),
+                            0, "A10 未声明时 declared_scenes 须为 0")
+
+            # ── B 声明≠自报 ──
+            rb = run_case(td, htm=html(echo={"s1": "chip"}))
+            tc.assert_equal(rb.errors, [], "B1 不一致只 WARN 不 ERROR（观感取向不阻断）")
+            tc.assert_true(any("s1" in m and "callout" in m for _, m in rb.warnings),
+                           f"B2 须点名 s1 与缺失的 callout：{rb.warnings}")
+            tc.assert_true(rb.warnings and all(cid == "emphasis_form" for cid, _ in rb.warnings),
+                           "B3 每条 WARN 须带 check_id=emphasis_form")
+
+            # ── C 缺自报 ──
+            rc = run_case(td, htm=html(echo={"s2": None}))
+            tc.assert_true(len(rc.warnings) == 1 and "data-emphasis" in rc.warnings[0][1],
+                           f"C1 缺自报须点名 data-emphasis：{rc.warnings}")
+
+            # ── D 缺声明 ──
+            rd = run_case(td, decl={"s2": None})
+            tc.assert_true(len(rd.warnings) == 1 and "emphasis_forms" in rd.warnings[0][1],
+                           f"D1 缺声明须点名 emphasis_forms：{rd.warnings}")
+
+            # ── E 非法形态名 ──
+            re_ = run_case(td, htm=html(echo={"s2": "pie"}),
+                           decl={"s2": "pie"})
+            tc.assert_true(any("不在合法集" in m and "pie" in m for _, m in re_.warnings),
+                           f"E1 非法形态名须点名：{re_.warnings}")
+
+            # ── F 契约元素缺席 / 放在别的场 ──
+            rf = run_case(td, htm=html(body={"s1": '<span class="kw">螺旋</span>'
+                                                        '<div class="callout">'
+                                                        '<span class="co-txt">FLAT</span></div>'}))
+            tc.assert_true(any("s1" in m and "kw-chip" in m for _, m in rf.warnings),
+                           f"F1 声明 chip 无 .kw-chip 须点名：{rf.warnings}")
+            rf2 = run_case(td, htm=html(body={
+                "s1": '<div class="callout"><span class="co-txt">FLAT</span></div>',
+                "s3": '<span class="kw">螺旋<span class="kw-chip"></span></span>'}))
+            tc.assert_true(any("s1" in m and "kw-chip" in m for _, m in rf2.warnings),
+                           f"F2 .kw-chip 放在别场不得顶替本场（子树作用域）：{rf2.warnings}")
+
+            # ── G hud 绑定三态 ──
+            rg = run_case(td, htm=html(body={
+                "s2": '<div class="param-hud"><span class="hud-k">W</span></div>'}))
+            tc.assert_true(any("hud-val" in m for _, m in rg.warnings),
+                           f"G1 .param-hud 缺 .hud-val 须点名：{rg.warnings}")
+            rg2 = run_case(td, htm=html(body={
+                "s2": '<div class="param-hud"><span class="hud-val">3.0</span></div>'
+                      '<div id="s2-model"></div>'}))
+            tc.assert_true(any("data-drive" in m for _, m in rg2.warnings),
+                           f"G2 缺 data-drive 须点名：{rg2.warnings}")
+            rg3 = run_case(td, htm=html(body={
+                "s2": '<div class="param-hud"><span class="hud-val" '
+                      'data-drive="ghost-model">3.0</span></div>'}))
+            tc.assert_true(any("ghost-model" in m and "不在本场" in m for _, m in rg3.warnings),
+                           f"G3 指向不存在的 id 须点名：{rg3.warnings}")
+            rg4 = run_case(td, htm=html(body={
+                "s2": '<div class="param-hud"><span class="hud-val" '
+                      'data-drive="s3-model">3.0</span></div>'}))
+            tc.assert_true(any("s3-model" in m and "不在本场" in m for _, m in rg4.warnings),
+                           f"G4 指向别场元素不得顶替（驱动目标须同场）：{rg4.warnings}")
+
+            # ── H chip 关键词不在旁白（口画一致）──
+            rh = run_case(td, htm=html(body={
+                "s1": '<span class="kw">鹦鹉螺<span class="kw-chip"></span></span>'
+                      '<div class="callout"><span class="co-txt">FLAT</span></div>'}))
+            tc.assert_true(any("鹦鹉螺" in m and "旁白" in m for _, m in rh.warnings),
+                           f"H1 关键词不在本场旁白须点名：{rh.warnings}")
+
+            # ── I cover 豁免（封面自报 chip 而无声明、也无契约元素）──
+            ri = run_case(td, htm=html(cover_echo="chip"))
+            tc.assert_equal(ri.warnings, [], f"I1 cover 不得入判：{ri.warnings}")
+
+            # ── J 取数断链：不得写成 OK ──
+            rj = _Rec()
+            pfc.check_emphasis_forms(Path(td) / "不存在" / "index.html", {},
+                                     Path(td) / "cfg.json", rj)
+            tc.assert_true(len(rj.warnings) == 1 and "取数断链" in rj.warnings[0][1],
+                           f"J1 HTML 读不回须点名断链：{rj.warnings}")
+            tc.assert_equal(rj.oks, [], "J2 断链不得写成 OK")
+            rn = run_case(td, break_narration=True)
+            tc.assert_true(any("取数断链" in m for _, m in rn.warnings),
+                           f"J3 narration 指针断须点名：{rn.warnings}")
+            tc.assert_equal(rn.oks, [], "J4 声明面断链不得写成 OK")
+            tc.assert_equal((rn.counts.get("emphasis_form") or {}).get("declared_available"),
+                            False, "J5 声明面断链须在计数里显形（declared_available=False）")
+
+            # ── L 数字 scene_id（1 基 / 0 基封面 / 非数字）──
+            rl = run_case(td, ids={"s0": 0, "s1": 1, "s2": 2, "s3": 3})
+            tc.assert_true(rl.exc is None, f"L1 数字 scene_id 不得抛异常：{rl.exc}")
+            tc.assert_equal(rl.warnings, [],
+                            f"L2 数字 id 与 HTML sN 归一后须对上，不得假报缺口：{rl.warnings}")
+            ro = run_case(td, ids={"s1": "intro", "s2": 2, "s3": 3})
+            tc.assert_true(ro.exc is None,
+                           f"L3 非数字 id 走排序兜底不得崩：{ro.exc}")
+
+        # ── K 挡位与接线 ──
+        tc.assert_true("emphasis_form" not in pfc.RENDER_CRITICAL_CHECKS,
+                       "K1 观感描述面不得进 RENDER_CRITICAL_CHECKS（进了即把可交付变不可交付）")
+        _src = (Path(__file__).parent / "preflight_check.py").read_text(encoding="utf-8")
+        _tree = ast.parse(_src)
+        _main = [n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"]
+        tc.assert_true(len(_main) == 1, "K2 main 须恰一个定义")
+        _called = {n.func.id for n in ast.walk(_main[0])
+                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_emphasis_forms" in _called,
+                       f"K3 main 必须调用 check_emphasis_forms（函数在位而无人调＝空转）："
+                       f"{sorted(_called)[:8]}")
+        _fns = [n for n in _tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "check_emphasis_forms"]
+        tc.assert_true(len(_fns) == 1, "K4 check_emphasis_forms 须恰一个定义")
+        _fn_src = ast.get_source_segment(_src, _fns[0]) or ""
+        tc.assert_true("normalize_scene_id" in _fn_src,
+                       "K5 场景 id 归一须走 cue_resolve 单源（自写切片即第二套口径）")
+        tc.assert_true("[1:]" not in _fn_src,
+                       "K6 不得自写 x[1:] 切片归一（数字 id 取到空串即崩）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("emphasis_forms_declared_contract error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_scene_root_selector_resolution() -> RegressionTestCase:
+    """用例142：`preflight_check.check_scene_root_selectors`（check 7i，ERROR）。
+
+    存在理由（2026-11-21 选择器误写批）：三形态静态门禁（7h）全绿、预览全绿，
+    但作者把场景根写成 "#sN"（元素 id 实为 "sceneN"）——chip 宽 0、HUD 数值不动，
+    成片零联动。静态面只证元素在场，证不了选择器能解析。
+
+    本用例锁：
+      A 正向：合法 `#sN …` 解析到元素 id，零 ERROR，计数 1/1/0；
+      B 负例：解析不到必 ERROR 并点名 sN 与文件:行，日志为 ERROR/scene_root_selector；
+      B4/B5 多处命中逐条点名；
+      C 前缀参数 prodEntry("#s8") 不是选择器，不得计入（紧邻引号的 lookahead）；
+      D 模板/变量形态计 unparsed 并点名，不阻断；
+      E HTML 读不回判 ERROR（阻断位点不得静默降级）；
+      G audit 模式降 WARN（RENDER_CRITICAL_CHECKS 归属由既有机制承担）；
+      H 注释里的示例选择器不计入判据；
+      I 无对象时打印扫描数 0、applicable=False，且不得写 OK；
+      F AST 锁接线、挡位归属与单一定义。
+    """
+    tc = RegressionTestCase(
+        "scene_root_selector_resolution",
+        "验证场景根选择器字面量能解析到页面元素 id；前缀参数不误报、模板计未解析、"
+        "注释不误报、断链阻断、audit 降级与接线"
+    )
+    try:
+        import ast
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        import preflight_check as pfc
+
+        BODY = """<!DOCTYPE html><html><head><style>
+#scene1 .card{opacity:0}
+</style></head><body><div id="root">
+<div id="scene0" class="scene" data-scene-id="s0" data-scene-entry="cover"></div>
+<div id="scene1" class="scene" data-scene-id="s1" data-scene-entry="gsap">
+  <div id="s1-tag"></div><span class="kw-chip"></span>
+</div>
+<div id="scene2" class="scene" data-scene-id="s2" data-scene-entry="gsap">
+  <div id="s2-model"></div><span class="hud-val" data-drive="s2-model"></span>
+</div>
+<div id="s3"></div>
+<script>
+var T={s1:3.0,s2:10.0};
+tl.fromTo("#scene1 .kw-chip",{opacity:0},{opacity:1},T.s1+0.5);
+tl.to("#s3 .bar",{scaleX:1},T.s2+0.5);
+tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);
+</script>
+</div></body></html>"""
+
+        def run(html_text, mode="render"):
+            tmp = Path(tempfile.mkdtemp(dir=td))
+            hp = tmp / "index.html"
+            hp.write_text(html_text, encoding="utf-8")
+            r = pfc.PreflightResult(mode=mode)
+            buf = io.StringIO()
+            exc = None
+            try:
+                with redirect_stdout(buf):
+                    pfc.check_scene_root_selectors(hp, r)
+            except Exception as e:                       # noqa: BLE001
+                exc = f"{type(e).__name__}: {e}"
+            return r, exc, buf.getvalue()
+
+        def _entries(r, level, check_id="scene_root_selector"):
+            return [e for e in r._log_entries
+                    if e["level"] == level and e["check_id"] == check_id]
+
+        BAD = BODY.replace('"#s3 .bar"', '"#s5 .hud-val"')
+        MULTI = BODY.replace('"#s3 .bar"', '"#s5 .hud-val"').replace(
+            'tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);',
+            'tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);\n'
+            'tl.to("#s9 .x",{opacity:1},T.s2+1.0);')
+        PREFIX = BODY.replace('tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);',
+                              'tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);\n'
+                              'prodEntry("#s8", 2);')
+        TEMPLATE = BODY.replace('tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);',
+                                'tl.fromTo("#s1-tag",{y:20},{y:0},T.s1+0.2);\n'
+                                'var sel=`#s${n} .item`;')
+        COMMENT = BODY.replace('<div id="s3"></div>',
+                               '<div id="s3"></div>\n<!-- 旧写法 tl.to("#s6 .x",{}) -->')
+        NOOBJ = BODY.replace('tl.to("#s3 .bar",{scaleX:1},T.s2+0.5);', '')
+
+        with tempfile.TemporaryDirectory() as td:
+            # ── A 正向 ──
+            ra, exc, _ = run(BODY)
+            tc.assert_true(exc is None, f"A0 正向不得抛异常：{exc}")
+            tc.assert_equal(ra.errors, [], f"A1 合法场景根选择器不得报错：{ra.errors}")
+            ca = ra.counts.get("scene_root_selector") or {}
+            tc.assert_true(ca.get("selectors") == 1 and ca.get("resolved") == 1
+                           and ca.get("unresolved") == 0,
+                           f"A2 计数须为 selectors=1/resolved=1/unresolved=0：{ca}")
+
+            # ── B 负例 ──
+            rb, exc, _ = run(BAD)
+            tc.assert_true(exc is None, f"B0 负例不得抛异常：{exc}")
+            tc.assert_equal(len(rb.errors), 1, f"B1 解析不到须恰一条 ERROR：{rb.errors}")
+            tc.assert_true(rb.errors and "#s5" in rb.errors[0]
+                           and "index.html:" in rb.errors[0],
+                           f"B2 须点名 #s5 与文件:行：{rb.errors}")
+            tc.assert_true(len(_entries(rb, "ERROR")) == 1,
+                           "B3 日志须登记 ERROR/scene_root_selector")
+
+            # ── B4/B5 多处命中逐条点名 ──
+            rm, exc, _ = run(MULTI)
+            tc.assert_equal(len(rm.errors), 2,
+                            f"B4 两处命中须两条 ERROR 逐条给出：{rm.errors}")
+            tc.assert_true(any("#s5" in e for e in rm.errors)
+                           and any("#s9" in e for e in rm.errors),
+                           f"B5 s5 与 s9 都须被点名：{rm.errors}")
+
+            # ── C 前缀参数不是选择器 ──
+            rc, exc, _ = run(PREFIX)
+            tc.assert_true(exc is None and not any("s8" in e for e in rc.errors),
+                           f"C1 prodEntry(\"#s8\") 不得计入判据：{rc.errors}")
+
+            # ── D 模板/变量形态：计未解析、不阻断 ──
+            rd, exc, _ = run(TEMPLATE)
+            tc.assert_equal(rd.errors, [], f"D1 模板形态不得阻断：{rd.errors}")
+            tc.assert_equal((rd.counts.get("scene_root_selector") or {}).get("unparsed"),
+                            1, "D2 模板形态须计入 unparsed=1")
+            tc.assert_true(any("模板" in e["message"] for e in _entries(rd, "INFO")),
+                           f"D3 模板形态须点名：{_entries(rd, 'INFO')}")
+
+            # ── E 取数断链：ERROR，不得静默降级 ──
+            re_ = pfc.PreflightResult(mode="render")
+            exe = None
+            with redirect_stdout(io.StringIO()):
+                try:
+                    pfc.check_scene_root_selectors(Path(td) / "不存在" / "index.html", re_)
+                except Exception as e:                   # noqa: BLE001
+                    exe = f"{type(e).__name__}: {e}"
+            tc.assert_true(exe is None and len(re_.errors) == 1
+                           and "取数断链" in re_.errors[0],
+                           f"E1 HTML 读不回须 ERROR 点名取数断链：{re_.errors} / {exe}")
+
+            # ── G audit 模式降 WARN ──
+            rg, exc, _ = run(BAD, mode="audit")
+            tc.assert_equal(rg.errors, [], f"G1 audit 模式不得有 ERROR：{rg.errors}")
+            tc.assert_equal(len(rg.warnings), 1,
+                            f"G2 audit 模式须降为恰一条 WARN：{rg.warnings}")
+            tc.assert_true(len(_entries(rg, "WARN_AUDIT")) == 1,
+                           "G3 audit 降级须在日志显形（WARN_AUDIT）")
+
+            # ── H 注释里的示例选择器不计入 ──
+            rh, exc, _ = run(COMMENT)
+            tc.assert_true(exc is None and rh.errors == [],
+                           f"H1 注释内选择器不得误报：{rh.errors}")
+
+            # ── I 无对象：不得读成通过 ──
+            ri, exc, out = run(NOOBJ)
+            ci = ri.counts.get("scene_root_selector") or {}
+            tc.assert_true(ci.get("applicable") is False and ci.get("selectors") == 0,
+                           f"I1 无对象须 applicable=False、selectors=0：{ci}")
+            tc.assert_true(not _entries(ri, "OK"),
+                           "I2 无对象不得写 OK（扫描数 0 已在不适用分支点名）")
+
+        # ── F 接线、挡位与单一定义 ──
+        _src = (Path(__file__).parent / "preflight_check.py").read_text(encoding="utf-8")
+        _tree = ast.parse(_src)
+        _main = [n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"]
+        tc.assert_true(len(_main) == 1, "F0 main 须恰一个定义")
+        _called = {n.func.id for n in ast.walk(_main[0])
+                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        tc.assert_true("check_scene_root_selectors" in _called,
+                       "F1 main 必须调用 check_scene_root_selectors（函数在位而无人调＝空转）")
+        tc.assert_true("scene_root_selector" in pfc.RENDER_CRITICAL_CHECKS,
+                       "F2 ERROR 挡位须入 RENDER_CRITICAL_CHECKS（audit 降级由该集合承担）")
+        _fns = [n for n in _tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "check_scene_root_selectors"]
+        tc.assert_true(len(_fns) == 1, "F3 check_scene_root_selectors 须恰一个定义")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_root_selector_resolution error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
 

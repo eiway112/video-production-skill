@@ -858,6 +858,105 @@ tl.to("#cursor",      { opacity:0, duration:0.4 },                              
 
 ---
 
+### 4.9 参数化解释三件套（关键词芯片 / 引线标注 / 参数 HUD）
+
+2026-11-21 借鉴批。三件写法取自一支参数化科普参考片（新华智见《三个数字能"画"出所有贝壳吗》）：原片用它们把"数值→图形→结论"绑在同一画面上——关键词被芯片点亮、标注用引线钉在模型上、参数面板的读数与图形同步变化。**它们是可选写法，不是承载形态**：一场仍须先答出 §4.8 的"这场的形状是什么"，三件套只负责把已经想清楚的关系演出来（先想特效再想形＝倒序，退化成装饰）。
+
+**契约（预检 check 7h 的对撞面，WARN 级、不阻断）**：
+
+| 位置 | 内容 |
+|---|---|
+| 声明 | `narration.json` 该场 `emphasis_forms`：取值 `chip`／`callout`／`hud`，可组合；字符串 `"chip,callout"` 或列表均可，大小写与空白不敏感 |
+| 自报 | 场景 div `data-emphasis="chip,callout"`（与声明同值） |
+| 契约元素（须落在**该场 div 子树内**） | chip → `.kw-chip`；callout → `.callout` 内含 `.co-txt`；hud → `.param-hud` 内含 `.hud-val[data-drive="<同场元素 id>"]` |
+| 机器另核 | chip 的关键词须出现在**本场旁白**里（口画一致）；`data-drive` 指向的元素须与数值**同场** |
+
+**边界（不得读宽）**：静态面只证"形态在场、绑定指向在场"，**不证"联动真的在动"**——后者在预览期由作者核对（`instant_preview` 多点截图里 HUD 数值应发生变化）。三形态均可不声明；未声明的场 check 7h 不告警。
+
+**一件：关键词白芯片**（念到某个词时，词后铺一块浅色芯片）
+
+```html
+<p class="lead">它决定<span class="kw">螺旋<span class="kw-chip"></span></span>的起点</p>
+<style>
+.kw { position: relative; display: inline-block; z-index: 0; }
+.kw-chip { position: absolute; left: -6px; right: -6px; top: 8%; bottom: 6%;
+           background: rgba(255,255,255,0.92); border-radius: 6px;
+           transform: scaleX(0); transform-origin: left center; z-index: -1; }
+</style>
+```
+```javascript
+tl.set("#s2 .kw-chip", { scaleX: 1 }, T.s2 + 2.0)
+  .set("#s2 .kw", { color: "#0d1117" }, T.s2 + 2.0);   // 芯片与字色同刻切换（硬出现）
+```
+
+三条约束：① 芯片里的词**必须是本场旁白里真说到的词**（机器会核，见契约表）；② **芯片与字色必须同刻切换**——深底的正文是浅色，芯片若先出、字色后变，扫入期间未覆盖部分是白字落在白芯片上＝关键词消失（本批 2026-11-21 探针实拍到了这个形态，故骨架用 `set` 硬出现）。想要扫入效果：要么把 scaleX 换成短 `to` 并接受 ≤0.2s 的瞬态，要么改用半透明高亮色（`rgba(251,191,36,0.35)`）不动字色，扫入全程可读；浅底则反过来用深色芯片＋白字，CSS 里静态写死即可；③ 每场 ≤2 个，芯片是"强调"不是"高亮全文"。
+
+**二件：引线标注**（用一条线把短标签钉在图形上）
+
+```html
+<div class="callout" style="position:absolute; left:640px; top:250px;">
+  <svg width="140" height="90" viewBox="0 0 140 90">
+    <path id="s3-lead" d="M4 84 L96 40 L136 8" fill="none" stroke="#f59e0b" stroke-width="2"/>
+    <circle cx="4" cy="84" r="4" fill="#f59e0b"/>
+  </svg>
+  <span class="co-txt">FLAT · 平旋</span>
+</div>
+<style>
+.callout { display:flex; align-items:flex-end; gap:8px; }
+.co-txt { background:#111827; color:#fff; border-radius:6px; padding:4px 10px;
+          font-size:22px; letter-spacing:0.04em; }
+</style>
+```
+```javascript
+var lp = document.getElementById("s3-lead");
+var L = lp.getTotalLength();
+lp.style.strokeDasharray = L; lp.style.strokeDashoffset = L;
+tl.to(lp, { strokeDashoffset: 0, duration: 0.6, ease: "power1.inOut" }, T.s3 + 1.6)
+  .from("#s3 .co-txt", { opacity: 0, y: 8, duration: 0.3 }, T.s3 + 1.9);
+```
+
+三条约束：① 引线**晚于它所指的关系被说出来**再画（与 §4.8 回流环同一条）；② 标签 ≤8 字，钉在图形旁不钉在空白处，引线不得穿过字幕安全区；③ 每场 ≤2 个。
+
+**三件：参数 HUD**（面板读数与图形同步变化）
+
+```html
+<div class="param-hud" style="position:absolute; right:60px; top:120px; width:360px;">
+  <div class="hud-row"><span class="hud-k">W</span>
+    <span class="hud-track"><i id="s4-fill"></i></span>
+    <span class="hud-val" data-drive="s4-model">1.0</span></div>
+</div>
+<div id="s4-model" class="model">…</div>
+```
+```css
+.param-hud { background: rgba(15,23,42,0.72); border: 1px solid rgba(255,255,255,0.14);
+             border-radius: 10px; padding: 14px 16px; color: #e5e7eb; font-size: 20px; }
+.hud-row { display: flex; align-items: center; gap: 10px; }
+.hud-k { width: 22px; color: #93c5fd; }
+.hud-track { flex: 1; height: 4px; background: rgba(255,255,255,0.18);
+             border-radius: 2px; overflow: hidden; }
+.hud-track i { display: block; height: 100%; width: 33%; background: #fbbf24; }
+.hud-val { width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+```
+```javascript
+var st = { w: 1.0 };
+tl.to(st, { w: 3.0, duration: 2.4, ease: "power1.inOut", onUpdate: function () {
+  document.getElementById("s4-model").style.transform = "scale(" + st.w.toFixed(2) + ")";
+  document.querySelector("#s4 .hud-val").textContent = st.w.toFixed(1);
+  document.getElementById("s4-fill").style.width = (st.w / 3.0 * 100) + "%";
+} }, T.s4 + 2.0);
+```
+
+三条约束：① 读数与它驱动的图形**同一 `onUpdate` 改**（两处各写一份＝两份真相，必然漂移）；② `data-drive` 指向的元素 id 须与 `getElementById` 用的是同一个（契约属性不是注释，机器会核对）；③ 数值必须出自旁白（口画一致），滑轨只是按值绘制的静态装饰，**不做可拖拽控件**。
+
+**共用纪律四条**：
+
+1. 三件套都是"表现手段"，不替代 §4.8 的承载形态——一场仍须先答出形状。
+2. 词与数必须来自本场旁白；参考件里有而本片旁白没有的不引入（与 §4.8 共用纪律 1 同源）。
+3. 所有元素落在**场景 div 内**——增量渲染的场景归属、逐场检查与 7h 的子树核对都依赖它；挂在根 `tl` 或场景外的全局层会让该场每次修订退回全量渲染。
+4. 落进分镜表「强调形态」列，并在 narration.json 写 `emphasis_forms`、在场景 div 写 `data-emphasis`。预检 7h 只 WARN——忘了写不会拦渲染，也就没人能发现。
+
+---
+
 ## 五、真实图片集成
 
 ### 5.1 全屏背景图场景

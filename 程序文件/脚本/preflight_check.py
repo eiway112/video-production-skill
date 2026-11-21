@@ -97,6 +97,11 @@ RENDER_CRITICAL_CHECKS = {
     # （t=0 常驻）、旧场退场锚没前移（新场永不退场）、z-index 没重排（层序错位），
     # 三处里只有"窗口重叠"会被既有检查抓到。
     "scene_insert",
+    # check 7i（2026-11-21 选择器误写批）：字符串字面量里的场景根写成 "#sN"（元素 id
+    # 实为 "sceneN"）→ JS 选择器解析到空集，动画对空元素执行。静态面只证元素在场
+    # （7h 三形态全绿）、预览全绿，而成片零联动（本项目 chip 宽 0、HUD 数值不动）。
+    # 落地前全仓 82 份 index.html 严格判据 0 命中＝无错杀对象。
+    "scene_root_selector",
     # check 7g（2026-11-12 demo 批）：场景根 fromTo 的 from 段非零 opacity 且无离屏
     # 偏移、未关 immediateRender → t=0 即不透明盖住低层场景。预览/presence 都量不到
     # 兄弟场景遮挡，只有全量渲完才暴露（一次白渲实证）。落地当轮全仓 0 命中＝无错杀。
@@ -2356,6 +2361,335 @@ def check_visual_form(html_path: Path, cfg: dict, config_path, r: PreflightResul
              check_id="visual_form")
 
 
+EMPHASIS_FORMS = ("chip", "callout", "hud")
+# 契约元素（class 名单一权威源；骨架住 HTML 基准 §4.9，本处只认这三组）：
+#   chip    → .kw-chip（关键词文本可取其自身或父元素）
+#   callout → .callout 内含 .co-txt（引线可另用 SVG .leader，不强制）
+#   hud     → .param-hud 内含 .hud-val[data-drive="<同场元素 id>"]
+_EMPHASIS_CONTRACT = {"chip": ("kw-chip",), "callout": ("callout", "co-txt"),
+                      "hud": ("param-hud", "hud-val")}
+
+
+def _emphasis_list(value):
+    """声明/自报归一：list/tuple/str → 去空白、小写、保序去重。
+
+    非法名保留原样（不丢弃）——否则"写了拼错的形态名"会被静默洗成"没写"。
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = []
+    for x in items:
+        x = str(x).strip().lower()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _emphasis_scene_dom(content, norm_scene_id):
+    """把 HTML 解析成场景子树：{归一 id: {node, echo, cover}}。
+
+    只为本检查服务：契约元素须落在**该场子树内**，故必须真解析结构，不能按
+    整份文本 grep——同名字符串出现在别的场里时，文本面判据会把"放错场"洗成通过。
+    """
+    from html.parser import HTMLParser
+
+    class _N:
+        __slots__ = ("tag", "attrs", "parent", "children", "text")
+
+        def __init__(self, tag, attrs, parent):
+            self.tag = tag
+            self.attrs = attrs
+            self.parent = parent
+            self.children = []
+            self.text = ""
+
+    class _P(HTMLParser):
+        VOID = {"img", "br", "hr", "input", "meta", "link", "source", "area",
+                "base", "col", "embed", "param", "track", "wbr"}
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root = _N("#root", {}, None)
+            self.cur = self.root
+            self.nodes = []
+
+        def handle_starttag(self, tag, attrs):
+            n = _N(tag, {k: (v or "") for k, v in attrs}, self.cur)
+            self.cur.children.append(n)
+            self.nodes.append(n)
+            if tag not in self.VOID:
+                self.cur = n
+
+        def handle_endtag(self, tag):
+            node = self.cur
+            while node is not None and node.tag != tag:
+                node = node.parent
+            if node is not None and node.parent is not None:
+                self.cur = node.parent
+
+        def handle_data(self, data):
+            if data.strip():
+                self.cur.text += data.strip()
+
+    p = _P()
+    p.feed(content)
+    out = {}
+    for n in p.nodes:
+        if n.tag != "div" or "data-scene-id" not in n.attrs:
+            continue
+        key = norm_scene_id(n.attrs.get("data-scene-id"))
+        out[key] = {"node": n,
+                    "echo": _emphasis_list(n.attrs.get("data-emphasis")),
+                    "cover": n.attrs.get("data-scene-entry") == "cover"}
+    return out
+
+
+def check_emphasis_forms(html_path: Path, cfg: dict, config_path, r: PreflightResult):
+    """[7h] 强调形态验收（2026-11-21 借鉴批；**只 WARN 不阻断**）。
+
+    存在理由：第三支参考片（参数化科普）的三件廉价写法——关键词白芯片高亮、
+    图形引线标注、参数 HUD 数值联动——若不配验收位点，落进文档后与"没写"等价
+    （2026-10-17 → 11-11 承载形态的教训：文档在位、逐场表无填写位、声明与产出
+    无对撞，24 天后原样复发）。本检查把**声明**（narration.json 逐场
+    `emphasis_forms`）与**自报**（场景 div `data-emphasis`）对撞，并核对契约元素
+    真的落在**该场子树**里；chip 的关键词须出现在本场旁白（口画一致），hud 的
+    数值须用 `data-drive` 指明它驱动的同场元素。
+
+    刻意 WARN 而非 ERROR：形态属观感取向（2026-10-10 常设裁定不为观感新增门禁），
+    且三形态本就是可选项、未声明合法。**边界**：静态面只证"形态在场、绑定指向
+    在场"，不证"联动真的在动"——后者由作者在预览期核对（多点截图里 HUD 数值应变化）。
+    """
+    print("\n[7h] Emphasis forms (narration emphasis_forms ↔ data-emphasis ↔ 契约元素)")
+    try:
+        content = html_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        r.warn(f"强调形态核对取数断链：HTML 读不回（{e}）——不得读成已核对",
+               check_id="emphasis_form")
+        return
+    try:
+        import cue_resolve as _cr
+    except ImportError as e:
+        r.warn(f"强调形态核对取数断链：cue_resolve 模块取不回（{e}）——场景 id 归一无单源，"
+               f"不得读成已核对", check_id="emphasis_form")
+        return
+    try:
+        dom = _emphasis_scene_dom(content, _cr.normalize_scene_id)
+    except Exception as e:                              # noqa: BLE001
+        r.warn(f"强调形态核对取数断链：DOM 解析异常（{type(e).__name__}: {str(e)[:80]}）"
+               f"——不得读成已核对", check_id="emphasis_form")
+        return
+    try:
+        scenes, _src = _script_env.resolve_narration_scenes(cfg or {}, config_path)
+    except RuntimeError as e:
+        r.warn(f"强调形态核对取数断链：narration 指针解析失败（{str(e)[:120]}）"
+               f"——声明面无从核对", check_id="emphasis_form")
+        scenes = None
+    declared, narr_by_id = {}, {}
+    if scenes:
+        for s in scenes:
+            key = _cr.normalize_scene_id(s.get("scene_id"))
+            declared[key] = _emphasis_list(s.get("emphasis_forms"))
+            narr_by_id[key] = str(s.get("narration") or "")
+    if scenes is None and not dom:
+        r.warn("强调形态核对取数断链：narration 与 HTML 两侧都取不到——不得读成已核对",
+               check_id="emphasis_form")
+        return
+
+    def _order(k):
+        return (0, int(k)) if str(k).isdigit() else (1, str(k))
+
+    def _cls(n):
+        return (n.attrs.get("class") or "").split()
+
+    def _desc(node):
+        stack = list(node.children)
+        while stack:
+            n = stack.pop()
+            yield n
+            stack.extend(n.children)
+
+    problems, census, n_decl = [], {}, 0
+    for sid in sorted(set(declared) | set(dom), key=_order):
+        info = dom.get(sid)
+        label = f"s{sid}" if sid else "<无 scene_id>"
+        if info and info["cover"]:
+            continue
+        d = declared.get(sid) or []
+        e = info["echo"] if info else []
+        narr = re.sub(r"\s+", "", narr_by_id.get(sid, ""))
+        if not d and not e:
+            continue
+        if d:
+            n_decl += 1
+        for form in sorted(set(d) | set(e)):
+            if form not in EMPHASIS_FORMS:
+                problems.append(f"{label} 强调形态名 {form} 不在合法集 {EMPHASIS_FORMS}")
+                continue
+            census[form] = census.get(form, 0) + 1
+        if scenes is not None:
+            if d and not e:
+                problems.append(f"{label} narration 声明 {d} 但场景 div 无 data-emphasis"
+                                f"（产出面未自报）")
+            elif e and not d:
+                problems.append(f"{label} HTML 自报 {e} 但 narration 无 emphasis_forms"
+                                f"（声明面缺位）")
+            elif set(d) != set(e):
+                problems.append(f"{label} 声明 {d} ≠ 自报 {e}"
+                                f"（分镜写的强调形态与画出来的不一致）")
+        if info is None:
+            problems.append(f"{label} 有声明但 HTML 里找不到该场 div（产出面缺场）")
+            continue
+        node = info["node"]
+        ids_in_scene = {node.attrs.get("id")} if node.attrs.get("id") else set()
+        ids_in_scene |= {n.attrs.get("id") for n in _desc(node) if n.attrs.get("id")}
+        forms_here = [f for f in sorted(set(d) | set(e)) if f in EMPHASIS_FORMS]
+        if "chip" in forms_here:
+            chips = [n for n in _desc(node) if "kw-chip" in _cls(n)]
+            if not chips:
+                problems.append(f"{label} 声明 chip 但场景内无 .kw-chip（形态未落到产出）")
+            for c in chips:
+                txt = (c.text or (c.parent.text if c.parent else "") or "").strip()
+                if not txt:
+                    problems.append(f"{label} .kw-chip 未带关键词文本（芯片无对象）")
+                elif narr and re.sub(r"\s+", "", txt) not in narr:
+                    problems.append(f"{label} 关键词「{txt}」不在本场旁白里（口画不一致）")
+        if "callout" in forms_here:
+            cos = [n for n in _desc(node) if "callout" in _cls(n)]
+            if not cos:
+                problems.append(f"{label} 声明 callout 但场景内无 .callout（形态未落到产出）")
+            elif not any("co-txt" in _cls(m) for c in cos for m in _desc(c)):
+                problems.append(f"{label} .callout 缺 .co-txt（标注无文字）")
+        if "hud" in forms_here:
+            huds = [n for n in _desc(node) if "param-hud" in _cls(n)]
+            vals = [v for h in huds for v in _desc(h) if "hud-val" in _cls(v)]
+            if not huds:
+                problems.append(f"{label} 声明 hud 但场景内无 .param-hud（形态未落到产出）")
+            elif not vals:
+                problems.append(f"{label} .param-hud 缺 .hud-val（无数值读出）")
+            for v in vals:
+                drive = (v.attrs.get("data-drive") or "").strip()
+                if not drive:
+                    problems.append(f"{label} .hud-val 无 data-drive"
+                                    f"（数值未声明它驱动的图形元素，联动无从核对）")
+                elif drive not in ids_in_scene:
+                    problems.append(f"{label} .hud-val 的 data-drive=\"{drive}\" 不在本场"
+                                    f"（驱动目标须与数值同场）")
+
+    n_scenes = sum(1 for k in dom if not dom[k]["cover"])
+    r.counts["emphasis_form"] = {"scenes": n_scenes, "declared_scenes": n_decl,
+                                 "declared_available": scenes is not None,
+                                 "forms": census, "problems": len(problems)}
+    dist = "／".join(f"{k}×{v}" for k, v in sorted(census.items())) or "无"
+    if problems:
+        for p in problems:
+            r.warn(p, check_id="emphasis_form")
+        print(f"  [WARN] {len(problems)} 处强调形态缺口；分布 {dist}")
+    elif scenes is None:
+        # 声明面取数断链：只核对了自报面与契约元素，不得写成 OK（A06 同族）
+        print(f"  [INFO] 声明面取数断链，仅核对自报面；分布 {dist}——不得读成已核对")
+    else:
+        r.ok(f"强调形态核对：{n_decl} 场声明、分布 {dist}"
+             f"（三形态可选；静态面只证形态在场与绑定指向，不证联动真的在动）",
+             check_id="emphasis_form")
+
+
+# check 7i 取数面：字符串字面量里的 `#sN`，且其后紧跟空白或组合符（场景根/后代用法）。
+# 紧邻引号/短横等的形态（prodEntry("#s1")、`#s1-tag`）不是场景根选择器，lookahead 天然排除。
+_SCENE_ROOT_SELECTOR_RE = re.compile(r"""["'`](#s\d+)(?=[\s>+~])""")
+# 模板/变量形态（`#s${n} .x`）静态不可解析：只计数并点名，不阻断。
+_SCENE_ROOT_TEMPLATE_RE = re.compile(r"#s(?:\{|\$\{)")
+
+
+def check_scene_root_selectors(html_path: Path, r: PreflightResult):
+    """[7i] 场景根选择器解析（2026-11-21 选择器误写批；ERROR，入 RENDER_CRITICAL_CHECKS）。
+
+    存在理由（本项目实证）：三形态静态门禁（7h）全绿、预览全绿，但作者把场景根写成
+    "#sN"（元素 id 实为 "sceneN"）——chip 宽 0、HUD 数值与条形不动，成片零联动。
+    静态面只证元素在场，证不了选择器能解析。本检查抽出字符串字面量里 `#sN` + 空白/
+    组合符的用法，逐条要求解析到页面元素 id（html.parser 收集的 id 集合）。
+
+    边界：只判静态可解析性。`#sN` 紧邻引号（前缀参数）不是选择器，不判；模板/变量
+    形态计 unparsed 不阻断；一条都没抽到时打印扫描数 0 并写明不适用，**不得读成通过**。
+    """
+    print("\n[7i/12] Scene-root selector resolution (\"#sN …\" ↔ 页面元素 id)")
+    from html.parser import HTMLParser
+
+    try:
+        raw = html_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        r.error(f"场景根选择器核对取数断链：HTML 读不回（{e}）——预检是阻断位点，"
+                f"不得静默降级", check_id="scene_root_selector")
+        return
+
+    # 剥 HTML 注释但保留行号（整块替换为等量换行）：注释里的示例选择器不是代码
+    content = re.sub(r"<!--.*?-->",
+                     lambda m: "\n" * m.group(0).count("\n"),
+                     raw, flags=re.DOTALL)
+
+    class _Ids(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.ids = set()
+
+        def handle_starttag(self, tag, attrs):
+            for k, v in attrs:
+                if k == "id" and v and v.strip():
+                    self.ids.add(v.strip())
+
+    try:
+        p = _Ids()
+        p.feed(content)
+        p.close()
+        ids = p.ids
+    except Exception as e:                              # noqa: BLE001
+        r.error(f"场景根选择器核对取数断链：DOM 解析异常"
+                f"（{type(e).__name__}: {str(e)[:80]}）——预检是阻断位点，不得静默降级",
+                check_id="scene_root_selector")
+        return
+
+    def _line(pos):
+        return content.count("\n", 0, pos) + 1
+
+    selectors = list(_SCENE_ROOT_SELECTOR_RE.finditer(content))
+    templates = list(_SCENE_ROOT_TEMPLATE_RE.finditer(content))
+    unresolved = []
+    for m in selectors:
+        if m.group(1)[1:] in ids:
+            continue
+        unresolved.append((m.group(1), _line(m.start())))
+
+    r.counts["scene_root_selector"] = {
+        "selectors": len(selectors),
+        "resolved": len(selectors) - len(unresolved),
+        "unresolved": len(unresolved),
+        "unparsed": len(templates),
+        "applicable": bool(selectors),
+    }
+    for sid, line in unresolved:
+        r.error(f"{sid} 选择器在页面无对应 id（{html_path.name}:{line}）——JS 选择器"
+                f"解析不到，动画/联动会对空元素执行（静态在场 ≠ 可解析）",
+                check_id="scene_root_selector")
+    if templates:
+        where = "、".join(f"行{_line(m.start())}" for m in templates[:5])
+        r.info(f"场景根选择器 {len(templates)} 处为模板/变量形态（{where}）"
+               f"——静态不可解析，计入未解析数、不阻断", check_id="scene_root_selector")
+    if not selectors:
+        if templates:
+            print(f"  [INFO] 抽出 0 条可静态解析的场景根选择器（模板/变量形态 "
+                  f"{len(templates)} 处）——无从核对，不得读成通过")
+        else:
+            print("  [INFO] 扫描数 0：本检查无对象（页面无 \"#sN …\" 选择器字面量）"
+                  "——不适用，不得读成通过")
+        return
+    if unresolved:
+        print(f"  [FAIL] 抽出 {len(selectors)} 条场景根选择器，"
+              f"{len(unresolved)} 条解析不到")
+    else:
+        r.ok(f"场景根选择器核对：抽出 {len(selectors)} 条、全部解析到页面元素 id"
+             f"（模板形态 {len(templates)} 处未计入）", check_id="scene_root_selector")
+
+
 def check_design_rules(html_path: Path, r: PreflightResult):
     """Check for known design anti-patterns that cause visual quality issues."""
     print("\n[8/12] Design Rules")
@@ -3320,6 +3654,8 @@ def main():
     check_scene_insert(html_path, r)
     check_transition_occlusion(html_path, r)
     check_visual_form(html_path, cfg or pre_cfg, config_path, r)
+    check_emphasis_forms(html_path, cfg or pre_cfg, config_path, r)
+    check_scene_root_selectors(html_path, r)
     check_incremental_eligibility(html_path, cfg or pre_cfg, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)
