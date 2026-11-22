@@ -424,7 +424,7 @@ def choreography_preview_lines(html_path):
     preview_report，渲染前可见——决策点前移，不新增门禁。
 
     口径与文案**单源**住 `choreography_profile.measure()` / `format_line()`：
-    本函数只接线，并按 measure 已给出的逐场字段挑覆盖率最低/无推进最长的三场，
+    本函数只接线，并按 measure 已给出的逐场字段挑推进/信息层两组的最低覆盖与最长空段三场，
     不复制阈值、不自算覆盖率与中位（同 `frame_occupancy`/`layout_fullness` 的取舍）。
 
     边界：不设阈值、不进 issues、不改退出码（2026-10-10 常设裁定）。
@@ -468,6 +468,13 @@ def choreography_preview_lines(html_path):
         lines.append("    覆盖率最低三场：" + low)
     if gap:
         lines.append("    最长无推进三场：" + gap)
+    # 2026-11-22 换尺：整列亚像素位移与装饰循环同样涨推进腿，信息层两榜须并列点名
+    info_low = _bottom("coverage_info")
+    info_gap = _bottom("info_gap_max_s", reverse=True, unit="{:.2f}s")
+    if info_low:
+        lines.append("    信息层覆盖最低三场：" + info_low)
+    if info_gap:
+        lines.append("    最长无信息层变化三场：" + info_gap)
     return lines
 
 
@@ -838,6 +845,186 @@ def write_bar_overflow_record(temp_dir, status, findings, meta, report_lines=Non
                                report_lines=report_lines, decision=decision)
 
 
+# ── 绘制盒压他人文字（运行时几何）判据：取数在 preview_capture.js，裁定在此 ──────────
+#
+# 存在理由（2026-11-22 使用者逐场裁定）：看片点名的 6 处缺陷里有 3 处是**运行时两两几何**
+# 问题——芯片压相邻词、进度线穿过正文、章级标识与首行零间距。既有预览四判据量的是
+# 元素**自身**盒（安全区／文字塌陷／柱溢出／密度），静态面 7j 量的是 CSS 声明是否外扩，
+# 没有一条量"这个盒此刻到底盖住了谁的字"。
+#
+# 判据量的是**被盖住的字形枚数**而不是相交面积——这条由实测定，不是偏好：
+# 真缺陷 `.kw-chip` 压相邻词的相交只有 186px²，而合法底衬与字的相交动辄上万 px²，
+# 面积既不能排序也不能设地板（首版地板 200px² 当场把这枚缺陷筛掉）。
+#
+# 定档＝**只点名不阻断**（`BOX_OVERLAP_BLOCKS=False`，刻意不进退出码）。落地前普查 13 个
+# 对象（12 支已交付／已验收项目＋本仓某支项目的**修前副本**），命中分布：
+#   · 修前副本 6 对（最多一对盖住 16/16 枚字）／同项目**修后** 132 组候选 0 对
+#     ⇒ 区分力实测成立，不是"永远红"也不是"永远绿"的判据；
+#   · 已交付项目 2 支各 2 对有命中：`wall-door-opening-node` 的两处动画容器各盖住
+#     `div.fig-cap` 图注 10/10 字（alpha=1）；另一支高隔声隔墙项目的 2 枚 `span.kw-chip`
+#     压本场标题各 1 枚字（alpha=0.45）——后者与静态面 7j 在同一支项目上点名的
+#     `.kw-chip` 负外扩**同向命中**，两条独立取数面指向同一枚病灶。
+# 按 7g/7i/7j 同一条纪律：会在已验收交付上判红的判据不得升为阻断。
+# 翻转前置（唯一一条）：上述 4 对经使用者逐条裁定「确为缺陷且修法不牵连其它构图」，
+# 届时须同时回答四态给法与会错杀哪些既有交付。
+BOX_OVERLAP_REQUIRED_KEYS = ("min_overlap_px", "min_covered_glyphs", "min_marks")
+BOX_OVERLAP_RECORD_NAME = "_box_overlap_check.json"
+BOX_OVERLAP_BLOCKS = False      # 见上方定档；用例锁住这条边界，不得随手改成 True
+
+
+def load_box_overlap_rules(rules_path=None):
+    """读 config/quality/video_quality_rules.json → box_overlap 节，返回 (rules, 归因)。
+
+    fail-closed 与 bar_overflow 同判据：缺文件／不可解析／缺节／缺键／值不可解析一律
+    (None, 点名断在哪条腿)。**不设默认阈值**——三项里任一被兜底成常量，报告面就会把
+    "配置没接上"读成"按某个数字查过且干净"。合法域取**正数**：min_overlap_px=0 会把
+    一切亚像素贴边纳入候选，min_covered_glyphs=0 则让门禁永不触发，两个方向都不可用。
+    """
+    path = Path(rules_path) if rules_path else QUALITY_DIR / "video_quality_rules.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, f"配置文件缺失：{path}"
+    except (OSError, ValueError) as e:
+        return None, f"配置文件不可解析：{path.name}（{type(e).__name__}: {e}）"
+    section = data.get("box_overlap") if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        return None, f"{path.name} 缺 box_overlap 节（阈值断链，不得按猜测值裁定）"
+    missing = [k for k in BOX_OVERLAP_REQUIRED_KEYS if k not in section]
+    if missing:
+        return None, f"{path.name} → box_overlap 缺必需键 {missing}"
+    rules = {}
+    for key in BOX_OVERLAP_REQUIRED_KEYS:
+        raw = section[key]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None, f"{path.name} → box_overlap.{key} 不可解析为数值：{raw!r}"
+        if not (value > 0 and value < float("inf")):
+            return None, (f"{path.name} → box_overlap.{key} 非法（须有限正数）：{raw!r}")
+        rules[key] = value
+    return rules, None
+
+
+def adjudicate_box_overlap(ovl, rules):
+    """四态裁定 → (status, 报告行列表, findings, meta)。
+
+    findings 判据：`covered_glyphs ≥ min_covered_glyphs` **且** `covered_marks ≥ min_marks`。
+    `covered_glyphs` 是 JS 侧逐字符 Range 盒 × `elementsFromPoint` 绘制栈序（绘制盒在
+    该文字的 run 之上）实测出来的枚数，不是估算。
+
+    未测面（各自点名，均不得读成通过）：
+      ① 段缺失／不是对象／status_hint（取数没跑成）；
+      ② `has_timeline=false`：页面无全局 `tl` 时 seek 是空操作，各采样点量的是同一帧
+         中间态，"每条都在"是伪证据；
+      ③ `stack_missing=true` 的行：该浏览器无 `elementsFromPoint`，层叠顺序无从判定。
+    对象为 0（一个候选对都没有）判 NOT_APPLICABLE，不判 PASS。
+    """
+    minG = rules["min_covered_glyphs"]
+    minM = rules["min_marks"]
+    floor = rules["min_overlap_px"]
+    label = (f"阈值：几何相交 ≥ {floor:g}px² 进候选，被盖字形 ≥ {minG:g} 枚"
+             f"且在 ≥ {minM:g} 个稳态采样点成立 判缺陷")
+    if ovl is None:
+        return (gs.UNTESTED,
+                [f"  [BOX-OVERLAP] UNTESTED — 捕获脚本未产出 box_overlap 段"
+                 f"（脚本版本不符或该步未跑），本项无从裁定；{label}"], [], {})
+    if not isinstance(ovl, dict):
+        return (gs.UNTESTED,
+                [f"  [BOX-OVERLAP] UNTESTED — box_overlap 段不是对象（实取 "
+                 f"{type(ovl).__name__}）；{label}"], [], {"reason": "not_mapping"})
+    hint = ovl.get("status_hint")
+    if hint:
+        why = {"measure_failed": "取数异常 " + str(ovl.get("error")),
+               "no_time_source": "页面无 S-block／T-block 且 config 无场景窗口，"
+                                 "稳态采样时刻无从落位",
+               "threshold_not_passed": "调用方未下传取数地板 min_overlap_px"
+                                       "（取数侧刻意不设缺省值）"}.get(hint, str(hint))
+        return gs.UNTESTED, [f"  [BOX-OVERLAP] UNTESTED — {why}；{label}"], [], dict(ovl)
+    if not ovl.get("has_timeline"):
+        return (gs.UNTESTED,
+                [f"  [BOX-OVERLAP] UNTESTED — 页面无全局 `tl`，seek 为空操作："
+                 f"各采样点量到的是同一帧中间态，两两遮挡的复现性无从裁定；{label}"],
+                [], {"reason": "no_seek"})
+
+    raw_pairs = ovl.get("pairs", [])
+    if not isinstance(raw_pairs, list):
+        return (gs.UNTESTED,
+                [f"  [BOX-OVERLAP] UNTESTED — box_overlap.pairs 不是列表（实取 "
+                 f"{type(raw_pairs).__name__}）；{label}"], [], {"reason": "pairs_not_list"})
+
+    def _num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+    pairs, unreadable, stackblind = [], [], 0
+    for n in raw_pairs:
+        if not isinstance(n, dict):
+            unreadable.append((str(n)[:24], "行不是对象"))
+            continue
+        g = _num(n.get("covered_glyphs"))
+        m = _num(n.get("covered_marks"))
+        if g is None or m is None:
+            unreadable.append((str(n.get("paint", "?"))[:36], "缺 covered_glyphs/covered_marks"))
+            continue
+        if n.get("stack_missing"):
+            stackblind += 1
+        pairs.append(dict(n, _g=g, _m=m))
+
+    findings = [p for p in pairs if p["_g"] >= minG and p["_m"] >= minM]
+    meta = {"time_src": ovl.get("time_src"), "samples": ovl.get("samples"),
+            "scenes_seen": ovl.get("scenes_seen"), "candidates": len(pairs),
+            "distinct_pairs": ovl.get("distinct_pairs"),
+            "pe_forced": sum(1 for p in pairs if p.get("paint_pe_none")),
+            "stack_blind": stackblind, "unreadable": len(unreadable),
+            "thresholds": dict(rules), "blocks": BOX_OVERLAP_BLOCKS}
+    head = (f"  [BOX-OVERLAP] 时刻源={ovl.get('time_src')} 采样 {ovl.get('samples')} 次 "
+            f"在场场景 {ovl.get('scenes_seen')} 个 候选对 {len(pairs)} 组（{label}）")
+    if findings:
+        tag = "FAIL" if BOX_OVERLAP_BLOCKS else "FAIL（本项定档＝只点名不阻断，见 AGENTS 门禁表）"
+        lines = [f"  [BOX-OVERLAP] {tag} — {len(findings)} 对「绘制盒盖住他人文字」"] + [head]
+        for p in sorted(findings, key=lambda x: (-x["_g"], -x["_m"]))[:12]:
+            chars = "".join(str(h.get("ch", "")) for h in (p.get("hit_glyphs") or [])[:8])
+            lines.append(
+                f"    ✗ {p.get('scene')} @{p.get('at_worst', p.get('at_first'))}s "
+                f"`{p.get('paint')}` 盖住 `{p.get('ink')}` 的 "
+                f"{int(p['_g'])}/{p.get('glyphs')} 枚字形（{chars or '—'}），"
+                f"复现 {int(p['_m'])}/{p.get('marks')} 采样点，最大单字 {p.get('worst_glyph_px')}px²")
+        lines.append("    -> 修向＝把绘制盒收进自己的盒内（负 left/right 换自身 padding）／"
+                     "把常驻线收进内容带外／抬高内容起始线；不要靠调 z-index 把字藏到下面")
+        if stackblind:
+            lines.append(f"    · 另有 {stackblind} 组无 elementsFromPoint 证据（无从判定层叠顺序）")
+        return gs.FAIL, lines, findings, meta
+    if unreadable:
+        detail = "；".join(f"{k}（{why}）" for k, why in unreadable[:10])
+        return (gs.UNTESTED,
+                [f"  [BOX-OVERLAP] UNTESTED — {len(unreadable)} 组候选缺核心读数：{detail}"
+                 f"（取数面与裁定面字段名不一致）；{label}"], [], meta)
+    if stackblind:
+        return (gs.UNTESTED,
+                [f"  [BOX-OVERLAP] UNTESTED — {stackblind} 组候选所在浏览器取不到绘制栈"
+                 f"（elementsFromPoint 不可用），层叠顺序无从裁定；{label}"], [], meta)
+    if not pairs:
+        return (gs.NOT_APPLICABLE,
+                [f"  [BOX-OVERLAP] NOT_APPLICABLE — 测量面无候选对（几何相交 ≥ {floor:g}px² 的"
+                 f"「绘制盒 × 他人字形」组合 0 组），本项不裁定也不计通过"] + [head], [], meta)
+    pe = meta["pe_forced"]
+    return (gs.PASS,
+            [f"  [BOX-OVERLAP] PASS — {len(pairs)} 组候选均未把绘制盒压到他人字形上"
+             + (f"（其中 {pe} 组的绘制盒声明了 pointer-events:none，"
+                f"取数时临时置 auto 后测得，测毕还原）" if pe else "")] + [head],
+            [], meta)
+
+
+def write_box_overlap_record(temp_dir, status, findings, meta, report_lines=None, decision=None):
+    """box_overlap 裁定留痕（_box_overlap_check.json）——语义见 _write_check_record。"""
+    return _write_check_record(BOX_OVERLAP_RECORD_NAME, temp_dir, status, findings, meta,
+                               report_lines=report_lines, decision=decision)
+
+
 def _thumb_size(png_bytes):
     """按截图实测宽高比选缩略图尺寸（竖版 1080×1920 压成 480×270 会失真到不可用）。"""
     from PIL import Image
@@ -1029,6 +1216,11 @@ def main():
     parser.add_argument("--bar-overflow-rules", default=None,
                         help="覆盖 bar_overflow 阈值文件路径（回归取证用；默认读 "
                              "config/quality/video_quality_rules.json 单一权威源）")
+    # 刻意**没有** --accept-box-overlap-*：本判据定档为只点名不阻断（FAIL 与 UNTESTED 都不
+    # 参与退出码），既然不阻断就不存在"放行"这一动作——加一个用不到的开关即假结构。
+    parser.add_argument("--box-overlap-rules", default=None,
+                        help="覆盖 box_overlap 阈值文件路径（回归取证用；默认读 "
+                             "config/quality/video_quality_rules.json 单一权威源）")
     parser.add_argument("--times", default=None,
                         help="额外按绝对秒抽帧（逗号分隔，如 62.5,88）。产出为组合画布全幅 PNG，"
                              "落项目 temp 的 preview_frame_<秒>.png；服务场首/场尾两点盖不到的"
@@ -1168,6 +1360,20 @@ def main():
         bar_status = gs.NOT_APPLICABLE
         bar_lines = ["  [BAR-OVERFLOW] NOT_APPLICABLE — 本次只跑密度分析"
                      "（--density-only 不启动截图，容器几何取数无对象）"]
+    # 绘制盒压他人文字：同判据先读阈值。本项定档为只点名不阻断，故不参与退出码，
+    # 但阈值断链仍要显式判 UNTESTED 并点名——"没配置"不得读成"查过且干净"，也不得读成"没这项检查"。
+    ovl_rules, ovl_rules_reason = load_box_overlap_rules(args.box_overlap_rules)
+    ovl_status = None
+    ovl_lines = []
+    ovl_findings = []
+    ovl_meta = {"thresholds": ovl_rules}
+    if ovl_rules is None:
+        ovl_status = gs.UNTESTED
+        ovl_lines = [f"  [BOX-OVERLAP] UNTESTED — 阈值断链：{ovl_rules_reason}"]
+    elif args.density_only:
+        ovl_status = gs.NOT_APPLICABLE
+        ovl_lines = ["  [BOX-OVERLAP] NOT_APPLICABLE — 本次只跑密度分析"
+                     "（--density-only 不启动截图，两两几何与绘制栈取数无对象）"]
     if not args.density_only:
         print("\n--- Phase 2: Chrome Screenshots (puppeteer-core) ---")
 
@@ -1250,6 +1456,10 @@ def main():
                 cmd += [f"--fit-min-cpl={text_fit_rules['min_chars_per_line']:g}",
                         f"--fit-min-lines={text_fit_rules['min_lines']:g}",
                         f"--fit-min-chars={text_fit_rules['min_chars']:g}"]
+            # 取数地板同样下传（权威源读者在 Python，取数侧无缺省值）：两侧字面不一致
+            # 即静默回吐 threshold_not_passed，这一态由 adjudicate 判 UNTESTED 并点名。
+            if ovl_rules is not None:
+                cmd += [f"--overlap-min-px={ovl_rules['min_overlap_px']:g}"]
             # 时刻值随命令行下传（取数在 node、裁定在此）；两侧字面必须一致，
             # 改名而不改对面＝静默不出图（用例87 D12 段锁同一枚字面）
             if extra_times:
@@ -1312,6 +1522,15 @@ def main():
                             manifest.get("bar_overflow"), bar_rules)
                         bar_meta.update(_bar_meta)
                     for line in bar_lines:
+                        print(line)
+
+                    # 绘制盒压他人文字裁定：同一次 node 调用取回的绘制栈证据，裁定面在此。
+                    # 阈值断链时不进 adjudicate（判完的项不得再走一遍取数，同 text_fit/bar）。
+                    if ovl_rules is not None:
+                        ovl_status, ovl_lines, ovl_findings, _ovl_meta = adjudicate_box_overlap(
+                            manifest.get("box_overlap"), ovl_rules)
+                        ovl_meta.update(_ovl_meta)
+                    for line in ovl_lines:
                         print(line)
 
                     # 留白描述面（不裁定）：同一次 node 调用取回的几何盒，
@@ -1424,6 +1643,18 @@ def main():
         bar_record_path = None
         print(f"  [BAR-OVERFLOW] 留痕写入失败（不影响裁定，影响追溯）: {e}")
 
+    # 同族兜底：box_overlap 随同一次 node 调用取数，未跑成时补 UNTESTED 并点名。
+    if ovl_status is None:
+        ovl_status = gs.UNTESTED
+        ovl_lines = ["  [BOX-OVERLAP] UNTESTED — 捕获脚本未成功返回，box_overlap 取数无落盘证据"]
+        print(ovl_lines[0])
+    try:
+        ovl_record_path = write_box_overlap_record(
+            temp_dir, ovl_status, ovl_findings, ovl_meta, report_lines=ovl_lines)
+    except OSError as e:
+        ovl_record_path = None
+        print(f"  [BOX-OVERLAP] 留痕写入失败（不影响裁定，影响追溯）: {e}")
+
     if not fullness_lines:
         fullness_lines = layout_fullness_lines(None)
         for line in fullness_lines:
@@ -1515,6 +1746,15 @@ def main():
                            f"{bar_decision}）" if bar_decision else ""))
     if bar_record_path is not None:
         report_lines.append(f"  留痕: {bar_record_path}")
+
+    # Box overlap（绘制盒盖住他人字形：运行时几何判据，定档＝只点名不阻断）
+    report_lines.append("")
+    report_lines.append("== Box Overlap (绘制盒压他人文字) ==")
+    report_lines.extend(ovl_lines)
+    report_lines.append(f"  状态: {ovl_status}"
+                        f"（本项不阻断、无放行开关；翻转前置与普查读数见 AGENTS 门禁表同名行）")
+    if ovl_record_path is not None:
+        report_lines.append(f"  留痕: {ovl_record_path}")
 
     # Layout fullness（描述面，2026-11-11 复盘批）：留白在渲染前可见，不裁定
     if fullness_lines:

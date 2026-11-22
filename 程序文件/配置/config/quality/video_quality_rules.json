@@ -24,5 +24,11 @@
   "cue_placement": {
     "min_observable_offset_chars": 6,
     "description": "词级 cue 落点预检（cue_resolve.py --narration）的『差值偏弱』档位：段内字数偏移低于此值即判『挂 cue 等于没挂』，只 WARN 不降格（它不是违规）。单位是**字数**，不换算成秒——预检面零 ASR 零渲染，拿不到真实秒。取值依据：2026-10-12 一支真实交付 27 条 cue 的实测回归斜率 4.76 字/秒，踩坑清单另记 3.87–3.95 区间；按最慢档折算，6 字 ≈ 1.5s，落在可观测边界之上。2026-10-16 单源收敛：该值此前只住 cue_resolve.py:405 的常量，注释与 AGENTS.md 的换算率各写一份（4.0 / 4.76），现阈值入本节，常量降为取不回时的兜底并打印归因。"
-  }
+  },
+  "box_overlap": {
+    "min_overlap_px": 24,
+    "min_covered_glyphs": 1,
+    "min_marks": 1
+  },
+  "$box_overlap_note": "绘制盒压他人文字（预览期运行时判据，2026-11-22 使用者逐场裁定换来）。min_overlap_px＝取数地板（px²，几何相交低于此不进候选；刻意取小值——真缺陷 .kw-chip 压相邻词的实测相交只有 186px²，而合法底衬与字的相交动辄上万，面积大不得当缺陷证据）。min_covered_glyphs＝裁定阈值：被盖住的**字形枚数**（逐字符 Range 盒 × elementsFromPoint 绘制栈序判定在上），这是观众实际看到的量，也是修前/修后有区分力的那一维（修前副本 6 对/最多 16 枚字，修后同项目 0 对）。min_marks＝该对须在几个稳态采样点成立；取 1 是实测决定的——每场只有 2 个稳态采样点，取 2 会把 s5/s6 的芯片压字一并筛掉（marks=1），复现性另有 covered_marks 透出供人读。本件不进退出码（定档见 instant_preview.adjudicate_box_overlap docstring 与 AGENTS 门禁表）。"
 }

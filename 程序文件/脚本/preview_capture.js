@@ -418,6 +418,267 @@ async function measureLayoutFill(page, fallbackWindows) {
     };
 }
 
+/**
+ * 绘制盒压在他人文字上的取数面（2026-11-22；判据住在 instant_preview.py，本函数只取数）。
+ *
+ * 为什么在预览里加这一条：使用者看片点名的缺陷 #3「关键词高亮后与相邻文字重叠」与
+ * #4「进度线穿过正文」都是**运行时几何**问题，静态面（7j）只能问"盒的 CSS 声明是否外扩"，
+ * 问不出"这个盒此刻到底盖住了谁的字"。既有三条预览判据量的是元素**自身**盒
+ * （安全区／文字塌陷／柱溢出），一条都不量**两两之间**的遮挡。
+ *
+ * 三条窄化（都由本仓实测换来；②③的初版写法被实测推翻，写法与后果一并留在括号里）：
+ *  ① **有效可见性走祖先链**：只看元素自身 opacity 会把藏在未揭示容器里的子元素算成在场
+ *     （首版即因此凭空造出 3 条假相交）。
+ *  ② **同 run 豁免**：绘制盒的父亲恰好是该文字所属的 run ⇒ 它是给**自己这个词**做的高亮底，
+ *     属设计意图。（初版写的是"互不为祖先"，那条把真缺陷整类摘掉了：`.kw-chip` 因
+ *     left/right 负外扩压到的是同一段落里**相邻词**的字，那个字的 run 是 `<p>`、芯片的
+ *     父亲是 `.kw`，二者互为后代即被豁免 ⇒ 修前副本 covering 恒 0、与修后逐字相同＝空跑。）
+ *  ③ **层叠由浏览器绘制栈序裁定**（`elementsFromPoint` 自上而下比索引）：底衬／卡片背景
+ *     在字之下 ⇒ 栈里 run 先于绘制盒 ⇒ 不计；纯几何相交在本仓不可用（某支已交付项目
+ *     248 组候选中合法底衬占绝大多数）。
+ *     （初版用 `elementFromPoint` 单元素＋祖先链判"字在上层"，后果是**同一 run 内的绘制盒
+ *     永远被豁免**——文字自己没有盒，命中链里必然含它那个 `<p>`，芯片压字形态结构性看不见。）
+ *
+ * `pointer-events:none` 的覆盖层不进命中栈（glow 类装饰层常这么写）。本函数不猜它盖没盖、
+ * 也不放弃这一腿：测量期间把该元素自身临时置 `auto`、测毕在 finally 里立即还原，
+ * 并在行上标 `paint_pe_none`，由 Python 侧把"这条读数是强制取到的"如实声明——
+ * 直接撤掉这一腿才是把"我没测到"写成"没有"（A06 同族）。
+ *
+ * @param {object} opts  minAreaPx：几何地板（px²），低于此属描边级贴边，不回报。
+ *                       阈值裁定不在 JS：这里只做候选枚举与命中测试。
+ */
+async function measureBoxOverlap(page, opts, fallbackWindows) {
+    const sampling = await computeSampleState(page, fallbackWindows);
+    if (sampling.timeSrc === 'none') {
+        return { status_hint: 'no_time_source', samples: 0, scenes_seen: 0, pairs: [] };
+    }
+    const acc = {};
+    let scenesSeen = 0;
+    for (const t of sampling.times) {
+        const rows = await page.evaluate(({ time, minArea }) => {
+            if (typeof tl !== 'undefined' && tl && tl.seek) {
+                tl.seek(time, false);
+                if (typeof gsap !== 'undefined') gsap.ticker.tick();
+            }
+            const chain = (el) => {           // 祖先链（含自身），命中测试证据比对用
+                const out = [];
+                for (let n = el; n && n !== document.documentElement; n = n.parentElement) out.push(n);
+                return out;
+            };
+            const stackAt = (x, y) => {
+                // elementsFromPoint 返回该点**按绘制序自上而下**的完整元素栈。
+                // 用栈而不是 elementFromPoint 的单个顶元素：文字自己没有盒，
+                // 它所在的那个 run（文本节点的父元素）与绘制盒常常有共同祖先，
+                // 单元素命中时"链里含 run"会把"芯片在字之上"洗成"字在上层"——
+                // 首版即此误：真缺陷副本 covering 恒 0，修前修后读数逐字相同＝空跑。
+                const f = document.elementsFromPoint || document.webkitElementsFromPoint;
+                return f ? f.call(document, x, y) : null;
+            };
+            const effOpacity = (el) => {
+                let o = 1;
+                for (const n of chain(el)) {
+                    const cs = getComputedStyle(n);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return 0;
+                    o *= parseFloat(cs.opacity || '1');
+                }
+                return o;
+            };
+            const idOf = (el) => {
+                if (el.id) return '#' + el.id;
+                const cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).filter(Boolean);
+                return el.tagName.toLowerCase() + (cls.length ? '.' + cls.slice(0, 2).join('.') : '');
+            };
+            const roots = [];
+            for (const r of document.querySelectorAll('[data-scene-id], [id^="scene"]')) {
+                if (effOpacity(r) >= 0.5) roots.push(r);
+            }
+            const out = [];
+            for (const root of roots) {
+                const scene = root.getAttribute('data-scene-id')
+                    || (root.id && root.id.startsWith('scene') ? 's' + root.id.slice(5) : '?');
+                const inks = [], paints = [];
+                for (const el of root.querySelectorAll('*')) {
+                    if (el.tagName === 'BR' || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') continue;
+                    const op = effOpacity(el);
+                    if (op < 0.5) continue;
+                    const cs = getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 2 || rect.height < 2) continue;
+                    // 承载可读文字：只取**直接文本节点**的实测行盒（Range），不取元素盒——
+                    // 元素盒含 padding/行距，会把"没压到字、只压到行空隙"也算成压字。
+                    for (const c of el.childNodes) {
+                        if (c.nodeType !== 3 || !c.data || !c.data.trim()) continue;
+                        const rg = document.createRange();
+                        rg.selectNodeContents(c);
+                        for (const r of Array.from(rg.getClientRects())) {
+                            if (r.width > 6 && r.height > 6) {
+                                inks.push({ owner: el, node: c, r: r,
+                                            text: c.data.trim().slice(0, 24), op: op });
+                            }
+                        }
+                    }
+                    const bg = cs.backgroundColor;
+                    const bgAlpha = !bg || bg === 'transparent' ? 0
+                        : (bg.startsWith('rgba') ? parseFloat(bg.split(',')[3]) : 1);
+                    const hasBgImg = cs.backgroundImage && cs.backgroundImage !== 'none';
+                    const border = ['Top', 'Right', 'Bottom', 'Left']
+                        .reduce((s, k) => s + (parseFloat(cs['border' + k + 'Width']) || 0), 0);
+                    const tag = el.tagName.toLowerCase();
+                    const media = ['img', 'canvas', 'video', 'svg', 'rect', 'path', 'line',
+                                   'polygon', 'polyline'].includes(tag);
+                    if (bgAlpha > 0.02 || hasBgImg || border > 0 || media) {
+                        paints.push({
+                            el: el, r: rect, name: idOf(el), op: op,
+                            pe: cs.pointerEvents, fillAlpha: bgAlpha,
+                        });
+                    }
+                }
+                for (const p of paints) {
+                    for (const q of inks) {
+                        const run = q.node ? q.node.parentElement : q.owner;
+                        if (!run || p.el === run) continue;
+                        // 同一个 run 内部的绘制盒＝该词自己的高亮底，是设计意图。
+                        // 判据问的是"它盖住了**别人**的字"：`.kw-chip` 盖住自己「盖章」两字合法，
+                        // 因 left/right 负外扩而盖到相邻句末那个字则是缺陷（使用者点名的图三）。
+                        if (p.el.parentElement === run) continue;
+                        const x1 = Math.max(p.r.left, q.r.left), y1 = Math.max(p.r.top, q.r.top);
+                        const x2 = Math.min(p.r.right, q.r.right), y2 = Math.min(p.r.bottom, q.r.bottom);
+                        const w = x2 - x1, h = y2 - y1;
+                        if (!(w > 0 && h > 0) || w * h < minArea) continue;
+                        // 廉价的"这一对里有没有字真的在绘制盒下面"预筛（用整行盒，不逐字）
+                        let pairAbove = 0, pairTotal = 0;
+                        const nx = Math.max(2, Math.min(4, Math.round(w / 24)));
+                        const ny = Math.max(2, Math.min(4, Math.round(h / 24)));
+                        let stackMissing = false;
+                        const compare = (px, py) => {
+                            const st = stackAt(px, py);
+                            if (st === null) { stackMissing = true; return 'unknown'; }
+                            const ip = st.indexOf(p.el);
+                            const ir = st.indexOf(run);
+                            if (ip < 0) return 'below';
+                            if (ir < 0) return 'unknown';
+                            return ip < ir ? 'above' : 'below';
+                        };
+                        for (let ix = 0; ix < nx; ix++) {
+                            for (let iy = 0; iy < ny; iy++) {
+                                const r0 = compare(x1 + (ix + 0.5) * w / nx, y1 + (iy + 0.5) * h / ny);
+                                if (r0 === 'unknown') continue;
+                                pairTotal += 1;
+                                if (r0 === 'above') pairAbove += 1;
+                            }
+                        }
+                        // 逐字细化（只对预筛已判"在上"的候选跑，成本受控）：
+                        // **面积类判据在本仓不可用**——真缺陷 `.kw-chip` 压相邻词的实测相交
+                        // 只有 6×31＝186px²，而合法底衬与字的相交动辄上万 px²；按面积排序会把
+                        // 缺陷排到噪声后面，按面积设地板（首版 200px²）则当场把这枚缺陷筛掉。
+                        // 观众看到的是"几个字被盖住"，所以取数面直接量它。
+                        let glyphs = 0, coveredGlyphs = 0, worstGlyphPx = 0, unknownPts = 0;
+                        const hitGlyphs = [];
+                        if (pairAbove > 0 && q.node) {
+                            // pointer-events:none 的元素**不进命中栈**（glow 类装饰层常这么写）。
+                            // 不猜它盖没盖，也不放弃这一腿：临时把它自身置 auto、测完立即还原，
+                            // 并把 pe_forced 记在行上——证据面如实说明这条读数是强制取到的。
+                            let forced = false;
+                            if (p.pe === 'none') { p.el.style.pointerEvents = 'auto'; forced = true; }
+                            try {
+                                for (let i = 0; i < q.node.data.length; i++) {
+                                    const chr = q.node.data[i];
+                                    if (!chr || !chr.trim()) continue;
+                                    const rg = document.createRange();
+                                    try { rg.setStart(q.node, i); rg.setEnd(q.node, i + 1); }
+                                    catch (e) { continue; }
+                                    for (const gr of Array.from(rg.getClientRects())) {
+                                        if (gr.width < 2 || gr.height < 2) continue;
+                                        glyphs += 1;
+                                        const gx1 = Math.max(p.r.left, gr.left);
+                                        const gy1 = Math.max(p.r.top, gr.top);
+                                        const gx2 = Math.min(p.r.right, gr.right);
+                                        const gy2 = Math.min(p.r.bottom, gr.bottom);
+                                        const gw = gx2 - gx1, gh = gy2 - gy1;
+                                        if (!(gw > 0 && gh > 0)) continue;
+                                        const area = gw * gh;
+                                        // 8% 字形盒——取数口径（"这枚字有没有被碰到"），不是裁定阈值；
+                                        // 裁定（几枚字算缺陷）住 config，由 instant_preview.py 判
+                                        if (area < 2 || area / (gr.width * gr.height) < 0.08) continue;
+                                        let top = 0, tot = 0;
+                                        for (let k = 0; k < 3; k++) {
+                                            const c0 = compare(gx1 + (k + 0.5) * gw / 3, (gy1 + gy2) / 2);
+                                            if (c0 === 'unknown') { unknownPts += 1; continue; }
+                                            tot += 1;
+                                            if (c0 === 'above') top += 1;
+                                        }
+                                        if (tot && top / tot >= 0.5) {
+                                            coveredGlyphs += 1;
+                                            worstGlyphPx = Math.max(worstGlyphPx, Math.round(area));
+                                            if (hitGlyphs.length < 6) {
+                                                hitGlyphs.push({ i: i, ch: chr, px: Math.round(area) });
+                                            }
+                                        }
+                                    }
+                                }
+                            } finally {
+                                if (forced) p.el.style.pointerEvents = '';
+                            }
+                        }
+                        out.push({
+                            scene: scene, at: time, paint: p.name, ink: idOf(run),
+                            text: q.text, overlap_px: Math.round(w * h),
+                            samples: pairTotal, covered: pairAbove,
+                            stack_missing: stackMissing, unknown_pts: unknownPts,
+                            glyphs: glyphs, covered_glyphs: coveredGlyphs,
+                            worst_glyph_px: worstGlyphPx, hit_glyphs: hitGlyphs,
+                            paint_pe_none: p.pe === 'none',
+                            paint_alpha: +(p.op * (p.fillAlpha || 1)).toFixed(3),
+                        });
+                    }
+                }
+            }
+            return { rows: out, scenes: roots.length };
+        }, { time: t, minArea: opts.minAreaPx });
+        scenesSeen = Math.max(scenesSeen, rows.scenes || 0);
+        for (const r of rows.rows) {
+            const key = [r.scene, r.paint, r.ink, r.text].join('|');
+            if (!acc[key]) {
+                acc[key] = { ...r, marks: 0, covered_marks: 0, worst_cover_ratio: 0,
+                             overlap_px_max: r.overlap_px, at_first: r.at,
+                             covered_glyphs_max: 0 };
+            }
+            const a = acc[key];
+            a.marks += 1;
+            const ratio = r.samples ? r.covered / r.samples : 0;
+            a.worst_cover_ratio = Math.max(a.worst_cover_ratio, ratio);
+            if (ratio >= 0.5) a.covered_marks += 1;
+            a.overlap_px_max = Math.max(a.overlap_px_max, r.overlap_px);
+            a.paint_pe_none = a.paint_pe_none || r.paint_pe_none;
+            // 被盖字形数取各采样点的**峰值**（不是求和）：同一枚字在 6 个采样点都被盖，
+            // 观众看到的是 1 个字被盖，求和会把它读成 6 个。
+            if ((r.covered_glyphs || 0) > (a.covered_glyphs_max || 0)) {
+                a.covered_glyphs_max = r.covered_glyphs;
+                a.glyphs = r.glyphs;
+                a.worst_glyph_px = r.worst_glyph_px;
+                a.hit_glyphs = r.hit_glyphs;
+                a.at_worst = r.at;
+            }
+        }
+    }
+    const pairs = Object.values(acc).sort((x, y) =>
+        ((y.covered_glyphs_max || 0) - (x.covered_glyphs_max || 0))
+        || (y.overlap_px_max - x.overlap_px_max)
+        || String(x.scene).localeCompare(String(y.scene)));
+    return {
+        time_src: sampling.timeSrc,
+        // 无页面全局 tl 时 seek 是空操作——各采样点量到的是**同一个** t=0 中间态，
+        // 该形态不得进入裁定（Python 侧按未测点名），否则"每条都在"是伪证据。
+        has_timeline: !!sampling.hasTimeline,
+        samples: sampling.times.length,
+        scenes_seen: scenesSeen,
+        distinct_pairs: pairs.length,
+        covering_pairs: pairs.filter(p => (p.covered_glyphs_max || 0) > 0).length,
+        pe_none_pairs: pairs.filter(p => p.paint_pe_none).length,
+        pairs: pairs.slice(0, 300),
+    };
+}
+
 async function main() {
     const args = process.argv.slice(2);
     if (args.length < 3) {
@@ -446,6 +707,9 @@ async function main() {
         minLines: flagNumber('--fit-min-lines='),
         minChars: flagNumber('--fit-min-chars='),
     };
+    // 盒相交的几何地板同样**不给 JS 侧缺省值**：缺省即"调用方忘了接线"，
+    // 那种形态必须显式暴露成未测，而不是静默按某个数字跑出一张看起来完整的候选表。
+    const overlapMinAreaPx = flagNumber('--overlap-min-px=');
 
     // 额外时刻（--extra-times=62.5,88）：绝对秒，逐枚全幅截图。
     // 刻意不判"属于哪一场"——调用方问的是"这个时刻画面对不对"，
@@ -728,6 +992,31 @@ async function main() {
             console.error(`  [LAYOUT-FILL] 取数异常: ${(e && e.message) || e}`);
         }
 
+        // ── 绘制盒压他人文字的取数：只取数，裁定与阈值归 instant_preview.py ──
+        // 传几何地板而不传裁定阈值：minAreaPx 决定"哪些相交根本不进候选表"（取数面入选门槛，
+        // 与 text_fit 同形），而"相交给到多少算压字"由 Python 按 config 裁定（与 bar_overflow 同形）。
+        const ovlStarted = Date.now();
+        if (overlapMinAreaPx === null) {
+            manifest.box_overlap = { status_hint: 'threshold_not_passed',
+                                     missing: ['minAreaPx(--overlap-min-px)'],
+                                     samples: 0, scenes_seen: 0, distinct_pairs: 0, pairs: [] };
+            console.log('  [BOX-OVERLAP] 取数未跑：调用方未传几何地板阈值');
+        } else {
+            try {
+                const ovl = await measureBoxOverlap(page, { minAreaPx: overlapMinAreaPx }, fitWindows);
+                manifest.box_overlap = ovl;
+                console.log(`  [BOX-OVERLAP] 时刻源=${ovl.time_src || 'none'} `
+                    + `采样 ${ovl.samples} 次，在场场景 ${ovl.scenes_seen} 个，`
+                    + `候选对 ${ovl.distinct_pairs} 组`
+                    + `（${((Date.now() - ovlStarted) / 1000).toFixed(1)}s）`);
+            } catch (e) {
+                manifest.box_overlap = { status_hint: 'measure_failed',
+                                         error: String((e && e.message) || e),
+                                         samples: 0, scenes_seen: 0, distinct_pairs: 0, pairs: [] };
+                console.error(`  [BOX-OVERLAP] 取数异常: ${(e && e.message) || e}`);
+            }
+        }
+
         // Write manifest
         const manifestPath = path.join(outputDir, 'capture_manifest.json');
         fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -756,5 +1045,8 @@ if (require.main === module) {
     });
 }
 
-module.exports = { measureTextFit, measureBarOverflow, measureLayoutFill, computeSampleState };
+module.exports = {
+    measureTextFit, measureBarOverflow, measureLayoutFill, measureBoxOverlap,
+    computeSampleState,
+};
 

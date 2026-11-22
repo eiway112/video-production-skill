@@ -22827,10 +22827,13 @@ def test_layout_fullness_descriptive_face() -> RegressionTestCase:
                        "C1 旧「底沿空占比」口径不得残留（两套口径并存即两份真相）")
 
         js = (script_dir / "preview_capture.js").read_text(encoding="utf-8")
+        exports = js.split("module.exports = {", 1)[-1].split("};", 1)[0]
         tc.assert_true("manifest.layout_fill = fill;" in js
                        and "measureLayoutFill(page, fitWindows)" in js
-                       and "measureLayoutFill, computeSampleState };" in js,
-                       "C2 生产取数腿须被调用、落 manifest 且对外导出（语句本体锚）")
+                       and "measureLayoutFill" in exports and "computeSampleState" in exports,
+                       "C2 生产取数腿须被调用、落 manifest 且对外导出（按导出**成员集合**判，"
+                       "不锚整行字面形状：147 批把 module.exports 拆成多行后形状锚等价改写即假红，"
+                       "与 138-M4 那条同族）")
         leg = js[js.index("async function measureLayoutFill"):js.index("async function main()")]
         tc.assert_true("860" not in leg and "1529" not in leg,
                        "C3 取数腿不得写安全线数值（分母单源在 Python 裁定侧）")
@@ -23337,6 +23340,10 @@ class RegressionTestRunner:
             test_emphasis_forms_declared_contract,
             test_scene_root_selector_resolution,
             test_preview_surfaces_choreography,
+            test_scene_window_expression_parsing,
+            test_info_layer_coverage_leg,
+            test_layout_geometry_early_presence_and_overhang,
+            test_box_overlap_glyph_coverage_adjudication,
         ]
         self.results = []
     
@@ -29838,6 +29845,19 @@ tl.to("#e",{opacity:1},T.s2+cue('s2','锚词',1.5));
             tc.assert_true("最长无推进三场：" + gap_txt in rep,
                            f"A8 最长无推进三场须按 measure 逐场值点名：期望 {gap_txt}")
 
+            # 2026-11-22 换尺：信息层两榜须同屏点名（推进腿可被整列亚像素位移与装饰循环刷分）
+            ilow = sorted(per, key=lambda s: s["coverage_info"])[:3]
+            igap = sorted(per, key=lambda s: -s["info_gap_max_s"])[:3]
+            ilow_txt = "／".join(f"{s['scene']} {s['coverage_info']:.3f}" for s in ilow)
+            igap_txt = "／".join(f"{s['scene']} {s['info_gap_max_s']:.2f}s" for s in igap)
+            tc.assert_true("信息层覆盖最低三场：" + ilow_txt in rep,
+                           f"A9 信息层覆盖最低三场须按 measure 逐场值点名：期望 {ilow_txt}")
+            tc.assert_true("最长无信息层变化三场：" + igap_txt in rep,
+                           f"A10 最长无信息层变化三场须按 measure 逐场值点名：期望 {igap_txt}")
+            tc.assert_true(bool(per) and all(s["coverage_info"] <= s["coverage_advance"] + 1e-9
+                                             for s in per),
+                           "A11 信息层腿须是推进腿的子集（逐场 info ≤ advance，否则分腿口径失效）")
+
             # ── B 断链：UNTESTED 点名，不得写 OK ──
             rc_b, out_b, rep_b = drive(NO_T, "case143_not_block")
             tc.assert_equal(rc_b, 0, f"B0 断链不得改变退出码（描述面不裁定）：{rc_b}")
@@ -29924,6 +29944,737 @@ tl.to("#e",{opacity:1},T.s2+cue('s2','锚词',1.5));
     except Exception as e:
         import traceback
         tc.mark_failed("preview_surfaces_choreography error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_scene_window_expression_parsing() -> RegressionTestCase:
+    """用例144：编排面受限表达式求值（取数面没有对象 → A06 同族，2026-11-21 观感根因批）。
+
+    存在理由（实测，非预防性）：骨架按窗长编排后写出 `T.s1+PLAY_HEAD` 与
+    `duration:sceneWindow(1)-PLAY_HEAD-PLAY_TAIL`，而解析器只认**数字偏移**的锚——实测同份
+    骨架 tweens_unparsed 由 8 涨到 20、推进覆盖只报 0.142→0.152。**判据在位而取数面没有
+    该形态的对象**：改节奏的人看到的是"几乎没变"，真实声明是 0.142→0.935。
+
+      A 求值器文法（直调）：具名常量锚／sceneWindow 差式／裸标识符场／一元负号各自精确；
+      B 不可求值一律不猜：未声明常量、函数调用、下标、三元、除零、场号不在 T 块；
+      C measure() 集成：锚与时长各单计（tweens_anchor_expr / tweens_duration_expr），
+        覆盖与最长无推进段按手算逐位钉死；跨场引用退回 unparsed 而非挑一个场；
+        求不出的时长落 default 计数，**不得按整场虚高**；
+      D 不放宽既有面：单变量锚仍走 variable_anchor（用例122 M 段语义不得被本批吃掉）；
+      E 骨架自证：templates_09 的推进覆盖与最长无推进段须达标——把"入场即静止"复发钉成回归；
+      F 描述面边界：新增键不改裁定语义、CALIBER 须携带该口径（读数须能说明自己怎么来的）。
+    """
+    tc = RegressionTestCase(
+        "scene_window_expression_parsing",
+        "验证编排面可精确解出具名常量与 sceneWindow 表达式、解不出不猜不虚高、骨架自证不被改回入场即静止"
+    )
+    try:
+        from pathlib import Path as _P
+        script_dir = _P(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import choreography_profile as cp
+
+        T = {"s1": 3.0, "s2": 23.0, "s3": 43.0}
+        win = {"s1": (3.0, 23.0), "s2": (23.0, 43.0), "s3": (43.0, 63.0)}
+        consts = {"PLAY_HEAD": 1.2, "PLAY_TAIL": 1.0}
+
+        # ── A 文法 ──
+        tc.assert_equal(cp._eval_time_expr("T.s1 + PLAY_HEAD", T, consts, win), (4.2, {"s1"}),
+                        "A1 具名常量锚须解出 (4.2, {s1})")
+        tc.assert_equal(cp._eval_time_expr("sceneWindow(1)-PLAY_HEAD-PLAY_TAIL", T, consts, win),
+                        (17.8, set()), "A2 sceneWindow 差式须解出 17.8 且不引用任何场")
+        tc.assert_equal(cp._eval_time_expr("sceneWindow(s2)", T, consts, win), (20.0, set()),
+                        "A3 场号可写成裸标识符 s2")
+        tc.assert_equal(cp._eval_time_expr("-1 + T.s2", T, consts, win), (22.0, {"s2"}),
+                        "A4 一元负号须可用")
+
+        # ── B 不可求值一律抛，交调用方按未解析点名 ──
+        for _bi, bad in enumerate(("T.s1 + NOPE", "f(1)", "a[0]", "x ? 1 : 2",
+                                   "1/0", "sceneWindow(9)"), start=1):
+            try:
+                cp._eval_time_expr(bad, T, consts, win)
+                tc.assert_true(False, f"B{_bi} 不可求值形态却返回了数值：{bad}")
+            except cp._ExprFail:
+                tc.assert_true(True, f"B{_bi} {bad} 须判不可求值而非猜一个")
+
+        # ── C measure() 集成 ──
+        import tempfile
+        head = ('<div id="root" data-duration="63"><div id="scene1" data-scene-id="s1">'
+                '</div><script>var T = { s1: 3.0, s2: 23.0, s3: 43.0 };\n'
+                'var PLAY_HEAD = 1.2;var PLAY_TAIL = 1.0;\n')
+        tail = '</script></div>'
+
+        def run(stmts):
+            with tempfile.TemporaryDirectory() as td:
+                f = _P(td) / "index.html"
+                f.write_text(head + "\n".join(stmts) + tail, encoding="utf-8")
+                return cp.measure(f)
+
+        long_pair = [
+            'tl.fromTo("#a-play",{opacity:0},{opacity:1,duration:0.4},T.s1+1.0);',
+            'tl.fromTo("#a-play-fill",{scaleX:0},{scaleX:1,duration:sceneWindow(1)'
+            '-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s1+PLAY_HEAD);',
+            'tl.fromTo("#a-play-dot",{left:"0%"},{left:"100%",duration:sceneWindow(1)'
+            '-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s1+PLAY_HEAD);',
+        ]
+        m = run(long_pair + ['tl.to("#x",{y:10,duration:0.6},T.s2+4.0);',
+                             'tl.to("#y",{y:10,duration:0.6},T.s3+4.0);'])
+        tc.assert_equal([m.get("tweens_anchor_expr"), m.get("tweens_duration_expr")], [2, 2],
+                        "C1 具名常量锚与窗长时长各须单计 2 条")
+        tc.assert_equal(m.get("tweens_unparsed"), 0,
+                        "C2 本夹具全部可解，unparsed 须归零（非恒真：B 组与 D 组另有对象）")
+        s1 = [s for s in m["per_scene"] if s["scene"] == "s1"][0]
+        tc.assert_equal(s1["coverage_advance"], 0.9,
+                        "C3 s1 覆盖须等于手算 (22.0-4.0)/20=0.9（覆盖区间合并后）")
+        tc.assert_equal(s1["advance_gap_max_s"], 1.0,
+                        "C4 s1 最长无推进段须为窗首 1.0s，窗尾已被推进线铺满")
+        tc.assert_true(cp.CALIBER.get("expr_treatment"), "C5 CALIBER 须携带该求值口径")
+
+        mx = run(['tl.to("#a",{opacity:1,duration:0.4},T.s1+1.0);',
+                  'tl.to("#z",{y:8,duration:0.6},T.s1+T.s2);',
+                  'tl.to("#w",{y:8,duration:0.6},T.s2);', 'tl.to("#v",{y:8,duration:0.6},T.s3);'])
+        tc.assert_equal([mx["tweens_unparsed"], mx["tweens_anchor_expr"]], [1, 0],
+                        "C6 跨场引用须整条退回 unparsed、既不计覆盖也不得被记成已解出")
+
+        mb = run(['tl.to("#p",{opacity:1,duration:0.5},T.s1+1.0);',
+                  'tl.to("#q",{opacity:1,duration:foo(1)},T.s1+2.0);',
+                  'tl.to("#r",{opacity:1,duration:0.6},T.s2+2.0);'])
+        tc.assert_equal(mb.get("tweens_default_duration"), 1,
+                        "C7 求不出的时长须落 default 计数（按整场计即虚高，正是本面要显形的形态）")
+        tc.assert_true(mb["coverage_advance_p50"] < 0.5,
+                       f"C7b 承上：该场覆盖不得因不可求值时长被抬到满窗：{mb['coverage_advance_p50']}")
+
+        # ── D 既有一元不放宽 ──
+        mv = run(['tl.to("#m",{opacity:1,duration:0.5},k);',
+                  'tl.to("#n",{opacity:1,duration:0.6},T.s1+2.0);',
+                  'tl.to("#o",{opacity:1,duration:0.6},T.s2+2.0);',
+                  'tl.to("#u",{opacity:1,duration:0.6},T.s3+2.0);'])
+        tc.assert_equal([mv.get("tweens_variable_anchor"), mv.get("tweens_unparsed"),
+                         mv.get("tweens_anchor_expr")], [1, 1, 0],
+                        "D1 裸变量锚仍须走 variable_anchor（helper 按数据执行 N 次，静态面看不见）")
+
+        # ── E 骨架自证：把"入场即静止"的复发钉成回归 ──
+        skel = script_dir.parent.parent / "AI视频制作工作流模板" / "templates_09_横屏多形态骨架.html"
+        tc.assert_true(skel.is_file(), "E0 骨架须与套件同面在位（清单 §2.1 列为必需导出项）")
+        ms = cp.measure(skel)
+        tc.assert_true(ms.get("advance_gap_max") is not None and ms["advance_gap_max"] <= 3.0,
+                       f"E1 骨架最长无推进段须 ≤3.0s（踩坑清单 §八 第 3 条）；现读 "
+                       f"{ms.get('advance_gap_max')}——回到该值即骨架又只教入场")
+        tc.assert_true(ms.get("coverage_advance_p50", 0) >= 0.60,
+                       f"E2 骨架推进覆盖中位须 ≥0.60；现读 {ms.get('coverage_advance_p50')}")
+
+        # ── F 描述面边界 ──
+        src = (script_dir / "choreography_profile.py").read_text(encoding="utf-8")
+        tc.assert_true("sys.exit" not in src and "RENDER_CRITICAL" not in src,
+                       "F1 本件不得引入裁定或退出码（2026-10-10 常设裁定，本批未翻）")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_window_expression_parsing error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_info_layer_coverage_leg() -> RegressionTestCase:
+    """用例145：编排面信息层腿（换尺子，2026-11-22 观感根因批）。
+
+    存在理由（实测，不是审美偏好）：`moving_share` 的判据是"整帧 mean|Δ| > 0.1 灰阶"，
+    于是同时给两类东西打高分——背景光斑 `scale` 循环（同份 HTML 摘掉装饰层后在位占比
+    0.923→0.692，占 25%）与整列 14px/15s 亚像素平移（其余大部分）；而承载内容的小面积变化
+    （一条 1760×4px 的讲解进度线）实测只有 0.007，**比阈值低 14 倍**。把"永动"当目标，
+    产出即被刷分写法占据。本用例锁的是新增的第二把尺子：**只认有内容在变化的时间占比**。
+
+      A 归属判据（直调）：文本／图形＝info；无内容且带柔化信号＝decor；场景根或同场内层
+        元素的祖先＝container（整块平移不双计）；无内容无信号的叶子＝unknown；
+        选择器解不到＝unresolved——`.cls` 只在**本场恰一个命中**时才算，跨场命中不算；
+      B measure() 集成：整列位移夹具的信息层覆盖须为 0（旧尺子会把它算成满窗推进）；
+        循环语句不参与分腿（否则"背景在呼吸"被重新引回尺子里）；
+      C 结构性不变式：任一片 `coverage_info ≤ coverage_advance`（信息层是推进型的子集）——
+        违反即归属算错，且本条不钉任何具体数值，不把"现状不好"写成回归；
+      D 单源与边界：instant_preview 不得自行重算层归属；本件不引入裁定／退出码。
+    """
+    tc = RegressionTestCase(
+        "info_layer_coverage_leg",
+        "验证编排面按元素结构分四层、整块位移与装饰不计入信息层、循环不参与分腿、info 是 advance 的子集"
+    )
+    try:
+        import ast
+        import tempfile
+        from pathlib import Path as _P
+        script_dir = _P(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import choreography_profile as cp
+
+        def mk(scenes, body, tl):
+            return ('<div id="root" data-duration="63">' + scenes + '<script>'
+                    'var T = { s1: 3.0, s2: 23.0, s3: 43.0 };\n' + tl + '</script></div>')
+
+        # 每列 ≥3 个文本节点：真实内容列就是这个量级。首版夹具只给 2 个，于是 .sc 未达
+        # "装着整场内容"的判定线，B1/B2 直接判不到 container——那是夹具太瘦，不是判据错。
+        def col(sid, extra):
+            return (f'<div id="scene{sid}" class="scene" data-scene-id="s{sid}">'
+                    f'<div class="sc">{extra}'
+                    f'<div id="t{sid}a">正文一</div><div id="t{sid}b">正文二</div>'
+                    f'<div id="t{sid}c">正文三</div></div></div>')
+        SCENES = (col(1, '<div id="glow1" class="wash" style="filter:blur(120px);'
+                         'background:rgba(59,130,246,0.08)"></div>'
+                         '<div id="bar1" style="width:100%"></div>'
+                         '<div id="outer"><div id="inner">子项</div></div>')
+                  + col(2, '') + col(3, ''))
+
+        def cls_of(tl):
+            elems, by_class, roots = cp._scan_layers(mk(SCENES, "", tl))
+            out = {}
+            # 标签即断言号：同一选择器在不同场要用两次，键不得互相覆盖
+            cases = (("#t1a", "s1", "A1"), ("#glow1", "s1", "A2"), ("#bar1", "s1", "A3"),
+                     ("#outer", "s1", "A5"), ("#scene1 .sc", "s1", "A4"),
+                     (".wash", "s1", "A6"), ("div.h1", "s1", "A7"), (".wash", "s9", "A8"))
+            for sel, key, label in cases:
+                tk = cp._resolve_target(sel, key, elems, by_class)
+                out[label] = (cp._classify_layer(tk, key, elems, {"inner"})
+                              if tk else "unresolved")
+            return out
+
+        # ── A 归属判据 ──
+        c = cls_of("tl.to('#t1a',{y:0},T.s1);")
+        for label, want in (("A1", "info"), ("A2", "decor"), ("A3", "unknown"),
+                            ("A4", "container"), ("A5", "container"), ("A6", "decor"),
+                            ("A7", "unresolved"), ("A8", "unresolved")):
+            tc.assert_equal(c[label], want, f"{label} 归属须为 {want}")
+        tc.assert_true(True, "A1-A8 逐形态独立成条（消息里带形态名，摘哪条腿红哪条）")
+
+        # ── B measure() 集成 ──
+        def run(tl):
+            with tempfile.TemporaryDirectory() as td:
+                f = _P(td) / "index.html"
+                f.write_text(mk(SCENES, "", tl), encoding="utf-8")
+                return cp.measure(f)
+
+        drift = run('tl.to("#scene1 .sc",{x:-14,y:-8,duration:15,ease:"none"},T.s1);\n'
+                    'tl.to("#scene2 .sc",{x:-12,duration:15,ease:"none"},T.s2);\n'
+                    'tl.to("#scene3 .sc",{x:-12,duration:15,ease:"none"},T.s3);\n')
+        tc.assert_equal([drift.get("tweens_layer_container"), drift.get("tweens_layer_info")],
+                        [3, 0], "B1 整列平移：三条全部归 container，信息层一条不涨")
+        tc.assert_equal(drift.get("coverage_info_p50"), 0.0,
+                        "B2 旧尺子会给出满窗推进——本腿必须读到 0（这正是换尺子的理由）")
+
+        loop = run('tl.to("#glow1",{scale:1.14,duration:4.2,yoyo:true,repeat:-1},T.s1);\n'
+                   'tl.to("#t2",{opacity:1,duration:0.6},T.s2+2.0);\n'
+                   'tl.to("#t3",{opacity:1,duration:0.6},T.s3+2.0);\n')
+        tc.assert_equal(loop.get("tweens_layer_decor"), 0,
+                        "B3 循环语句不参与分腿（否则「背景在呼吸」又被引回尺子里）")
+        tc.assert_true(loop["tweens_layer_info"] + loop["tweens_layer_container"]
+                       + loop["tweens_layer_unknown"] + loop["tweens_layer_decor"]
+                       + loop["tweens_layer_unresolved"]
+                       <= loop["tweens_parsed"],
+                       "B4 分腿总数不得超过已解析语句数（无静默重复计数）")
+        tc.assert_true(cp.CALIBER.get("layer_treatment"), "B5 CALIBER 须携带本腿口径")
+        tc.assert_true(all("coverage_info" in s and "info_gap_max_s" in s
+                           for s in loop["per_scene"]),
+                       "B6 逐场须同时给出两腿，缺任一键即整面不可用")
+
+        # ── C 结构性不变式（不钉具体值） ──
+        for name, m in (("drift", drift), ("loop", loop)):
+            tc.assert_true(m["coverage_info_p50"] <= m["coverage_advance_p50"] + 1e-9,
+                           f"C1[{name}] 信息层是推进型的子集，超过即归属算错")
+        skel = script_dir.parent.parent / "AI视频制作工作流模板" / "templates_09_横屏多形态骨架.html"
+        if skel.is_file():
+            ms = cp.measure(skel)
+            tc.assert_true(ms["coverage_info_p50"] <= ms["coverage_advance_p50"] + 1e-9,
+                           "C2 骨架同判（两腿并存是本批的核心可见性）")
+        else:
+            tc.assert_true(False, "C2 骨架件缺席——清单 §2.1 列为必需导出项，缺席即红")
+
+        # ── D 单源与边界 ──
+        ip = (script_dir / "instant_preview.py").read_text(encoding="utf-8")
+        tc.assert_true("_classify_layer" not in ip and "_scan_layers" not in ip,
+                       "D1 预览侧不得自行分腿（判据住 choreography_profile 单源）")
+        src = (script_dir / "choreography_profile.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        tc.assert_true("sys.exit" not in src, "D2 本件不得引入退出码（2026-10-10 常设裁定未翻）")
+        tc.assert_true(isinstance(tree, ast.Module), "D3 本件须可解析")
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("info_layer_coverage_leg error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_layout_geometry_early_presence_and_overhang() -> RegressionTestCase:
+    """用例146：`preflight_check.check_layout_geometry`（check 7j，WARN 不阻断）。
+
+    存在理由（2026-11-22 使用者逐场裁定）：看片点名的四处里有两条是静态可判的，
+    而预览四判据与三把尺全都看不见——
+      ① 元素级「提前在场」：给 CSS 已声明初始隐藏的元素写
+         `tl.fromTo(el,{opacity:1},…)` 当保持呼吸。GSAP `immediateRender` 默认在
+         **建表时刻**写 from 值 ⇒ 元素从第 0 帧即在画面，早于其揭示锚。
+         实测某支项目 s5 的卡片因此在旁白还没走到该段时就出现在右侧（使用者原话
+         "破坏内容出现次序的优先级而显得突兀"）。运行时探针同批实测真露 2 处。
+      ② 覆盖盒外扩：`position:absolute` 且 left/right **同为负值** 的高亮盒，
+         侵占的是相邻内容的像素（实测 .kw-chip 左沿压进相邻词末字 6px）。
+
+    与既有判据的分工（本用例锁住边界）：7g 只裁**场景根** fromTo 遮挡；7b 形态③
+    问的是"该在的没在"，本条问的是"不该在的提前在"——方向相反，不可互替。
+
+    取数面必须含**辅助函数**：真实缺陷是 `breathe("#s5-sweep", …)` 调一个体内写
+    `tl.fromTo(sel,{opacity:1},…)` 的封装；只扫字面语句则本条对现网**一个对象都取不到**
+    （A06 同族）。C 组专门钉这条。
+
+    场景根回落口径（D 组）：普查首读曾报 64 处，全因排除只看 `data-scene-id`
+    而手写 HTML 常只有 `id="sceneN"`——把合法的场景根揭示整片判成缺陷。
+    补回落口径后同一普查降到 2 处。D 组钉的就是这条错杀面。
+
+    定档（H 组）：WARN 而非 ERROR，且**不入** RENDER_CRITICAL_CHECKS——落地前
+    全仓 83 份普查有 2 处命中在已交付/已验收项目上，按 7g/7i 同一纪律不得升阻断。
+    """
+    tc = RegressionTestCase(
+        "layout_geometry_early_presence_and_overhang",
+        "验证元素级 from{opacity>0} 提前在场（含辅助函数取数面）、场景根回落排除、"
+        "absolute 双侧负值外扩、恢复可见豁免、WARN 定档与接线"
+    )
+    try:
+        import ast
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        import preflight_check as pfc
+
+        BODY = """<!DOCTYPE html><html><head><style>
+.rv{opacity:0;}
+#stars{opacity:0;}
+/* 场景根本身也处于初始隐藏态——手写 HTML 的常见形制。7j 的排除腿必须有对象，
+   否则"摘掉场景根排除"这种变异在夹具上无从显形（普查首读 64 处误报即此形态）。 */
+#scene1{opacity:0;}
+.kw{position:relative;display:inline-block;}
+.kw-chip{position:absolute;left:-6px;right:-6px;top:6%;bottom:4%;background:#1e3a5f;}
+.restored{opacity:0;}
+#restored{opacity:0;}
+#restored{opacity:1;}
+</style></head><body><div id="root">
+<div id="scene0" class="scene" data-scene-id="s0" data-scene-entry="cover"></div>
+<div id="scene1" class="scene" data-scene-id="s1" data-scene-entry="gsap">
+  <div class="card rv" id="s1-sweep"></div>
+  <div id="stars" class="stars"></div>
+  <div id="plain"></div>
+  <span class="kw" id="s1-kw">盖章<span class="kw-chip" id="s1-kwc"></span></span>
+  <div class="restored" id="restored"></div>
+</div>
+<script>
+var T={s1:3.0,s2:10.0};
+function breathe(sel, at, seg){
+  tl.fromTo(sel,{opacity:1},{opacity:0.72,duration:0.6,ease:'sine.inOut',yoyo:true,repeat:1},at);
+}
+breathe("#s1-sweep", T.s1+16.0, 0.6);
+tl.fromTo("#s1-sweep",{x:24,opacity:0},{x:0,opacity:1,duration:0.5},T.s1+14.2);
+tl.fromTo("#scene1",{opacity:1},{opacity:1},T.s1);
+tl.fromTo("#plain",{opacity:1},{opacity:1},T.s1+1.0);
+tl.fromTo("#restored",{opacity:1},{opacity:1},T.s1+1.0);
+</script>
+</div></body></html>"""
+
+        def run(html_text, mode="render"):
+            tmp = Path(tempfile.mkdtemp())
+            hp = tmp / "index.html"
+            hp.write_text(html_text, encoding="utf-8")
+            r = pfc.PreflightResult(mode=mode)
+            buf = io.StringIO()
+            exc = None
+            try:
+                with redirect_stdout(buf):
+                    pfc.check_layout_geometry(hp, r)
+            except Exception as e:                       # noqa: BLE001
+                exc = f"{type(e).__name__}: {e}"
+            return r, exc, buf.getvalue()
+
+        def _rows(r, level):
+            return [e for e in r._log_entries
+                    if e["level"] == level and e["check_id"] == "layout_geometry"]
+
+        # ── A 正向：呼吸用 to()、芯片不外扩 ──
+        GOOD = (BODY.replace(".kw-chip{position:absolute;left:-6px;right:-6px;",
+                             ".kw-chip{position:absolute;left:3px;right:3px;")
+                    .replace("tl.fromTo(sel,{opacity:1},{opacity:0.72,",
+                             "tl.to(sel,{opacity:0.72,"))
+        rg, exc, logg = run(GOOD)
+        tc.assert_true(exc is None, f"A0 正向不得抛异常：{exc}")
+        tc.assert_true(not _rows(rg, "ERROR"), "A1 正向不得置 ERROR（本条定档 WARN）")
+        tc.assert_true(not _rows(rg, "WARN"), f"A2 正向不得点名：{_rows(rg, 'WARN')}")
+        cg = rg.counts.get("layout_geometry") or {}
+        tc.assert_true(cg.get("early_present") == 0 and cg.get("overhang_rules") == 0,
+                       f"A3 正向计数须为 0/0：{cg}")
+        tc.assert_true("无缺陷" in logg, f"A4 正向须印正证据行，实读：{logg[:80]}")
+
+        # ── B 元素级提前在场（直接语句这条腿） ──
+        # 夹具里同时存在"经辅助函数"那一条（C 组的对象），故按**命中路径**过滤而不是
+        # 断言总条数：总条数把两条腿焊死在一起，改任一条腿都会顶掉另一条的断言
+        # （首版 B1 期望 1、实读 2 即此形态，不是实现缺陷而是断言口径缺了归属维度）。
+        DIRECT = BODY.replace('tl.fromTo("#plain",{opacity:1},{opacity:1},T.s1+1.0);',
+                              'tl.fromTo("#stars",{opacity:1},{opacity:0.8},T.s1+5.0);')
+        rb, exc, _ = run(DIRECT)
+        early_rows = [str(x["message"]) for x in _rows(rb, "WARN")
+                      if "immediateRender" in str(x["message"])]
+        tc.assert_true(exc is None, f"B0 不得抛异常：{exc}")
+        direct_rows = [m for m in early_rows if "直接语句" in m]
+        tc.assert_true(len(direct_rows) == 1,
+                       f"B1 直接语句这条腿须恰 1 条，实读 {len(direct_rows)}：{direct_rows}")
+        tc.assert_true(bool(direct_rows) and "#stars" in direct_rows[0],
+                       f"B2 须点名元素 id，实读：{direct_rows[:1]}")
+        cg_b = rb.counts["layout_geometry"]
+        tc.assert_true(cg_b["early_present"] == len(early_rows),
+                       f"B3 counts 与点名条数须一致（不得一处算两处漏）："
+                       f"{cg_b['early_present']} vs {len(early_rows)}")
+        tc.assert_true(cg_b["from_to_literals"] >= 1,
+                       f"B4 字面 fromTo 计数须非零：{cg_b}")
+
+        # ── C 经辅助函数（真实缺陷形态；取数面没有它就恒绿） ──
+        rc, exc, _ = run(BODY)
+        tc.assert_true(exc is None, f"C0 不得抛异常：{exc}")
+        early = [str(x["message"]) for x in _rows(rc, "WARN")
+                 if "immediateRender" in str(x["message"])]
+        via_helper = [m for m in early if "辅助函数" in m]
+        tc.assert_true(len(via_helper) == 1,
+                       f"C1 经 breathe() 的 s1-sweep 须命中且只 1 条，实读 {len(via_helper)}")
+        tc.assert_true(bool(via_helper) and "s1-sweep" in via_helper[0],
+                       f"C2 命中路径是辅助函数且点名被包裹的选择器，实读：{via_helper[:1]}")
+        cc = rc.counts["layout_geometry"]
+        tc.assert_true(cc["from_to_via_helper"] >= 1 and cc["helpers"] >= 1,
+                       f"C3 辅助函数取数面须非零（否则本腿对现网无对象）：{cc}")
+
+        # ── D 场景根不计入（错杀面守卫） ──
+        tc.assert_true(not any("#scene1" in str(x["message"]) for x in _rows(rc, "WARN")),
+                       "D1 场景根 `#scene1` 不得计入本条（归 7g）")
+        NO_ATTR = BODY.replace('id="scene1" class="scene" data-scene-id="s1"',
+                               'id="scene1" class="scene"')
+        rn, _, _ = run(NO_ATTR)
+        tc.assert_true(not any("#scene1" in str(x["message"]) for x in _rows(rn, "WARN")),
+                       "D2 手写 HTML 只有 id=\"sceneN\" 而无 data-scene-id 时同样须排除"
+                       "（普查首读 64 处误报即此口径缺失）")
+
+        # ── E 非初始隐藏元素不判 ──
+        tc.assert_true(not any("#plain" in str(x["message"]) for x in _rows(rc, "WARN")),
+                       "E1 #plain 无 .rv／无 opacity:0 声明，from{opacity:1} 是它本来的样子，不判")
+
+        # ── F 被规则设回可见的元素不判 ──
+        tc.assert_true(not any("restored" in str(x["message"]) for x in _rows(rc, "WARN")),
+                       "F1 CSS 另有 opacity:1 规则设回可见者豁免（restored 面须真被消费）")
+
+        # ── G 外扩腿 ──
+        g_rows = [str(x["message"]) for x in _rows(rc, "WARN") if "外扩" in str(x["message"])]
+        tc.assert_true(len(g_rows) == 1, f"G1 双侧负值须命中 1 条，实读 {len(g_rows)}")
+        tc.assert_true(bool(g_rows) and ".kw-chip" in g_rows[0], f"G2 须点名规则选择器：{g_rows[:1]}")
+        ONE_SIDE = BODY.replace("left:-6px;right:-6px;", "left:-6px;right:3px;")
+        r1, _, _ = run(ONE_SIDE)
+        tc.assert_true(not any("外扩" in str(x["message"]) for x in _rows(r1, "WARN")),
+                       "G3 只有一侧为负不构成两侧侵占，不得判")
+        NO_ABS = BODY.replace(".kw-chip{position:absolute;", ".kw-chip{position:relative;")
+        r2, _, _ = run(NO_ABS)
+        tc.assert_true(not any("外扩" in str(x["message"]) for x in _rows(r2, "WARN")),
+                       "G4 非 absolute 的负值 left/right 不入本判据（文档流里那是正常偏移）")
+
+        # ── H 定档边界：WARN 而非 ERROR，且不进 RENDER_CRITICAL_CHECKS ──
+        tc.assert_true(not _rows(rc, "ERROR"),
+                       "H1 本条现档只置 WARN（普查 83 份有 2 处命中在已交付项目，"
+                       "按 7g/7i 同纪律不得升阻断）")
+        ra2, _, _ = run(BODY, mode="audit")
+        tc.assert_true(not _rows(ra2, "ERROR"), "H2 audit 模式同样不得置 ERROR")
+        src = (Path(__file__).resolve().parent / "preflight_check.py").read_text(encoding="utf-8")
+        block = src.split("RENDER_CRITICAL_CHECKS = {", 1)[1].split("\n}", 1)[0]
+        tc.assert_true("layout_geometry" not in block,
+                       "H3 本条不得入 RENDER_CRITICAL_CHECKS（WARN 判据入表即假承诺）")
+
+        # ── I 接线与单源 ──
+        tree = ast.parse(src)
+        called = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "check_layout_geometry"]
+        tc.assert_true(len(called) == 1, f"I1 main 里须恰一处接线，实读 {len(called)}")
+        helper = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == "_collect_hidden_selectors"]
+        tc.assert_true(len(helper) == 1, "I2 初始隐藏集合须住单一函数（7b/7j 共用一份前提）")
+        er_body = src.split("def check_element_reveal", 1)[1].split("def check_", 1)[0]
+        tc.assert_true("_collect_hidden_selectors(styles)" in er_body
+                       and "hidden_classes.add(" not in er_body,
+                       "I3 7b 不得再自带一份隐藏解析（两份真相会给出矛盾前提）")
+        jg_body = src.split("def check_layout_geometry", 1)[1].split("\ndef ", 1)[0]
+        tc.assert_true("_collect_hidden_selectors" in jg_body, "I4 7j 须消费同一单源 helper")
+
+        # ── J 取数断链不得写成干净 ──
+        # 变量目标（`tl.fromTo(SELVAR,{opacity:1},…)`）静态面解析不出元素。不记账时
+        # 通过行"扫描 fromTo 字面 N 条"会把它读成"都核对过了"（A06 同族）。
+        BROKEN = BODY.replace('tl.fromTo("#s1-sweep",{x:24,opacity:0},{x:0,opacity:1,duration:0.5},T.s1+14.2);',
+                              'tl.fromTo(SELVAR,{opacity:1},{opacity:0.7},T.s1+5.0);')
+        rj, exc, logj = run(BROKEN)
+        cj = rj.counts["layout_geometry"]
+        tc.assert_true(exc is None, f"J0 不得抛异常：{exc}")
+        tc.assert_true(cj.get("unreachable_targets") == 1,
+                       f"J1 顶层变量目标须计入盲区计数：{cj}")
+        tc.assert_true("覆盖面自报" in logj,
+                       f"J2 有盲区时须有覆盖面自报行，实读：{logj[-160:]}")
+        tc.assert_true("无缺陷" not in logj, f"J3 盲区在位时通过行不得出现：{logj[-120:]}")
+
+        # 已被字面调用点解析到的封装形参**不是**盲区：把它计入会让每个用 breathe 的项目
+        # 都白报一行，噪声判据与漏判同样有害（真实项目全部经辅助函数写呼吸）。
+        tc.assert_true(rc.counts["layout_geometry"].get("unreachable_targets") == 0,
+                       f"J4 辅助函数首参已由调用点覆盖，不得重复计盲区："
+                       f"{rc.counts['layout_geometry']}")
+        # 病灶为 0 而盲区 >0：仍须 WARN 点名，不得升格为 OK。
+        CLEAN_BLIND = (GOOD.replace('tl.fromTo("#plain",{opacity:1},{opacity:1},T.s1+1.0);',
+                                    'tl.fromTo(SELVAR,{opacity:1},{opacity:0.7},T.s1+1.0);'))
+        rcb, exc, logcb = run(CLEAN_BLIND)
+        tc.assert_true(exc is None, f"J5 不得抛异常：{exc}")
+        tc.assert_true(rcb.counts["layout_geometry"]["early_present"] == 0,
+                       f"J6 该夹具本身无病灶：{rcb.counts['layout_geometry']}")
+        info7 = _rows(rcb, "INFO")
+        tc.assert_true(not _rows(rcb, "WARN"),
+                       f"J7a 盲区不是病灶，不得升为 WARN（普查 33/83 份含变量目标，"
+                       f"记 WARN 即 40% 项目白报一行）：{_rows(rcb, 'WARN')}")
+        tc.assert_true(len(info7) == 1 and "覆盖面自报" in str(info7[0]["message"]),
+                       f"J7b 零病灶＋有盲区须恰一行 INFO 自陈覆盖面，实读：{logcb[-200:]}")
+        tc.assert_true("无缺陷" not in logcb,
+                       f"J7c 盲区在位时通过行不得出现：{logcb[-160:]}")
+
+        # ── K 选择器落在隐藏集之外的 unresolved 面 ──
+        GHOST = BODY.replace('tl.fromTo("#plain",{opacity:1},{opacity:1},T.s1+1.0);',
+                             'tl.fromTo(".ghost",{opacity:1},{opacity:0.7},T.s1+1.0);')
+        rk, exc, logk = run(GHOST)
+        ck = rk.counts["layout_geometry"]
+        tc.assert_true(exc is None, f"K0 不得抛异常：{exc}")
+        tc.assert_true(ck["unresolved"] == 1,
+                       f"K1 非字面命中且不以 # 开头的选择器须计入 unresolved：{ck}")
+        tc.assert_true("覆盖面自报" in logk
+                       and str(cj_k := ck["unresolved"]) in logk,
+                       f"K2 unresolved 须在覆盖面自报行里带出实数：{logk[-160:]}")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("layout_geometry_early_presence_and_overhang error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_box_overlap_glyph_coverage_adjudication() -> RegressionTestCase:
+    """用例147：绘制盒压他人文字（预览期运行时判据）的裁定面、四态与定档边界。
+
+    存在理由（2026-11-22 使用者逐场裁定）：看片点名的 6 处缺陷里 3 处是**运行时两两几何**
+    （芯片压相邻词、进度线穿正文、callout 文字与标题重叠）。静态面 7j 问"CSS 声明是否外扩"，
+    预览四判据量的是元素**自身**盒——没有一条问"这个盒此刻盖住了谁的字"。
+
+    分工（与 text_fit／bar_overflow／layout_fill 同一纪律）：取数在 `preview_capture.js`
+    （祖先链有效可见性 → 同 run 豁免 → `elementsFromPoint` 绘制栈序 → 逐字符 Range 盒），
+    裁定与阈值在 `instant_preview.py`。**JS 侧的选法本身不在本用例面**（套件不启动浏览器），
+    其区分力由同批 A/B 实测承重：某支项目修前副本 6 对（最多一对盖住 16/16 枚字）、
+    修后同项目 132 组候选 0 对；改 JS 选法须重跑该 A/B。
+
+    定档由 G 组锁住：`BOX_OVERLAP_BLOCKS=False`、退出码不消费本项状态、
+    且**不存在** `--accept-box-overlap-*` 开关——不阻断的判据配一个"放行"开关即假结构。
+    """
+    tc = RegressionTestCase(
+        "box_overlap_glyph_coverage_adjudication",
+        "验证绘制盒压字裁定：被盖字形数阈值与复现点数边界、七形态未测面、"
+        "阈值 fail-closed、取数地板双向接线、只点名不阻断的定档"
+    )
+    try:
+        import ast
+        import json as _json
+        import tempfile
+        import instant_preview as ip
+
+        RULES = {"min_overlap_px": 24.0, "min_covered_glyphs": 1.0, "min_marks": 1.0}
+
+        def pair(**kw):
+            base = {"scene": "s3", "at_first": 40.0, "paint": "span.kw-chip",
+                    "ink": "p.body", "text": "产出与盖章", "overlap_px": 186,
+                    "glyphs": 12, "covered_glyphs": 0, "covered_marks": 0, "marks": 0,
+                    "worst_glyph_px": 184, "hit_glyphs": [{"i": 3, "ch": "出", "px": 184}],
+                    "paint_pe_none": False, "stack_missing": False,
+                    "samples": 4, "covered": 0}
+            base.update(kw)
+            return base
+
+        def adjudicate(pairs, rules=RULES, **section):
+            body = {"time_src": "S-block", "has_timeline": True, "samples": 15,
+                    "scenes_seen": 1, "distinct_pairs": len(pairs), "pairs": pairs}
+            body.update(section)
+            return ip.adjudicate_box_overlap(body, rules)
+
+        # ── A 正向与"无对象" ──
+        st, lines, fnd, meta = adjudicate([pair()])
+        tc.assert_true(st == ip.gs.PASS, f"A1 候选在位而无一盖字须 PASS，实得 {st}")
+        tc.assert_true(not fnd and meta["candidates"] == 1, f"A2 findings 须空：{fnd}")
+        st, lines, _, _ = adjudicate([])
+        tc.assert_true(st == ip.gs.NOT_APPLICABLE,
+                       f"A3 候选 0 组不得判 PASS（测量面无对象）：{st}")
+        tc.assert_true("不裁定也不计通过" in " ".join(lines),
+                       f"A4 N/A 文案须自陈不計通过：{lines}")
+
+        # ── B 裁定：被盖字形数 ──
+        st, lines, fnd, meta = adjudicate([pair(covered_glyphs=1, covered_marks=1, marks=1)])
+        tc.assert_true(st == ip.gs.FAIL, f"B1 盖住 1 枚字且复现 1 点须 FAIL，实得 {st}")
+        joined = " ".join(lines)
+        tc.assert_true("kw-chip" in joined and "1/12" in joined,
+                       f"B2 须点名绘制方与被盖字数（n/总数）：{joined[:160]}")
+        tc.assert_true("出" in joined, f"B3 须给出被盖字符本身便于定位：{joined[:200]}")
+        tc.assert_true("不阻断" in joined,
+                       f"B4 只点名不阻断须在文案里自陈，不得让 FAIL 冒充门禁结论：{joined[:160]}")
+
+        # ── C 阈值边界（两轴各自承重）──
+        st, _, fnd, _ = adjudicate([pair(covered_glyphs=2, covered_marks=1, marks=1)],
+                                   dict(RULES, min_covered_glyphs=3))
+        tc.assert_true(st == ip.gs.PASS and not fnd,
+                       f"C1 字形数不足阈值不得 FAIL：{st}")
+        st, _, fnd, _ = adjudicate([pair(covered_glyphs=5, covered_marks=1, marks=3)],
+                                   dict(RULES, min_marks=2))
+        tc.assert_true(st == ip.gs.PASS and not fnd,
+                       f"C2 复现点数不足阈值不得 FAIL（单帧巧合）：{st}")
+        st, _, fnd, _ = adjudicate([pair(covered_glyphs=3, covered_marks=2, marks=2)],
+                                   dict(RULES, min_covered_glyphs=3, min_marks=2))
+        tc.assert_true(st == ip.gs.FAIL, f"C3 两轴均恰等阈值须 FAIL（边界是 >= 非 >）：{st}")
+
+        # ── D 未测面（七形态各自点名，均不得读成通过）──
+        untested_cases = [
+            (None, "段缺失"),
+            ("not-a-dict", "段不是对象"),
+            ({"status_hint": "measure_failed", "error": "boom"}, "取数异常"),
+            ({"status_hint": "no_time_source"}, "无时刻源"),
+            ({"status_hint": "threshold_not_passed"}, "取数地板未下传"),
+            ({"has_timeline": False, "pairs": [pair(covered_glyphs=9, covered_marks=9)]},
+             "seek 空操作"),
+            ({"pairs": "oops"}, "pairs 非列表"),
+        ]
+        for i, (body, why) in enumerate(untested_cases, 1):
+            st, lines, fnd, _ = ip.adjudicate_box_overlap(body, RULES)
+            tc.assert_true(st == ip.gs.UNTESTED and not fnd,
+                           f"D{i} 「{why}」须判 UNTESTED 且不产出病灶，实得 {st}")
+        # 行缺核心读数＝取数断链，不得按 0 计
+        st, lines, fnd, _ = ip.adjudicate_box_overlap(
+            {"time_src": "S-block", "has_timeline": True, "samples": 15,
+             "pairs": [{"paint": "#x", "scene": "s1"}]}, RULES)
+        tc.assert_true(st == ip.gs.UNTESTED, f"D2 行缺 covered_* 须判未测而非按 0 计：{st}")
+        st, lines, _, meta = adjudicate([pair(stack_missing=True)])
+        tc.assert_true(st == ip.gs.UNTESTED and "elementsFromPoint" in " ".join(lines),
+                       f"D3 绘制栈取不到须单独点名（不得读成没遮挡）：{st} {lines[:1]}")
+        st, lines, _, meta = adjudicate([pair(paint_pe_none=True)])
+        tc.assert_true(st == ip.gs.PASS and meta["pe_forced"] == 1
+                       and "pointer-events:none" in " ".join(lines),
+                       f"D4 pe:none 腿经强制取数后须如实声明：{meta} {lines[:1]}")
+
+        # ── E 阈值 fail-closed（六形态各点名断在哪条腿）──
+        tmp = Path(tempfile.mkdtemp())
+
+        def write_rules(obj, name="video_quality_rules.json"):
+            fp = tmp / name
+            if isinstance(obj, str):
+                fp.write_text(obj, encoding="utf-8")
+            else:
+                fp.write_text(_json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            return str(fp)
+
+        r, why = ip.load_box_overlap_rules(str(tmp / "nope.json"))
+        tc.assert_true(r is None and "缺失" in why, f"E1 缺文件：{why}")
+        r, why = ip.load_box_overlap_rules(write_rules("{not json"))
+        tc.assert_true(r is None and "不可解析" in why, f"E2 坏 JSON：{why}")
+        r, why = ip.load_box_overlap_rules(write_rules({"text_fit": {}}))
+        tc.assert_true(r is None and "box_overlap" in why, f"E3 缺节：{why}")
+        r, why = ip.load_box_overlap_rules(write_rules({"box_overlap": {"min_overlap_px": 24}}))
+        tc.assert_true(r is None and "缺必需键" in why, f"E4 缺键：{why}")
+        for bad in (0, -5, "abc", None, float("inf")):
+            r, why = ip.load_box_overlap_rules(
+                write_rules({"box_overlap": {"min_overlap_px": 24,
+                                             "min_covered_glyphs": bad,
+                                             "min_marks": 1}}))
+            tc.assert_true(r is None, f"E5 非法阈值须拒收（{bad!r}），实得 {r}")
+        r, _ = ip.load_box_overlap_rules(write_rules({"box_overlap": {
+            "min_overlap_px": 24, "min_covered_glyphs": 1, "min_marks": 1}}))
+        tc.assert_true(r == {"min_overlap_px": 24.0, "min_covered_glyphs": 1.0,
+                             "min_marks": 1.0}, f"E6 合法配置须三项齐读：{r}")
+
+        # ── F 取数地板双向接线（改名即断链，两侧字面须逐字相同）──
+        ip_src = (Path(__file__).resolve().parent / "instant_preview.py").read_text(encoding="utf-8")
+        js_src = (Path(__file__).resolve().parent / "preview_capture.js").read_text(encoding="utf-8")
+        tc.assert_true("--overlap-min-px=" in ip_src, "F1 Python 侧须下传取数地板")
+        tc.assert_true("flagNumber('--overlap-min-px=')" in js_src,
+                       "F2 JS 侧须按同一枚字面接收（只改一侧＝静默回吐 threshold_not_passed）")
+        tc.assert_true("threshold_not_passed" in js_src and "threshold_not_passed" in ip_src,
+                       "F3 缺传的形态两侧都要有出口，不得静默按某个数字跑")
+
+        # ── G 定档边界：只点名不阻断，且不存在放行开关 ──
+        tc.assert_true(ip.BOX_OVERLAP_BLOCKS is False,
+                       "G1 本项定档为不阻断（普查在两支已交付项目上有命中，按 7g/7i/7j 同纪律）")
+        # 消费点用 AST 找"if 里比较 *_status 且分支内 return 非零常量"——子串匹配照不出
+        # 报告行里的 `{ovl_status}`（首版正是这么写，把报告文案读成了阻断消费点）。
+        ip_tree = ast.parse(ip_src)
+        main_fn = [n for n in ip_tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "main"][0]
+        blocking = set()
+        for node in ast.walk(main_fn):
+            if not isinstance(node, ast.If):
+                continue
+            rets = [r for r in ast.walk(node) if isinstance(r, ast.Return)
+                    and isinstance(r.value, ast.Constant)
+                    and isinstance(r.value.value, int) and r.value.value != 0]
+            if not rets:
+                continue
+            blocking |= {n.id for n in ast.walk(node.test)
+                         if isinstance(n, ast.Name) and n.id.endswith("_status")}
+        tc.assert_true("ovl_status" not in blocking,
+                       f"G2 退出码判定不得消费本项状态（写成阻断即在已验收交付上造死锁）："
+                       f"{sorted(blocking)}")
+        tc.assert_true('add_argument("--accept-box-overlap' not in ip_src,
+                       "G3 不阻断的判据不得配\"放行\"开关（假结构）")
+        tc.assert_true({"fit_status", "bar_status"} & blocking,
+                       f"G4 反面对照：会阻断的那几项确有消费点（本用例不得靠全仓零命中变绿）："
+                       f"{sorted(blocking)}")
+
+        # ── H 分工：阈值与几何不得两处算 ──
+        fn_body = js_src.split("async function measureBoxOverlap", 1)[1].split("\nasync function", 1)[0]
+        for lit in ("min_covered_glyphs", "min_marks", "covered_marks >="):
+            tc.assert_true(lit not in fn_body,
+                           f"H1 JS 侧不得持有裁定阈值「{lit}」（阈值单源在 config＋Python 裁定面）")
+        tc.assert_true("getClientRects" in fn_body and "elementsFromPoint" in fn_body,
+                       "H2 逐字行盒与绘制栈取数须在 JS 侧（判据住 JS 即不可在 CI 取证）")
+        tc.assert_true("getBoundingClientRect" not in ip_src.split("def adjudicate_box_overlap", 1)[1]
+                       .split("\ndef ", 1)[0],
+                       "H3 Python 侧不得重算几何（两份取数面必漂移）")
+
+        # ── I 接线与留痕 ──
+        tree = ast.parse(ip_src)
+        called = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                  and getattr(n.func, "id", "") == "adjudicate_box_overlap"]
+        tc.assert_true(len(called) == 1, f"I1 裁定须恰一处接线，实读 {len(called)}")
+        rec = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+               and getattr(n.func, "id", "") == "write_box_overlap_record"]
+        tc.assert_true(len(rec) == 1, f"I2 留痕须恰一处，实读 {len(rec)}")
+        tc.assert_true(ip.BOX_OVERLAP_RECORD_NAME == "_box_overlap_check.json",
+                       f"I3 留痕文件名即追溯键：{ip.BOX_OVERLAP_RECORD_NAME}")
+        p = tmp / "t"
+        p.mkdir(parents=True, exist_ok=True)
+        out = ip.write_box_overlap_record(p, ip.gs.FAIL, [pair(covered_glyphs=1, covered_marks=1,
+                                                              marks=1)], meta,
+                                          report_lines=["x"])
+        saved = _json.loads(Path(out).read_text(encoding="utf-8"))
+        tc.assert_true(saved.get("status") == str(ip.gs.FAIL) or "FAIL" in str(saved.get("status")),
+                       f"I4 留痕须落状态与病灶：{list(saved)}")
+        tc.assert_true(saved.get("findings"), "I5 留痕须含 findings（报告面不得只剩结论）")
+
+        # ── J 阈值文件同源（不得另指一份）──
+        sig = ast.parse(ip_src)
+        defaults = {}
+        for node in ast.walk(sig):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                    "load_box_overlap_rules", "load_bar_overflow_rules", "load_text_fit_rules"):
+                dflt = node.args.defaults[0]
+                defaults[node.name] = ast.dump(dflt)
+        tc.assert_true(len(set(defaults.values())) == 1,
+                       f"J1 三项判据须读同一枚权威源文件（各指一份即两份真相）：{defaults}")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("box_overlap_glyph_coverage_adjudication error: " + str(e) + "\n"
                        + traceback.format_exc())
     return tc
 

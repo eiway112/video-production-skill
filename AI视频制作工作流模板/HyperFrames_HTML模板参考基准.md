@@ -89,10 +89,14 @@ body { width:1920px; height:1080px; overflow:hidden;
 | 字幕预留带 | 220px（1080 画布） | 由安全线推导 | **权威源 `visual_boundary_check.subtitle_safety_line`**：1080→y860、1920→y1529，即预留带＝画布高×220/1080。不得反推 |
 | subtitle-safe height | ＝预留带 | 同预留带 | 渐变只是视觉实现；**它的高度不是内容上限的依据**（旧表由它＋20px 推 padding，得出的上限落在安全线之下 60–80px） |
 | .sc padding-bottom | ＝预留带 | ≥预留带 | 内容盒下界即安全线；小于它＝把内容放进字幕带 |
-| .sc padding-top | 50-80px | 50-80px | 封面 50px，内容 60-80px |
+| .sc padding-top | 封面 50px；**有章级标识时 ≥ 标识底沿＋20px（横屏实测 96px）** | 50-110px | 见下条"章级标识与内容起始线" |
 | .sc padding-x | 100-120px | 80-120px | 信息密集取大值 |
 | .sc gap | 28-40px | 24-44px | 元素间距 |
 | 内容 max-width | 1400px | 1200-1760px | 卡片网格可达 1760px |
+
+**章级标识与内容起始线必须协调（2026-11-22 使用者逐场裁定"标题拥挤"换来）**：`#chapter`／`#chapter-bar` 是 `position:absolute`，**不占文档流**，而 `.sc` 的首行（`.tag` 英文眉）从 `padding-top` 起排。两者各写各的就会纵向相撞——实测某支项目：标识 label 占 y 26–57、刻度条占 y 68–73，而 `--pad-top:50px` 使首行 tag 落在 y 50–68 ⇒ **与 label 重叠 7px、与刻度零间距**，7 场同形（骨架 `templates_09` 旧值 50px 与之同源）。判据＝`padding-top ≥ 标识底沿 ＋ 20px`；带刻度条的横屏实测取 **96px**（复验净间距 23px）。代价须如实说：内容区高度少 46px，`[LAYOUT-FULLNESS]` 填充率中位随之从 71% 降到 69%，属正常支出而非退化，改完必须重跑预览看有没有把内容顶到安全线。
+
+**贯穿型进度线的 `bottom` 不得落在内容带内**：内容底沿＝画布高 − `padding-bottom`（1080−240＝840），字幕安全线＝860，两者之间是**唯一无归属的空带**。旧骨架值 `bottom:270px` 对应 y≈810，即在内容带内，贴底的判据行/结论行会被线从字上穿过（实测某支项目 s2 判据行与线相交 1472px²）。取 `bottom:226px`（y 850–854）并把这条写进骨架——**逐场挪 y 是错的**，常驻线的全片一致性本身就是它的可读性来源。
 
 **内容场 `.sc` 不得写 `justify-content:center`**（封面可以）。居中容器的高度由内容自然高决定，内容少就上下各空一半，"把卡片做大"治不了它。2026-11-11 同口径实测（墨迹盒裁到画布、分母＝主体区 1920×860、每场取 start+0.95×窗长）：某交付片居中版式高度占比中位 **0.513**；只加大卡片 min-height＋两场换图形 ⇒ **0.558**；另一条线全片改绝对定位、逐场把底沿顶到 y779—845 ⇒ **0.897**（最小场 0.762）。差别在**版面坐标系**不在元素大小：顶对齐＋余高由 `flex:1` 的图形区吸收（或 `space-between` 把底沿顶住），高度才由容器决定。可跑起点见 `templates_09_横屏多形态骨架.html`。渲染前读数：`instant_preview.py` 的 `[LAYOUT-FULLNESS]` 行给**主体区填充率**中位与最低三场（描述面、不裁定）；同批三线实测 0.436／0.496／0.786，能区分被投诉片与观感合格片——审核节点第 7 项对照它改版面，而不是等交付后投诉。
 
@@ -269,6 +273,7 @@ tl.set("#sceneN", { visibility:"hidden" }, T + 0.9);
 - **旧场景 `visibility:hidden` 的时刻，本节是唯一口径来源**：判据＝不得早于该次转场最后一条腿结束，即 `T + max(入场腿末, 出场腿末)`，再按需要留 buffer。上面三个值（水平 T+1.0、垂直 T+1.2、缩放穿越 T+0.9）都由此派生（0.8/1.0/0.7 腿末 ＋ 0.2s buffer），**不是三个独立常量**；`templates_06` 组件里出现的 `T + 1.7` 是同一式的放宽取值（buffer≈0.9），合法但不得反向收紧成判据。硬切写法下该时刻即边界本身（`T`），本条不适用
 - 转场时间计入场景窗口（如场景窗口 0-10s，转场在 10s 开始）
 - **场景根揭示的 opacity 必须落在 to 段或一条 `tl.set(根, {opacity:1}, 锚)` 上**：只写在 from 段且配 `immediateRender:false` 时，HyperFrames 运行时在转场窗结束后把场景恢复成 CSS 的 opacity:0——纯 Chrome `tl.seek()` 探针（预览/空窗/presence）量不出来，只有渲染产物或 `render --fps 1 --format png-sequence` 探针能看见（2026-11-12 两次白渲实证，预检 7g 两腿拦截）
+- **元素级镜像形态（2026-11-22 使用者逐场裁定"卡片提前出现"换来）**：给**已带 `.rv`（CSS opacity:0）的元素**写 `tl.fromTo(el, {opacity:1}, {opacity:0.72, yoyo:true, repeat:1}, at)` 当"保持呼吸"，其 from 段受 GSAP `immediateRender` 默认值支配，在**建表时刻**即写入行内样式 → 该元素从第 0 帧就在场，且若同元素另有一条 `fromTo(...{x:24,opacity:0},{x:0,opacity:1})` 揭示腿，则位移仍停在 from 值而透明度已被抬起＝**半入场态**（实测未 seek 前 `opacity:1; transform:translate(24px,0)`）。**保持呼吸一律用 `tl.to()`**（`to` 不在建表写值），且呼吸锚**必须晚于本场揭示锚**，否则是对隐藏元素呼吸、无可见效果。本形态与上一条方向相反（上一条是"该在的没了"，本条是"不该在的提前在"），7g 只裁**场景根** fromTo，**元素级不在其判据对象内**，预检与预览全绿也照不出
 
 ### 3.4 内容入场动画
 
@@ -418,9 +423,15 @@ function flushCuePlan(){                        // 在构造时间轴的 script 
     /* 深色底卡片（白字）不走背景腿，只动边框与光晕——否则点亮把字糊掉 */
     var doBg = /rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(bg) ||
                (function(m){ return m && m.length >= 3 && (0.299*m[0]+0.587*m[1]+0.114*m[2]) > 150; })(bg.match(/\d+/g));
+    /* 守卫必须**同时看字色**：上面那条只看背景，于是"背景透明而字色为白"的元素
+       （如 `.co-txt` 被别处规则改成透明底、或深底卡上的白字标签）会判 doBg=true，
+       抬起时被铺上浅底 #eef5ff → 浅底 × 白字，对比≈1.06:1 直接不可读
+       （2026-11-22 实测某支项目 s1 引线标注抬起帧即此形态，使用者判为缺陷）。
+       字色浅时要么走深底（`#1d4ed8`）、要么整条背景腿不动，不得猜。 */
+    var inkLum = (function(m){ return m && m.length >= 3 ? (0.2126*m[0]+0.7152*m[1]+0.0722*m[2])/255 : 0; })(cs.color.match(/[\d.]+/g));
     var on = { boxShadow:"0px 16px 40px rgba(37,99,235,0.45)", borderColor:"#2563eb" };
     var off = { boxShadow:bs, borderColor:(cs.borderColor || "rgba(0,0,0,0)") };
-    if (doBg){ on.backgroundColor = "#eef5ff"; off.backgroundColor = bg; }
+    if (doBg){ on.backgroundColor = inkLum > 0.6 ? "#1d4ed8" : "#eef5ff"; off.backgroundColor = bg; }
     var onAt = Math.max(cur.at, cur.enterAt), offAt = cur.offAt;
     if (offAt === null){
       offAt = onAt + 8;                          // 约束三：封顶
@@ -878,8 +889,13 @@ tl.to("#cursor",      { opacity:0, duration:0.4 },                              
 ```html
 <p class="lead">它决定<span class="kw">螺旋<span class="kw-chip"></span></span>的起点</p>
 <style>
-.kw { position: relative; display: inline-block; z-index: 0; }
-.kw-chip { position: absolute; left: -6px; right: -6px; top: 8%; bottom: 6%;
+.kw { position: relative; display: inline-block; z-index: 0; padding: 0 8px; }
+/* 呼吸位由 .kw 自身 padding 让出，芯片收在盒内（left/right:3px）。
+   旧写法 `left:-6px; right:-6px` 把芯片盒推到相邻字形里——实测某支项目 s6
+   「盖章」芯片左沿 498 压进「产出」末字右沿 504（相交 6×31px）、右沿 556
+   越出 .kw 盒 550 压住句号，使用者判为缺陷。外扩量在行内是**侵占他人**，
+   不是给自己留白。 */
+.kw-chip { position: absolute; left: 3px; right: 3px; top: 8%; bottom: 6%;
            background: rgba(255,255,255,0.92); border-radius: 6px;
            transform: scaleX(0); transform-origin: left center; z-index: -1; }
 </style>
@@ -948,12 +964,13 @@ tl.to(st, { w: 3.0, duration: 2.4, ease: "power1.inOut", onUpdate: function () {
 
 三条约束：① 读数与它驱动的图形**同一 `onUpdate` 改**（两处各写一份＝两份真相，必然漂移）；② `data-drive` 指向的元素 id 须与 `getElementById` 用的是同一个（契约属性不是注释，机器会核对）；③ 数值必须出自旁白（口画一致），滑轨只是按值绘制的静态装饰，**不做可拖拽控件**。
 
-**共用纪律四条**：
+**共用纪律五条**：
 
 1. 三件套都是"表现手段"，不替代 §4.8 的承载形态——一场仍须先答出形状。
 2. 词与数必须来自本场旁白；参考件里有而本片旁白没有的不引入（与 §4.8 共用纪律 1 同源）。
 3. 所有元素落在**场景 div 内**——增量渲染的场景归属、逐场检查与 7h 的子树核对都依赖它；挂在根 `tl` 或场景外的全局层会让该场每次修订退回全量渲染。
 4. 落进分镜表「强调形态」列，并在 narration.json 写 `emphasis_forms`、在场景 div 写 `data-emphasis`。预检 7h 只 WARN——忘了写不会拦渲染，也就没人能发现。
+5. **带填充的盒子不得压在他人字形上**。芯片、标注框、HUD 底衬、进度线都是"有不透明绘制的矩形"，一旦与相邻行／图注／标题的文字矩形相交且自己绘制在上，观众看到的是被切掉半截的字（2026-11-22 一支交付片同时踩中三种：进度线从判据行字上穿过、三处 `kw-chip` 压相邻行、标注框压自己的标签外侧行）。要点是**让位而不是抬层级**——提高 `z-index` 只会把遮挡做得更实；合法修法：加行距／把芯片挂到所指词上方的空带／缩盒内边距。该形态由预览期运行时判据点名（`preview_capture.measureBoxOverlap` → 预览报告 `Box Overlap` 节，**只点名不阻断**），阈值与裁定单源在 `video_quality_rules.json → box_overlap` ＋ `instant_preview.adjudicate_box_overlap`，本节不复制数字；静态面 7j 只判"抬起态在位"，结构上看不见遮挡。
 
 ---
 

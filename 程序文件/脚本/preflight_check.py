@@ -1397,6 +1397,278 @@ def _gsap_reveal_index(scripts):
     return reveal, froms, stmt_counts
 
 
+def _collect_hidden_selectors(styles_text):
+    """从 `<style>` 文本取**初始隐藏**与**已设回可见**的选择器集合（单源）。
+
+    抽出来的理由：check 7b（元素未揭示）与 check 7j（元素提前在场）问的是同一件事
+    的两面——"这个元素在 CSS 里是不是 0"。两处各写一份正则即两份真相，改一面
+    忘另一面就会让两条判据对同一份 HTML 给出矛盾前提（本仓 A06/单源收敛同族）。
+
+    返回 `(hidden_classes, hidden_ids, restored_ids)`。
+    """
+    styles = re.sub(r'/\*.*?\*/', '', styles_text, flags=re.DOTALL)  # 注释里的 { } 会让规则切分错位
+    hidden_classes, hidden_ids, restored_ids = set(), set(), set()
+    for sel_list, body in re.findall(r'([^{}]+)\{([^{}]*)\}', styles):
+        hidden = (re.search(r'opacity\s*:\s*0(?![.\d])', body)
+                  or re.search(r'visibility\s*:\s*hidden', body))
+        shown = (re.search(r'opacity\s*:\s*(?:[1-9]|0\.\d)', body)
+                 or re.search(r'visibility\s*:\s*visible', body))
+        for one in (s.strip() for s in sel_list.split(',')):
+            m = re.fullmatch(r'\.([A-Za-z_][\w-]*)', one)
+            if m:
+                if hidden:
+                    hidden_classes.add(m.group(1))
+                continue
+            m = re.fullmatch(r'#([A-Za-z_][\w-]*)', one)
+            if not m:
+                continue
+            if hidden:
+                hidden_ids.add(m.group(1))
+            elif shown:
+                restored_ids.add(m.group(1))
+    return hidden_classes, hidden_ids, restored_ids
+
+
+def _js_function_bodies(script_text):
+    """扫出 `function NAME(a, b…){ … }` 的 (name, 形参列表, 函数体, 体起点, 体终点)。
+
+    后两个是**偏移**：调用方要靠它们判断"某条 `fromTo(sel, …)` 位于哪个函数体内"，
+    从而区分"这个变量目标已被某个带字面调用点的封装覆盖"与"没人解析得到它"。
+    只按**花括号配平**取体，不解析 JS：本判据要问的是"体里有没有一条 fromTo 把它的
+    第一个形参当目标、且 from 段把 opacity 抬到非零"，那是字面结构问题。配平失败
+    （体被注释里的孤立花括号打断）时该函数**不返回**＝该条腿对这份 HTML 取不到数，
+    由调用方计入 `unresolved` 点名，不得当成"没有这种写法"。
+    """
+    out = []
+    for m in re.finditer(r'function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{', script_text):
+        i, depth, end = m.end(), 1, None
+        while i < len(script_text):
+            ch = script_text[i]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        if end is None:
+            continue
+        params = [p.strip() for p in m.group(2).split(',') if p.strip()]
+        out.append((m.group(1), params, script_text[m.end():end], m.end(), end))
+    return out
+
+
+def check_layout_geometry(html_path: Path, r: PreflightResult):
+    """check 7j：抬起态与覆盖盒的两条零渲染几何判据（2026-11-22 使用者逐场裁定换来）。
+
+    存在理由：使用者看片点名的四处里，有两条是**静态可判**的，而此前没有任何机算腿
+    覆盖，预览四判据（安全区／文字塌陷／柱溢出／密度）与三把尺全部看不见它们：
+
+      **腿 A「提前在场」**——给 CSS 里已声明初始隐藏（`opacity:0`）的元素写
+      `tl.fromTo(el, {opacity:1}, …)` 当"保持呼吸"。GSAP `fromTo` 的 from 段受
+      `immediateRender` 默认值支配，在**建表时刻**即写入行内样式，于是该元素从第 0 帧
+      就在场；若同元素另有揭示腿，其位移仍停在 from 值而透明度已被抬起＝半入场态。
+      实测某支项目 s5 的"定期扫"卡因此在旁白还没走到该段时就出现在画面右侧，
+      使用者判为"破坏内容出现次序的优先级而显得突兀"。
+      与 7b 形态③ 是**镜像**：那条问"该在的没在"，本条问"不该在的提前在"。
+      与 7g 的分工：7g 只裁**场景根** fromTo，元素级不在其判据对象内。
+
+      **腿 B「覆盖盒外扩」**——`position:absolute` 且 `left` 与 `right` **同为负值**
+      的装饰/高亮盒，必然向父盒两侧各侵占若干像素。实测某支项目 `.kw-chip`
+      （left/right:-6px）左沿压进相邻词末字 6px、右沿越过本盒压住句号，
+      使用者判为"突出关键词后与相邻文字重叠"。合法写法是**由自身 padding 让出呼吸位**，
+      不是把盒推出去。
+
+    取数面必须含**辅助函数**：真实缺陷形态是 `breathe("#s5-sweep", …)` 调一个体内写
+    `tl.fromTo(sel,{opacity:1},…)` 的封装——只扫字面 `tl.fromTo("…")` 会**一个对象都取不到**
+    （A06 同族：判据在位而取数面没有该形态的对象）。故本条同时解析
+    `function NAME(sel, …)` 体，再把 `NAME("字面选择器", …)` 的调用点纳入。
+
+    边界（不得读宽）：
+      - 只看 from 段的 opacity 非零；`to`/`fromTo` 的 to 段把 opacity 抬到 1 是合法揭示，不入判。
+      - 元素若被某条 CSS 规则设回可见（`_collect_hidden_selectors` 的 restored 面），不判。
+      - 选择器解析不到 DOM 元素、辅助函数体配平失败、或 `fromTo` 首参是变量
+        （`tl.fromTo(el, …)`／封装形参且无字面调用点）→ 分别计入 `unresolved` 与
+        `unreachable_targets`，两者合成**覆盖面自报行**（`r.info`，不计 WARN、不阻断），
+        且此时**不印**"无缺陷"通过行。口径由来自全仓普查：83 份里 **33 份**含变量目标
+        （合计 152 处，多为 `forEach(el => tl.fromTo(el, …))` 这类结构上无法静态归因的写法）。
+        记成 WARN 会让四成项目白报一行、信号疲劳淹没真病灶；但从输出面删掉它就是把
+        "我没对象"读成"已核对"（A06 同族）——故降档为 INFO 而**不撤**。
+      - 本条不判两两盒相交（那需要布局引擎），运行时几何自检的落点是
+        `instant_preview` 的取数腿，属另一批。
+
+    **定档＝WARN 不阻断（2026-11-22 落地前全仓普查现读，83 份 index.html）**：
+      元素级提前在场 **1** 处（`vertical-style-pilot` 的 `#stars`，类 `.stars`）、
+      覆盖盒外扩 **1** 处（一支高隔声隔墙项目的 `.kw-chip`）。两处都在
+      **已交付/已验收**项目上，按 7g/7i 同一条纪律（严格判据须 0 命中才升 ERROR），
+      有错杀对象即定 WARN。
+      普查首读曾报 **64 处**——那是本函数自己的取数面缺陷：场景根排除只认
+      `data-scene-id`，而手写 HTML 常只有 `id="sceneN"`，于是 12 支项目的**场景根揭示**
+      被整片计入（场景根归 7g，且 `fromTo('#sceneN',{opacity:1}…)` 在那里是合法写法）。
+      补 `id="sceneN"` 回落口径后同一普查降到上述 2 处。
+      **升为 ERROR 的翻转前置（唯一一条）**：这 2 处经使用者逐条裁定"确为缺陷且
+      修法不牵连其它场"；届时须同时回答四态给法与会错杀哪些既有交付。
+    """
+    print("\n[7j/14] Layout Geometry (early presence via from-state / absolute box overhang)")
+
+    if not html_path.exists():
+        r.error(f"HTML file not found: {html_path}", check_id="layout_geometry")
+        return
+
+    content = html_path.read_text(encoding='utf-8')
+    styles_raw = "".join(re.findall(r'<style[^>]*>(.*?)</style>', content, re.DOTALL))
+    scripts = "".join(re.findall(r'<script[^>]*>(.*?)</script>', content, re.DOTALL))
+    hidden_classes, hidden_ids, restored_ids = _collect_hidden_selectors(styles_raw)
+
+    counts = {"hidden_selectors": len(hidden_classes) + len(hidden_ids),
+              "early_present": 0, "overhang_rules": 0, "unresolved": 0,
+              "from_to_literals": 0, "from_to_via_helper": 0, "helpers": 0}
+
+    # ── 腿 B：absolute 且左右同为负值 ──
+    overhang = []
+    for sel_list, body in re.findall(r'([^{}]+)\{([^{}]*)\}',
+                                     re.sub(r'/\*.*?\*/', '', styles_raw, flags=re.DOTALL)):
+        compact = body.replace(' ', '').replace('\n', '')
+        if 'position:absolute' not in compact:
+            continue
+        if re.search(r'left\s*:\s*-', body) and re.search(r'right\s*:\s*-', body):
+            overhang.append(" / ".join(s.strip() for s in sel_list.split(',')))
+    counts["overhang_rules"] = len(overhang)
+    for sel in overhang:
+        r.warn(f"覆盖盒向父盒两侧外扩：`{sel}` 同时声明负值 left 与 right —— "
+                f"它侵占的是**相邻内容**的像素（实测某支项目 .kw-chip 左沿压进相邻词末字 6px）。"
+                f"呼吸位应由该元素自身 padding 让出，芯片收在盒内",
+                check_id="layout_geometry")
+
+    # ── 腿 A：from 段把 opacity 抬到非零的目标 ──
+    def _from_visible(block):
+        return bool(re.search(r'opacity\s*:\s*(?:0\.\d*[1-9]|[1-9](?:\.\d*)?)', block))
+
+    # 元素树：把选择器末段解析成**真实元素**再问它是否初始隐藏。
+    # 只按 CSS 选择器字面比对会整条落空——本仓的隐藏声明几乎都写在**类**上
+    # （`.rv{opacity:0}`），而 GSAP 目标写的是 **id**（`#s5-sweep`）。首版即此误：
+    # 在缺陷件字节上 early_present 恒 0，摘掉判据也不红＝取数面没有对象（A06 同族）。
+    from html.parser import HTMLParser
+
+    class _Coll(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.by_id = {}
+            self.scene_roots = set()
+
+        def handle_starttag(self, tag, attrs):
+            d = dict(attrs or [])
+            cls = set((d.get("class") or "").split())
+            if d.get("id"):
+                self.by_id[d["id"]] = cls
+                # 场景根两形制都要认（与 transition_overlap_census 同口径）：
+                # `data-scene-id` 权威，手写 HTML 常只有 `id="sceneN"`。首版只认前者，
+                # 于是普查 83 份里 64 处命中**几乎全是场景根**——本条要裁的是元素级，
+                # 场景根的 from 段遮挡归 7g，重复置位会把合法揭示写法判成缺陷。
+                if d.get("data-scene-id") or re.fullmatch(r'scene\d+', d["id"]):
+                    self.scene_roots.add(d["id"])
+
+    coll = _Coll()
+    coll.feed(content)
+
+    def _hidden_hit(sel):
+        """选择器**末段**解析到真实元素后，该元素是否处于 CSS 初始隐藏态。"""
+        last = sel.split()[-1] if sel.split() else ""
+        m = re.match(r'#([A-Za-z_][\w-]*)', last)
+        if m:
+            name = m.group(1)
+            if name in coll.scene_roots:
+                return None                      # 场景根由 7g 裁，本条不重复置位
+            if name in restored_ids:
+                return None
+            if name in hidden_ids:
+                return f"#{name}"
+            hit = coll.by_id.get(name, set()) & hidden_classes
+            return f"#{name}(类 .{sorted(hit)[0]})" if hit else None
+        m = re.fullmatch(r'\.([A-Za-z_][\w-]*)', last)
+        if m and m.group(1) in hidden_classes:
+            return f".{m.group(1)}"
+        return None
+
+    hits, unresolved, unreachable_targets = [], 0, 0
+
+    for m in re.finditer(r'fromTo\(\s*[\'"]([^\'"]+)[\'"]\s*,\s*\{([^}]*)\}', scripts):
+        counts["from_to_literals"] += 1
+        if _from_visible(m.group(2)):
+            hit = _hidden_hit(m.group(1))
+            if hit:
+                hits.append((m.group(1), hit, "直接语句"))
+            elif not m.group(1).startswith('#'):
+                unresolved += 1
+
+    # 首参**不是字符串字面量**的直接语句（`tl.fromTo(SELVAR,{opacity:1},…)`）：
+    # 静态面解析不出目标元素，本判据对它没有对象。不计数就会被"扫描 fromTo 字面 N 条"
+    # 的通过行读成"都核对过了"（A06 同族：取数面没有对象 ≠ 没有这种写法）。
+    var_targets = [(m.group(1), m.start()) for m in
+                   re.finditer(r'fromTo\(\s*([A-Za-z_$][\w$]*)\s*,', scripts)]
+
+    helper_names = set()
+    helper_param = {}          # (name, 体起点, 体终点) -> 第一个形参名
+    for name, params, body, b0, b1 in _js_function_bodies(scripts):
+        counts["helpers"] += 1
+        if not params:
+            continue
+        fm = re.search(r'fromTo\(\s*' + re.escape(params[0]) + r'\s*,\s*\{([^}]*)\}', body)
+        if fm and _from_visible(fm.group(1)):
+            helper_names.add(name)
+            helper_param[(name, b0, b1)] = params[0]
+    calls_by_helper = {}
+    for name in helper_names:
+        for cm in re.finditer(r'\b' + re.escape(name) + r'\(\s*[\'"]([^\'"]+)[\'"]', scripts):
+            counts["from_to_via_helper"] += 1
+            calls_by_helper[name] = calls_by_helper.get(name, 0) + 1
+            hit = _hidden_hit(cm.group(1))
+            if hit:
+                hits.append((cm.group(1), hit, f"经辅助函数 `{name}()`"))
+            elif not cm.group(1).startswith('#'):
+                unresolved += 1
+
+    # 变量目标归属：位于某个**已解析到字面调用点**的辅助函数体内、且正是它的首参
+    # → 上面的调用点循环已覆盖它，不重复计；其余（顶层变量、或该 helper 零字面调用点）
+    # → `unreachable_targets` 点名。
+    for ident, pos in var_targets:
+        owner = next((k for k, v in helper_param.items()
+                      if v == ident and k[1] <= pos < k[2]), None)
+        if owner and calls_by_helper.get(owner[0]):
+            continue
+        unreachable_targets += 1
+    counts["unreachable_targets"] = unreachable_targets
+
+    counts["early_present"] = len(hits)
+    counts["unresolved"] = unresolved
+    for sel, hit, how in hits:
+        r.warn(f"初始隐藏元素 `{hit}`（选择器 `{sel}`，{how}）被一条 **from 段 opacity 非零**的 "
+                f"`fromTo` 命中——GSAP `immediateRender` 默认在**建表时刻**就写入 from 值，"
+                f"该元素从第 0 帧即在画面里，早于其揭示锚。保持呼吸/明暗一律改用 `tl.to()`"
+                f"（to 不在建表写值），且呼吸锚须晚于本场揭示锚",
+                check_id="layout_geometry")
+
+    blind = unresolved + unreachable_targets
+    if hits or overhang:
+        pass                                   # 病灶已逐条 WARN，覆盖面另计（见下）
+    if blind:
+        # 走 INFO 而非 WARN：全仓 83 份普查有 **33 份**含变量目标 fromTo（合计 152 处，
+        # 多为 `forEach(el => tl.fromTo(el, …))` 这类结构上无法静态归因的写法）。把它记成
+        # WARN 会让 40% 的项目白报一行，信号疲劳淹没真病灶——`PreflightResult.info` 的
+        # 存在理由正是这条（画像降级同源）。但它**不得**因此从输出面消失：同一轮
+        # "无缺陷"通过行在此缺席，覆盖面自报行把"没对象"与"没病灶"分开。
+        r.info(f"覆盖面自报：{unresolved} 处 fromTo 目标选择器不在初始隐藏集合、"
+               f"{unreachable_targets} 处首参是变量（静态面无对象可归因）——"
+               f"病灶点名只覆盖已解析的部分，本行不得读成「已核对」",
+               check_id="layout_geometry")
+    elif not (hits or overhang):
+        r.ok(f"抬起态与覆盖盒无缺陷（扫描 fromTo 字面 {counts['from_to_literals']} 条／"
+             f"经辅助函数 {counts['from_to_via_helper']} 条／函数 {counts['helpers']} 个／"
+             f"absolute 规则外扩 0）", check_id="layout_geometry")
+    r.counts["layout_geometry"] = counts
+
+
 def check_element_reveal(html_path: Path, r: PreflightResult):
     """CRITICAL (元素级): 初始隐藏的元素必须有入场语句**命中它自己**。
 
@@ -1452,26 +1724,7 @@ def check_element_reveal(html_path: Path, r: PreflightResult):
 
     # ── 1. 初始隐藏的选择器：从 <style> 里取声明了 opacity:0 / visibility:hidden 的规则 ──
     styles = "".join(re.findall(r'<style[^>]*>(.*?)</style>', content, re.DOTALL))
-    styles = re.sub(r'/\*.*?\*/', '', styles, flags=re.DOTALL)   # 注释里的 { } 会让规则切分错位
-    hidden_classes, hidden_ids, restored_ids = set(), set(), set()
-    for sel_list, body in re.findall(r'([^{}]+)\{([^{}]*)\}', styles):
-        hidden = (re.search(r'opacity\s*:\s*0(?![.\d])', body)
-                  or re.search(r'visibility\s*:\s*hidden', body))
-        shown = (re.search(r'opacity\s*:\s*(?:[1-9]|0\.\d)', body)
-                 or re.search(r'visibility\s*:\s*visible', body))
-        for one in (s.strip() for s in sel_list.split(',')):
-            m = re.fullmatch(r'\.([A-Za-z_][\w-]*)', one)
-            if m:
-                if hidden:
-                    hidden_classes.add(m.group(1))
-                continue
-            m = re.fullmatch(r'#([A-Za-z_][\w-]*)', one)
-            if not m:
-                continue
-            if hidden:
-                hidden_ids.add(m.group(1))
-            elif shown:
-                restored_ids.add(m.group(1))
+    hidden_classes, hidden_ids, restored_ids = _collect_hidden_selectors(styles)
 
     if not hidden_classes and not hidden_ids:
         r.counts["element_reveal"] = {"hidden": 0, "scene_root_hidden": 0,
@@ -3656,6 +3909,7 @@ def main():
     check_visual_form(html_path, cfg or pre_cfg, config_path, r)
     check_emphasis_forms(html_path, cfg or pre_cfg, config_path, r)
     check_scene_root_selectors(html_path, r)
+    check_layout_geometry(html_path, r)
     check_incremental_eligibility(html_path, cfg or pre_cfg, r)
     check_design_rules(html_path, r)
     check_animation_density(html_path, cfg or pre_cfg, r)

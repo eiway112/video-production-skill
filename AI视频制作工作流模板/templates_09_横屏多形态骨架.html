@@ -45,7 +45,10 @@
   --cw: 1920px;
   --ch: 1080px;
   --pad-x: 90px;
-  --pad-top: 50px;
+  --pad-top: 96px;               /* 必须 ≥ 章级标识底沿 ＋ 20px。旧值 50px 与
+                                    #chapter-bar（top:24，底沿≈50）零间距；若项目另加
+                                    刻度条（.ch-ticks top:42、底沿≈73）则首行 .tag 被
+                                    压住 7px——2026-11-22 使用者逐场裁定的「标题拥挤」即此。 */
   --pad-bottom: 240px;          /* 预留带 220 ＋ 20px 设计余量；内容下边界由它顶住 */
   --gap: 20px;
   --min-cpl: 6;                 /* 与 video_quality_rules.json → text_fit.min_chars_per_line 同源 */
@@ -109,6 +112,17 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
 .layer.main .lv,.layer.main .ld{color:#bfdbfe;}
 .layer.main .lt{color:#fff;}
 .side-card{border:2px dashed #93c5fd;border-radius:12px;padding:20px 22px;background:rgba(59,130,246,0.04);}
+
+/* 贯穿型信息层动效：讲解进度线。绝对定位、不入文档流，故不改各场版面高度分配。
+   bottom 由 270px 收到 226px：270px 时线落在**内容带内**（内容底沿＝1080−240＝840，
+   而 270px 对应 y≈810），贴底的判据行/结论行会被线从字上穿过（2026-11-22 实测某支
+   项目 s2 判据行与线相交 1472px²）。226px 把线放进内容底沿 840 与字幕安全线 860
+   之间的空带，全片同一 y，不逐场挪。 */
+.play{position:absolute;left:80px;right:80px;bottom:226px;height:4px;border-radius:2px;
+      background:rgba(148,163,184,0.20);}
+.play-fill{position:absolute;left:0;top:0;bottom:0;width:100%;border-radius:2px;background:var(--blue);}
+.play-dot{position:absolute;top:50%;left:0;width:12px;height:12px;margin-top:-6px;border-radius:50%;
+          background:#fff;box-shadow:0 0 14px rgba(37,99,235,0.85);}
 
 /* 形态三：同量纲对比条形。轨道先出、填充后长 */
 .bar-row{display:flex;align-items:center;gap:24px;}
@@ -206,6 +220,7 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
 </svg>
 </div>
 </div>
+<div class="play" id="s1-play"><div class="play-fill" id="s1-play-fill"></div><div class="play-dot" id="s1-play-dot"></div></div>
 <div class="subtitle-safe"></div>
 </div>
 
@@ -229,6 +244,7 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
   </div>
 </div>
 </div>
+<div class="play" id="s2-play"><div class="play-fill" id="s2-play-fill"></div><div class="play-dot" id="s2-play-dot"></div></div>
 <div class="subtitle-safe"></div>
 </div>
 
@@ -250,11 +266,12 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
     <span class="val" style="color:var(--blue);">约 10 分钟</span>
   </div>
   <div class="rv" id="s3-delta" style="display:flex;align-items:center;justify-content:center;gap:30px;padding:26px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);">
-    <span style="font-size:76px;font-weight:900;color:var(--green);">≈288×</span>
+    <span style="font-size:76px;font-weight:900;color:var(--green);">≈<span id="s3-num">0</span>×</span>
     <span style="font-size:var(--fs-h2);color:var(--ink-2);max-width:760px;">同一件事的耗时比。两条量的是同一量纲（时长换算后），故可并置；不同量纲并置即假对比</span>
   </div>
 </div>
 </div>
+<div class="play" id="s3-play"><div class="play-fill" id="s3-play-fill"></div><div class="play-dot" id="s3-play-dot"></div></div>
 <div class="subtitle-safe"></div>
 </div>
 
@@ -301,6 +318,7 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
   </div>
 </div>
 </div>
+<div class="play" id="s4-play"><div class="play-fill" id="s4-play-fill"></div><div class="play-dot" id="s4-play-dot"></div></div>
 <div class="subtitle-safe"></div>
 </div>
 
@@ -324,6 +342,7 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
   </div>
 </div>
 </div>
+<div class="play" id="s5-play"><div class="play-fill" id="s5-play-fill"></div><div class="play-dot" id="s5-play-dot"></div></div>
 <div class="subtitle-safe"></div>
 </div>
 
@@ -338,6 +357,7 @@ svg text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;}
 <div id="s6-line" class="rv" style="width:300px;height:1px;background:var(--line);margin:40px 0;"></div>
 <div id="s6-f" class="rv tag">SKELETON · templates_09</div>
 </div>
+<div class="play" id="s6-play"><div class="play-fill" id="s6-play-fill"></div><div class="play-dot" id="s6-play-dot"></div></div>
 <div class="subtitle-safe"></div>
 </div>
 
@@ -426,15 +446,48 @@ function growLayer(sel, at, dur){
     {scaleY:1, opacity:1, duration:(dur||0.55), ease:'power2.out'}, at);
 }
 
+/* 原语五：贯穿型持续动效（信息层）。入场只活 0.5s，旁白要念 8-20s——这段保持区间
+   必须由这条推进线铺满：它随旁白匀速走完该场窗口，指示"讲到哪儿了"，有终点故属推进型。
+   `repeat:-1`／`yoyo` 不计入推进覆盖，不得拿循环充当填充（choreography_profile 同判据）。
+
+   存在的理由是实测而非风格偏好（2026-11-21）：本骨架此前全部 duration 落在 0.3–0.9s，
+   即"入场即静止"，从它起步的成片最长静止窗 6.3s、在动占比 0.236。跨 10 支已交付成片，
+   「贯穿型动效条数 ↔ 成片实测在动占比」r=0.806，而同批量的描画 r=0.065、cue 声明
+   r=-0.132、文字动效 r=-0.261 均与该轴测不出关系——门禁化的正是无关的那几项。
+   逐片读数与口径见 `操作日志.md` [2026-11-21] 条。 */
+var PLAY_HEAD = 1.2;   // 让开入场（首条正文 tween 须 ≤ T.sN+1.0s，见 HTML 基准 §2.2）
+var PLAY_TAIL = 1.0;   // 让开退场
+
+/* 场窗长一律由 T-block 推导，不得抄字面秒——timeline 步按音频实测改写 T 后它自动跟随。 */
+function sceneWindow(i){
+  var cur = T['s' + i];
+  if (cur == null) return 0;
+  var nxt = T['s' + (i + 1)];
+  if (nxt != null) return nxt - cur;
+  var root = document.getElementById('root');
+  var tot = root ? parseFloat(root.getAttribute('data-duration')) : NaN;
+  return (isFinite(tot) && tot > cur) ? tot - cur : 0;
+}
+
+/* 轨道 DOM 一律写在场景 HTML 里、id 取 `sN-play`／`-fill`／`-dot`：
+   `scene_patch_render` 的选择器归因按**静态** DOM 解析，元素若由 JS 创建则解析不到归属，
+   此后任何一次节奏修订都会点名"跨场/无归属"并退回全量渲染（一次约 20 分钟机时）。 */
+
 /* ── T-block／S-block：单一权威源，由 timeline 步按音频实测改写 ── */
 var T = { s1: 3.0, s2: 23.0, s3: 43.0, s4: 63.0, s5: 83.0, s6: 103.0 };
+/* S 块键名必须与权威解析器 `_gsap_time_utils.parse_scene_map` 一致：它取
+   `s.get('cover')` 与 `s.get('dur')`。旧形制写 `"duration"` 且**没有 cover 条目**，
+   而本骨架 DOM 里 scene0 是 `data-scene-entry="cover"`／`data-cover-duration="3"`
+   ——抄骨架者首轮预检即报 `Cover duration mismatch (S-block=0.0s)`（2026-11-22 真实踩到）。
+   数值仍由作者/流水线按 narration 维护，这里只把**形制**对齐，不改时长语义。 */
 var S = [
- {"scene_id":"s1","start":3.0,"end":23.0,"duration":20.0},
- {"scene_id":"s2","start":23.0,"end":43.0,"duration":20.0},
- {"scene_id":"s3","start":43.0,"end":63.0,"duration":20.0},
- {"scene_id":"s4","start":63.0,"end":83.0,"duration":20.0},
- {"scene_id":"s5","start":83.0,"end":103.0,"duration":20.0},
- {"scene_id":"s6","start":103.0,"end":123.0,"duration":20.0}
+ {"cover": true, "start": 0, "end": 3, "dur": 3},
+ {"scene_id":"s1","start":3.0,"end":23.0,"dur":20.0,"type":"content"},
+ {"scene_id":"s2","start":23.0,"end":43.0,"dur":20.0,"type":"content"},
+ {"scene_id":"s3","start":43.0,"end":63.0,"dur":20.0,"type":"content"},
+ {"scene_id":"s4","start":63.0,"end":83.0,"dur":20.0,"type":"content"},
+ {"scene_id":"s5","start":83.0,"end":103.0,"dur":20.0,"type":"content"},
+ {"scene_id":"s6","start":103.0,"end":123.0,"dur":20.0,"type":"content"}
 ];
 
 /* ── 封面 ── */
@@ -451,21 +504,27 @@ tl.set("#scene1",{opacity:1,visibility:"visible"},T.s1);
 tl.fromTo("#s1-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s1+0.3);
 tl.fromTo("#s1-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s1+0.6);
 tl.fromTo("#s1-wrap",{opacity:0},{opacity:1,duration:0.3},T.s1+1.2);
-svgFlow("#s1-svg", T.s1+1.4, {step:2.6, draw:0.9, pop:0.5});
+svgFlow("#s1-svg", T.s1+1.4, {step:(sceneWindow(1)-5.0)/4, draw:0.9, pop:0.5});
+tl.fromTo("#s1-play",{opacity:0},{opacity:1,duration:0.4},T.s1+1.0);
+tl.fromTo("#s1-play-fill",{scaleX:0,transformOrigin:"left center"},{scaleX:1,duration:sceneWindow(1)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s1+PLAY_HEAD);
+tl.fromTo("#s1-play-dot",{left:"0%",xPercent:-50},{left:"100%",xPercent:-50,duration:sceneWindow(1)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s1+PLAY_HEAD);
 tl.set("#scene1",{visibility:"hidden"},T.s2);
 
 /* ── s2 分层色带：逐层长出，主层稍慢，约束栏最后 ── */
 tl.set("#scene2",{opacity:1,visibility:"visible"},T.s2);
 tl.fromTo("#s2-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s2+0.3);
 tl.fromTo("#s2-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s2+0.6);
-growLayer("#s2-l1",T.s2+1.6);
-growLayer("#s2-l2",T.s2+3.4);
-growLayer("#s2-l3",T.s2+5.2,0.75);
-growLayer("#s2-l4",T.s2+7.4);
-growLayer("#s2-l5",T.s2+9.2);
+growLayer("#s2-l1",T.s2+1.6+(sceneWindow(2)-4.0)*0/4);
+growLayer("#s2-l2",T.s2+1.6+(sceneWindow(2)-4.0)*1/4);
+growLayer("#s2-l3",T.s2+1.6+(sceneWindow(2)-4.0)*2/4,0.75);
+growLayer("#s2-l4",T.s2+1.6+(sceneWindow(2)-4.0)*3/4);
+growLayer("#s2-l5",T.s2+1.6+(sceneWindow(2)-4.0)*4/4);
 tl.fromTo("#s2-c1",{x:26,opacity:0},{x:0,opacity:1,duration:0.55,ease:"power2.out"},T.s2+11.4);
 tl.fromTo("#s2-c2",{x:26,opacity:0},{x:0,opacity:1,duration:0.55,ease:"power2.out"},T.s2+13.0);
 tl.fromTo("#s2-c3",{x:26,opacity:0},{x:0,opacity:1,duration:0.55,ease:"power2.out"},T.s2+14.6);
+tl.fromTo("#s2-play",{opacity:0},{opacity:1,duration:0.4},T.s2+1.0);
+tl.fromTo("#s2-play-fill",{scaleX:0,transformOrigin:"left center"},{scaleX:1,duration:sceneWindow(2)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s2+PLAY_HEAD);
+tl.fromTo("#s2-play-dot",{left:"0%",xPercent:-50},{left:"100%",xPercent:-50,duration:sceneWindow(2)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s2+PLAY_HEAD);
 tl.set("#scene2",{visibility:"hidden"},T.s3);
 
 /* ── s3 对比条形：两条分别对齐各自被说出的时刻 ── */
@@ -477,17 +536,24 @@ growBar("#s3-f1",T.s3+2.4,1.4);
 tl.fromTo("#s3-r2",{y:22,opacity:0},{y:0,opacity:1,duration:0.55},T.s3+7.6);
 growBar("#s3-f2",T.s3+8.2,0.9);
 tl.fromTo("#s3-delta",{y:20,opacity:0},{y:0,opacity:1,duration:0.6},T.s3+12.0);
+countUp("#s3-num",288,T.s3+12.4,4.6,0);
+tl.fromTo("#s3-play",{opacity:0},{opacity:1,duration:0.4},T.s3+1.0);
+tl.fromTo("#s3-play-fill",{scaleX:0,transformOrigin:"left center"},{scaleX:1,duration:sceneWindow(3)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s3+PLAY_HEAD);
+tl.fromTo("#s3-play-dot",{left:"0%",xPercent:-50},{left:"100%",xPercent:-50,duration:sceneWindow(3)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s3+PLAY_HEAD);
 tl.set("#scene3",{visibility:"hidden"},T.s4);
 
 /* ── s4 循环图：四节点逐跳，弧箭头描画，闭合后旁注 ── */
 tl.set("#scene4",{opacity:1,visibility:"visible"},T.s4);
 tl.fromTo("#s4-tag",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s4+0.3);
 tl.fromTo("#s4-title",{y:24,opacity:0},{y:0,opacity:1,duration:0.6,ease:"power2.out"},T.s4+0.6);
-svgFlow("#s4-svg", T.s4+1.6, {step:2.4, draw:0.85, pop:0.5});
+svgFlow("#s4-svg", T.s4+1.6, {step:(sceneWindow(4)-5.2)/4, draw:0.85, pop:0.5});
 tl.fromTo("#s4-a1",{x:-24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+2.0);
 tl.fromTo("#s4-a2",{x:-24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+6.4);
 tl.fromTo("#s4-a3",{x:24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+11.0);
 tl.fromTo("#s4-a4",{x:24,opacity:0},{x:0,opacity:1,duration:0.55},T.s4+14.4);
+tl.fromTo("#s4-play",{opacity:0},{opacity:1,duration:0.4},T.s4+1.0);
+tl.fromTo("#s4-play-fill",{scaleX:0,transformOrigin:"left center"},{scaleX:1,duration:sceneWindow(4)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s4+PLAY_HEAD);
+tl.fromTo("#s4-play-dot",{left:"0%",xPercent:-50},{left:"100%",xPercent:-50,duration:sceneWindow(4)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s4+PLAY_HEAD);
 tl.set("#scene4",{visibility:"hidden"},T.s5);
 
 /* ── s5 代码块逐行 + 数字跳数 ── */
@@ -507,6 +573,9 @@ tl.fromTo("#s5-k3",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+14.0);
 countUp("#s5-n3",26,T.s5+14.4,1.0);
 tl.fromTo("#s5-k4",{y:20,opacity:0},{y:0,opacity:1,duration:0.5},T.s5+15.8);
 countUp("#s5-n4",85.7,T.s5+16.2,1.3,1);
+tl.fromTo("#s5-play",{opacity:0},{opacity:1,duration:0.4},T.s5+1.0);
+tl.fromTo("#s5-play-fill",{scaleX:0,transformOrigin:"left center"},{scaleX:1,duration:sceneWindow(5)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s5+PLAY_HEAD);
+tl.fromTo("#s5-play-dot",{left:"0%",xPercent:-50},{left:"100%",xPercent:-50,duration:sceneWindow(5)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s5+PLAY_HEAD);
 tl.set("#scene5",{visibility:"hidden"},T.s6);
 
 /* ── s6 收尾 ── */
@@ -516,6 +585,9 @@ tl.fromTo("#s6-s",{y:18,opacity:0},{y:0,opacity:1,duration:0.6},T.s6+2.4);
 tl.fromTo("#s6-line",{scaleX:0,opacity:0},{scaleX:1,opacity:1,duration:0.7},T.s6+4.2);
 tl.fromTo("#s6-f",{opacity:0},{opacity:1,duration:0.6},T.s6+5.4);
 tl.to("#chapter-bar",{opacity:0,duration:0.5},T.s6+6.0);
+tl.fromTo("#s6-play",{opacity:0},{opacity:1,duration:0.4},T.s6+1.0);
+tl.fromTo("#s6-play-fill",{scaleX:0,transformOrigin:"left center"},{scaleX:1,duration:sceneWindow(6)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s6+PLAY_HEAD);
+tl.fromTo("#s6-play-dot",{left:"0%",xPercent:-50},{left:"100%",xPercent:-50,duration:sceneWindow(6)-PLAY_HEAD-PLAY_TAIL,ease:"none"},T.s6+PLAY_HEAD);
 
 window.__timelines["main"] = tl;
 </script>
