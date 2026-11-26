@@ -32350,7 +32350,8 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                                and "失败出口状态刷新失败: synthetic projection failure" in projection_output.getvalue(),
                                "L 投影异常须保留原失败并点名归因")
 
-                for label, start_from in (("setup", None), ("prereq", "render")):
+                for label, start_from in (("setup", None), ("prereq", "render"),
+                                          ("missing-method", None)):
                     stale_snapshot = project_status(acceptance_mode="production")
                     dump(temp / "acceptance_status.json", stale_snapshot)
                     set_report("FAILED", 1)
@@ -32360,9 +32361,13 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                     early_exit.quick_fix = False
                     early_exit.force = False
                     early_exit.take_over_lock = False
-                    early_exit._setup_env = lambda: label != "setup"
+                    early_exit._setup_env = lambda: True
                     early_exit._warn_previous_interrupted_runs = lambda: None
                     early_exit._skill_version_stamp = lambda: None
+                    if label == "setup":
+                        early_exit._setup_env = lambda: False
+                    elif label == "missing-method":
+                        early_exit.step_preflight = None
                     early_output = io.StringIO()
                     with contextlib.redirect_stdout(early_output):
                         try:
@@ -32370,6 +32375,10 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                             tc.assert_true(False, "L2 早期失败出口必须退出 1：" + label)
                         except SystemExit as exc:
                             tc.assert_equal(exc.code, 1, "L2 早期失败出口退出码：" + label)
+                    if label == "missing-method":
+                        tc.assert_true("FATAL: Missing step method: step_preflight()"
+                                       in early_output.getvalue(),
+                                       "L2 缺 step 方法夹具确实走到目标出口")
                     tc.assert_equal(
                         (early_exit.acceptance_status or {}).get("technical_validation", {}).get("status"),
                         "FAIL", "L2 早期失败出口刷新内存四轴状态：" + label)
