@@ -1282,6 +1282,12 @@ class PipelineRunner:
         satisfied, reasons = acceptance.acceptance_satisfied(status)
         return status, satisfied, reasons
 
+    def _refresh_acceptance_on_failure(self):
+        try:
+            self._project_acceptance()
+        except Exception as exc:
+            print(f"[ACCEPTANCE] ERROR: 失败出口状态刷新失败: {exc}")
+
     def _technical_config_input(self):
         if not hasattr(self, "config"):
             return str(self.config_path)
@@ -4165,6 +4171,7 @@ class PipelineRunner:
                      if age is not None else ""))
             print("  等它跑完再起跑；确需并行 → 追加 --take-over-lock（留痕 state.lock_takeover，"
                   "代价是本轮 state 的步时间戳不再构成可复核证据）")
+            # 锁冲突时 temp 归另一进程所有，不能刷新本项目的验收快照。
             sys.exit(1)
         if held and self.take_over_lock:
             self.state.data["lock_takeover"] = {
@@ -4204,11 +4211,13 @@ class PipelineRunner:
                           f"，该结论已不对应当前输入")
                 print(f"\nRun prerequisites first (drop --step to let --resume roll back"
                       f" to the earliest stale step), or use --force to override.")
+                self._refresh_acceptance_on_failure()
                 sys.exit(1)
 
         # Setup environment
         print("--- Environment Setup ---")
         if not self._setup_env():
+            self._refresh_acceptance_on_failure()
             sys.exit(1)
         print()
 
@@ -4220,6 +4229,7 @@ class PipelineRunner:
             func = getattr(self, f"step_{step_name}", None)
             if func is None:
                 print(f"FATAL: Missing step method: step_{step_name}()")
+                self._refresh_acceptance_on_failure()
                 sys.exit(1)
             step_funcs[step_name] = func
 
@@ -4248,10 +4258,7 @@ class PipelineRunner:
             if not ok:
                 print(f"\nPIPELINE FAILED at: {step_label}")
                 print(f"Fix the issue and re-run with --resume or --quick-fix")
-                try:
-                    self._project_acceptance()
-                except Exception as exc:
-                    print(f"[ACCEPTANCE] ERROR: 失败出口状态刷新失败: {exc}")
+                self._refresh_acceptance_on_failure()
                 sys.exit(1)
             print()
 

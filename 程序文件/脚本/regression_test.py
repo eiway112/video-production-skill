@@ -32349,6 +32349,33 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 tc.assert_true("PIPELINE FAILED at: 静态预检" in projection_output.getvalue()
                                and "失败出口状态刷新失败: synthetic projection failure" in projection_output.getvalue(),
                                "L 投影异常须保留原失败并点名归因")
+
+                for label, start_from in (("setup", None), ("prereq", "render")):
+                    stale_snapshot = project_status(acceptance_mode="production")
+                    dump(temp / "acceptance_status.json", stale_snapshot)
+                    set_report("FAILED", 1)
+                    early_exit = make_runner("production", "early-exit-" + label)
+                    early_exit.source_dir = root / "hyperframes" / "project"
+                    early_exit.gate_mode = "render"
+                    early_exit.quick_fix = False
+                    early_exit.force = False
+                    early_exit.take_over_lock = False
+                    early_exit._setup_env = lambda: label != "setup"
+                    early_exit._warn_previous_interrupted_runs = lambda: None
+                    early_exit._skill_version_stamp = lambda: None
+                    early_output = io.StringIO()
+                    with contextlib.redirect_stdout(early_output):
+                        try:
+                            early_exit.run(start_from=start_from)
+                            tc.assert_true(False, "L2 早期失败出口必须退出 1：" + label)
+                        except SystemExit as exc:
+                            tc.assert_equal(exc.code, 1, "L2 早期失败出口退出码：" + label)
+                    tc.assert_equal(
+                        (early_exit.acceptance_status or {}).get("technical_validation", {}).get("status"),
+                        "FAIL", "L2 早期失败出口刷新内存四轴状态：" + label)
+                    refreshed_early = json.loads((temp / "acceptance_status.json").read_text(encoding="utf-8"))
+                    tc.assert_equal(refreshed_early["technical_validation"]["status"], "FAIL",
+                                    "L2 早期失败出口不遗留旧通过快照：" + label)
                 set_report()
 
                 cli = [
