@@ -110,28 +110,15 @@ python config_manager.py
    - TTS 生成并发数由 `程序文件/配置/config/system/hyperframes_config.json` 的 `tts_concurrency` 控制（默认 3，硬上限 5，设 1 为串行；读取失败回退 3 并告警）；并发仅作用于 TTS 网络生成阶段，失败场景自动串行兜底重试一次。
    - 渲染期间的 `[RENDER]` 前缀进度/心跳日志来自旁路观察者线程，纯观测输出，不改变渲染控制流与退出码。
 2. 失败处理：修复后 `--resume`（自动回退到最早失效步）；字幕/BGM 类修改用 `--quick-fix`。注意 `--quick-fix` 会将渲染链前置步骤标记 skipped，delivery 硬门禁必然拦截（错误码 `QUICKFIX_BLOCKED`）——仅用于快速排查，不产生可交付产物，交付前须跑完整流水线。同一问题修复超过 3 次 → 停止，输出阻塞报告等用户方向。渲染成本受预算门禁治理：全量渲染尝试次数达到 `render_rules.json render_budget.max_full_renders`（默认 5，2026-10-21 上调）后自动阻断——超限通常意味着问题不在渲染本身，先定点诊断；确需继续用 `--accept-over-render` 显式放行留痕。**增量渲染不需要显式开启**（2026-09-03 起）：只要存在基线 `render_raw.mp4` + `scene_fingerprints.json`，render 步自动调用分类器裁定 PATCH/FULL，`--scene-patch` 已废弃为空操作，`--no-scene-patch` 才是退出开关；PATCH 成功落地与 `--quick-fix` 均不计入预算，裁定结果留痕 `state.scene_patch` + `scene_patch_verdict.json`。已登记交付的成片不得被任何模式覆盖（拦截点：render 前置 + postprocess 写入点），修订须改 `_修订NN` 文件名，确需覆盖用 `--force`。
-3. 交付验收：
-   ```
-   python generate_completion_report.py --project-name "<项目名>" --video-file "<成片绝对路径>" --subtitle-file "<字幕绝对路径>" --state-file "<项目temp>/pipeline_state.json" --output-file "<报告绝对路径>" --audit --config-file "<项目配置绝对路径>"
-   ```
-   必传项以 `--help` 为准（`--project-name`/`--video-file` 必传，`--config-file` 与 `--audit` 配对）。参数一律传**全路径**——本脚本不解析裸文件名（踩坑清单 §5.4）。缺 `--state-file` 时审计按 `Pipeline state file not provided — delivery rejected` 拒收，**属取数断链而非项目不合格**：补参数重跑即可，禁止据此改判据或重渲。
-   报告数据必须源自 ffprobe/pipeline_state/SRT 真实测量。`--audit` 执行交付审计：6 维度全部由真实数据推导、治具裁定（端到端真实性/门禁完整性/交付合规/分镜忠实度/收尾完成度/交付说明一致性），任一维度失败退出码 4，禁止声明交付。
+3. 交付验收：以 pipeline 的 `completion_report` 为唯一机器出口；该步实际执行 `generate_completion_report.py --audit --config-file`，技术报告通过后才写交付登记，再投影四轴验收状态。不得在阶段 D 对同一报告重复后置审计，也不得把 Agent Critic/Evaluator 或工作区体检伪装成 pipeline step。普通制作与工程验收的路由、四轴证据和模式出口以仓内 `agents.md`「执行模式与四轴验收」为指针，判据本体住 `程序文件/脚本/delivery_acceptance.py`。
+   需要定点诊断时才单独调用完工报告工具；参数一律传全路径，必传项以 `--help` 为准。缺 `--state-file` 时审计按 `Pipeline state file not provided — delivery rejected` 拒收，**属取数断链而非项目不合格**：补参数重跑即可，禁止据此改判据或重渲。
 4. 收尾：确认 `成果文件/视频/`、`成果文件/字幕/` 产物就位（路径前置展示给用户）→ `project_cleanup.py --execute` 清理中间产物。已交付文件永不覆盖，修订加 `_修订NN` 后缀。
 
-## 交付审计（阶段D强制，退出码 0 才可声明完成）
+## 技术审计与验收出口
 
-**原则：模型不得给自己打分**（agent-wiki 角色分离）。旧版"自评量表"已废除——执行者不自评，由 `generate_completion_report.py --audit` 治具裁定：
+**原则：模型不得给自己打分**。本地六维技术审计由 pipeline 的 `completion_report` 步实际执行 `generate_completion_report.py --audit --config-file`，不在阶段 D 对同一报告重复后置审计。六维定义与失败处置以完工报告工具和 `agents.md`「执行模式与四轴验收」为单源指针；审计失败须修复对应技术原因后重跑，禁止手工改 state 或报告绕过。
 
-| 维度 | 数据来源 |
-|------|---------|
-| 端到端真实性 | pipeline_state 全步 passed + 音视频流实测 |
-| 门禁完整性 | verifications 节全过 + 无 `--force` 绕过留痕（state `forced_run`） |
-| 交付合规 | 文件名无禁用技术词（config `prohibited_terms`）+ srt/mp4 同基名 |
-| 分镜忠实度 | `narration_source` 指针可解析 + 场景指纹（sha256）留档 |
-| 收尾完成度 | 报告状态 VALIDATED + ffprobe 实测 + 产物 mtime 一致性已执行 |
-| 交付说明一致性 | 交付说明 md 的「字幕时间戳来源」节由流水线写入并等于终检实测分布（终检无 facts 时判不适用，不阻断） |
-
-审计失败 → 修复对应维度后重跑，禁止手工改 state 或报告绕过。
+Agent Critic/Evaluator 与工作区治理是工程验收模式下主智能体的独立过程，不是这条 pipeline 机器链的一部分；其治理 FAIL 不得回写视频交付事实，技术 FAIL 则不得登记交付。
 
 ## 常见陷阱
 

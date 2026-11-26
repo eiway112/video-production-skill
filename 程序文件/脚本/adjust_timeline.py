@@ -225,8 +225,25 @@ def calculate_offsets(boundaries, tts_durations, buffer=0.5, shrink=False, shrin
     return extensions, offsets, sum(extensions)
 
 
-def authoritative_video_duration(boundaries, offsets, extensions):
-    """权威总时长单源：round(末场绝对边界 + 本轮累计扩展量, 1)，**单次舍入**。
+def authoritative_scene_boundaries(boundaries, offsets, extensions):
+    """相邻场景共享下一场起点，同一浮点边界只规范化一次。"""
+    starts = [
+        round(start + offsets[i], 1)
+        for i, (start, end) in enumerate(boundaries)
+    ]
+    adjusted = []
+    for i, (start, end) in enumerate(boundaries):
+        new_end = (
+            starts[i + 1]
+            if i + 1 < len(starts)
+            else round(end + offsets[i] + extensions[i], 1)
+        )
+        adjusted.append((starts[i], new_end))
+    return adjusted
+
+
+def authoritative_video_duration(boundaries, offsets, extensions, adjusted_boundaries=None):
+    """权威总时长单源：规范边界存在时取其末场终点，否则单次舍入 b+o+e。
 
     存在理由（2026-11-17 发布仓 §8.3 生产实证）：同一轮 timeline 的总时长此前由
     两个式子各算一遍——HTML 侧 update_data_duration 的 `{x:.1f}` 单次舍入，config
@@ -241,6 +258,8 @@ def authoritative_video_duration(boundaries, offsets, extensions):
     boundaries 取 narration/S-block 的**绝对末场边界**（cover 已含），因此
     offsets/extensions 以绝对坐标直接叠加，不再经过 cover 相对坐标的往返舍入。
     """
+    if adjusted_boundaries is not None:
+        return adjusted_boundaries[-1][1]
     return round(boundaries[-1][1] + offsets[-1] + extensions[-1], 1)
 
 
@@ -287,13 +306,21 @@ def get_offset_for_time(time_val, boundaries, extensions):
     return offset
 
 
-def adjust_gsap_times(html_content, boundaries, extensions):
+def adjust_gsap_times(html_content, boundaries, extensions, adjusted_boundaries=None):
     """Replace all time positions in GSAP code with offset-adjusted values.
 
     Timestamps beyond the last scene boundary are preserved as-is
     (treated as manually designed for the adjusted timeline).
     """
     max_boundary = boundaries[-1][1] if boundaries else float('inf')
+
+    def canonical_time(old_time):
+        if adjusted_boundaries:
+            for i, (start, end) in enumerate(boundaries):
+                if old_time < end - 0.01 or i == len(boundaries) - 1:
+                    return round(adjusted_boundaries[i][0] + old_time - start, 1)
+        offset = get_offset_for_time(old_time, boundaries, extensions)
+        return old_time + offset
 
     def replace_time_in_tl_calls(content):
         """Replace time positions in tl.to/tl.fromTo/tl.set calls.
@@ -310,8 +337,7 @@ def adjust_gsap_times(html_content, boundaries, extensions):
                     old_time = float(m.group(1))
                     if old_time > max_boundary:
                         return m.group(0)  # Preserve manual edits
-                    offset = get_offset_for_time(old_time, boundaries, extensions)
-                    new_time = old_time + offset
+                    new_time = canonical_time(old_time)
                     # Produce: }, NEW_NUMBER)
                     return '}, ' + f'{new_time:.1f}' + ')'
 
@@ -331,8 +357,7 @@ def adjust_gsap_times(html_content, boundaries, extensions):
                 if n > max_boundary:
                     new_numbers.append(f'{n:.1f}')  # Preserve manual edits
                 else:
-                    offset = get_offset_for_time(n, boundaries, extensions)
-                    new_numbers.append(f'{n + offset:.1f}')
+                    new_numbers.append(f'{canonical_time(n):.1f}')
             return 'var starts = [' + ', '.join(new_numbers) + ']'
 
         return re.sub(r'var\s+starts\s*=\s*\[([0-9.,\s]+)\]', replacer, content)
@@ -350,7 +375,7 @@ def detect_t_block(html_content):
     return re.search(r'var\s+T\s*=\s*\{([^}]+)\}\s*;', html_content)
 
 
-def adjust_t_block(html_content, boundaries, extensions):
+def adjust_t_block(html_content, boundaries, extensions, adjusted_boundaries=None):
     """Rewrite T-block values with cumulative offsets (structured timeline path).
 
     When the compiler emits a T-block (var T = { s1: 3.0, s2: 14.0, ... };),
@@ -370,7 +395,9 @@ def adjust_t_block(html_content, boundaries, extensions):
         scene_idx = int(entry_match.group(1)) - 1  # 0-based
         old_val = float(entry_match.group(2))
 
-        if scene_idx < len(boundaries):
+        if scene_idx < len(adjusted_boundaries or boundaries):
+            new_val = (adjusted_boundaries or boundaries)[scene_idx][0]
+        elif scene_idx < len(boundaries):
             offset = get_offset_for_time(old_val, boundaries, extensions)
             new_val = old_val + offset
         else:
@@ -439,7 +466,7 @@ def _split_s_block_entries(array_text):
     return out
 
 
-def adjust_s_block(html_content, boundaries, extensions):
+def adjust_s_block(html_content, boundaries, extensions, adjusted_boundaries=None):
     """Rewrite S-block scene start/end/dur values **in place, preserving the written shape**.
 
     Applies cumulative offsets to each scene's timing, keeping the declaration
@@ -498,10 +525,13 @@ def adjust_s_block(html_content, boundaries, extensions):
         elif content_idx >= len(boundaries):
             new_seg = seg                      # 边界表比声明短：不猜，原样带过（旧行为）
         else:
-            offset = get_offset_for_time(float(s['start']), boundaries, extensions)
-            ext = extensions[content_idx] if content_idx < len(extensions) else 0
-            ns = round(float(s['start']) + offset, 1)
-            ne = round(float(s['end']) + offset + ext, 1)
+            if adjusted_boundaries is not None:
+                ns, ne = adjusted_boundaries[content_idx]
+            else:
+                offset = get_offset_for_time(float(s['start']), boundaries, extensions)
+                ext = extensions[content_idx] if content_idx < len(extensions) else 0
+                ns = round(float(s['start']) + offset, 1)
+                ne = round(float(s['end']) + offset + ext, 1)
             new_seg = _replace_num(seg, 'start', ns)
             new_seg = _replace_num(new_seg, 'end', ne)
             new_seg = _replace_num(new_seg, 'dur', round(ne - ns, 1))
@@ -536,7 +566,8 @@ def update_data_duration(content, new_duration):
     )
 
 
-def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, boundaries=None):
+def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, boundaries=None,
+                  adjusted_boundaries=None):
     """Update config JSON with new scene boundaries and video duration.
 
     When S-block boundaries are given (authoritative), config scenes are
@@ -548,7 +579,10 @@ def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, b
     """
     new_scenes = []
     for i, s in enumerate(scenes):
-        if boundaries is not None:
+        if adjusted_boundaries is not None:
+            new_start = adjusted_boundaries[i][0] - cover_duration
+            new_end = adjusted_boundaries[i][1] - cover_duration
+        elif boundaries is not None:
             new_start = boundaries[i][0] + offsets[i] - cover_duration
             new_end = boundaries[i][1] + offsets[i] + extensions[i] - cover_duration
         else:
@@ -569,12 +603,13 @@ def update_config(cfg, scenes, extensions, offsets, total_ext, cover_duration, b
         new_scenes.append(updated)
 
     cfg['scenes'] = new_scenes
-    if boundaries is not None:
+    if boundaries is not None or adjusted_boundaries is not None:
         # video_duration = 末场绝对 end + 本轮扩展量，经 authoritative_video_duration
         # 单次舍入。旧式 round(new_scenes[-1]['end'] + cover_duration, 1) 是两次舍入
         # （scenes 端已在 cover 相对坐标 round 过一次），与 HTML 侧 .1f 在半界上
         # 分叉出 45.0/44.9（2026-11-17 生产实证）——三方必须同一舍入点。
-        cfg['video_duration'] = authoritative_video_duration(boundaries, offsets, extensions)
+        cfg['video_duration'] = authoritative_video_duration(
+            boundaries, offsets, extensions, adjusted_boundaries)
     else:
         cfg['video_duration'] = round(float(cfg['video_duration']) + total_ext, 1)
     return cfg
@@ -612,7 +647,7 @@ def _write_hash(hash_path, content):
     atomic_write_text(hash_path, h)
 
 
-def _write_narration_scenes(narration_path, scenes, cover_duration):
+def _write_narration_scenes(narration_path, scenes, cover_duration, adjusted_boundaries=None):
     """P0-03 指针模式写回：调整后的场景写回 narration.json（绝对时间）。
 
     config 不内嵌 scenes，narration.json 保持唯一权威源，避免双源分叉。
@@ -627,10 +662,13 @@ def _write_narration_scenes(narration_path, scenes, cover_duration):
     with open(narration_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     shifted = {}
-    for s in scenes:
+    for i, s in enumerate(scenes):
         m = dict(s)
-        m['start'] = round(float(s['start']) + cover_duration, 1)
-        m['end'] = round(float(s['end']) + cover_duration, 1)
+        if adjusted_boundaries is not None:
+            m['start'], m['end'] = adjusted_boundaries[i]
+        else:
+            m['start'] = round(float(s['start']) + cover_duration, 1)
+            m['end'] = round(float(s['end']) + cover_duration, 1)
         if 'duration' in m:
             m['duration'] = round(m['end'] - m['start'], 1)
         shifted[str(s.get('scene_id'))] = m
@@ -812,6 +850,7 @@ def main():
     config_hash_path = config_path.with_suffix('.hash')
 
     html_restore_pending = False
+    config_restore_pending = False
     if not html_bak.exists():
         # First run: backup original, record hash
         shutil.copy2(html_path, html_bak)
@@ -871,10 +910,9 @@ def main():
             _write_hash(config_hash_path, current_cfg_text)
             print(f"  Manual config edit detected, fresh baseline")
         else:
-            shutil.copy2(config_bak, config_path)
-            print(f"  Restored config from backup")
+            config_restore_pending = True
 
-    # Re-read restored config
+    # Re-read current config before deciding whether the baseline may be restored.
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
 
@@ -884,6 +922,18 @@ def main():
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(EXIT_CODE.GATE_FAILURE)
+
+    # 指针模式的 narration 已携带调整后的边界，恢复调整前 config 会重新引入
+    # 旧 scenes/时长并把零调整轮变成一次隐式写回；旧模式仍靠基线恢复防重复应用。
+    if config_restore_pending:
+        if narration_path is not None:
+            print("  Pointer mode: config hash-verified, keeping current (no baseline restore)")
+        else:
+            shutil.copy2(config_bak, config_path)
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            print("  Restored config from backup")
+
     if narration_path is not None:
         cfg['scenes'] = ptr_scenes
         print(f"  Scene source: narration_source ({narration_path.name}, {len(ptr_scenes)} scenes)")
@@ -946,10 +996,12 @@ def main():
             print(f"  [SHRINK-BASIS] speech_end 生效：可裁尾部静音合计 {reclaim:.2f}s"
                   f"（{len(speech_ends)}/{num_scenes} 场有末句实测）")
 
+    calculation_boundaries = authoritative_scene_boundaries(
+        boundaries, [0.0] * num_scenes, [0.0] * num_scenes)
     print(f"\nTTS Duration Analysis (shrink={'ON' if args.shrink else 'OFF'}" +
           (f", margin={args.shrink_margin}s" if args.shrink else "") +
           (f", basis={basis}" if args.shrink else "") + "):")
-    for i, (start, end) in enumerate(boundaries):
+    for i, (start, end) in enumerate(calculation_boundaries):
         window = end - start
         tts = tts_durations[i]
         surplus = window - tts
@@ -963,9 +1015,16 @@ def main():
 
     # Calculate extensions and offsets (bidirectional)
     extensions, offsets, total_ext = calculate_offsets(
-        boundaries, tts_durations,
+        calculation_boundaries, tts_durations,
         shrink=args.shrink, shrink_margin=args.shrink_margin,
         trim_durations=trim_durations
+    )
+
+    adjusted_boundaries = authoritative_scene_boundaries(
+        calculation_boundaries, offsets, extensions)
+    boundaries_need_rewrite = any(
+        abs(adjusted_boundaries[i][j] - boundaries[i][j]) > 1e-9
+        for i in range(num_scenes) for j in (0, 1)
     )
 
     ext_label = f"{total_ext:+.1f}s" if total_ext < 0 else f"+{total_ext:.1f}s"
@@ -976,12 +1035,11 @@ def main():
 
     for i in range(num_scenes):
         orig_start, orig_end = boundaries[i]
-        new_start = orig_start + offsets[i]
-        new_end = orig_end + offsets[i] + extensions[i]
+        new_start, new_end = adjusted_boundaries[i]
         ext_str = f"{extensions[i]:+.1f}s" if extensions[i] < 0 else f"+{extensions[i]:.1f}s"
         print(f"  Scene {i+1}: {orig_start:.1f}-{orig_end:.1f} -> {new_start:.1f}-{new_end:.1f} (ext={ext_str})")
 
-    if abs(total_ext) < 0.1 and all(abs(e) < 0.1 for e in extensions):
+    if abs(total_ext) < 0.1 and all(abs(e) < 0.1 for e in extensions) and not boundaries_need_rewrite:
         print("\n  No adjustment needed (all scenes within tolerance).")
         html_resynced = False
         resync_tol = _zero_adjust_resync_tolerance()
@@ -998,7 +1056,8 @@ def main():
         # 零调整分支本身已证 GSAP 时间轴与权威边界的偏差 ≤0.1s（偏差大时
         # extensions 会大、走下方调整分支重写 T 块），收敛它不触碰动画时间轴。
         if narration_path is not None:
-            expected_dur = authoritative_video_duration(boundaries, offsets, extensions)
+            expected_dur = authoritative_video_duration(
+                boundaries, offsets, extensions, adjusted_boundaries)
             dur_m = re.search(r'data-duration="([\d.]+)"', html_content)
             if dur_m is None:
                 print(f"\n  ERROR: HTML root data-duration attribute missing — "
@@ -1036,7 +1095,8 @@ def main():
         if s_map or narration_path is not None:
             zeros = [0.0] * num_scenes
             synced = update_config(dict(cfg), cfg['scenes'], zeros, zeros, 0.0,
-                                   cover_duration, boundaries=boundaries)
+                                   cover_duration, boundaries=boundaries,
+                                   adjusted_boundaries=adjusted_boundaries)
             if narration_path is not None:
                 # 零调整轮的 video_duration 必须与守卫基准/HTML 写盘同源（含本轮
                 # offsets/extensions 的微量修正）。zeros 调用本身产出的是
@@ -1052,7 +1112,8 @@ def main():
             if drifted:
                 cfg = synced
                 if narration_path is not None:
-                    _write_narration_scenes(narration_path, cfg.pop('scenes'), cover_duration)
+                    _write_narration_scenes(narration_path, cfg.pop('scenes'), cover_duration,
+                                            adjusted_boundaries=adjusted_boundaries)
                 atomic_write_json(config_path, cfg)
                 # Current state IS the baseline (nothing was applied on top),
                 # so refresh backup + hash to keep restore idempotent.
@@ -1063,29 +1124,35 @@ def main():
                       f"video_duration={cfg['video_duration']:.1f}s")
         return 0
 
+    if boundaries_need_rewrite:
+        print("\n  [BOUNDARY-RESYNC] 相邻场景边界漂移，按共享边界重写 T/S/config/narration。")
+
     # Adjust GSAP time positions in HTML
     # Prefer T-block (structured: rewrite one block), fall back to regex (legacy: per-line)
-    html_content, used_t_block = adjust_t_block(html_content, boundaries, extensions)
+    html_content, used_t_block = adjust_t_block(
+        html_content, boundaries, extensions,
+        adjusted_boundaries=adjusted_boundaries)
     if used_t_block:
         print("  Timeline adjustment: T-block rewrite (structured)")
     else:
-        html_content = adjust_gsap_times(html_content, boundaries, extensions)
+        html_content = adjust_gsap_times(
+            html_content, boundaries, extensions,
+            adjusted_boundaries=adjusted_boundaries)
         print("  Timeline adjustment: regex scan (legacy)")
 
     # Rewrite S-block (authoritative scene metadata stays in sync)
-    html_content, used_s_block = adjust_s_block(html_content, boundaries, extensions)
+    html_content, used_s_block = adjust_s_block(
+        html_content, boundaries, extensions,
+        adjusted_boundaries=adjusted_boundaries)
     if used_s_block:
         print("  S-block: rewritten (structured)")
 
-    # Update data-duration — prefer S-block duration, fall back to config
-    if s_map:
-        new_video_duration = s_map['duration'] + total_ext
-    elif narration_path is not None:
-        # 指针模式：经 authoritative_video_duration 单源（末场绝对边界 + 本轮
-        # 扩展量、单次舍入），与 update_config 的 config 写盘、零调整守卫基准
-        # 同一舍入点。旧值是未舍入表达式靠 .1f 格式化收口——与 config 侧两次
-        # 舍入在半界上分叉出 45.0/44.9（2026-11-17 生产实证）。
-        new_video_duration = authoritative_video_duration(boundaries, offsets, extensions)
+    # Update data-duration — authoritative normalized boundary is the single source
+    if boundaries:
+        # 指针/S-block/legacy 三形态共用同一规范末场边界；旧 S-block 式
+        # s_map['duration'] + total_ext 与逐场累计扩展在含 shrink 时并不等价。
+        new_video_duration = authoritative_video_duration(
+            boundaries, offsets, extensions, adjusted_boundaries)
     else:
         new_video_duration = cfg['video_duration'] + total_ext
     html_content = update_data_duration(html_content, new_video_duration)
@@ -1105,9 +1172,11 @@ def main():
     # Update config JSON — when S-block is authoritative, derive config scenes
     # from S-block boundaries so the two timelines can never drift apart
     cfg = update_config(cfg, cfg['scenes'], extensions, offsets, total_ext, cover_duration,
-                        boundaries=boundaries if (s_map or narration_path is not None) else None)
+                        boundaries=boundaries or None,
+                        adjusted_boundaries=adjusted_boundaries)
     if narration_path is not None:
-        _write_narration_scenes(narration_path, cfg.pop('scenes'), cover_duration)
+        _write_narration_scenes(narration_path, cfg.pop('scenes'), cover_duration,
+                                adjusted_boundaries=adjusted_boundaries)
     atomic_write_json(config_path, cfg)
     _write_hash(config_hash_path, config_path.read_text(encoding='utf-8'))
     print(f"  Updated config: {config_path}")

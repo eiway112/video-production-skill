@@ -53,6 +53,7 @@ from _script_env import (ROOT, VENV_PYTHON, delivery_notes_candidates,
 from script_interface import atomic_write_json
 from media_qa_gate import inspect_frame_content
 import _gate_status as gs
+import delivery_acceptance as acceptance
 
 # 换包装时必须持住旧流对象，换完后还须持住本次造出的新代：旧 TextIOWrapper 一旦
 # 引用归零即 finalize（无需 gc.collect），其析构会关掉共享的底层 buffer，宿主进程
@@ -881,8 +882,12 @@ class PipelineRunner:
     accept_text_fit_untested = False
     accept_bar_overflow_untested = False
     accept_pause_untested = False
+    acceptance_mode = acceptance.DEFAULT_ACCEPTANCE_MODE
+    acceptance_status = None
+    governance_evidence_dir = None
+    business_acceptance_file = None
 
-    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False, accept_bar_overflow_untested=False, accept_pause_untested=False):
+    def __init__(self, config_path, html_project=None, quick_fix=False, force=False, gate_mode="render", shrink=True, fresh=False, no_scene_patch=False, confirm_fresh=False, accept_over_budget=False, accept_over_render=False, accept_media_untested=False, take_over_lock=False, accept_render_env=False, accept_text_fit_untested=False, accept_bar_overflow_untested=False, accept_pause_untested=False, acceptance_mode=None, governance_evidence_dir=None, business_acceptance_file=None):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             # Search subdirectories (pipelines/, openmontage/, system/) then root
@@ -900,6 +905,19 @@ class PipelineRunner:
 
         with open(self.config_path, 'r', encoding='utf-8') as f:
             self.config = json.load(f)
+
+        self.acceptance_mode = acceptance.resolve_acceptance_mode(
+            acceptance_mode, self.config)
+        self.governance_evidence_dir = acceptance.resolve_evidence_path(
+            governance_evidence_dir if governance_evidence_dir is not None
+            else self.config.get("governance_evidence_dir"),
+            ROOT,
+        )
+        self.business_acceptance_file = acceptance.resolve_evidence_path(
+            business_acceptance_file if business_acceptance_file is not None
+            else self.config.get("business_acceptance_file"),
+            ROOT,
+        )
 
         # Resolve paths from config
         paths = self.config.get("paths", {})
@@ -1234,6 +1252,51 @@ class PipelineRunner:
     # 规则：跳步必须同时满足 status=passed AND 输入指纹一致；
     #       无指纹的旧状态一律重跑；命中缓存必须显式打印状态日期。
 
+    def _acceptance_governance_dir(self):
+        return (Path(self.governance_evidence_dir)
+                if self.governance_evidence_dir else self.temp_dir / "governance")
+
+    def _project_acceptance(self, report_path=None):
+        video_path, srt_path = self._delivery_paths()
+        report_path = Path(report_path) if report_path else self.temp_dir / "completion_report.json"
+        status = acceptance.build_acceptance_status(
+            registry_file=DELIVERY_REGISTRY,
+            video_file=video_path,
+            completion_report=report_path,
+            project=self.html_project,
+            acceptance_mode=self.acceptance_mode,
+            governance_evidence_dir=self._acceptance_governance_dir(),
+            business_acceptance_file=self.business_acceptance_file,
+        )
+        self.acceptance_status = status
+        try:
+            acceptance.write_acceptance_status(
+                self.temp_dir / "acceptance_status.json", status
+            )
+        except OSError as exc:
+            print(f"[ACCEPTANCE] ERROR: 状态写入失败: {exc}")
+            return status, False, ["验收状态写入失败"]
+        print("[ACCEPTANCE]")
+        for line in acceptance.format_status_lines(status):
+            print(f"  {line}")
+        satisfied, reasons = acceptance.acceptance_satisfied(status)
+        return status, satisfied, reasons
+
+    def _technical_config_input(self):
+        if not hasattr(self, "config"):
+            return str(self.config_path)
+        if not any(key in self.config for key in acceptance.CONFIG_FIELDS):
+            return str(self.config_path)
+        technical_config = {
+            key: value for key, value in self.config.items()
+            if key not in acceptance.CONFIG_FIELDS
+        }
+        payload = json.dumps(technical_config, ensure_ascii=False,
+                             sort_keys=True, separators=(",", ":"))
+        return "digest:technical-config:" + hashlib.sha256(
+            payload.encode("utf-8")
+        ).hexdigest()
+
     def _step_inputs(self, step):
         """每个步骤的输入文件清单（用于指纹计算）。
 
@@ -1272,13 +1335,14 @@ class PipelineRunner:
         quality_dir = CONFIG_DIR / "quality"
         audio_rules = quality_dir / "audio_sync_rules.json"
         enhance_script = SCRIPTS / "enhance_video_audio.py"
+        # 验收模式与治理/业务证据不重跑技术报告；缓存命中仍每次重投影并按模式验收。
         inputs_map = {
             # preflight 的结论同时取决于 gate_mode：audit 模式下 8 类
             # RENDER_CRITICAL_CHECKS 降级为警告（preflight_check.py:60-69/98-100），
             # 同一份 HTML 在 audit 里 passed 绝不等于在 render 里 passed。旧指纹不含
             # gate_mode，故 audit 跑过的结果被严格模式直接复用（A06-②）。
             # 非文件输入用 "mode:" 前缀字面量，与 completion_report 的 "digest:" 同一惯例。
-            "preflight":    {"config": self.config_path, "html": self.html_path,
+            "preflight":    {"config": self._technical_config_input(), "html": self.html_path,
                              "narration": narration,
                              "asset_signoff_sheet": self.source_dir / "素材确认单.json",
                              "narration_digits_rules": quality_dir / "narration_digits_rules.json",
@@ -1331,7 +1395,7 @@ class PipelineRunner:
                              # 该前提自本批起不成立，不登记即"改了缺省而两步缓存照常命中"。
                              "script_env": SCRIPTS / "_script_env.py",
                              "script": SCRIPTS / "preflight_check.py"},
-            "tts":          {"config": self.config_path, "narration": narration,
+            "tts":          {"config": self._technical_config_input(), "narration": narration,
                              "compiled_scenes": compiled,
                              # 停顿声明的同一条真实读取链（生效面）：enhance 的
                              # _scene_pause_plan 在"有声明或自动开"时读 pause_marks
@@ -1369,7 +1433,7 @@ class PipelineRunner:
                              "intra_pause_rules": SCRIPTS / "intra_pause.py",
                              "gsap_time_utils": gsap_utils,
                              "script": enhance_script},
-            "timeline":     {"config": self.config_path, "html": self.html_path,
+            "timeline":     {"config": self._technical_config_input(), "html": self.html_path,
                              "tts_manifest": tts_manifest,
                              # 2026-10-12 词级 cue 批补第三枚：本步现读 `_timeline_manifest.json`
                              # （adjust_timeline.load_cue_time_source，路径按 tts_dir.parent 推导＝
@@ -1396,7 +1460,7 @@ class PipelineRunner:
             #    即新接入的塌陷判据对全部存量项目静默不生效（本批判据若不入登记面＝条文
             #    在生效路径上没有载体，与词级 cue 批那条"须同步补登记"同族）。
             # ② video_quality_rules —— text_fit 阈值就住在这份文件里，改阈值即须重测。
-            "preview":      {"config": self.config_path, "html": self.html_path,
+            "preview":      {"config": self._technical_config_input(), "html": self.html_path,
                              "tts_manifest": tts_manifest,
                              # 2026-10-16 审计批补登三条（同一判据：登记面＝真实读取路径）：
                              # ① boundary_module —— instant_preview.py:301 按名导入
@@ -1418,17 +1482,17 @@ class PipelineRunner:
                              # 不登记即"改了编排口径而预览缓存照常命中"（A06 同族）。
                              "choreography_profile": SCRIPTS / "choreography_profile.py",
                              "script": SCRIPTS / "instant_preview.py"},
-            "render":       {"config": self.config_path, "html": self.html_path,
+            "render":       {"config": self._technical_config_input(), "html": self.html_path,
                              "render_rules": quality_dir / "render_rules.json"},
-            "verify":       {"config": self.config_path, "html": self.html_path,
+            "verify":       {"config": self._technical_config_input(), "html": self.html_path,
                              # 2026-10-16 审计批补登：本步的时长一致性取数经
                              # pipeline_runner.py:48 的 parse_scene_map（T-block 解析真身）。
                              "gsap_time_utils": gsap_utils,
                              "render_raw": self.render_raw},
-            "visual_check": {"config": self.config_path, "render_raw": self.render_raw,
+            "visual_check": {"config": self._technical_config_input(), "render_raw": self.render_raw,
                              "gate_status": gate_status,
                              "script": SCRIPTS / "visual_boundary_check.py"},
-            "postprocess":  {"config": self.config_path, "html": self.html_path,
+            "postprocess":  {"config": self._technical_config_input(), "html": self.html_path,
                              "render_raw": self.render_raw, "narration": narration,
                              "tts_manifest": tts_manifest,
                              "audio_sync_rules": audio_rules,
@@ -1459,12 +1523,12 @@ class PipelineRunner:
                              "gsap_time_utils": gsap_utils,
                              "mode": "mode:" + ("quick-fix" if self.quick_fix else "full"),
                              "script": enhance_script},
-            "delivery":     {"config": self.config_path, "video": self._delivery_paths()[0],
+            "delivery":     {"config": self._technical_config_input(), "video": self._delivery_paths()[0],
                              "srt": self._delivery_paths()[1]},
             # completion_report 消费 state 内容，但不能把 pipeline_state.json 整文件
             # 纳入指纹——本步骤完成时 mark_completed 会写回该文件（自引用回路，
             # 指纹永远漂移、缓存永不可命中）。改用稳定摘要：排除自写与易变字段。
-            "completion_report": {"config": self.config_path,
+            "completion_report": {"config": self._technical_config_input(),
                              "video": self._delivery_paths()[0],
                              "srt": self._delivery_paths()[1],
                              # 登记面补齐（2026-10-13，A06 同族）：本步登记面此前不含
@@ -1472,6 +1536,8 @@ class PipelineRunner:
                              # data_sources 节对全部存量项目静默不出现。frame_occupancy 是
                              # 该节的判据真身与文案单源，同样必须登记。
                              "script": SCRIPTS / "generate_completion_report.py",
+                             "completion_audit_contract": SCRIPTS / "completion_audit_contract.py",
+                             "acceptance_module": SCRIPTS / "delivery_acceptance.py",
                              "occupancy_module": SCRIPTS / "frame_occupancy.py",
                              # 2026-11-05 编排面同判据登记：data_sources.choreography 的判据真身
                              # 与文案单源都在本件（generate_completion_report 只接线），
@@ -1625,6 +1691,7 @@ class PipelineRunner:
           no-fingerprint — 历史状态无指纹，不予信任
           inputs-changed — 输入指纹与完成时刻不一致（上游已变化）
           content-invalid — render_raw 未通过内容检查，缓存不得复用
+          technical-evidence-invalid — 完工报告身份或审计证据不可用
         """
         rec = self.state.data.get("steps", {}).get(step, {})
         if rec.get("status") != "passed":
@@ -1638,6 +1705,16 @@ class PipelineRunner:
             status, _ = _render_content_status(self.render_raw)
             if status not in (gs.PASS, gs.NOT_APPLICABLE):
                 return "content-invalid"
+        if step == "completion_report":
+            video_path, _ = self._delivery_paths()
+            usable, _ = acceptance.technical_evidence_usable(
+                report_path=self.temp_dir / "completion_report.json",
+                video_file=video_path,
+                project=self.html_project,
+                root=ROOT,
+            )
+            if not usable:
+                return "technical-evidence-invalid"
         return None
 
     def _earliest_rerun_step(self):
@@ -1700,6 +1777,17 @@ class PipelineRunner:
         if reason == "content-invalid":
             status, message = _render_content_status(self.render_raw)
             print(f"  [STALE] Render cache rejected ({status}): {message} — re-running")
+            return False
+        if reason == "technical-evidence-invalid":
+            video_path, _ = self._delivery_paths()
+            _usable, reasons = acceptance.technical_evidence_usable(
+                report_path=self.temp_dir / "completion_report.json",
+                video_file=video_path,
+                project=self.html_project,
+                root=ROOT,
+            )
+            print("  [STALE] Completion report evidence rejected: "
+                  + "; ".join(reasons) + " — re-running")
             return False
         if reason is not None:
             return False
@@ -3329,6 +3417,8 @@ class PipelineRunner:
             "config": Path(self.config_path).name,
             "duration_seconds": self._probe_duration(video_path),
             "bytes": Path(video_path).stat().st_size if Path(video_path).exists() else None,
+            "sha256": (hashlib.sha256(Path(video_path).read_bytes()).hexdigest()
+                       if Path(video_path).exists() else None),
             "report_status": report_status,
             "source": "pipeline",
             "delivered_at": datetime.now().isoformat(timespec="seconds"),
@@ -3340,9 +3430,30 @@ class PipelineRunner:
             raise RuntimeError(
                 f"{DELIVERY_REGISTRY.name} 无法解析，拒绝在损坏表上追加登记"
                 "（先 git checkout 恢复该文件再重跑）")
-        # 同名成片按登记时间保留最新一条（修订版走 _修订NN 名，不产生同名覆盖）
+        prior = next((e for e in data["deliveries"]
+                      if isinstance(e, dict)
+                      and e.get("video") == entry["video"]
+                      and e.get("project") == self.html_project
+                      and not e.get("retired")), None)
+        same_artifact = bool(
+            prior
+            and entry["bytes"] is not None
+            and prior.get("bytes") == entry["bytes"]
+            and isinstance(prior.get("sha256"), str)
+            and prior["sha256"].lower() == entry["sha256"]
+        )
+        if same_artifact:
+            try:
+                datetime.fromisoformat(prior.get("delivered_at"))
+            except (TypeError, ValueError):
+                pass
+            else:
+                entry["delivered_at"] = prior["delivered_at"]
+        # 同项目同名成片按登记时间保留最新一条；跨项目同名不得互相删除。
         deliveries = [e for e in data["deliveries"]
-                      if not (isinstance(e, dict) and e.get("video") == entry["video"])]
+                      if not (isinstance(e, dict)
+                              and e.get("project") == entry["project"]
+                              and e.get("video") == entry["video"])]
         deliveries.append(entry)
         deliveries.sort(key=lambda e: str(e.get("delivered_at") or ""))
         data["deliveries"] = deliveries
@@ -3828,74 +3939,198 @@ class PipelineRunner:
         self.state.mark_completed("delivery", self._fingerprint("delivery"))
         return True
 
-    def step_completion_report(self):
-        """完工报告：调用 generate_completion_report.py，状态源自其真实测量。
+    def _clear_stale_force_marker(self):
+        run_started = getattr(self, "_run_started_at", None)
+        marker = self.state.data.get("forced_run")
+        if (
+            self.force
+            or self.quick_fix
+            or not run_started
+            or not isinstance(marker, dict)
+            or self.state.data.get("lock_takeover")
+        ):
+            return
+        try:
+            started = datetime.fromisoformat(run_started)
+            marked = datetime.fromisoformat(marker.get("at", ""))
+        except (TypeError, ValueError):
+            return
 
-        报告脚本 FAILED → 非零退出码（EXIT_CODE.GATE_FAILURE=4）→ 本步骤失败；
-        runner 不硬编码任何成功字样。纯BGM项目（tts_enabled=false）无字幕产物，
-        不传 --subtitle-file（报告端 typed-skip 豁免 tts/timeline 步骤检查）。
-        """
+        def comparable(value):
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is not None and started.tzinfo is None:
+                return parsed.astimezone().replace(tzinfo=None)
+            if parsed.tzinfo is None and started.tzinfo is not None:
+                return parsed.replace(tzinfo=started.tzinfo)
+            return parsed
+
+        # 单步/缓存续跑不能把历史 --force 事实洗掉；只有前置步骤均在本轮
+        # 非 force 全链中真实执行且指纹仍有效，审计才可不再引用该旧标记。
+        for step, _label in STEPS[:STEP_NAMES.index("completion_report")]:
+            rec = self.state.data.get("steps", {}).get(step, {})
+            if rec.get("status") == "passed":
+                try:
+                    if comparable(rec["started"]) < started:
+                        return
+                    if rec.get("input_fingerprint") != self._fingerprint(step):
+                        return
+                except (KeyError, TypeError, ValueError):
+                    return
+            elif not (
+                step == "tts"
+                and not self.tts_enabled
+                and rec.get("status") == "skipped"
+            ):
+                return
+        if comparable(marker["at"]) < started:
+            del self.state.data["forced_run"]
+            self.state.save()
+            print("  [AUDIT] stale forced_run marker cleared before audit")
+
+    def _quarantine_failed_completion_report(self, video_path, report_path,
+                                             reasons=None):
+        if reasons is None:
+            usable, technical_reasons = acceptance.technical_evidence_usable(
+                report_path=report_path,
+                video_file=video_path,
+                project=self.html_project,
+                root=ROOT,
+            )
+            if usable:
+                return
+            errors = list(technical_reasons)
+        else:
+            errors = list(reasons)
+        try:
+            data = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            summary = data.get("validation_summary")
+            failed = summary.get("failed_checks") if isinstance(summary, dict) else None
+            if data.get("status") == "FAILED":
+                errors.append("completion_report status FAILED")
+            if type(failed) is int and failed > 0:
+                errors.append(f"completion_report failed_checks={failed}")
+            audit = data.get("audit")
+            if isinstance(audit, dict) and audit.get("passed") is False:
+                errors.append("六维技术审计未通过")
+                dimensions = audit.get("dimensions")
+                if isinstance(dimensions, dict):
+                    errors.extend(
+                        f"{name}: {item.get('evidence', 'failed')}"
+                        for name, item in dimensions.items()
+                        if isinstance(item, dict) and item.get("passed") is False
+                    )
+        self._quarantine_failed_slot(
+            video_path, {"verdict": "FAIL", "errors": errors}
+        )
+
+    def step_completion_report(self):
+        """执行六维技术审计、登记交付事实，再按模式投影四轴验收状态。"""
         if self._can_skip("completion_report"):
+            _status, satisfied, reasons = self._project_acceptance()
+            if not satisfied:
+                for reason in reasons:
+                    print(f"  BLOCKED: {reason}")
+                return False
             return True
 
         self.state.mark_started("completion_report")
 
         video_path, srt_path = self._delivery_paths()
+        report_out = self.temp_dir / "completion_report.json"
+        if report_out.exists():
+            archived = report_out.with_name(
+                "completion_report.prev-"
+                + datetime.now().strftime("%Y%m%dT%H%M%S%f") + ".json"
+            )
+            os.replace(report_out, archived)
+            print(f"  [REPORT] 旧完工报告已隔离: {archived}")
         _matches, _ = self._delivery_object_matches_output()
         if not _matches:
+            self._project_acceptance()
             self._fail("completion_report",
                        f"交付校验对象与本轮产物不一致：{video_path} != {self.output_file}"
                        "（拒绝在错误对象上生成完工报告/登记交付）",
                        VERIFY_FAILED)
             return False
-        report_out = self.temp_dir / "completion_report.json"
+        self._clear_stale_force_marker()
+        try:
+            print(f"  [DELIVERY-NOTES] {self._sync_subtitle_source_section()}")
+        except OSError as e:
+            print(f"  WARNING: 交付说明节写入失败（--audit 一致性维会判 FAIL）: {e}")
         cmd = [str(VENV_PYTHON), "generate_completion_report.py",
                "--project-name", self.html_project,
                "--video-file", str(video_path),
                "--state-file", str(self.state.path),
-               "--output-file", str(report_out)]
+               "--output-file", str(report_out),
+               "--audit", "--config-file", str(self.config_path)]
         if self.tts_enabled:
             cmd.extend(["--subtitle-file", str(srt_path)])
         rc = self._run(cmd, cwd=str(SCRIPTS), desc="completion report")
-        # 报告状态源自脚本真实测量：FAILED 时脚本退出非零（GATE_FAILURE），
-        # VALIDATED / VALIDATED_WITH_ISSUES 退出 0。此处不硬编码任何成功判定。
         if rc != 0:
-            self._fail("completion_report", "Completion report validation FAILED (see report)",
+            self._quarantine_failed_completion_report(
+                video_path, report_out, ["完工报告命令失败"]
+            )
+            self._project_acceptance()
+            self._fail("completion_report", "Completion report validation/audit FAILED (see report)",
                        VERIFY_FAILED)
             return False
         print(f"  完工报告已生成: {report_out}")
-        self.state.mark_completed("completion_report", self._fingerprint("completion_report"))
-        # 交付登记：仅当完工报告裁定为 VALIDATED* 才授予交付身份（报告状态源自脚本
-        # 真实测量，此处不自行判断）。登记是尽力而为——失败只告警，不翻转步骤结论。
         try:
             with open(report_out, "r", encoding="utf-8") as f:
-                rep_status = str(json.load(f).get("status", ""))
-        except (json.JSONDecodeError, OSError):
-            rep_status = ""
-        if rep_status.startswith("VALIDATED"):
-            try:
-                entry = self._record_delivery(video_path,
-                                              srt_path if srt_path.exists() else None,
-                                              rep_status)
-                print(f"  [REGISTRY] 交付登记已写入 {DELIVERY_REGISTRY.name}: "
-                      f"{entry['video']} "
-                      f"({entry['duration_seconds']}s, {entry['bytes']} bytes)")
-            except OSError as e:
-                print(f"  WARNING: 交付登记写入失败（交付物保护门禁将退回完工报告判据）: {e}")
-            # 交付说明的「字幕时间戳来源」节同样只在 VALIDATED 后写：报告未过就
-            # 写字节进成果目录，等于把未过门的结论放进人读的那一份。
-            try:
-                print(f"  [DELIVERY-NOTES] {self._sync_subtitle_source_section()}")
-            except OSError as e:
-                print(f"  WARNING: 交付说明节写入失败（--audit 一致性维会判 FAIL）: {e}")
-            # 渲染预算按交付轮计数：本轮到此刻已验证交付，下一轮从 0 起算。
-            # 累计 full_render_attempts 照常保留作成本台账，不再作为拦截阈值。
-            _metrics = self._render_metrics()
-            if int(_metrics.get("delivery_round_attempts", 0) or 0) != 0:
-                _metrics["delivery_round_attempts"] = 0
-                _metrics["round_reset_at"] = datetime.now().isoformat()
-                _metrics["round_reset_reason"] = "validated_delivery"
-                self.state.save()
+                report_data = json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeError):
+            report_data = {}
+        rep_status = report_data.get("status", "") if isinstance(report_data, dict) else ""
+        if rep_status not in acceptance.REPORT_PASS_STATES:
+            self._quarantine_failed_completion_report(video_path, report_out)
+            self._project_acceptance()
+            self._fail("completion_report",
+                       f"完工报告状态无法授予交付身份：{rep_status!r}",
+                       VERIFY_FAILED)
+            return False
+        usable, technical_reasons = acceptance.technical_evidence_usable(
+            report_path=report_out,
+            video_file=video_path,
+            project=self.html_project,
+            root=ROOT,
+        )
+        if not usable:
+            self._quarantine_failed_completion_report(
+                video_path, report_out, technical_reasons
+            )
+            self._project_acceptance()
+            self._fail("completion_report",
+                       "完工报告技术证据不可用：" + "; ".join(technical_reasons),
+                       VERIFY_FAILED)
+            return False
+        try:
+            entry = self._record_delivery(video_path,
+                                          srt_path if srt_path.exists() else None,
+                                          rep_status)
+        except (OSError, RuntimeError) as exc:
+            self._project_acceptance()
+            self._fail("completion_report",
+                       f"交付登记写入失败，拒绝宣称本轮已交付：{exc}",
+                       VERIFY_FAILED)
+            return False
+        print(f"  [REGISTRY] 交付登记已写入 {DELIVERY_REGISTRY.name}: "
+              f"{entry['video']} "
+              f"({entry['duration_seconds']}s, {entry['bytes']} bytes)")
+        _metrics = self._render_metrics()
+        if int(_metrics.get("delivery_round_attempts", 0) or 0) != 0:
+            _metrics["delivery_round_attempts"] = 0
+            _metrics["round_reset_at"] = datetime.now().isoformat()
+            _metrics["round_reset_reason"] = "validated_delivery"
+            self.state.save()
+        _status, satisfied, reasons = self._project_acceptance()
+        self.state.mark_completed("completion_report", self._fingerprint("completion_report"))
+        if not satisfied:
+            for reason in reasons:
+                print(f"  BLOCKED: {reason}")
+            return False
         return True
 
     def run(self, start_from=None):
@@ -3941,6 +4176,7 @@ class PipelineRunner:
             }
             self.state.save()
         atexit.register(self.lock.release)
+        self._run_started_at = datetime.now().isoformat()
 
         # 中断可见性：上次运行若被外部中断（日志缺尾行），在此显式告警
         self._warn_previous_interrupted_runs()
@@ -4012,21 +4248,26 @@ class PipelineRunner:
             if not ok:
                 print(f"\nPIPELINE FAILED at: {step_label}")
                 print(f"Fix the issue and re-run with --resume or --quick-fix")
+                try:
+                    self._project_acceptance()
+                except Exception as exc:
+                    print(f"[ACCEPTANCE] ERROR: 失败出口状态刷新失败: {exc}")
                 sys.exit(1)
             print()
 
         # Success
         print("=" * 60)
-        print("PIPELINE COMPLETE")
+        print("PIPELINE TECHNICAL COMPLETE")
         print("=" * 60)
         print(f"  Video:    {self.output_file}")
-
-        # 非 force 运行全链成功 → 历史 --force 留痕已过时（当前状态由合规运行
-        # 重新建立），清除以免交付审计 gate_integrity 误判。force 运行自身保留。
-        if not self.force and "forced_run" in self.state.data:
-            del self.state.data["forced_run"]
-            self.state.save()
-            print("  [AUDIT] stale forced_run marker cleared (clean full run completed)")
+        self.acceptance_status, satisfied, reasons = self._project_acceptance()
+        if not satisfied:
+            print("\nPIPELINE TECHNICAL ACCEPTANCE FAILED")
+            for reason in reasons:
+                print(f"  BLOCKED: {reason}")
+            sys.exit(1)
+        for line in acceptance.format_status_lines(self.acceptance_status):
+            print(f"  {line}")
 
         # Move .noaudio backup out of output dir
         backup_name = self.output_file.stem + ".noaudio.mp4"
@@ -4111,6 +4352,15 @@ Examples:
                         default="render",
                         help="Preflight gate mode: 'audit' (warn-only) or 'render' (hard-block). "
                              "Default: render")
+    parser.add_argument("--acceptance-mode", choices=acceptance.ACCEPTANCE_MODES,
+                        help="Execution mode: production keeps technical gates only; "
+                             "engineering also requires governance evidence.")
+    parser.add_argument("--governance-evidence-dir",
+                        help="Directory containing workspace_health.json, "
+                             "independent_review.json and governance_checks.json.")
+    parser.add_argument("--business-acceptance-file",
+                        help="Explicit user acceptance evidence JSON; absence stays "
+                             "PENDING_USER and never blocks technical delivery.")
     parser.add_argument("--engine", choices=["hyperframes", "openmontage"],
                         default=None,
                         help="Pipeline engine (auto-detected from config if omitted)")
@@ -4225,6 +4475,23 @@ Examples:
 
     # Route to OpenMontage runner if engine is openmontage
     if engine == "openmontage":
+        explicit_acceptance = (args.acceptance_mode is not None
+                               or args.governance_evidence_dir is not None
+                               or args.business_acceptance_file is not None)
+        config_acceptance = False
+        if config_path.exists():
+            try:
+                openmontage_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                openmontage_config = {}
+            if isinstance(openmontage_config, dict):
+                config_acceptance = any(
+                    key in openmontage_config for key in acceptance.CONFIG_FIELDS
+                )
+        if explicit_acceptance or config_acceptance:
+            print("[ACCEPTANCE] ERROR: OpenMontage 尚不支持四轴验收模式或证据参数",
+                  file=sys.stderr)
+            sys.exit(2)
         from openmontage_runner import OpenMontageRunner
         runner = OpenMontageRunner(
             config_path=str(config_path),
@@ -4246,25 +4513,32 @@ Examples:
         print("[NOTICE] --scene-patch 已失效：增量渲染自 2026-09-03 起为默认行为"
               "（基线齐备即自动尝试，分类器裁定 PATCH/FULL）。如需强制全量渲染请用 --no-scene-patch。")
 
-    runner = PipelineRunner(
-        config_path=args.config,
-        html_project=args.html,
-        quick_fix=args.quick_fix,
-        force=args.force,
-        gate_mode=args.gate_mode,
-        shrink=(not args.no_shrink),
-        fresh=args.fresh,
-        no_scene_patch=args.no_scene_patch,
-        confirm_fresh=args.confirm_fresh,
-        accept_over_budget=args.accept_over_budget,
-        accept_over_render=args.accept_over_render,
-        accept_media_untested=args.accept_media_untested,
-        take_over_lock=args.take_over_lock,
-        accept_render_env=args.accept_render_env,
-        accept_text_fit_untested=args.accept_text_fit_untested,
-        accept_bar_overflow_untested=args.accept_bar_overflow_untested,
-        accept_pause_untested=args.accept_pause_untested,
-    )
+    try:
+        runner = PipelineRunner(
+            config_path=args.config,
+            html_project=args.html,
+            quick_fix=args.quick_fix,
+            force=args.force,
+            gate_mode=args.gate_mode,
+            shrink=(not args.no_shrink),
+            fresh=args.fresh,
+            no_scene_patch=args.no_scene_patch,
+            confirm_fresh=args.confirm_fresh,
+            accept_over_budget=args.accept_over_budget,
+            accept_over_render=args.accept_over_render,
+            accept_media_untested=args.accept_media_untested,
+            take_over_lock=args.take_over_lock,
+            accept_render_env=args.accept_render_env,
+            accept_text_fit_untested=args.accept_text_fit_untested,
+            accept_bar_overflow_untested=args.accept_bar_overflow_untested,
+            accept_pause_untested=args.accept_pause_untested,
+            acceptance_mode=args.acceptance_mode,
+            governance_evidence_dir=args.governance_evidence_dir,
+            business_acceptance_file=args.business_acceptance_file,
+        )
+    except acceptance.AcceptanceInputError as exc:
+        print(f"[ACCEPTANCE] ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     if args.status:
         runner.state.print_status()

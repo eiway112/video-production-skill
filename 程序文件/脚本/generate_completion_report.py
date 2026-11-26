@@ -4,6 +4,8 @@
 import sys
 import time
 from script_interface import Result, EXIT_CODE
+import _gate_status as gs
+import completion_audit_contract as audit_contract
 # -*- coding: utf-8 -*-
 """
 数据驱动的项目完工报告生成器（P0-08 整改）
@@ -164,7 +166,9 @@ def evaluate_product_state_consistency(video_path, pp_started, pp_completed,
         detail["video_mtime_minus_completed_s"] = round(lag, 3)
         _leg("legacy_abs_deviation", consistent,
              deviation_seconds=round(lag, 3),
-             reason="回退判据：mtime 与 postprocess 完成时刻的绝对差超容差")
+             reason=("回退判据：mtime 与 postprocess 完成时刻的绝对差在自适应容差内"
+                     if consistent else
+                     "回退判据：mtime 与 postprocess 完成时刻的绝对差超容差"))
         detail["basis"] = ("回退基准（无落槽登记）：成片 mtime 与 postprocess 完成时刻的绝对差"
                            "不得超过自适应容差（base 10s + 5% × 视频时长，封顶 120s，参数见"
                            " config/quality/delivery_gate_rules.json）")
@@ -189,26 +193,34 @@ def evaluate_product_state_consistency(video_path, pp_started, pp_completed,
             _e = datetime.fromisoformat(pp_completed).timestamp()
             l1 = _s - clock_epsilon_s <= committed_ts <= _e + clock_epsilon_s
             _leg("in_run_window", l1,
-                 reason="落槽动作不在本轮 postprocess 区间内 → 登记属另一轮运行")
+                 reason=("落槽动作在本轮 postprocess 区间内" if l1 else
+                         "落槽动作不在本轮 postprocess 区间内 → 登记属另一轮运行"))
         except ValueError:
             _leg("in_run_window", None, reason="postprocess 起止时刻不可解析")
     elif pp_completed:
         try:
             _e = datetime.fromisoformat(pp_completed).timestamp()
-            _leg("in_run_window", committed_ts <= _e + clock_epsilon_s,
-                 reason="落槽晚于 postprocess 完成时刻",
+            _upper_ok = committed_ts <= _e + clock_epsilon_s
+            _leg("in_run_window", _upper_ok,
+                 reason=("落槽动作不晚于 postprocess 完成时刻（区间下界缺失）" if _upper_ok else
+                         "落槽晚于 postprocess 完成时刻"),
                  note="state 无 postprocess.started，区间下界缺失，仅裁定不晚于完成时刻")
         except ValueError:
             _leg("in_run_window", None, reason="postprocess 完成时刻不可解析")
     else:
         _leg("in_run_window", None, reason="state 无 postprocess 起止时刻，归属无从裁定")
 
-    _leg("not_rewritten", mtime <= committed_ts + clock_epsilon_s,
-         reason="成片 mtime 晚于落槽动作 → 落槽之后被外部改写")
+    _rewrite_ok = mtime <= committed_ts + clock_epsilon_s
+    _leg("not_rewritten", _rewrite_ok,
+         reason=("成片 mtime 不晚于落槽动作" if _rewrite_ok else
+                 "成片 mtime 晚于落槽动作 → 落槽之后被外部改写"))
     _stale = committed_ts - mtime
-    _leg("not_stale", _stale <= tolerance_s,
+    _stale_ok = _stale <= tolerance_s
+    _leg("not_stale", _stale_ok,
          seconds_earlier=round(_stale, 3),
-         reason=(f"落槽的字节比落槽动作早 {_stale:.1f}s（>容差 {tolerance_s}s）"
+         reason=(f"落槽动作与成片 mtime 的时间差 {_stale:.1f}s 未超过容差 {tolerance_s}s"
+                 if _stale_ok else
+                 f"落槽的字节比落槽动作早 {_stale:.1f}s（>容差 {tolerance_s}s）"
                  "→ 陈旧产物被改名冒充，不是本轮产出"))
 
     verdicts = [v.get("passed") for v in detail["legs"].values()]
@@ -243,13 +255,8 @@ def run_delivery_audit(report: Dict[str, Any],
     """交付审计（agent-wiki 角色分离落地：模型不得给自己打分）。
 
     背景：SKILL.md 旧版"自评量表"由执行者自评 5 维度，属 Generator 自证。
-    本函数把 6 维度全部改为从真实数据推导，治具裁定，退出码说话：
-      1. end_to_end_authenticity  ← 全步 passed + 音视频流真实存在
-      2. gate_integrity           ← verifications 全过 + 无未测项 + 无"跑了却无证据"的缺键 + 无 --force 绕过留痕
-      3. delivery_compliance      ← 交付文件名无技术词 + srt 与 mp4 同基名
-      4. storyboard_fidelity      ← narration_source 指针可解析、场景指纹可追溯
-      5. completion_integrity     ← 报告状态 VALIDATED + ffprobe 实测 + 产物一致性已执行
-      6. delivery_notes_consistency ← 交付说明的本节存在且等于报告实测分布（无实测事实时不适用）
+    六维键集合以 completion_audit_contract.AUDIT_DIMENSIONS 为唯一契约；
+    全部维度由真实数据推导，治具裁定，退出码说话。
 
     参数 config_file 为项目流水线配置（审计模式下必填，供 prohibited_terms 与
     narration_source 解析）。返回 {"dimensions": {...}, "passed": bool}。
@@ -266,7 +273,7 @@ def run_delivery_audit(report: Dict[str, Any],
     d1 = (bool(step_checks) and all(step_checks.values())
           and validation.get("has_video_stream", False)
           and validation.get("has_audio_stream", False))
-    dims["end_to_end_authenticity"] = {
+    dims[audit_contract.END_TO_END_AUTHENTICITY] = {
         "passed": d1,
         "evidence": f"{sum(step_checks.values())}/{len(step_checks)} steps passed, "
                     f"video_stream={validation.get('has_video_stream')}, "
@@ -321,7 +328,7 @@ def run_delivery_audit(report: Dict[str, Any],
     if validation.get("media_qa_artifact_matches_delivered") is False:
         d2_reasons.append(
             "final media QA measured a different artifact than the delivered video")
-    dims["gate_integrity"] = {
+    dims[audit_contract.GATE_INTEGRITY] = {
         "passed": not d2_reasons,
         "evidence": "; ".join(d2_reasons) if d2_reasons
                     else f"{len(verif_checks)} verifications passed, no --force trace",
@@ -362,7 +369,7 @@ def run_delivery_audit(report: Dict[str, Any],
                 # 不静默当成"逐字同名"。
                 srt_note = (f"no prohibited terms, srt shares base stem "
                             f"'{srt_stem}' for revision")
-    dims["delivery_compliance"] = {
+    dims[audit_contract.DELIVERY_COMPLIANCE] = {
         "passed": not d3_reasons,
         "evidence": "; ".join(d3_reasons) if d3_reasons else srt_note,
     }
@@ -383,7 +390,7 @@ def run_delivery_audit(report: Dict[str, Any],
                                   f"{len(scenes)} content scenes, sha256={digest}")
         except Exception as e:
             d4_reasons.append(f"narration_source broken at audit time: {e}")
-    dims["storyboard_fidelity"] = {
+    dims[audit_contract.STORYBOARD_FIDELITY] = {
         "passed": not d4_reasons,
         "evidence": "; ".join(d4_reasons) if d4_reasons else narration_evidence,
     }
@@ -391,8 +398,11 @@ def run_delivery_audit(report: Dict[str, Any],
 
     # ── 维度5：收尾完成度 ──
     d5_reasons = []
-    if report.get("status") != "VALIDATED":
-        d5_reasons.append(f"report status is {report.get('status')}, not VALIDATED")
+    if report.get("status") not in audit_contract.REPORT_PASS_STATES:
+        d5_reasons.append(
+            "report status is "
+            f"{report.get('status')}, not one of {audit_contract.REPORT_PASS_STATES}"
+        )
     video_src = report.get("data_sources", {}).get("video_file", {})
     if not video_src.get("ffprobe_available"):
         d5_reasons.append("ffprobe metadata unavailable — duration not measured")
@@ -400,10 +410,11 @@ def run_delivery_audit(report: Dict[str, Any],
         d5_reasons.append("product-state consistency check not executed")
     elif not validation["product_state_consistent"]:
         d5_reasons.append("product-state consistency check failed")
-    dims["completion_integrity"] = {
+    dims[audit_contract.COMPLETION_INTEGRITY] = {
         "passed": not d5_reasons,
         "evidence": "; ".join(d5_reasons) if d5_reasons
-                    else "status VALIDATED, ffprobe measured, mtime consistency passed",
+                    else (f"status {report.get('status')}, ffprobe measured, "
+                          "mtime consistency passed"),
     }
 
     # ── 维度6：交付说明一致性（字幕时间戳来源节，方案 B，2026-09-19）──
@@ -445,7 +456,7 @@ def run_delivery_audit(report: Dict[str, Any],
                     f"本节与完工报告实测不一致，应为: {expected}")
         d6_evidence = (f"notes={notes.name}{notes_note}, 与完工报告 data_sources."
                        f"subtitle_timestamp_source 同源")
-    dims["delivery_notes_consistency"] = {
+    dims[audit_contract.DELIVERY_NOTES_CONSISTENCY] = {
         "passed": not d6_reasons,
         "applicable": d6_applicable,
         "evidence": "; ".join(d6_reasons) if d6_reasons else d6_evidence,
@@ -453,7 +464,8 @@ def run_delivery_audit(report: Dict[str, Any],
 
     passed = all(d["passed"] for d in dims.values())
     return {"dimensions": dims, "passed": passed,
-            "basis": "agent-wiki 角色分离：6 维度全部由真实数据推导，治具裁定，禁止自证"}
+            "basis": (f"agent-wiki 角色分离：{len(audit_contract.AUDIT_DIMENSIONS)} "
+                  "维度全部由真实数据推导，治具裁定，禁止自证")}
 
 
 def _frame_occupancy_face(video_path):
@@ -725,6 +737,13 @@ def generate_report(
             "modified_at": datetime.fromtimestamp(video_path.stat().st_mtime).isoformat(),
             "ffprobe_available": "format" in video_metadata
         }
+        video_identity = _file_identity(video_path)
+        if video_identity is None:
+            report["data_sources"]["video_file"]["sha256"] = None
+            report["issues"].append(f"Video identity unreadable: {video_file}")
+            all_valid = False
+        else:
+            report["data_sources"]["video_file"]["sha256"] = video_identity["sha256"]
         
         # 验证：有效的 ffprobe 输出
         if "format" in video_metadata:
@@ -1154,15 +1173,16 @@ def main():
 
     # 审计段输出与裁定（治具裁定优先于报告状态：审计不过即交付拒收）
     audit = report.get("audit")
-    if audit:
-        print(f"\n[DELIVERY AUDIT] {'PASSED' if audit['passed'] else 'FAILED'}")
-        for dim, res in audit["dimensions"].items():
-            # 不适用不得印成 PASS（四态纪律：无实测事实的维度不参与裁定）
-            if res.get("applicable", True) is False:
-                mark = "N/A"
-            else:
-                mark = "PASS" if res["passed"] else "FAIL"
-            print(f"  [{mark}] {dim}: {res['evidence']}")
+    audit_status, audit_reasons = audit_contract.adjudicate_audit(audit)
+    print(f"\n[DELIVERY AUDIT] {audit_status}")
+    if audit_status == gs.PASS:
+        for dim in audit_contract.AUDIT_DIMENSIONS:
+            res = audit["dimensions"][dim]
+            mark = "N/A" if res.get("applicable", True) is False else "PASS"
+            print(f"  [{mark}] {dim}: {res.get('evidence', '')}")
+    else:
+        for reason in audit_reasons:
+            print(f"  - {reason}")
     
     # 保存报告文件
     if args.output_file:
@@ -1172,17 +1192,15 @@ def main():
     
     # 以状态码退出（更新为 Result Object）
     # 审计具有最终裁定权：即使报告 VALIDATED，审计任一维度失败即交付拒收。
-    audit_failed = bool(report.get("audit")) and not report["audit"]["passed"]
-    if audit_failed:
-        failed_dims = [d for d, r in report["audit"]["dimensions"].items() if not r["passed"]]
+    if audit_status != gs.PASS:
         result = Result.failure(
             code=EXIT_CODE.GATE_FAILURE,
-            message=f"Delivery audit FAILED on dimension(s): {', '.join(failed_dims)}",
-            data={"audit": report["audit"], "issues": report['issues']}
+            message=f"Delivery audit {audit_status}: {'; '.join(audit_reasons)}",
+            data={"audit": audit, "audit_reasons": audit_reasons, "issues": report['issues']}
         )
         result.print_to_stdout()
         sys.exit(result.code)
-    if report['status'] in ('VALIDATED', 'VALIDATED_WITH_ISSUES'):
+    if report['status'] in audit_contract.REPORT_PASS_STATES:
         result = Result.success(
             data={
                 "report_file": args.output_file,

@@ -2433,10 +2433,12 @@ def test_completion_report_fingerprint_stability() -> RegressionTestCase:
     )
 
     try:
+        import hashlib
         import sys
         script_dir = Path(__file__).parent
         if str(script_dir) not in sys.path:
             sys.path.insert(0, str(script_dir))
+        import completion_audit_contract as audit_contract
         _pr = _safe_import_pipeline_runner()
         PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
 
@@ -2465,8 +2467,34 @@ def test_completion_report_fingerprint_stability() -> RegressionTestCase:
             runner.tts_dir = tmpdir / "tts_44k"
             runner.render_raw = tmpdir / "render_raw.mp4"
             runner.output_file = tmpdir / "test_proj.mp4"
+            runner._delivery_paths = lambda: (runner.output_file, tmpdir / "test_proj.srt")
             runner.gate_mode = "render"
             runner.quick_fix = False
+            runner.output_file.write_bytes(b"cache-fixture-video")
+            (tmpdir / "completion_report.json").write_text(json.dumps({
+                "status": "VALIDATED",
+                "project_name": runner.html_project,
+                "validation_summary": {"failed_checks": 0},
+                "data_sources": {
+                    "video_file": {
+                        "path": str(runner.output_file),
+                        "size_bytes": runner.output_file.stat().st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            runner.output_file.stat().st_mtime
+                        ).isoformat(),
+                        "sha256": hashlib.sha256(
+                            runner.output_file.read_bytes()
+                        ).hexdigest(),
+                    }
+                },
+                "audit": {
+                    "passed": True,
+                    "dimensions": {
+                        name: {"passed": True}
+                        for name in audit_contract.AUDIT_DIMENSIONS
+                    },
+                },
+            }, ensure_ascii=False), encoding="utf-8")
 
             # 接线检查：指纹输入已改用稳定摘要，不再含 state 文件路径
             inputs = runner._step_inputs("completion_report")
@@ -3013,6 +3041,16 @@ def test_delivery_audit_fixture_verdict() -> RegressionTestCase:
             tc.assert_true("sha256=" in audit["dimensions"]["storyboard_fidelity"]["evidence"],
                            "narration fingerprint recorded for traceability")
 
+            rpt_with_issues = _base_report()
+            rpt_with_issues["status"] = "VALIDATED_WITH_ISSUES"
+            audit = run_delivery_audit(rpt_with_issues, str(video_ok), str(srt_ok),
+                                       str(state_path), str(cfg_path))
+            tc.assert_true(audit["dimensions"]["completion_integrity"]["passed"],
+                           "shared pass states accept VALIDATED_WITH_ISSUES")
+            tc.assert_true("status VALIDATED_WITH_ISSUES" in
+                           audit["dimensions"]["completion_integrity"]["evidence"],
+                           "audit evidence names the actual report status")
+
             # 2. 禁用技术词入名 → 交付合规 FAIL
             video_bad = tmpdir / "业务主题_final.mp4"
             video_bad.write_bytes(b"")
@@ -3072,25 +3110,244 @@ def test_delivery_audit_fixture_verdict() -> RegressionTestCase:
             tc.assert_true(not audit["dimensions"]["storyboard_fidelity"]["passed"],
                             "broken narration_source fails storyboard_fidelity")
 
-            # 8. 维度名以代码为权威源（A12）：AST 抓 dims["..."] ↔ 运行时键集一致。
-            #    文档侧的中文枚举（AGENTS.md 交付审计行）不参与机器比对，
-            #    新增/删除维度若忘了同步裁定逻辑，本处即红。
+            # 8. 维度名以共享契约为权威源：生成端属性引用 ↔ 契约 ↔ 运行时键集一致。
             import ast as _ast
+            import completion_audit_contract as _audit_contract
             _rep_src = (Path(__file__).parent / "generate_completion_report.py"
                         ).read_text(encoding='utf-8')
             _declared = set()
+            _consumed_attrs = set()
+            _expected_attrs = {
+                name for name, value in vars(_audit_contract).items()
+                if name.isupper() and value in _audit_contract.AUDIT_DIMENSIONS
+            }
             for _node in _ast.walk(_ast.parse(_rep_src)):
-                if (isinstance(_node, _ast.Assign) and len(_node.targets) == 1
-                        and isinstance(_node.targets[0], _ast.Subscript)
-                        and isinstance(_node.targets[0].slice, _ast.Constant)
-                        and isinstance(_node.targets[0].slice.value, str)
-                        and isinstance(getattr(_node.targets[0].value, 'id', None), str)
-                        and _node.targets[0].value.id == 'dims'):
-                    _declared.add(_node.targets[0].slice.value)
+                _target = (
+                    _node.targets[0]
+                    if isinstance(_node, _ast.Assign)
+                    and len(_node.targets) == 1
+                    else None
+                )
+                _slice = (
+                    _target.slice
+                    if isinstance(_target, _ast.Subscript)
+                    else None
+                )
+                if (isinstance(_target, _ast.Subscript)
+                        and isinstance(getattr(_target.value, 'id', None), str)
+                        and _target.value.id == 'dims'
+                        and isinstance(_slice, _ast.Attribute)
+                        and isinstance(getattr(_slice.value, 'id', None), str)
+                        and _slice.value.id == 'audit_contract'):
+                    _attr = _slice.attr
+                    _consumed_attrs.add(_attr)
+                    if _attr in _expected_attrs:
+                        _declared.add(getattr(_audit_contract, _attr))
             tc.assert_true(len(_declared) >= 3,
                            f"AST found {len(_declared)} audit dimensions (authority is not empty)")
+            tc.assert_equal(_consumed_attrs, _expected_attrs,
+                            "the report writer consumes exactly the shared audit constants")
+            tc.assert_equal(_declared, set(_audit_contract.AUDIT_DIMENSIONS),
+                            "the report writer consumes every shared audit dimension")
             tc.assert_equal(set(audit["dimensions"]), _declared,
                             "the runtime audit reports exactly the dimensions the code declares")
+
+            # 9. 主入口必须与六维契约消费同一通过态集合；不写报告文件，只验真实退出语义。
+            import contextlib
+            import io
+            import generate_completion_report as gcr
+
+            def _main_exit(status, audit="valid"):
+                stub = {
+                    "project_name": "验收夹具",
+                    "status": status,
+                    "generated_at": "2026-11-25T00:00:00",
+                    "validation_summary": {
+                        "passed_checks": 0,
+                        "total_checks": 0,
+                    },
+                    "issues": [],
+                }
+                if audit == "valid":
+                    stub["audit"] = {
+                        "passed": True,
+                        "dimensions": {
+                            name: {"passed": True}
+                            for name in _audit_contract.AUDIT_DIMENSIONS
+                        },
+                    }
+                elif audit != "absent":
+                    stub["audit"] = audit
+                old_generate = gcr.generate_report
+                old_argv = sys.argv
+                output = io.StringIO()
+                gcr.generate_report = lambda **kwargs: stub
+                sys.argv = [
+                    "generate_completion_report.py",
+                    "--project-name", "验收夹具",
+                    "--video-file", str(video_ok),
+                ]
+                try:
+                    with contextlib.redirect_stdout(output):
+                        gcr.main()
+                except SystemExit as exc:
+                    return exc.code, output.getvalue()
+                finally:
+                    gcr.generate_report = old_generate
+                    sys.argv = old_argv
+                return None, output.getvalue()
+
+            code, output = _main_exit("VALIDATED_WITH_ISSUES")
+            tc.assert_equal(code, gcr.EXIT_CODE.SUCCESS,
+                            "S1 主入口按共享通过态集合放行 VALIDATED_WITH_ISSUES")
+            tc.assert_true("VALIDATED_WITH_ISSUES" in output,
+                            "S2 主入口成功读数点名实际报告状态")
+            code, output = _main_exit("FAILED")
+            tc.assert_equal(code, gcr.EXIT_CODE.GATE_FAILURE,
+                            "S3 主入口对 FAILED 仍返回门禁失败码")
+            tc.assert_true("failed validation" in output,
+                            "S4 主入口失败归因不得被通过态分支吞掉")
+
+            _inner_failed = {
+                "passed": True,
+                "dimensions": {
+                    name: {"passed": name != _audit_contract.AUDIT_DIMENSIONS[0]}
+                    for name in _audit_contract.AUDIT_DIMENSIONS
+                },
+            }
+            _missing_dimension = {
+                "passed": True,
+                "dimensions": {
+                    name: {"passed": True}
+                    for name in _audit_contract.AUDIT_DIMENSIONS[1:]
+                },
+            }
+            _unknown_dimension = {
+                "passed": True,
+                "dimensions": {
+                    **{
+                        name: {"passed": True}
+                        for name in _audit_contract.AUDIT_DIMENSIONS
+                    },
+                    "unexpected": {"passed": True},
+                },
+            }
+            _main_audit_negatives = [
+                ("absent", "T1 主入口不得放行缺失审计"),
+                (_inner_failed, "T2 主入口须拒绝顶层通过但单维失败"),
+                (_missing_dimension, "T3 主入口须拒绝缺维"),
+                (_unknown_dimension, "T4 主入口须拒绝未知维"),
+                ({"passed": True, "dimensions": []},
+                 "T5 主入口须拒绝非对象 dimensions"),
+                ({"passed": True, "dimensions": {
+                    name: [] for name in _audit_contract.AUDIT_DIMENSIONS
+                }}, "T6 主入口须拒绝非对象审计维度"),
+                ({"passed": "yes", "dimensions": {
+                    name: {"passed": True}
+                    for name in _audit_contract.AUDIT_DIMENSIONS
+                }}, "T7 主入口须拒绝非布尔 passed"),
+            ]
+            for _idx, (_audit, _message) in enumerate(_main_audit_negatives, 1):
+                code, output = _main_exit("VALIDATED", _audit)
+                tc.assert_equal(code, gcr.EXIT_CODE.GATE_FAILURE, _message)
+
+            # 10. 生产者哈希失败必须写显式 null，不能被投影器当历史报告放行。
+            import hashlib
+            from unittest import mock
+            import delivery_acceptance as _acceptance
+
+            producer = tmpdir / "producer"
+            producer.mkdir()
+            producer_video = producer / "业务主题.mp4"
+            producer_srt = producer / "业务主题.srt"
+            producer_state = producer / "pipeline_state.json"
+            producer_report = producer / "completion_report.json"
+            producer_payload = b"synthetic-producer-video"
+            producer_video.write_bytes(producer_payload)
+            producer_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n测试旁白\n",
+                encoding="utf-8",
+            )
+            produced_at = datetime.fromtimestamp(
+                producer_video.stat().st_mtime
+            ).isoformat()
+            required_steps = (
+                "preflight", "tts", "timeline", "render", "verify", "postprocess"
+            )
+            producer_state.write_text(json.dumps({
+                "steps": {
+                    name: {
+                        "status": "passed",
+                        "started": produced_at,
+                        "completed": produced_at,
+                    }
+                    for name in required_steps
+                }
+            }, ensure_ascii=False), encoding="utf-8")
+            metadata = {
+                "format": {"duration": "1.0"},
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264",
+                     "width": 1920, "height": 1080, "r_frame_rate": "30/1"},
+                    {"codec_type": "audio", "codec_name": "aac",
+                     "sample_rate": "48000"},
+                ],
+            }
+            with mock.patch.object(gcr, "ffprobe_get_metadata", return_value=metadata), \
+                    mock.patch.object(gcr, "_file_identity", return_value=None), \
+                    mock.patch.object(gcr, "_frame_occupancy_face", return_value={}), \
+                    mock.patch.object(gcr, "_choreography_face", return_value={}), \
+                    mock.patch.object(gcr, "_transition_face", return_value={}), \
+                    mock.patch.object(gcr, "_fo_format", return_value=""), \
+                    mock.patch.object(gcr, "_ch_format", return_value=""), \
+                    mock.patch.object(gcr, "_tr_format", return_value=""), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                produced = gcr.generate_report(
+                    project_name="身份夹具",
+                    video_file=str(producer_video),
+                    subtitle_file=str(producer_srt),
+                    state_file=str(producer_state),
+                )
+            tc.assert_equal(produced["status"], "FAILED",
+                            "P1 生产者哈希读取失败必须拒收")
+            tc.assert_true("sha256" in produced["data_sources"]["video_file"]
+                           and produced["data_sources"]["video_file"]["sha256"] is None,
+                           "P2 哈希失败必须写显式 sha256:null")
+            tc.assert_true(any("Video identity unreadable" in issue
+                               for issue in produced["issues"]),
+                           "P3 哈希失败必须点名归因")
+
+            produced["status"] = "VALIDATED"
+            produced["validation_summary"]["failed_checks"] = 0
+            produced["audit"] = {
+                "passed": True,
+                "dimensions": {
+                    name: {"passed": True}
+                    for name in _audit_contract.AUDIT_DIMENSIONS
+                },
+            }
+            producer_report.write_text(
+                json.dumps(produced, ensure_ascii=False), encoding="utf-8"
+            )
+            projected = _acceptance._project_technical(
+                producer_report, "身份夹具", producer_video, producer
+            )
+            tc.assert_equal(projected["status"], "UNTESTED",
+                            "P4 新报告 sha256:null 不得退回历史兼容")
+            tc.assert_true("sha256" in projected.get("reason", ""),
+                           "P5 投影器须点名非法 SHA256")
+
+            produced["data_sources"]["video_file"]["sha256"] = hashlib.sha256(
+                producer_payload
+            ).hexdigest()
+            producer_report.write_text(
+                json.dumps(produced, ensure_ascii=False), encoding="utf-8"
+            )
+            positive = _acceptance._project_technical(
+                producer_report, "身份夹具", producer_video, producer
+            )
+            tc.assert_equal(positive["status"], "PASS",
+                            "P6 同一生产者夹具恢复合法 SHA 后须通过")
 
             tc.mark_passed()
 
@@ -8710,7 +8967,8 @@ def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
     )
 
     try:
-        import re
+        import contextlib
+        import io
         from types import SimpleNamespace
 
         script_dir = Path(__file__).parent
@@ -8915,11 +9173,40 @@ def test_delivery_notes_subtitle_source_section() -> RegressionTestCase:
             tc.assert_equal(d6(facts)["passed"], False,
                             "手改本节数字 → FAIL（一致性维不是恒真回执）")
 
-        # ── 7. 不适用维度在打印面不得显示为 PASS ──
-        gcr_src = (script_dir / "generate_completion_report.py").read_text(encoding='utf-8')
-        tc.assert_true(bool(re.search(r'if res\.get\("applicable",\s*True\) is False:\s*\n\s*mark = "N/A"',
-                                      gcr_src)),
-                       "审计打印按 applicable 分档，未裁定项不得印成 PASS")
+        # ── 7. 不适用维度在真实打印出口不得显示为 PASS ──
+        audit = {
+            "passed": True,
+            "dimensions": {
+                name: {"passed": True, "evidence": name}
+                for name in gcr.audit_contract.AUDIT_DIMENSIONS
+            },
+        }
+        audit["dimensions"]["delivery_notes_consistency"] = d6_none
+        stub = {
+            "project_name": "审计打印夹具",
+            "status": "VALIDATED",
+            "generated_at": "2026-11-25T00:00:00",
+            "validation_summary": {"passed_checks": 0, "total_checks": 0},
+            "issues": [],
+            "audit": audit,
+        }
+        printed = io.StringIO()
+        with mock.patch.object(gcr, "generate_report", return_value=stub), \
+                mock.patch.object(sys, "argv", [
+                    "generate_completion_report.py",
+                    "--project-name", "审计打印夹具",
+                    "--video-file", str(video),
+                ]), contextlib.redirect_stdout(printed):
+            try:
+                gcr.main()
+            except SystemExit as exc:
+                print_code = exc.code
+        tc.assert_equal(print_code, gcr.EXIT_CODE.SUCCESS,
+                        "7a 不适用维度不翻转六维审计总结论")
+        tc.assert_true("[N/A] delivery_notes_consistency" in printed.getvalue(),
+                       "7b 未裁定维度必须显示 N/A")
+        tc.assert_true("[PASS] delivery_notes_consistency" not in printed.getvalue(),
+                       "7c 未裁定维度不得印成 PASS")
 
         tc.mark_passed()
 
@@ -10557,9 +10844,7 @@ def test_product_state_consistency_three_legs() -> RegressionTestCase:
     H 真实 _commit_delivery_slot 落盘登记，且**不改写成片 mtime**（os.replace 保留源
       mtime 是"字节何时写出"的独立证据，抹平它就等于放弃 D 腿）
     I 标记文件名两侧单源锁相等（改名即两处同改）J 端到端 generate_report 基准选择正确。
-    变异：M1 摘 not_rewritten（改写不再被捕获）/ M2 摘 not_stale（陈旧不再被捕获）/
-    M3 回退分支不再裁定（无登记＝直接放行）/ M4 归属腿改成 abs 偏差（把终检耗时又请回来）/
-    M5 _commit_delivery_slot 不再写登记 / M6 落槽后 utime 抹平 mtime（H 抓）。
+    理由文案与判定值的一致性另由 product_state_reason_matches_verdict 锁定；本用例不虚列未登记的变异编号。
     """
     tc = RegressionTestCase(
         "product_state_consistency_three_legs",
@@ -20568,6 +20853,8 @@ def test_mutation_matrix_engine_adjudicates_its_own_criteria() -> RegressionTest
     D 开发仓面：取证三件套在位、路径单源同仓、变异表落点等于引擎默认值、
       且三件均已登记进 never_in_target（不得被后续导出批顺手带走）；
     P 发布仓面：三件套缺席即锁（半缺席判红），并仍裁公开面流水线未接进本件。
+    Q 报告身份绑定 runner/矩阵/引擎/目标源码与基线断言序列，逐枚复位留完整哈希；
+    R 全部变异对位但源文件在过程中漂移时，报告、终端与退出码必须同为失败。
     """
     tc = RegressionTestCase(
         "mutation_matrix_engine_adjudicates_its_own_criteria",
@@ -20626,6 +20913,7 @@ def test_mutation_matrix_engine_adjudicates_its_own_criteria() -> RegressionTest
         # 引擎自身导出的 SCRIPT_DIR/ROOT 作为路径单源（本套件内 SCRIPT_DIR 是各用例
         # 局部名，另写一份推导即第二个真相源）
         mm = importlib.import_module("mutation_matrix")
+        import hashlib
         assert_equal(Path(str(mm.SCRIPT_DIR)).resolve(), SUITE_SCRIPT_DIR,
                      "D1 路径单源：引擎侧 SCRIPT_DIR 与套件侧 SUITE_SCRIPT_DIR 须同源，"
                      "两处各写一份推导即第二个真相源")
@@ -20678,6 +20966,10 @@ elif flag("BASE_RED"):
 if any(not x["passed"] for x in A) and not err:
     err = "Assertion failed: " + [x for x in A if not x["passed"]][0]["message"]
 status = "passed" if all(x["passed"] for x in A) and not err else "failed"
+drift_matrix = os.environ.get("MM_DRIFT_MATRIX")
+if drift_matrix and flag("LEG_A"):
+    with open(drift_matrix, "a", encoding="utf-8") as fh:
+        fh.write(NL)
 json.dump({"results": [{"name": "MM-CASE", "status": status, "error": err,
                         "assertions": A}]},
           open(out, "w", encoding="utf-8"), ensure_ascii=False)
@@ -20697,7 +20989,7 @@ sys.exit(0 if status == "passed" else 1)
                 ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
             return root, tp, mx
 
-        def _eng(root, mx, only=()):
+        def _eng(root, mx, only=(), drift_matrix=False):
             cmd = [sys.executable, "-B", "-X", "utf8", str(ENGINE),
                    "--matrix", str(mx), "--root", str(root),
                    "--runner", str(root / "fake_runner.py"),
@@ -20710,6 +21002,9 @@ sys.exit(0 if status == "passed" else 1)
             env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
                        MM_TARGET=str(root / "target.py"),
                        MM_CALLED=str(called))
+            env.pop("MM_DRIFT_MATRIX", None)
+            if drift_matrix:
+                env["MM_DRIFT_MATRIX"] = str(mx)
             p = subprocess.run(cmd, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", env=env,
                                timeout=300)
@@ -20911,6 +21206,77 @@ sys.exit(0 if status == "passed" else 1)
                     "O1 控制台打印的判据须与报告 JSON 同源（不得两处各写一份）")
         assert_equal(len(rep["criteria"]), 3,
                      f"O2 三条内置判据须齐备，实得 {rep['criteria']}")
+
+        # ── Q. 报告绑定最终源码、矩阵与逐用例基线断言序列 ────────────────
+        def _digest(path):
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+        assert_equal(rep.get("engine_sha256"), _digest(ENGINE),
+                     "Q1 报告引擎 SHA256 须等于真实引擎字节")
+        assert_equal(rep.get("runner_sha256"), _digest(r / "fake_runner.py"),
+                     "Q2 报告 runner SHA256 须等于真实夹具字节")
+        assert_equal(rep.get("matrix_sha256"), _digest(mx),
+                     "Q3 报告矩阵 SHA256 须等于真实矩阵字节")
+        target_map = rep.get("target_sources") or {}
+        assert_equal(target_map.get(str(tp.resolve())), _digest(tp),
+                     "Q4 每个目标源码的完整 SHA256 须留在报告中")
+        baselines = rep.get("case_baselines") or []
+        assert_equal(len(baselines), 1, "Q5 逐用例基线记录不得缺失")
+        baseline = baselines[0] if baselines else {}
+        assert_equal(baseline.get("case"), "MM-CASE",
+                     "Q6 基线记录须绑定真实用例名")
+        assert_equal(baseline.get("assertion_count"), 5,
+                     "Q7 基线断言数须取真实序列而非手抄")
+        sequence = [f"{name} 夹具断言 {name}"
+                    for name in ("A1", "B1", "AB1", "AB2", "C1")]
+        assert_equal(
+            baseline.get("assertion_sequence_sha256"),
+            mm.assertion_sequence_sha256(sequence),
+            "Q8 基线断言序列摘要须可独立复算",
+        )
+        assert_true(
+            baseline.get("assertion_sequence_sha256")
+            != mm.assertion_sequence_sha256(sequence[:-1]),
+            "Q9 断言消息序列变化必须改变基线身份",
+        )
+        assert_equal(baseline.get("runner_sha256"), rep.get("runner_sha256"),
+                     "Q10 基线还须绑定当轮 runner 身份")
+        row = (rep.get("rows") or [{}])[0]
+        reset = row.get("reset") or {}
+        assert_equal(reset.get("ok"), True, "Q11 逐枚复位结论须结构化留档")
+        assert_equal(reset.get("expected_sha256"), _digest(tp),
+                     "Q12 复位期望值须等于注入前目标字节")
+        assert_equal(reset.get("actual_sha256"), _digest(tp),
+                     "Q13 复位实测值须等于当前目标字节")
+        assert_equal(rep.get("selected"), {"cases": ["MM-CASE"], "only": []},
+                     "Q14 筛选条件须与实跑范围一并留档")
+        assert_equal(rep.get("final_sources_unchanged"), True,
+                     "Q15 正常轮次终态不得报源码漂移")
+        assert_equal(rep.get("source_drift"), [],
+                     "Q16 正常轮次漂移清单须为空")
+        assert_equal(rep.get("verdict"), "PASS",
+                     "Q17 报告终态须由异常与源码漂移共同裁定")
+
+        # ── R. 对位全绿但过程中源文件漂移：不得只判报告 FAIL 却退 0 ─────
+        r, tp, mx = _mk([_mut("MM-DRIFT", "LEG_A = False", "LEG_A = True",
+                              expect=["A1"])])
+        matrix_before = _digest(mx)
+        rc, so, rep, ncall = _eng(r, mx, drift_matrix=True)
+        assert_equal(_mark(rep), "RED-OK",
+                     "R1 漂移夹具仍须先证明变异本身落对位")
+        assert_equal(rep.get("final_sources_unchanged"), False,
+                     "R2 过程中矩阵字节变化须被判为终态漂移")
+        assert_equal(rep.get("source_drift"), [str(mx.resolve())],
+                     "R3 漂移清单须点名真实矩阵路径")
+        assert_equal(rep.get("verdict"), "FAIL",
+                     "R4 对位全绿不得覆盖源码漂移")
+        assert_equal(rc, 1, "R5 报告判 FAIL 时退出码必须非零")
+        assert_true("[SOURCE-DRIFT]" in so,
+                    "R6 终端须显式点名源码漂移，不得静默退 0")
+        assert_true(_digest(mx) != matrix_before,
+                    "R7 漂移夹具必须真的改变矩阵字节")
+        assert_equal(((rep.get("rows") or [{}])[0].get("reset") or {}).get("ok"),
+                     True, "R8 源矩阵漂移不得伪装成目标未复位")
 
         tc.mark_passed()
     except Exception as e:
@@ -23344,6 +23710,9 @@ class RegressionTestRunner:
             test_info_layer_coverage_leg,
             test_layout_geometry_early_presence_and_overhang,
             test_box_overlap_glyph_coverage_adjudication,
+            test_shared_scene_boundary_rounding,
+            test_product_state_reason_matches_verdict,
+            test_delivery_acceptance_mode_decoupling,
         ]
         self.results = []
     
@@ -25146,16 +25515,17 @@ def test_registry_reconciliation_and_revision_naming() -> RegressionTestCase:
                            "E9 corrupt registry must be an explicit error")
 
             # ── F：登记写入带 source 且同名保留最新一条 ──
-            reg_slot = Path(tmp) / "成果文件" / "交付登记.json"
-            data_before = json.loads(reg_slot.read_text(encoding="utf-8"))
-            data_before["deliveries"].append(
-                {"video": video.name, "bytes": 1, "source": "manual"})
-            reg_slot.write_text(json.dumps(data_before, ensure_ascii=False),
-                                encoding="utf-8")
+            reg_slot = reg
             obj = pr.PipelineRunner.__new__(pr.PipelineRunner)
             obj.html_project = "演示成片"
             obj.config_path = cfg_path
             obj._probe_duration = lambda _p: 12.5
+            data_before = json.loads(reg_slot.read_text(encoding="utf-8"))
+            data_before["deliveries"].append(
+                {"project": obj.html_project, "video": video.name,
+                 "bytes": 1, "source": "manual"})
+            reg_slot.write_text(json.dumps(data_before, ensure_ascii=False),
+                                encoding="utf-8")
             old_registry = pr.DELIVERY_REGISTRY
             pr.DELIVERY_REGISTRY = reg_slot
             try:
@@ -30676,6 +31046,1344 @@ def test_box_overlap_glyph_coverage_adjudication() -> RegressionTestCase:
         import traceback
         tc.mark_failed("box_overlap_glyph_coverage_adjudication error: " + str(e) + "\n"
                        + traceback.format_exc())
+    return tc
+
+
+def _shared_scene_boundary_rounding_impl(tc: RegressionTestCase):
+    import ast
+    import os
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+    import wave
+
+    import adjust_timeline as at
+
+    script_dir = Path(__file__).parent
+    boundaries = [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)]
+    ext_small = [0.025, 0.025, 0.0]
+    ext_large = [0.225, 0.225, 0.0]
+    offsets_small = [0.0, 0.025, 0.05]
+    offsets_large = [0.0, 0.225, 0.45]
+    old_small = [
+        (round(s + o, 1), round(e + o + x, 1))
+        for (s, e), o, x in zip(boundaries, offsets_small, ext_small)
+    ]
+    old_large = [
+        (round(s + o, 1), round(e + o + x, 1))
+        for (s, e), o, x in zip(boundaries, offsets_large, ext_large)
+    ]
+    adjusted_small = at.authoritative_scene_boundaries(
+        boundaries, offsets_small, ext_small)
+    adjusted_large = at.authoritative_scene_boundaries(
+        boundaries, offsets_large, ext_large)
+
+    tc.assert_equal(old_small[2][0] - old_small[1][1], 0.10000000000000142,
+                    "A1 反例：同一浮点边界独立舍入会产生 +0.1s 空隙")
+    tc.assert_equal(old_large[2][0] - old_large[1][1], -0.10000000000000142,
+                    "A2 反例：同一浮点边界独立舍入会产生 -0.1s 重叠")
+    tc.assert_equal(adjusted_small,
+                    [(0.0, 10.0), (10.0, 20.1), (20.1, 30.1)],
+                    "A3 0.025 扩展量下前场终点复用下一场规范起点")
+    tc.assert_equal(adjusted_large,
+                    [(0.0, 10.2), (10.2, 20.4), (20.4, 30.4)],
+                    "A4 0.225 扩展量下前场终点复用下一场规范起点")
+    tc.assert_equal(adjusted_small[1][1], adjusted_small[2][0],
+                    "A5 小扩展量相邻边界逐字相等")
+    tc.assert_equal(adjusted_large[1][1], adjusted_large[2][0],
+                    "A6 大扩展量相邻边界逐字相等")
+    tc.assert_equal(at.authoritative_video_duration(
+        boundaries, offsets_small, ext_small, adjusted_small), 30.1,
+                    "A7 总时长取规范末场终点而非另算一遍")
+    tc.assert_equal(at.authoritative_video_duration(
+        boundaries, offsets_large, ext_large, adjusted_large), 30.4,
+                    "A8 大扩展量总时长保持规范边界")
+    legacy_sample = "tl.to('#x',{opacity:1},10.54);\nvar starts = [10.54, 20.0];"
+    legacy_after = at.adjust_gsap_times(
+        legacy_sample, boundaries, ext_large, adjusted_large)
+    tc.assert_equal(legacy_after,
+                    "tl.to('#x',{opacity:1}, 10.7);\nvar starts = [10.7, 20.4];",
+                    "A9 旧式逐行时刻与 starts 数组都按规范起点映射")
+
+    at_source = (script_dir / "adjust_timeline.py").read_text(encoding="utf-8")
+    at_tree = ast.parse(at_source)
+    main_fn = next(n for n in at_tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+    helper_defs = [n for n in at_tree.body
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "authoritative_scene_boundaries"]
+    tc.assert_equal(len(helper_defs), 1, "B1 规范边界只有一个定义点")
+    helper_calls = [n for n in ast.walk(main_fn)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == "authoritative_scene_boundaries"]
+    tc.assert_equal(len(helper_calls), 2,
+                    "B2 main 在余量计算前后各消费一次规范边界")
+    writer_names = {"adjust_t_block", "adjust_s_block", "adjust_gsap_times",
+                    "update_config", "_write_narration_scenes"}
+    writer_calls = [n for n in ast.walk(main_fn)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id in writer_names]
+    missing_adjusted = [n.func.id for n in writer_calls
+                        if not any(k.arg == "adjusted_boundaries"
+                                   for k in n.keywords)]
+    tc.assert_equal(sorted({n.func.id for n in writer_calls}),
+                    ["_write_narration_scenes", "adjust_gsap_times",
+                     "adjust_s_block", "adjust_t_block", "update_config"],
+                    "B3 T/S/旧式逐行/config/narration 五个写回者均在 main 接线")
+    tc.assert_equal(missing_adjusted, [],
+                    "B4 每个写回者都显式接收同一份规范边界")
+    tc.assert_true("not boundaries_need_rewrite" in at_source,
+                   "B5 已漂移边界不得被零调整早退跳过")
+
+    evidence_root = (script_dir.parent.parent / "过程产物" / "临时产物"
+                     / "_取证" / "20261124")
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    project_name = f"_regress-boundary-{os.getpid()}-148"
+    project_dir = script_dir.parent / "源码" / "hyperframes" / project_name
+    tc.assert_true(not project_dir.exists(), "C0 唯一夹具目录尚未被占用")
+    project_dir.mkdir()
+    try:
+        with tempfile.TemporaryDirectory(
+                prefix="boundary148-", dir=str(evidence_root)) as work:
+            work_dir = Path(work)
+            tts_dir = work_dir / "tts"
+            tts_dir.mkdir()
+            for i, seconds in enumerate((9.0, 9.5, 5.6), 1):
+                tts_path = tts_dir / f"scene_{i}_hq.wav"
+                with wave.open(str(tts_path), "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(16000)
+                    wav.writeframes(b"\x00\x00" * int(seconds * 16000))
+
+            s_block = (
+                'var T={s1:2.0,s2:12.5,s3:23.5};\n'
+                'var S=[\n'
+                ' {"cover":true,"start":0,"end":2,"dur":2},\n'
+                ' {"scene_id":"s1","start":2.0,"end":12.6,"dur":10.6,"type":"content"},\n'
+                ' {"scene_id":"s2","start":12.5,"end":23.4,"dur":10.9,"type":"content"},\n'
+                ' {"scene_id":"s3","start":23.5,"end":30.6,"dur":7.1,"type":"content"}\n'
+                '];')
+            html_path = project_dir / "index.html"
+            html_path.write_text(
+                '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+                '</head><body>\n<div id="root" data-duration="30.6" '
+                'data-cover-duration="2.0"></div>\n<script>\n' + s_block +
+                '\n</script></body></html>\n', encoding="utf-8")
+
+            scenes = [
+                {"scene_id": "s0", "type": "cover", "start": 0.0,
+                 "end": 2.0, "duration": 2.0, "narration": "",
+                 "narration_required": False, "subtitle_required": False,
+                 "title": "封面保留", "assets": ["cover.svg"]},
+                {"scene_id": "s1", "type": "content", "start": 0.0,
+                 "end": 10.6, "duration": 10.6, "narration": "第一场旁白。",
+                 "narration_required": True, "subtitle_required": True,
+                 "title": "第一场", "assets": ["a.svg"], "custom": {"keep": 1}},
+                {"scene_id": "s2", "type": "content", "start": 10.5,
+                 "end": 21.4, "duration": 10.9, "narration": "第二场旁白。",
+                 "narration_required": True, "subtitle_required": True,
+                 "title": "第二场"},
+                {"scene_id": "s3", "type": "content", "start": 21.5,
+                 "end": 28.6, "duration": 7.1, "narration": "第三场旁白。",
+                 "narration_required": True, "subtitle_required": True,
+                 "title": "第三场"},
+            ]
+            narration_path = project_dir / "narration.json"
+            narration_path.write_text(json.dumps(
+                {"project": project_name, "version": 1, "scenes": scenes},
+                ensure_ascii=False, indent=2), encoding="utf-8")
+            cfg = {
+                "version": 1,
+                "paths": {"html_project": project_name,
+                          "video_name": "boundary-fixture.mp4",
+                          "subtitle_name": "boundary-fixture.srt",
+                          "temp_subdir": project_name + "_audio"},
+                "video_duration": 30.6,
+                "cover_duration": 2.0,
+                "narration_source": "./narration.json",
+                "scenes": json.loads(json.dumps(scenes)),
+                "audio": {"type": "tts", "tts_engine": "elevenlabs"},
+            }
+            cfg_path = work_dir / "config.json"
+            cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+            cmd = [sys.executable, "-X", "utf8", str(script_dir / "adjust_timeline.py"),
+                   "--config", str(cfg_path), "--tts-dir", str(tts_dir),
+                   "--shrink", "--shrink-margin", "1.5"]
+            env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+            first = subprocess.run(cmd, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", env=env,
+                                   timeout=120)
+            tc.assert_equal(first.returncode, 0,
+                            "C1 已漂移 S 块在零扩展量下仍须重写")
+            tc.assert_true("[BOUNDARY-RESYNC]" in first.stdout + first.stderr,
+                           "C2 首次运行点名相邻边界漂移")
+            cli_log = evidence_root / f"{project_name}_cli.log"
+            cli_log.write_text(
+                "=== first stdout ===\n" + first.stdout
+                + "\n=== first stderr ===\n" + first.stderr,
+                encoding="utf-8")
+
+            html_after = html_path.read_text(encoding="utf-8")
+            narration_after = json.loads(narration_path.read_text(encoding="utf-8"))
+            cfg_after = json.loads(cfg_path.read_text(encoding="utf-8"))
+            s_boundaries, s_map = at.parse_boundaries_from_sblock(html_after)
+            t_match = re.search(r'var\s+T\s*=\s*\{([^}]*)\}', html_after)
+            t_values = [float(v) for v in re.findall(r's\d+\s*:\s*([\d.]+)',
+                                                     t_match.group(1))]
+            pointer = cfg_after.get("narration_source")
+            tc.assert_equal(pointer, "./narration.json",
+                            "C5a config 只保留 narration_source 指针")
+            tc.assert_true("scenes" not in cfg_after,
+                           "C5b 最终 config 不重新引入内嵌 scenes")
+            pointer_path = (script_dir.parent / "源码" / "hyperframes"
+                            / cfg_after["paths"]["html_project"] / pointer)
+            pointer_narration = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer_content = [s for s in pointer_narration["scenes"]
+                               if s.get("type") != "cover"]
+            narration_content = [s for s in narration_after["scenes"]
+                                 if s.get("type") != "cover"]
+            tc.assert_equal(s_boundaries,
+                            [(2.0, 12.5), (12.5, 23.5), (23.5, 30.6)],
+                            "C3 S 块正负漂移均收敛为共享边界")
+            tc.assert_equal(t_values, [2.0, 12.5, 23.5],
+                            "C4 T 块与 S 块起点一致")
+            tc.assert_equal([(s["start"], s["end"]) for s in pointer_content],
+                            s_boundaries, "C5c 指针消费面内容场与 S 块一致")
+            tc.assert_equal([(s["start"], s["end"]) for s in narration_content],
+                            s_boundaries, "C6 narration 内容场与 S 块一致")
+            tc.assert_equal(cfg_after["video_duration"], 30.6,
+                            "C7 总时长取规范末场终点")
+            tc.assert_true(narration_after["scenes"][0]["title"] == "封面保留"
+                           and narration_after["scenes"][0]["assets"] == ["cover.svg"],
+                           "C8 cover 富字段保留")
+            tc.assert_true(narration_after["scenes"][1]["custom"] == {"keep": 1}
+                           and narration_after["scenes"][1]["assets"] == ["a.svg"],
+                           "C9 内容场富字段就地保留")
+            tc.assert_true('data-duration="30.6"' in html_after
+                           and '"scene_id":"s2"' in html_after
+                           and '"scene_id":"s3"' in html_after,
+                           "C10 根时长正确且 S 块保持 JSON 键形态")
+
+            before_second = {p: p.read_bytes() for p in
+                             (html_path, narration_path, cfg_path)}
+            second = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", env=env,
+                                    timeout=120)
+            tc.assert_equal(second.returncode, 0, "D1 第二次运行成功")
+            cli_log.write_text(
+                cli_log.read_text(encoding="utf-8")
+                + "\n=== second stdout ===\n" + second.stdout
+                + "\n=== second stderr ===\n" + second.stderr,
+                encoding="utf-8")
+            tc.assert_true("No adjustment needed" in second.stdout + second.stderr,
+                           "D2 第二次运行进入零调整幂等分支")
+            tc.assert_true("Pointer mode: config hash-verified, keeping current"
+                           in second.stdout + second.stderr,
+                           "D2a 指针模式零调整前不得恢复旧 config 备份")
+            tc.assert_true("Restored config from backup" not in second.stdout + second.stderr,
+                           "D2b 指针模式不得发生隐式 config 基线恢复")
+            tc.assert_equal({p: p.read_bytes() for p in before_second}, before_second,
+                            "D3 第二次运行三份权威源零字节变化")
+    finally:
+        if project_dir.exists():
+            shutil.rmtree(project_dir)
+
+
+def test_shared_scene_boundary_rounding() -> RegressionTestCase:
+    import traceback
+
+    tc = RegressionTestCase(
+        "shared_scene_boundary_rounding",
+        "相邻场景共享规范起点，漂移 S 块可重写且二次运行幂等"
+    )
+    try:
+        _shared_scene_boundary_rounding_impl(tc)
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed("shared_scene_boundary_rounding error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def _product_state_reason_matches_verdict_impl(tc):
+    import os
+    import tempfile
+    from datetime import datetime, timedelta
+
+    script_dir = Path(__file__).parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    evaluate = _safe_import_rebinding_module(
+        "generate_completion_report").evaluate_product_state_consistency
+    t0 = datetime(2026, 11, 24, 20, 0, 0)
+
+    def iso(dt):
+        return dt.isoformat(timespec="microseconds")
+
+    def marker(tag, committed_at):
+        return {"output": f"{tag}.mp4", "bytes": 4096,
+                "committed_at": iso(committed_at),
+                "artifact_mtime": iso(committed_at)}
+
+    def reason(tc, tag, detail, leg, expected, required, forbidden):
+        row = detail["legs"][leg]
+        text = str(row.get("reason", ""))
+        tc.assert_equal(row.get("passed"), expected,
+                        f"{tag} {leg} 判定值保持预期")
+        for token in required:
+            tc.assert_true(token in text,
+                           f"{tag} {leg} 理由含与判定同向的「{token}」")
+        for token in forbidden:
+            tc.assert_true(token not in text,
+                           f"{tag} {leg} 理由不得含反向结论「{token}」")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def video(tag, mtime):
+            path = root / f"{tag}.mp4"
+            path.write_bytes(b"\x00" * 4096)
+            stamp = mtime.timestamp()
+            os.utime(path, (stamp, stamp))
+            return path
+
+        v = video("happy", t0 + timedelta(seconds=5))
+        ok, d = evaluate(v, iso(t0), iso(t0 + timedelta(seconds=60)),
+                         marker("happy", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(ok, "A 三腿全通过时整体一致")
+        reason(tc, "A", d, "in_run_window", True,
+               ("落槽动作在本轮 postprocess 区间内",),
+               ("落槽动作不在本轮 postprocess 区间内 → 登记属另一轮运行",))
+        reason(tc, "A", d, "not_rewritten", True,
+               ("不晚于落槽动作",), ("之后被外部改写",))
+        reason(tc, "A", d, "not_stale", True,
+               ("未超过容差",), ("陈旧产物",))
+
+        v = video("rewrite", t0 + timedelta(seconds=70))
+        ok, d = evaluate(v, iso(t0), iso(t0 + timedelta(seconds=90)),
+                         marker("rewrite", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(not ok, "B 落槽后改写仍拒绝")
+        reason(tc, "B", d, "not_rewritten", False,
+               ("之后被外部改写",), ("不晚于落槽动作",))
+
+        v = video("stale", t0 - timedelta(seconds=400))
+        ok, d = evaluate(v, iso(t0), iso(t0 + timedelta(seconds=60)),
+                         marker("stale", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(not ok, "C 陈旧产物仍拒绝")
+        reason(tc, "C", d, "not_stale", False,
+               ("陈旧产物",), ("未超过容差",))
+
+        v = video("other_round", t0 + timedelta(seconds=5))
+        ok, d = evaluate(v, iso(t0 + timedelta(seconds=200)),
+                         iso(t0 + timedelta(seconds=260)),
+                         marker("other_round", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(not ok, "D 另一轮登记仍拒绝")
+        reason(tc, "D", d, "in_run_window", False,
+               ("落槽动作不在本轮 postprocess 区间内 → 登记属另一轮运行",),
+               ("落槽动作在本轮 postprocess 区间内",))
+
+        v = video("upper_pass", t0 + timedelta(seconds=5))
+        ok, d = evaluate(v, None, iso(t0 + timedelta(seconds=60)),
+                         marker("upper_pass", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(ok, "E 缺 started 时上界通过仍放行")
+        reason(tc, "E", d, "in_run_window", True,
+               ("区间下界缺失", "不晚于 postprocess 完成时刻"), ("落槽晚于",))
+
+        v = video("upper_fail", t0 + timedelta(seconds=5))
+        ok, d = evaluate(v, None, iso(t0 + timedelta(seconds=60)),
+                         marker("upper_fail", t0 + timedelta(seconds=70)), 15.0)
+        tc.assert_true(not ok, "F 缺 started 时上界失败仍拒绝")
+        reason(tc, "F", d, "in_run_window", False,
+               ("落槽晚于 postprocess 完成时刻",), ("不晚于",))
+
+        v = video("untested", t0 + timedelta(seconds=5))
+        ok, d = evaluate(v, None, None,
+                         marker("untested", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(not ok, "G 无起止时刻不得读成通过")
+        reason(tc, "G", d, "in_run_window", None,
+               ("无从裁定",), ("落槽动作在本轮 postprocess 区间内",))
+
+        ok, d = evaluate(v, "not-a-timestamp", iso(t0 + timedelta(seconds=60)),
+                         marker("untested", t0 + timedelta(seconds=10)), 15.0)
+        tc.assert_true(not ok, "H 起止时刻不可解析不得读成通过")
+        reason(tc, "H", d, "in_run_window", None,
+               ("不可解析",), ("落槽动作在本轮 postprocess 区间内",))
+
+        v = video("legacy_pass", t0 + timedelta(seconds=50))
+        ok, d = evaluate(v, iso(t0), iso(t0 + timedelta(seconds=60)), None, 15.0)
+        tc.assert_true(ok, "I 回退判据通过时理由同为通过语义")
+        reason(tc, "I", d, "legacy_abs_deviation", True,
+               ("绝对差在自适应容差内",), ("超容差",))
+
+        v = video("legacy_fail", t0 - timedelta(seconds=400))
+        ok, d = evaluate(v, iso(t0), iso(t0 + timedelta(seconds=60)), None, 15.0)
+        tc.assert_true(not ok, "J 回退判据失败时理由同为失败语义")
+        reason(tc, "J", d, "legacy_abs_deviation", False,
+               ("超容差",), ("绝对差在自适应容差内",))
+
+
+def test_product_state_reason_matches_verdict() -> RegressionTestCase:
+    import traceback
+
+    tc = RegressionTestCase(
+        "product_state_reason_matches_verdict",
+        "产物状态三腿与回退路径的理由文案必须和判定值同向"
+    )
+    try:
+        _product_state_reason_matches_verdict_impl(tc)
+        tc.mark_passed()
+    except Exception as e:
+        tc.mark_failed("product_state_reason_matches_verdict error: " + str(e)
+                       + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
+    import contextlib
+    import hashlib
+    import io
+    import os
+    import subprocess
+    import sys
+    from unittest import mock
+
+    tc = RegressionTestCase(
+        "delivery_acceptance_mode_decoupling",
+        "视频交付、技术、治理、业务四轴独立，制作与工程模式走真实门禁"
+    )
+    try:
+        script_dir = Path(__file__).resolve().parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import delivery_acceptance as acceptance
+        _pr = _safe_import_pipeline_runner()
+        PipelineRunner, PipelineState = _pr.PipelineRunner, _pr.PipelineState
+
+        def dump(path, data):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "成果文件" / "视频" / "主题_声音治理.mp4"
+            video.parent.mkdir(parents=True)
+            payload = b"synthetic-video-bytes"
+            video.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            srt = root / "成果文件" / "字幕" / "主题_声音治理.srt"
+            srt.parent.mkdir(parents=True)
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n测试\n", encoding="utf-8")
+            temp = root / "temp"
+            temp.mkdir()
+            registry = root / "成果文件" / "交付登记.json"
+            report = temp / "completion_report.json"
+            governance = temp / "governance"
+            business = root / "business.json"
+            config_path = root / "config.json"
+            dump(config_path, {"paths": {"video_name": video.name}})
+            first_delivered = "2026-11-24T20:18:45"
+            entry = {
+                "video": video.name, "subtitle": srt.name,
+                "project": "acceptance-fixture", "config": "config.json",
+                "duration_seconds": 157.6, "bytes": len(payload),
+                "sha256": digest, "report_status": "VALIDATED",
+                "source": "pipeline", "delivered_at": first_delivered,
+            }
+
+            def set_registry(value=None):
+                if value is None:
+                    deliveries = [dict(entry)]
+                elif isinstance(value, dict):
+                    deliveries = [value]
+                else:
+                    deliveries = value
+                dump(registry, {"deliveries": deliveries})
+
+            def valid_audit():
+                return {
+                    "passed": True,
+                    "dimensions": {
+                        name: {"passed": True}
+                        for name in acceptance.audit_contract.AUDIT_DIMENSIONS
+                    },
+                }
+
+            def set_report(status="VALIDATED", failed=0, audit="absent",
+                           project_name="acceptance-fixture", video_path=None):
+                target_video = video if video_path is None else Path(video_path)
+                data = {
+                    "status": status,
+                    "project_name": project_name,
+                    "validation_summary": {"failed_checks": failed},
+                    "data_sources": {
+                        "video_file": {
+                            "path": str(target_video),
+                            "size_bytes": target_video.stat().st_size,
+                            "modified_at": datetime.fromtimestamp(
+                                target_video.stat().st_mtime
+                            ).isoformat(),
+                            "sha256": hashlib.sha256(
+                                target_video.read_bytes()
+                            ).hexdigest(),
+                        }
+                    },
+                    "audit": valid_audit() if audit == "absent" else audit,
+                }
+                dump(report, data)
+
+            evidence_pointers = {
+                "critic": "程序文件/脚本/delivery_acceptance.py:1",
+                "evaluator": "程序文件/脚本/completion_audit_contract.py:1",
+                "ledger": "AGENTS.md:1",
+                "provenance": "程序文件/脚本/pipeline_runner.py:1",
+                "version_trace": "程序文件/脚本/regression_test.py:1",
+            }
+
+            def set_governance(status="PASS", warn=False, health_overrides=None,
+                               review_overrides=None, checks_overrides=None):
+                health = {
+                    "scope": "workspace",
+                    "subject": str(_pr.ROOT.parent),
+                    "overall_status": "OK" if status == "PASS" else status,
+                    "workspace_status": "OK" if status == "PASS" else status,
+                    "can_proceed": status != "FAIL",
+                    "timestamp": "2026-11-25T16:48:04",
+                }
+                health.update(health_overrides or {})
+                review = {
+                    "critic": {"status": status, "evidence": evidence_pointers["critic"]},
+                    "evaluator": {"status": status, "evidence": evidence_pointers["evaluator"]},
+                }
+                review.update(review_overrides or {})
+                checks = {
+                    "ledger": {"status": "WARN" if warn else status, "evidence": evidence_pointers["ledger"]},
+                    "provenance": {"status": status, "evidence": evidence_pointers["provenance"]},
+                    "version_trace": {"status": status, "evidence": evidence_pointers["version_trace"]},
+                }
+                checks.update(checks_overrides or {})
+                dump(governance / "workspace_health.json", health)
+                dump(governance / "independent_review.json", review)
+                dump(governance / "governance_checks.json", checks)
+
+            def project_status(**overrides):
+                args = {
+                    "registry_file": registry, "video_file": video,
+                    "completion_report": report,
+                    "project": "acceptance-fixture",
+                    "acceptance_mode": "production",
+                    "governance_evidence_dir": governance,
+                    "business_acceptance_file": business,
+                    "root": _pr.ROOT,
+                    "workspace_root": _pr.ROOT.parent,
+                }
+                args.update(overrides)
+                return acceptance.build_acceptance_status(**args)
+
+            def set_business(**overrides):
+                data = {
+                    "status": "USER_ACCEPTED",
+                    "project": "acceptance-fixture",
+                    "video": video.name,
+                    "accepted_at": "2026-11-25T10:00:00",
+                    "delivered_at": first_delivered,
+                    "sha256": digest,
+                    "evidence": "agents.md:1",
+                }
+                data.update(overrides)
+                dump(business, data)
+
+            def clear_governance():
+                for child in governance.glob("*.json"):
+                    child.unlink()
+
+            def make_runner(mode="production", tag="main"):
+                runner = PipelineRunner.__new__(PipelineRunner)
+                runner.state = PipelineState(temp / f"state-{tag}.json")
+                runner.output_file = video
+                runner.temp_dir = temp
+                runner.html_project = "acceptance-fixture"
+                runner.config_path = config_path
+                runner.config = {"paths": {"video_name": video.name}}
+                runner.acceptance_mode = mode
+                runner.governance_evidence_dir = governance
+                runner.business_acceptance_file = None
+                runner.acceptance_status = None
+                runner.tts_enabled = True
+                runner._delivery_paths = lambda: (video, srt)
+                runner._probe_duration = lambda path: 157.6
+                return runner
+
+            saved_registry = _pr.DELIVERY_REGISTRY
+            saved_lock = _pr.PipelineLock
+            _pr.DELIVERY_REGISTRY = registry
+            try:
+                set_registry()
+                set_report()
+                clear_governance()
+                runner = make_runner()
+
+                tc.assert_equal(acceptance.DEFAULT_ACCEPTANCE_MODE, "production", "A 默认模式为普通制作")
+                tc.assert_equal(acceptance.resolve_acceptance_mode(config={"acceptance_mode": "engineering"}), "engineering", "A config 模式被读取")
+                try:
+                    acceptance.resolve_acceptance_mode(config={"acceptance_mode": "L3"})
+                    tc.assert_true(False, "A 非法模式必须拒绝")
+                except acceptance.AcceptanceInputError:
+                    tc.assert_true(True, "A 非法模式必须拒绝")
+
+                production_status, satisfied, reasons = runner._project_acceptance()
+                tc.assert_equal(production_status["video_delivery"]["status"], "DELIVERED", "B 普通制作登记即已交付")
+                tc.assert_equal(production_status["video_delivery"]["delivered_at"], first_delivered, "B 交付时间取登记事实")
+                tc.assert_equal(production_status["technical_validation"]["status"], "PASS", "B 技术报告通过")
+                tc.assert_equal(production_status["governance_acceptance"]["status"], "NOT_RUN", "B 普通制作不强跑治理")
+                tc.assert_true(production_status["governance_acceptance"]["can_proceed"], "B 普通制作无治理不阻断")
+                tc.assert_true(satisfied and not reasons, "B 普通制作完成条件只含交付与技术")
+                tc.assert_equal(production_status["business_acceptance"]["status"], "PENDING_USER", "B 技术通过不代替业务验收")
+
+                engineering = make_runner("engineering", "engineering")
+                engineering_status, satisfied, reasons = engineering._project_acceptance()
+                tc.assert_equal(engineering_status["governance_acceptance"]["status"], "NOT_RUN", "C 工程模式无治理证据为未跑")
+                tc.assert_true(not satisfied and reasons == ["工程治理验收未通过"], "C 工程模式必须阻断未跑治理")
+
+                set_governance()
+                _, satisfied, _ = engineering._project_acceptance()
+                tc.assert_true(satisfied, "C 工程治理三件套完整通过")
+                set_governance(warn=True)
+                _, satisfied, _ = engineering._project_acceptance()
+                tc.assert_true(satisfied, "C 工程治理 WARN 不阻断")
+                set_governance()
+                (governance / "independent_review.json").unlink()
+                partial_status, satisfied, _ = make_runner("production", "partial")._project_acceptance()
+                tc.assert_equal(partial_status["governance_acceptance"]["status"], "WARN", "C 普通模式部分治理证据只能 WARN")
+                tc.assert_true(satisfied, "C 普通模式部分治理不阻断")
+                tc.assert_equal(len(partial_status["governance_acceptance"]["missing_evidence"]), 1, "C 缺失证据单列不重复记错误")
+                tc.assert_equal(partial_status["governance_acceptance"]["errors"], [], "C 文件缺席不冒充不可读错误")
+                _, satisfied, _ = engineering._project_acceptance()
+                tc.assert_true(not satisfied, "C 工程模式缺独立复核即阻断")
+                set_governance("FAIL")
+                failed_gov, satisfied, _ = engineering._project_acceptance()
+                tc.assert_equal(failed_gov["video_delivery"]["status"], "DELIVERED", "D 治理 FAIL 不抹除交付")
+                tc.assert_equal(failed_gov["video_delivery"]["delivered_at"], first_delivered, "D 治理 FAIL 不改交付时间")
+                tc.assert_equal(failed_gov["technical_validation"]["status"], "PASS", "D 治理 FAIL 不改技术事实")
+                tc.assert_equal(failed_gov["governance_acceptance"]["status"], "FAIL", "D 工程治理 FAIL 保持 FAIL")
+                tc.assert_true(not satisfied, "D 工程治理 FAIL 阻断工程验收")
+                tc.assert_equal(acceptance.acceptance_satisfied(failed_gov | {"acceptance_mode": "production"})[0], True, "D 普通制作不被治理 FAIL 阻断")
+
+                set_report("FAILED", 1)
+                for mode in ("production", "engineering"):
+                    bad = make_runner(mode, "tech-" + mode)
+                    state, ok, why = bad._project_acceptance()
+                    tc.assert_equal(state["technical_validation"]["status"], "FAIL", "E 技术失败保持 FAIL")
+                    tc.assert_true(not ok and "技术验证未通过" in why, "E 技术失败阻断两种模式")
+                set_report(failed=-1)
+                tc.assert_equal(make_runner()._project_acceptance()[0]["technical_validation"]["status"], "UNTESTED", "E 非法失败计数为未测")
+                set_report(audit={"passed": "yes"})
+                tc.assert_equal(make_runner()._project_acceptance()[0]["technical_validation"]["status"], "UNTESTED", "E 非法 audit 为未测")
+                tc.assert_true(acceptance.REPORT_PASS_STATES is acceptance.audit_contract.REPORT_PASS_STATES,
+                               "E 投影器复用技术通过态单一契约")
+                set_report("VALIDATED_WITH_ISSUES")
+                tc.assert_equal(make_runner()._project_acceptance()[0]["technical_validation"]["status"], "PASS",
+                                "E 带问题通过报告且六维全过时技术为 PASS")
+                tc.assert_true(acceptance.technical_evidence_usable(
+                    report_path=report, video_file=video,
+                    project="acceptance-fixture", root=_pr.ROOT)[0],
+                    "E 带问题通过报告可作技术证据")
+                inner_failure = valid_audit()
+                inner_failure["dimensions"][acceptance.audit_contract.GATE_INTEGRITY]["passed"] = False
+                set_report("VALIDATED_WITH_ISSUES", audit=inner_failure)
+                tc.assert_equal(make_runner()._project_acceptance()[0]["technical_validation"]["status"], "FAIL",
+                                "E 带问题通过报告不能覆盖六维失败")
+                tc.assert_true(not acceptance.technical_evidence_usable(
+                    report_path=report, video_file=video,
+                    project="acceptance-fixture", root=_pr.ROOT)[0],
+                    "E 六维失败不得作技术证据")
+                set_report()
+
+                clear_governance()
+                set_registry()
+                current = make_runner()
+                calls = []
+                original_project = current._project_acceptance
+
+                def cached_project():
+                    calls.append("project")
+                    return original_project()
+
+                current._can_skip = lambda step: True
+                current._project_acceptance = cached_project
+                before_report = report.read_bytes()
+                tc.assert_true(current.step_completion_report(), "F 缓存命中仍执行验收投影")
+                tc.assert_equal(calls, ["project"], "F 缓存命中不重跑报告生成")
+                tc.assert_equal(report.read_bytes(), before_report, "F 缓存命中报告字节不变")
+
+                set_governance("FAIL")
+                engineering._can_skip = lambda step: True
+                engineering.state.data["steps"]["completion_report"] = {}
+                engineering.state.mark_completed("completion_report")
+                original_project = engineering._project_acceptance
+                engineering._project_acceptance = lambda: original_project()
+                tc.assert_true(not engineering.step_completion_report(), "F 工程缓存路径仍可被治理阻断")
+                tc.assert_equal(engineering.state.data["steps"]["completion_report"]["status"], "passed", "F 治理阻断不把技术报告步骤改成 failed")
+
+                set_governance()
+                failed_runner = make_runner("production", "failed-report")
+                failed_runner._can_skip = lambda step: False
+                failed_runner._delivery_object_matches_output = lambda: (True, video)
+                failed_runner._fingerprint = lambda step: "stable"
+                failed_runner._run = lambda cmd, cwd, desc: 1
+                failed_runner._sync_subtitle_source_section = lambda: "未建"
+                failed_runner._render_metrics = lambda: {"delivery_round_attempts": 0}
+                set_report()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = failed_runner.step_completion_report()
+                tc.assert_true(not result, "G 报告进程失败不宣称完成")
+                tc.assert_true(list(temp.glob("completion_report.prev-*.json")), "G 旧报告在重跑前隔离")
+                tc.assert_equal(failed_runner.state.data["steps"]["completion_report"]["status"], "failed", "G 失败轮状态为 failed")
+                tc.assert_equal(failed_runner.acceptance_status["technical_validation"]["status"], "UNTESTED", "G 失败轮不误读旧 PASS")
+
+                mismatch = make_runner("production", "mismatch")
+                mismatch._can_skip = lambda step: False
+                mismatch._delivery_object_matches_output = lambda: (False, video)
+                mismatch._fingerprint = lambda step: "stable"
+                mismatch._run = lambda *args, **kwargs: tc.assert_true(False, "G 对象不一致不得启动报告生成") or 0
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = mismatch.step_completion_report()
+                tc.assert_true(not result, "G 交付对象不一致必须阻断")
+                tc.assert_equal(mismatch.state.data["steps"]["completion_report"]["status"], "failed", "G 对象不一致落失败态")
+
+                set_report()
+                write_failure = make_runner("production", "write-failure")
+                write_failure._can_skip = lambda step: False
+                write_failure._delivery_object_matches_output = lambda: (True, video)
+                write_failure._fingerprint = lambda step: "stable"
+                def write_passing_report(cmd, cwd, desc):
+                    set_report()
+                    return 0
+                write_failure._run = write_passing_report
+                write_failure._sync_subtitle_source_section = lambda: "未建"
+                write_failure._render_metrics = lambda: {"delivery_round_attempts": 0}
+                write_failure._record_delivery = lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic registry failure"))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = write_failure.step_completion_report()
+                tc.assert_true(not result, "G 登记写失败不得宣称交付")
+                tc.assert_equal(write_failure.state.data["steps"]["completion_report"]["status"], "failed", "G 登记异常落失败态")
+
+                set_report()
+                set_registry()
+                re_recorded = make_runner()._record_delivery(video, srt, "VALIDATED")
+                tc.assert_equal(re_recorded["delivered_at"], first_delivered, "H 同实物重登记保留首次交付时间")
+                tc.assert_equal(re_recorded["sha256"], digest, "H 新登记写入 SHA256")
+                set_registry(entry | {"sha256": "0" * 64})
+                changed_time = make_runner()._record_delivery(video, srt, "VALIDATED")["delivered_at"]
+                tc.assert_true(changed_time != first_delivered, "H SHA256 变化不得沿用旧交付时间")
+                legacy_entry = dict(entry)
+                legacy_entry.pop("sha256")
+                set_registry(legacy_entry)
+                video.write_bytes(b"x" * len(payload))
+                legacy_time = make_runner()._record_delivery(video, srt, "VALIDATED")["delivered_at"]
+                tc.assert_true(legacy_time != first_delivered, "H 旧登记缺 SHA 时同尺寸也不得沿用首次交付时间")
+                video.write_bytes(payload)
+                other_entry = entry | {
+                    "project": "another-project",
+                    "delivered_at": "2026-11-20T10:00:00",
+                }
+                set_registry([entry, other_entry])
+                tc.assert_equal(
+                    [type(item).__name__ for item in json.loads(
+                        registry.read_text(encoding="utf-8"))["deliveries"]],
+                    ["dict", "dict"],
+                    "H 跨项目登记夹具由两条对象组成",
+                )
+                make_runner()._record_delivery(video, srt, "VALIDATED")
+                registered = json.loads(registry.read_text(encoding="utf-8"))["deliveries"]
+                tc.assert_equal(len(registered), 2, "H 同项目重登记只替换本项")
+                tc.assert_equal(sum(item.get("project") == "another-project" for item in registered), 1, "H 跨项目同名成片登记不得互删")
+                tc.assert_equal([item.get("delivered_at") for item in registered if item.get("project") == "another-project"], [other_entry["delivered_at"]], "H 跨项目交付时间保持不变")
+                set_registry()
+                state = acceptance.build_acceptance_status(
+                    registry_file=registry, video_file=video, completion_report=report,
+                    project="acceptance-fixture", acceptance_mode="production",
+                    governance_evidence_dir=governance,
+                )
+                tc.assert_equal(state["video_delivery"]["status"], "DELIVERED", "I 登记与实物一致")
+                dump(registry, {"deliveries": [entry | {"bytes": len(payload) + 1}]})
+                tc.assert_equal(acceptance.build_acceptance_status(registry_file=registry, video_file=video, completion_report=report, project="acceptance-fixture")["video_delivery"]["status"], "NOT_DELIVERED", "I 字节不一致不认交付")
+                dump(registry, {"deliveries": [entry | {"sha256": "0" * 64}]})
+                tc.assert_equal(acceptance.build_acceptance_status(registry_file=registry, video_file=video, completion_report=report, project="acceptance-fixture")["video_delivery"]["status"], "NOT_DELIVERED", "I SHA256 不一致不认交付")
+                set_registry()
+                missing_video = root / "成果文件" / "视频" / "历史归档.mp4"
+                dump(registry, {"deliveries": [entry | {"video": missing_video.name}]})
+                historical = acceptance.build_acceptance_status(registry_file=registry, video_file=missing_video, completion_report=report, project="acceptance-fixture")
+                tc.assert_equal(historical["video_delivery"]["status"], "DELIVERED", "I 历史实物缺席不抹除曾交付事实")
+                tc.assert_true(not historical["video_delivery"]["artifact_present"], "I 实物缺席独立披露")
+                set_registry()
+
+                set_business(project="another-project")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "J 跨项目确认不得挂接")
+                set_business()
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "USER_ACCEPTED", "J 显式同身份确认才升级")
+                set_business(delivered_at="2026-11-24T20:18:46")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 业务确认必须绑定当前交付时间")
+                set_business(accepted_at="2026-11-24T20:18:44")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 验收时间不得早于交付")
+                set_business(accepted_at="2026-11-25")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 纯日期不是合法验收时间")
+                set_business(sha256="0" * 64)
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 业务确认必须绑定当前 SHA256")
+                set_business(evidence="过程产物/临时产物/_取证/20261125/not-created.json:1")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 用户确认证据不可读不得升级")
+                set_business(evidence="agents.md:99999")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 用户确认证据行号越界不得升级")
+                set_business(evidence=str(_pr.ROOT / "agents.md") + ":1")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 用户确认证据拒绝绝对路径")
+                set_business(evidence="../agents.md:1")
+                tc.assert_equal(project_status()["business_acceptance"]["status"], "PENDING_USER", "N 用户确认证据拒绝越界路径")
+                set_business()
+                config_only = project_status(
+                    business_acceptance_file=None,
+                    config={"business_acceptance_file": str(business)},
+                )
+                tc.assert_equal(config_only["business_acceptance"]["status"], "USER_ACCEPTED", "N config-only 业务证据路径被消费")
+
+                set_business()
+                sha_delivery = dict(entry, status="DELIVERED")
+                tc.assert_equal(
+                    acceptance._project_business(business, "acceptance-fixture", video, sha_delivery, _pr.ROOT)["status"],
+                    "USER_ACCEPTED", "N2 SHA256 匹配可直接确认当前业务验收")
+                bytes_delivery = dict(sha_delivery)
+                bytes_delivery.pop("sha256")
+                set_business(bytes=len(payload))
+                tc.assert_equal(
+                    acceptance._project_business(business, "acceptance-fixture", video, bytes_delivery, _pr.ROOT)["status"],
+                    "USER_ACCEPTED", "N2 历史登记仅有 bytes 时可绑定同尺寸业务确认")
+                set_business(bytes=len(payload) + 1)
+                tc.assert_equal(
+                    acceptance._project_business(business, "acceptance-fixture", video, bytes_delivery, _pr.ROOT)["status"],
+                    "PENDING_USER", "N2 bytes 不匹配不得升级业务验收")
+                no_business_identity = dict(sha_delivery)
+                no_business_identity.pop("sha256")
+                no_business_identity.pop("bytes")
+                set_business(bytes=len(payload))
+                missing_identity = acceptance._project_business(
+                    business, "acceptance-fixture", video, no_business_identity, _pr.ROOT)
+                tc.assert_equal(missing_identity["status"], "PENDING_USER", "N2 交付 SHA/bytes 全缺不得升级业务验收")
+                tc.assert_true("身份不足" in missing_identity.get("reason", ""), "N2 缺身份归因不得被时间或项目守卫顶替")
+
+                business.unlink()
+                tc.assert_equal(project_status(business_acceptance_file=None)["business_acceptance"]["status"], "PENDING_USER", "N 无业务证据不自动验收")
+
+                for bad_project in ("", "   ", "../other", "a/b"):
+                    try:
+                        project_status(project=bad_project)
+                        tc.assert_true(False, "N 公共投影入口拒绝非法 project: " + repr(bad_project))
+                    except acceptance.AcceptanceInputError:
+                        tc.assert_true(True, "N 公共投影入口拒绝非法 project: " + repr(bad_project))
+                    try:
+                        acceptance.technical_evidence_usable(
+                            report_path=report, video_file=video,
+                            project=bad_project, root=_pr.ROOT)
+                        tc.assert_true(False, "N 缓存辅助入口拒绝非法 project: " + repr(bad_project))
+                    except acceptance.AcceptanceInputError:
+                        tc.assert_true(True, "N 缓存辅助入口拒绝非法 project: " + repr(bad_project))
+
+                set_registry(entry | {"project": "another-project"})
+                tc.assert_equal(project_status()["video_delivery"]["status"], "NOT_DELIVERED", "O 跨项目登记不得借用")
+                set_registry(entry | {"bytes": "22"})
+                tc.assert_equal(project_status()["video_delivery"]["status"], "NOT_DELIVERED", "O 登记 bytes 类型非法不认交付")
+                set_registry(entry | {"sha256": "not-a-digest"})
+                tc.assert_equal(project_status()["video_delivery"]["status"], "NOT_DELIVERED", "O 登记 SHA256 非法不认交付")
+                no_identity = dict(entry)
+                no_identity.pop("bytes")
+                no_identity.pop("sha256")
+                set_registry(no_identity)
+                tc.assert_equal(project_status()["video_delivery"]["status"], "NOT_DELIVERED", "O 实物在位却无 bytes/SHA 不认交付")
+                set_registry()
+
+                set_report(project_name="another-project")
+                tc.assert_equal(project_status()["technical_validation"]["status"], "UNTESTED", "O 报告项目身份不符为未测")
+                other_video = root / "other.mp4"
+                other_video.write_bytes(payload)
+                os.utime(other_video, ns=(video.stat().st_atime_ns, video.stat().st_mtime_ns))
+                set_report(video_path=other_video)
+                tc.assert_equal(project_status()["technical_validation"]["status"], "UNTESTED", "O 报告视频身份不符为未测")
+                tc.assert_true("path" in project_status()["technical_validation"].get("reason", ""), "O 同内容异路径只能由报告路径守卫拦下")
+                set_report()
+                malformed = json.loads(report.read_text(encoding="utf-8"))
+                malformed["data_sources"] = []
+                dump(report, malformed)
+                tc.assert_equal(project_status()["technical_validation"]["status"], "UNTESTED", "O 畸形 data_sources 不崩溃且为未测")
+                malformed = json.loads(report.read_text(encoding="utf-8"))
+                malformed.pop("audit")
+                dump(report, malformed)
+                tc.assert_equal(project_status()["technical_validation"]["status"], "UNTESTED", "O 报告缺六维审计为未测")
+                set_report(audit={"passed": False})
+                tc.assert_equal(project_status()["technical_validation"]["status"], "FAIL", "O 六维技术审计失败为 FAIL")
+                set_report()
+                usable, helper_reasons = acceptance.technical_evidence_usable(
+                    report_path=report, video_file=video,
+                    project="acceptance-fixture", root=_pr.ROOT)
+                tc.assert_true(usable and helper_reasons == [], "O 技术证据可用时原因列表为空")
+
+                _identity_cases = (
+                    ("size+1", lambda source: source.__setitem__("size_bytes", source["size_bytes"] + 1)),
+                    ("missing-size", lambda source: source.pop("size_bytes")),
+                    ("epoch-mtime", lambda source: source.__setitem__("modified_at", "1970-01-01T00:00:00")),
+                    ("missing-mtime", lambda source: source.pop("modified_at")),
+                    ("invalid-mtime", lambda source: source.__setitem__("modified_at", "not-a-time")),
+                    ("aware-mtime", lambda source: source.__setitem__("modified_at", "2026-11-24T20:18:45+00:00")),
+                    ("null-sha", lambda source: source.__setitem__("sha256", None)),
+                    ("wrong-sha", lambda source: source.__setitem__("sha256", "0" * 64)),
+                )
+                for label, mutate_identity in _identity_cases:
+                    set_report()
+                    identity_report = json.loads(report.read_text(encoding="utf-8"))
+                    mutate_identity(identity_report["data_sources"]["video_file"])
+                    dump(report, identity_report)
+                    observed = project_status()["technical_validation"]
+                    tc.assert_equal(observed["status"], "UNTESTED", "O2 技术报告身份不可用：" + label)
+                    tc.assert_true(observed.get("reason"), "O2 身份失败必须留归因：" + label)
+
+                set_report()
+                legacy_report = json.loads(report.read_text(encoding="utf-8"))
+                legacy_report["data_sources"]["video_file"].pop("sha256")
+                dump(report, legacy_report)
+                legacy_technical = project_status()["technical_validation"]
+                tc.assert_equal(legacy_technical["status"], "PASS", "O2 历史报告完全无 SHA 键时才走 size/mtime 兼容")
+                tc.assert_equal(legacy_technical["video_identity_mode"], "legacy_size_mtime", "O2 历史兼容路径必须显式点名")
+
+                set_report()
+                original_stat = video.stat()
+                try:
+                    video.write_bytes(b"X" * len(payload))
+                    os.utime(video, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+                    replacement = project_status()["technical_validation"]
+                    tc.assert_equal(replacement["status"], "UNTESTED", "O2 同路径同尺寸同 mtime 换片仍须被 SHA 对撞拦下")
+                    tc.assert_true("SHA256" in replacement.get("reason", ""), "O2 同路径换片归因须点名 SHA256")
+                finally:
+                    video.write_bytes(payload)
+                    os.utime(video, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+                set_report()
+                identity_source = json.loads(report.read_text(encoding="utf-8"))["data_sources"]["video_file"]
+
+                with mock.patch.object(Path, "open", side_effect=OSError("synthetic read failure")):
+                    read_error, identity_mode = acceptance._video_identity_error(identity_source, video)
+                tc.assert_true(read_error and "不可核对" in read_error, "O2 视频读取失败为未测并点名")
+                tc.assert_equal(identity_mode, "sha256", "O2 新报告读取失败不得退回历史兼容")
+                real_stat = video.stat()
+                changed_stat = mock.Mock(
+                    st_size=real_stat.st_size + 1, st_mtime_ns=real_stat.st_mtime_ns,
+                    st_mtime=real_stat.st_mtime, st_mode=real_stat.st_mode)
+                with mock.patch.object(Path, "is_file", return_value=True), \
+                        mock.patch.object(Path, "stat", autospec=True,
+                                          side_effect=[real_stat, changed_stat]) as stat_probe:
+                    change_error, identity_mode = acceptance._video_identity_error(identity_source, video)
+                tc.assert_equal(stat_probe.call_count, 2, "O2 变化夹具只驱动身份核对前后两次 stat")
+                tc.assert_true(change_error and "发生变化" in change_error, "O2 身份核对期间实物变化为未测")
+                tc.assert_equal(identity_mode, "sha256", "O2 核对中变化不得退回历史兼容")
+
+                missing_dimension = valid_audit()
+                missing_dimension["dimensions"].pop(acceptance.audit_contract.AUDIT_DIMENSIONS[0])
+                unknown_dimension = valid_audit()
+                unknown_dimension["dimensions"]["unexpected"] = {"passed": True}
+                malformed_dimension = valid_audit()
+                malformed_dimension["dimensions"][acceptance.audit_contract.AUDIT_DIMENSIONS[0]] = []
+                non_boolean_dimension = valid_audit()
+                non_boolean_dimension["dimensions"][acceptance.audit_contract.AUDIT_DIMENSIONS[0]]["passed"] = "yes"
+                inner_failure = valid_audit()
+                inner_failure["dimensions"][acceptance.audit_contract.GATE_INTEGRITY]["passed"] = False
+                failure_and_malformed = valid_audit()
+                failure_and_malformed["dimensions"][acceptance.audit_contract.GATE_INTEGRITY]["passed"] = False
+                failure_and_malformed["dimensions"][acceptance.audit_contract.AUDIT_DIMENSIONS[0]] = []
+                not_applicable_notes = valid_audit()
+                not_applicable_notes["dimensions"][acceptance.audit_contract.DELIVERY_NOTES_CONSISTENCY]["applicable"] = False
+                for label, candidate, expected in (
+                    ("六维齐全", valid_audit(), "PASS"),
+                    ("第六维不适用", not_applicable_notes, "PASS"),
+                    ("空维度", {"passed": True, "dimensions": {}}, "UNTESTED"),
+                    ("缺少维度", missing_dimension, "UNTESTED"),
+                    ("额外维度", unknown_dimension, "UNTESTED"),
+                    ("维度集合非对象", {"passed": True, "dimensions": []}, "UNTESTED"),
+                    ("单维非对象", malformed_dimension, "UNTESTED"),
+                    ("单维 passed 非布尔", non_boolean_dimension, "UNTESTED"),
+                    ("顶层 passed 非布尔", {"passed": "yes", "dimensions": valid_audit()["dimensions"]}, "UNTESTED"),
+                    ("内部失败覆盖顶层通过", inner_failure, "FAIL"),
+                    ("明确失败优先于畸形", failure_and_malformed, "FAIL"),
+                ):
+                    set_report(audit=candidate)
+                    observed = project_status()["technical_validation"]
+                    tc.assert_equal(observed["status"], expected, "O 审计结构：" + label)
+                    usable, _ = acceptance.technical_evidence_usable(
+                        report_path=report, video_file=video,
+                        project="acceptance-fixture", root=_pr.ROOT)
+                    tc.assert_equal(usable, expected == "PASS", "O 审计结构进入技术证据门禁：" + label)
+                    verdict, reasons = acceptance.audit_contract.adjudicate_audit(candidate)
+                    tc.assert_equal(verdict, expected, "O 共享契约直接裁定：" + label)
+                    tc.assert_equal(any("六维技术审计未通过" in reason for reason in reasons), expected == "FAIL", "O 审计失败原因单源：" + label)
+                set_report()
+
+                set_governance(health_overrides={"scope": "project"})
+                bad_scope, ok, _ = make_runner("engineering", "scope")._project_acceptance()
+                tc.assert_equal(bad_scope["governance_acceptance"]["status"], "FAIL", "P scope=project 不得冒充工程工作区")
+                tc.assert_true(not ok, "P 工程工作区 scope 错误阻断")
+                production_bad_scope, production_ok, _ = make_runner("production", "production-scope")._project_acceptance()
+                tc.assert_equal(production_bad_scope["governance_acceptance"]["status"], "WARN", "P 普通模式非法体检 schema 不得显示 PASS")
+                tc.assert_true(production_ok, "P 普通模式非法体检 schema 不阻断技术交付")
+                set_governance(health_overrides={"subject": str(root)})
+                bad_subject, ok, _ = make_runner("engineering", "subject")._project_acceptance()
+                tc.assert_equal(bad_subject["governance_acceptance"]["status"], "FAIL", "P 异域 subject 不得冒充当前工作区")
+                tc.assert_true(not ok, "P 工程工作区身份错误阻断")
+                set_governance(health_overrides={"workspace_status": "FAIL"})
+                bad_health = make_runner("engineering", "health-status")._project_acceptance()[0]
+                tc.assert_equal(bad_health["governance_acceptance"]["status"], "FAIL", "P workspace_status 必须与 overall_status 一致")
+                set_governance(health_overrides={"can_proceed": False})
+                bad_proceed = make_runner("engineering", "health-proceed")._project_acceptance()[0]
+                tc.assert_equal(bad_proceed["governance_acceptance"]["status"], "FAIL", "P can_proceed 必须与总体状态一致")
+                production_bad_proceed = make_runner("production", "production-proceed")._project_acceptance()[0]
+                tc.assert_equal(production_bad_proceed["governance_acceptance"]["status"], "WARN", "P 普通模式 can_proceed 矛盾不得显示 PASS")
+                set_governance(health_overrides={"timestamp": "2026-11-25"})
+                bad_time = make_runner("engineering", "health-time")._project_acceptance()[0]
+                tc.assert_equal(bad_time["governance_acceptance"]["status"], "FAIL", "P 工程体检时间必须合法")
+                set_governance(review_overrides={"critic": {"status": "PASS", "evidence": "agents.md:99999"}})
+                bad_pointer = make_runner("engineering", "pointer")._project_acceptance()[0]
+                tc.assert_equal(bad_pointer["governance_acceptance"]["status"], "FAIL", "P 治理证据行号越界为失败")
+                set_governance(review_overrides={"critic": {"status": "PASS", "evidence": str(_pr.ROOT / "agents.md") + ":1"}})
+                absolute_pointer = make_runner("engineering", "absolute")._project_acceptance()[0]
+                tc.assert_equal(absolute_pointer["governance_acceptance"]["status"], "FAIL", "P 治理证据拒绝绝对路径")
+                set_governance(review_overrides={"critic": {"status": "PASS", "evidence": "../agents.md:1"}})
+                traversal_pointer = make_runner("engineering", "traversal")._project_acceptance()[0]
+                tc.assert_equal(traversal_pointer["governance_acceptance"]["status"], "FAIL", "P 治理证据拒绝越界路径")
+                set_governance()
+                tc.assert_equal(project_status(governance_evidence_dir=None, config={"governance_evidence_dir": str(governance)}, acceptance_mode="engineering")["governance_acceptance"]["status"], "PASS", "P config-only 治理证据路径被消费")
+
+                set_registry()
+                events = []
+                audit_runner = make_runner("production", "audit-order")
+                audit_runner._can_skip = lambda step: False
+                audit_runner._delivery_object_matches_output = lambda: (True, video)
+                audit_runner._fingerprint = lambda step: "stable"
+                audit_runner._sync_subtitle_source_section = lambda: events.append("notes") or "已同步"
+                audit_runner._render_metrics = lambda: {"delivery_round_attempts": 0}
+                original_record = audit_runner._record_delivery
+                def ordered_record(*args, **kwargs):
+                    events.append("registry")
+                    return original_record(*args, **kwargs)
+                audit_runner._record_delivery = ordered_record
+                def audited_report(cmd, cwd, desc):
+                    events.append("audit")
+                    tc.assert_true("--audit" in cmd and "--config-file" in cmd, "Q 完工报告命令包含六维审计与配置")
+                    set_report()
+                    return 0
+                audit_runner._run = audited_report
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.assert_true(audit_runner.step_completion_report(), "Q 审计通过才登记交付")
+                tc.assert_equal(events, ["notes", "audit", "registry"], "Q 说明同步先于审计且登记后不重复改说明")
+
+                set_report()
+                registry.unlink()
+                audit_failure = make_runner("production", "audit-failure")
+                audit_failure._can_skip = lambda step: False
+                audit_failure._delivery_object_matches_output = lambda: (True, video)
+                audit_failure._fingerprint = lambda step: "stable"
+                audit_failure._sync_subtitle_source_section = lambda: "未建"
+                audit_failure._render_metrics = lambda: {"delivery_round_attempts": 0}
+                quarantined = []
+                audit_failure._quarantine_failed_slot = lambda path, result: quarantined.append(result)
+                def failed_audit(cmd, cwd, desc):
+                    set_report(audit={"passed": False, "dimensions": ["malformed"]})
+                    return 0
+                audit_failure._run = failed_audit
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.assert_true(not audit_failure.step_completion_report(), "Q 六维审计失败阻断登记")
+                tc.assert_true(not registry.exists(), "Q 审计失败不得写交付登记")
+                tc.assert_equal(len(quarantined), 1, "Q 审计失败隔离无背书槽位")
+                tc.assert_true(bool(quarantined) and any("六维技术审计未通过" in reason for reason in quarantined[0]["errors"]), "Q 隔离原因保留审计失败")
+
+                video_source = {
+                    "path": str(video),
+                    "size_bytes": video.stat().st_size,
+                    "modified_at": datetime.fromtimestamp(video.stat().st_mtime).isoformat(),
+                    "sha256": hashlib.sha256(video.read_bytes()).hexdigest(),
+                }
+                for label, report_bytes in (
+                    ("missing-audit", json.dumps({
+                        "status": "VALIDATED", "project_name": "acceptance-fixture",
+                        "validation_summary": {"failed_checks": 0},
+                        "data_sources": {"video_file": video_source},
+                    }, ensure_ascii=False).encode("utf-8")),
+                    ("thin-audit", json.dumps({
+                        "status": "VALIDATED", "project_name": "acceptance-fixture",
+                        "validation_summary": {"failed_checks": 0},
+                        "data_sources": {"video_file": video_source},
+                        "audit": {"passed": True},
+                    }, ensure_ascii=False).encode("utf-8")),
+                    ("empty-audit-dimensions", json.dumps({
+                        "status": "VALIDATED", "project_name": "acceptance-fixture",
+                        "validation_summary": {"failed_checks": 0},
+                        "data_sources": {"video_file": video_source},
+                        "audit": {"passed": True, "dimensions": {}},
+                    }, ensure_ascii=False).encode("utf-8")),
+                    ("inner-audit-failure", json.dumps({
+                        "status": "VALIDATED", "project_name": "acceptance-fixture",
+                        "validation_summary": {"failed_checks": 0},
+                        "data_sources": {"video_file": video_source},
+                        "audit": inner_failure,
+                    }, ensure_ascii=False).encode("utf-8")),
+                    ("wrong-identity", json.dumps({
+                        "status": "VALIDATED", "project_name": "another-project",
+                        "validation_summary": {"failed_checks": 0},
+                        "data_sources": {"video_file": video_source},
+                        "audit": {"passed": True},
+                    }, ensure_ascii=False).encode("utf-8")),
+                    ("invalid-json", b"{"),
+                    ("invalid-utf8", b"\xff\xfe"),
+                ):
+                    report.write_bytes(report_bytes)
+                    invalid_runner = make_runner("production", "invalid-" + label)
+                    invalid_runner._can_skip = lambda step: False
+                    invalid_runner._delivery_object_matches_output = lambda: (True, video)
+                    invalid_runner._fingerprint = lambda step: "stable"
+                    invalid_runner._sync_subtitle_source_section = lambda: "未建"
+                    invalid_runner._render_metrics = lambda: {"delivery_round_attempts": 0}
+                    invalid_quarantine = []
+                    invalid_runner._quarantine_failed_slot = lambda path, result: invalid_quarantine.append(result)
+                    def rewrite_invalid(cmd, cwd, desc, content=report_bytes):
+                        report.write_bytes(content)
+                        return 0
+                    invalid_runner._run = rewrite_invalid
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        tc.assert_true(not invalid_runner.step_completion_report(), "Q " + label + " 报告不得登记")
+                    tc.assert_true(not registry.exists(), "Q " + label + " 不得写登记")
+                    tc.assert_equal(len(invalid_quarantine), 1, "Q " + label + " 必须隔离旧槽位")
+                set_report()
+
+                cache_runner = make_runner("production", "cache-invalid")
+                cache_runner._fingerprint = lambda step: "stable"
+                cache_runner.state.data["steps"]["completion_report"] = {}
+                cache_runner.state.mark_completed("completion_report", "stable")
+                malformed = json.loads(report.read_text(encoding="utf-8"))
+                malformed.pop("audit")
+                dump(report, malformed)
+                tc.assert_equal(cache_runner._step_dirty_reason("completion_report"), "technical-evidence-invalid", "Q 缓存报告缺审计必须失效")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.assert_true(not cache_runner._can_skip("completion_report"), "Q 缓存报告缺审计不直接放行")
+                malformed = json.loads(report.read_text(encoding="utf-8"))
+                malformed["audit"] = {"passed": True, "dimensions": {}}
+                dump(report, malformed)
+                tc.assert_equal(cache_runner._step_dirty_reason("completion_report"), "technical-evidence-invalid", "Q 缓存报告空六维必须失效")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.assert_true(not cache_runner._can_skip("completion_report"), "Q 缓存报告空六维不直接放行")
+                set_report(audit=inner_failure)
+                tc.assert_equal(cache_runner._step_dirty_reason("completion_report"), "technical-evidence-invalid", "Q 缓存报告内部审计失败必须失效")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.assert_true(not cache_runner._can_skip("completion_report"), "Q 缓存报告内部审计失败不直接放行")
+                set_report()
+
+                force_runner = make_runner("production", "force-marker")
+                force_runner.force = False
+                force_runner.quick_fix = False
+                force_runner._run_started_at = "2026-11-25T12:00:00"
+                force_runner._fingerprint = lambda step: "stable"
+                force_runner.state.data["forced_run"] = {"at": "2026-11-24T20:00:00"}
+                for step, _label in _pr.STEPS[:_pr.STEP_NAMES.index("completion_report")]:
+                    force_runner.state.data["steps"][step] = {
+                        "status": "passed", "started": "2026-11-25T11:59:00", "input_fingerprint": "stable",
+                    }
+                force_runner.state.data["steps"]["completion_report"] = {"started": "2026-11-25T12:01:00"}
+                force_runner._clear_stale_force_marker()
+                tc.assert_true("forced_run" in force_runner.state.data, "R 单步续跑不得清除历史 force")
+                force_runner.state.data["lock_takeover"] = {"previous_pid": 1}
+                for step, _label in _pr.STEPS[:_pr.STEP_NAMES.index("completion_report")]:
+                    force_runner.state.data["steps"][step] = {
+                        "status": "passed", "started": "2026-11-25T12:01:00", "input_fingerprint": "stable",
+                    }
+                force_runner._clear_stale_force_marker()
+                tc.assert_true("forced_run" in force_runner.state.data, "R 接管锁轮次不得清除历史 force")
+                force_runner.state.data.pop("lock_takeover")
+                force_runner._clear_stale_force_marker()
+                tc.assert_true("forced_run" not in force_runner.state.data, "R 可信非 force 全链可清除旧标记")
+
+                set_registry()
+                cfg_runner = make_runner()
+                cfg_runner.config = {"paths": {"video_name": video.name}}
+                legacy = cfg_runner._technical_config_input()
+                tc.assert_equal(legacy, str(config_path), "K 旧项目保留原配置指纹输入")
+                cfg_runner.config = {
+                    "paths": {"video_name": video.name}, "acceptance_mode": "production",
+                    "governance_evidence_dir": "temp/governance",
+                    "business_acceptance_file": "business.json",
+                }
+                cfg_runner.source_dir = root / "hyperframes" / "project"
+                cfg_runner.html_path = cfg_runner.source_dir / "index.html"
+                cfg_runner.render_raw = temp / "render_raw.mp4"
+                cfg_runner.gate_mode = "render"
+                cfg_runner.quick_fix = False
+                base = cfg_runner._technical_config_input()
+                cfg_runner.config["acceptance_mode"] = "engineering"
+                cfg_runner.config["governance_evidence_dir"] = "other"
+                cfg_runner.config["business_acceptance_file"] = "other.json"
+                tc.assert_equal(cfg_runner._technical_config_input(), base, "K 验收专属字段不改技术指纹")
+                cfg_runner.config["video_duration"] = 10
+                tc.assert_true(cfg_runner._technical_config_input() != base, "K 技术配置变化仍使指纹失效")
+                current_base = cfg_runner._technical_config_input()
+                step_inputs = {step: cfg_runner._step_inputs(step) for step, _label in _pr.STEPS}
+                bad_config_steps = [name for name, value in step_inputs.items() if value.get("config") != current_base]
+                tc.assert_equal(bad_config_steps, [], "K 十个技术步骤统一隔离验收配置")
+
+                status_write = make_runner()
+                saved_write = acceptance.write_acceptance_status
+                acceptance.write_acceptance_status = lambda *args: (_ for _ in ()).throw(OSError("synthetic write failure"))
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _, ok, why = status_write._project_acceptance()
+                    tc.assert_true(not ok and why == ["验收状态写入失败"], "L 状态写盘失败不得放行")
+                finally:
+                    acceptance.write_acceptance_status = saved_write
+
+                set_registry()
+                set_governance()
+                final_runner = make_runner("engineering", "final-reprojection")
+                final_runner.source_dir = root / "hyperframes" / "project"
+                final_runner.quick_fix = False
+                final_runner.force = False
+                final_runner.gate_mode = "render"
+                final_runner.take_over_lock = False
+                final_runner.acceptance_status = acceptance.build_acceptance_status(
+                    registry_file=registry, video_file=video, completion_report=report,
+                    project="acceptance-fixture", acceptance_mode="engineering",
+                    governance_evidence_dir=governance,
+                ) | {"technical_validation": {"status": "FAIL"}}
+                final_runner.state.data["last_run"] = "2026-11-25T00:00:00"
+                final_runner.forced_run = lambda step: False
+                final_runner.backup_baseline = lambda: None
+                final_runner._subtitle_source_note_line = lambda: None
+                final_runner._record_timeline_run = lambda: None
+                final_runner._age = lambda: 0
+                final_runner._can_skip = lambda step: True
+                for step, _label in _pr.STEPS:
+                    final_runner.state.data["steps"][step] = {}
+                    final_runner.state.mark_completed(step)
+                    setattr(final_runner, "step_" + step, lambda: True)
+                final_runner.state.print_status = lambda: None
+                class Lock:
+                    def __init__(self, *args, **kwargs): pass
+                    def acquire(self, **kwargs): return True, None
+                    def release(self): pass
+                _pr.PipelineLock = Lock
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        final_runner.run()
+                        tc.assert_true(True, "L 最终出口忽略预置旧失败快照")
+                    except SystemExit as exc:
+                        tc.assert_true(False, "L 真实证据通过时不得沿用预置失败: " + str(exc.code))
+                tc.assert_equal(final_runner.acceptance_status["technical_validation"]["status"], "PASS", "L 最终状态取自最新技术报告")
+                final_runner.acceptance_status = acceptance.build_acceptance_status(
+                    registry_file=registry, video_file=video, completion_report=report,
+                    project="acceptance-fixture", acceptance_mode="engineering",
+                    governance_evidence_dir=governance,
+                )
+                set_report("FAILED", 1)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        final_runner.run()
+                        tc.assert_true(False, "L 最终出口必须复核已有状态")
+                    except SystemExit as exc:
+                        tc.assert_equal(exc.code, 1, "L 最新技术失败覆盖预置通过快照")
+                tc.assert_equal(final_runner.acceptance_status["technical_validation"]["status"], "FAIL", "L 最新技术失败进入最终状态")
+
+                stale_snapshot = project_status(acceptance_mode="production")
+                dump(temp / "acceptance_status.json", stale_snapshot)
+                set_report("FAILED", 1)
+                failed_exit = make_runner("production", "failed-exit-refresh")
+                failed_exit.source_dir = root / "hyperframes" / "project"
+                failed_exit.gate_mode = "render"
+                failed_exit.quick_fix = False
+                failed_exit.force = True
+                failed_exit.take_over_lock = False
+                failed_exit._setup_env = lambda: True
+                failed_exit._warn_previous_interrupted_runs = lambda: None
+                failed_exit._skill_version_stamp = lambda: None
+                for step, _label in _pr.STEPS:
+                    setattr(failed_exit, "step_" + step, lambda: True)
+                failed_exit.step_preflight = lambda: False
+                failed_output = io.StringIO()
+                with contextlib.redirect_stdout(failed_output):
+                    try:
+                        failed_exit.run()
+                        tc.assert_true(False, "L 通用失败出口必须退出 1")
+                    except SystemExit as exc:
+                        tc.assert_equal(exc.code, 1, "L 通用失败出口必须退出 1")
+                tc.assert_true("PIPELINE FAILED at: 静态预检" in failed_output.getvalue(),
+                               "L 通用失败出口保留原始失败步骤")
+                current_status = (failed_exit.acceptance_status or {}).get("technical_validation", {}).get("status")
+                tc.assert_equal(current_status, "FAIL",
+                                "L 通用失败出口重投影最新技术失败")
+                refreshed_snapshot = json.loads((temp / "acceptance_status.json").read_text(encoding="utf-8"))
+                tc.assert_equal(refreshed_snapshot["technical_validation"]["status"], "FAIL",
+                                "L 失败轮不遗留旧通过快照")
+
+                projection_exit = make_runner("production", "failed-exit-projection-error")
+                projection_exit.source_dir = root / "hyperframes" / "project"
+                projection_exit.gate_mode = "render"
+                projection_exit.quick_fix = False
+                projection_exit.force = True
+                projection_exit.take_over_lock = False
+                projection_exit._setup_env = lambda: True
+                projection_exit._warn_previous_interrupted_runs = lambda: None
+                projection_exit._skill_version_stamp = lambda: None
+                projection_exit._project_acceptance = lambda: (_ for _ in ()).throw(
+                    RuntimeError("synthetic projection failure"))
+                for step, _label in _pr.STEPS:
+                    setattr(projection_exit, "step_" + step, lambda: True)
+                projection_exit.step_preflight = lambda: False
+                projection_output = io.StringIO()
+                with contextlib.redirect_stdout(projection_output):
+                    try:
+                        projection_exit.run()
+                        tc.assert_true(False, "L 投影异常不得吞掉原失败")
+                    except SystemExit as exc:
+                        tc.assert_equal(exc.code, 1, "L 投影异常不得顶替原退出码")
+                tc.assert_true("PIPELINE FAILED at: 静态预检" in projection_output.getvalue()
+                               and "失败出口状态刷新失败: synthetic projection failure" in projection_output.getvalue(),
+                               "L 投影异常须保留原失败并点名归因")
+                set_report()
+
+                cli = [
+                    sys.executable, str(script_dir / "delivery_acceptance.py"),
+                    "--registry-file", str(registry), "--video-file", str(video),
+                    "--completion-report", str(report), "--project-name", "acceptance-fixture",
+                    "--acceptance-mode", "engineering", "--governance-evidence-dir", str(governance),
+                    "--require-acceptance",
+                ]
+                cli_result = subprocess.run(cli, cwd=str(script_dir), capture_output=True, text=True, encoding="utf-8")
+                tc.assert_equal(cli_result.returncode, 0, "M CLI 工程验收通过\nstdout=" + cli_result.stdout + "\nstderr=" + cli_result.stderr)
+                tc.assert_true("治理验收: PASS" in cli_result.stdout, "M CLI 输出四轴状态")
+                om = subprocess.run([
+                    sys.executable, str(script_dir / "openmontage_runner.py"),
+                    "--config", str(config_path), "--acceptance-mode", "production",
+                ], cwd=str(script_dir), capture_output=True, text=True, encoding="utf-8")
+                tc.assert_equal(om.returncode, 2, "M OpenMontage 不静默忽略验收参数")
+                tc.assert_true("尚不支持四轴验收模式" in om.stderr, "M OpenMontage 拒绝原因可定位")
+                bad_cli = list(cli)
+                bad_cli[bad_cli.index("acceptance-fixture")] = "../other"
+                bad_cli_result = subprocess.run(bad_cli, cwd=str(script_dir), capture_output=True, text=True, encoding="utf-8")
+                tc.assert_equal(bad_cli_result.returncode, 2, "S CLI 公共入口拒绝路径型 project")
+                config_path.write_bytes(b"\xff\xfe")
+                bad_config_result = subprocess.run(cli + ["--config-file", str(config_path)], cwd=str(script_dir), capture_output=True, text=True, encoding="utf-8")
+                tc.assert_equal(bad_config_result.returncode, 2, "S CLI 非 UTF-8 config 落输入错误")
+                tc.assert_true("Traceback" not in bad_config_result.stderr, "S CLI 非 UTF-8 config 不泄漏未捕获异常")
+                dump(config_path, {"paths": {"video_name": video.name}})
+            finally:
+                _pr.DELIVERY_REGISTRY = saved_registry
+                _pr.PipelineLock = saved_lock
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("delivery_acceptance_mode_decoupling error: " + str(e)
+                       + "\n" + traceback.format_exc())
     return tc
 
 

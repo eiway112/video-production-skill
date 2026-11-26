@@ -46,6 +46,7 @@ _streams_kept = (sys.stdout, sys.stderr)
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _script_env import ROOT, VENV_PYTHON, validate_managed_name
+import delivery_acceptance as acceptance
 SCRIPTS = ROOT / "程序文件" / "脚本"
 CONFIG_DIR = ROOT / "程序文件" / "配置"
 OPENMONTAGE_SRC = ROOT / "程序文件" / "源码" / "openmontage"
@@ -1892,6 +1893,9 @@ Examples:
                         help="Show current pipeline state and exit")
     parser.add_argument("--force", action="store_true",
                         help="Re-run all steps regardless of previous state")
+    parser.add_argument("--acceptance-mode", choices=acceptance.ACCEPTANCE_MODES)
+    parser.add_argument("--governance-evidence-dir")
+    parser.add_argument("--business-acceptance-file")
 
     args = parser.parse_args()
 
@@ -1910,6 +1914,24 @@ Examples:
     if not config_path.exists():
         print(f"ERROR: Config not found: {config_path}")
         sys.exit(1)
+
+    try:
+        openmontage_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: Config unreadable: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(openmontage_config, dict):
+        print("ERROR: Config must be a JSON object", file=sys.stderr)
+        sys.exit(2)
+    explicit_acceptance = any((
+        args.acceptance_mode is not None,
+        args.governance_evidence_dir is not None,
+        args.business_acceptance_file is not None,
+        any(key in openmontage_config for key in acceptance.CONFIG_FIELDS),
+    ))
+    if explicit_acceptance:
+        print("ERROR: OpenMontage 尚不支持四轴验收模式；请使用 pipeline_runner.py。", file=sys.stderr)
+        sys.exit(2)
 
     runner = OpenMontageRunner(
         config_path=str(config_path),
