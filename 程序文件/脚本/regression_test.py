@@ -32352,10 +32352,14 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
 
                 for label, start_from in (("setup", None), ("prereq", "render"),
                                           ("missing-method", None)):
+                    set_report()
                     stale_snapshot = project_status(acceptance_mode="production")
+                    tc.assert_equal(stale_snapshot["technical_validation"]["status"], "PASS",
+                                    "L2 早期失败夹具预置旧通过快照：" + label)
                     dump(temp / "acceptance_status.json", stale_snapshot)
                     set_report("FAILED", 1)
                     early_exit = make_runner("production", "early-exit-" + label)
+                    early_exit.acceptance_status = stale_snapshot
                     early_exit.source_dir = root / "hyperframes" / "project"
                     early_exit.gate_mode = "render"
                     early_exit.quick_fix = False
