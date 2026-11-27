@@ -28,9 +28,8 @@ transform 归零）再量；直接量初始态会把动画位移读成裁切（�
 退出码：0=无裁切（各场均在容差内）；1=存在裁切（列出逐场溢出量与最深元素）；
 2=无从观测（页面取不到、Chrome 起不来、场景结构读不出等——不得读成通过）。
 
-边界：本件是**诊断工具**，不进任何步骤的指纹登记面，也不接门禁阻断位点——
-"要不要把裁切升级为阻断"属门禁设计变更，另案裁定。工具存在不等于会被执行，
-故调用方须在自己的流程里显式跑它。
+边界：本件已接入 `pipeline_runner.step_preview` 并登记 preview 指纹；命中只 WARN、
+不阻断，UNTESTED 也必须落盘，调用方不得把不存在的 JSON 路径写成已取得证据。
 """
 import argparse
 import json
@@ -51,21 +50,44 @@ import _gate_status as gs  # noqa: E402  四态词汇唯一源
 # 亚像素取整与 1px 描边的容差：内容底边压线不算"被裁"，多出几像素才算
 DEFAULT_TOLERANCE_PX = 2.0
 
-_MEASURE_JS = """
+_MEASURE_JS = r"""
 <script>
 (function () {
-  // 场景窗口表：优先取页面声明的 var S（adjust_s_block 的单一权威源），
-  // 取不到就按场景根顺序退化——两种写法本仓都在用，缺一即整件无从观测。
+  // 场景窗口表：优先取 var S；缺失场次按 var T 的下一场起点补齐，
+  // 末场取根 data-duration。两种时间源都取不到该场窗口时，该场判 UNTESTED。
+  // scene_id 既有数字也有 "sN" 字符串两种形态：已带 s 前缀时不得再拼一次，
+  // 否则键变成 "ss1"，所有场景都取不到时间窗（2026-11-26 实测整件 UNTESTED）。
   function sceneWindows() {
     var map = {};
     // 用 window.S 显式取全局：函数内 `var S` 会 hoist 遮蔽全局同名变量，
-    // `typeof S` 于是恒为 'undefined'（局部未赋值）——取不到时间窗即整件无从观测。
+    // `typeof S` 于是恒为 'undefined'（局部未赋值）。
     var g = (typeof window.S !== 'undefined' && Array.isArray(window.S)) ? window.S : null;
     if (g) {
       for (var i = 0; i < g.length; i++) {
         var rec = g[i];
         if (rec.cover) { map.s0 = rec.end; }
-        else if (rec.scene_id !== undefined) { map['s' + rec.scene_id] = rec.end; }
+        else if (rec.scene_id !== undefined) {
+          var raw = String(rec.scene_id);
+          map[/^s\d+$/.test(raw) ? raw : 's' + raw] = rec.end;
+        }
+      }
+    }
+    var t = (typeof window.T !== 'undefined' && window.T && typeof window.T === 'object') ? window.T : null;
+    if (t) {
+      var roots = Array.prototype.slice.call(document.querySelectorAll('[data-scene-id]'));
+      var timed = [];
+      for (var r = 0; r < roots.length; r++) {
+        var sid = roots[r].getAttribute('data-scene-id');
+        var start = t[sid];
+        if (typeof start === 'number' && isFinite(start)) timed.push({sid: sid, start: start});
+      }
+      timed.sort(function (a, b) { return a.start - b.start; });
+      var meta = document.getElementById('root') || document.documentElement;
+      var total = parseFloat(meta.getAttribute('data-duration'));
+      for (var j = 0; j < timed.length; j++) {
+        if (map[timed[j].sid]) continue;
+        var end = j + 1 < timed.length ? timed[j + 1].start : total;
+        if (isFinite(end) && end > timed[j].start) map[timed[j].sid] = end;
       }
     }
     return map;
@@ -208,6 +230,41 @@ def _fmt_clips(clips, tolerance_px):
     return ranked[:5]
 
 
+def _write_result(path, html_src, tolerance_px, verdict, *, reason=None,
+                  scenes=None, missing=None, data=None):
+    if not path:
+        return True
+    payload = {
+        "html": str(html_src),
+        "tolerance_px": tolerance_px,
+        "verdict": verdict,
+        "scenes": scenes or [],
+        "missing_assets": missing or [],
+    }
+    if reason:
+        payload["reason"] = reason
+    if data is not None:
+        raw_scenes = data.get("scenes") or []
+        payload["diagnostics"] = {
+            "viewport": data.get("viewport"),
+            "canvas": data.get("canvas"),
+            "driver": data.get("driver"),
+            "observed_scene_ids": [s.get("scene_id") for s in raw_scenes],
+            "unseeked_scene_ids": [s.get("scene_id") for s in raw_scenes
+                                   if not s.get("seeked")],
+        }
+    out = Path(path)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n",
+                       encoding="utf-8")
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[ERROR] 结果 JSON 写入失败：{out}（{type(exc).__name__}: {exc}）")
+        return False
+    print(f"[OK] 结果已写入：{out}")
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="场景容器裁切实测（零渲染诊断工具）")
     ap.add_argument("html", help="项目 index.html 路径")
@@ -218,13 +275,19 @@ def main() -> int:
 
     html_src = Path(args.html)
     if not html_src.is_file():
-        print(f"[ERROR] 找不到 HTML：{html_src}")
+        reason = f"找不到 HTML：{html_src}"
+        print(f"[ERROR] {reason}")
+        _write_result(args.json_out, html_src, args.tolerance_px, gs.UNTESTED,
+                      reason=reason)
         return 2
 
     try:
         data, missing = measure(html_src, args.tolerance_px)
     except Exception as exc:  # 取数断链一律判无从观测，不得读成通过
-        print(f"[UNTESTED] 无从观测：{exc}")
+        reason = f"无从观测：{exc}"
+        print(f"[UNTESTED] {reason}")
+        _write_result(args.json_out, html_src, args.tolerance_px, gs.UNTESTED,
+                      reason=reason)
         return 2
     vp = data.get("viewport", {})
     canvas = data.get("canvas", {})
@@ -238,18 +301,27 @@ def main() -> int:
               f"{', '.join(missing[:8])}")
 
     if not scenes:
-        print("[UNTESTED] 页面里读不到 [data-scene-id] 场景根，无法观测")
+        reason = "页面里读不到 [data-scene-id] 场景根，无法观测"
+        print(f"[UNTESTED] {reason}")
+        _write_result(args.json_out, html_src, args.tolerance_px, gs.UNTESTED,
+                      reason=reason, missing=missing, data=data)
         return 2
 
     # 驱动源缺失＝动画态没能归零，量到的是入场 from 态——不得读成通过
     if not data.get("driver"):
-        print("[UNTESTED] 页面里取不到主时间轴驱动源（全局 tl 或 window.__timelines 单一条目），"
-              "入场位移无法归零，本件不出读数（不得读成无裁切）")
+        reason = ("页面里取不到主时间轴驱动源（全局 tl 或 window.__timelines 单一条目），"
+                  "入场位移无法归零，本件不出读数（不得读成无裁切）")
+        print(f"[UNTESTED] {reason}")
+        _write_result(args.json_out, html_src, args.tolerance_px, gs.UNTESTED,
+                      reason=reason, missing=missing, data=data)
         return 2
     not_seeked = [s["scene_id"] for s in scenes if not s.get("seeked")]
     if not_seeked:
-        print(f"[UNTESTED] 以下场景未能定位时间窗（未 seek，动画态未归零）："
-              f"{', '.join(not_seeked)}")
+        reason = (f"以下场景未能定位时间窗（未 seek，动画态未归零）："
+                  f"{', '.join(not_seeked)}")
+        print(f"[UNTESTED] {reason}")
+        _write_result(args.json_out, html_src, args.tolerance_px, gs.UNTESTED,
+                      reason=reason, missing=missing, data=data)
         return 2
 
     rows = []
@@ -275,14 +347,10 @@ def main() -> int:
             print(f"  ✓ {row['scene_id']}: 无裁切")
 
     total = len(rows)
-    if args.json_out:
-        out = Path(args.json_out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(
-            {"html": str(html_src), "tolerance_px": args.tolerance_px,
-             "scenes": rows, "missing_assets": missing},
-            ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"[OK] 结果已写入：{out}")
+    verdict = gs.FAIL if failures else gs.PASS
+    if not _write_result(args.json_out, html_src, args.tolerance_px, verdict,
+                         scenes=rows, missing=missing, data=data):
+        return 2
 
     if failures:
         print(f"[FAIL] {len(failures)}/{total} 个场景存在容器裁切")

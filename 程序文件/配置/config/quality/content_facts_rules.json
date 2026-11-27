@@ -1,6 +1,6 @@
 {
   "$schema": "内容事实台账判据（内容溯源门禁）",
-  "$description": "旁白里的可核查断言必须挂在事实台账上，且台账内部自洽。判据本体全住本文件，脚本内零阈值字面量。借鉴对象＝vibe-knowledge 的 check.py（2026-11-07 评估批），只取可机算部分：来源快照哈希、引文逐字命中、来源等级充分性、旁白数字必须挂事实、非确定状态必须写说明。刻意不借其 44 套风格库与时长偏差 15% 判据（后者本仓 duration_budget 是更严的绝对秒数门禁）。",
+  "$description": "旁白里的可核查断言必须挂在事实台账上，且台账内部自洽；事实可声明 visual_bindings，由预检逐行对撞对应 HTML 场景。判据本体全住本文件，脚本内零阈值字面量。借鉴对象＝vibe-knowledge 的 check.py（2026-11-07 评估批），只取可机算部分：来源快照哈希、引文逐字命中、来源等级充分性、旁白数字必须挂事实、非确定状态必须写说明。刻意不借其 44 套风格库与时长偏差 15% 判据（后者本仓 duration_budget 是更严的绝对秒数门禁）。",
 
   "facts_config_key": "content_facts",
   "default_filename": "facts.json",
@@ -28,6 +28,7 @@
   "verified_min_sources": {"t1": 1, "else_t2": 2},
 
   "number_claim_field": "numbers",
+  "visual_binding_field": "visual_bindings",
   "ordinal_prefix_chars": ["第"],
   "_number_policy": "旁白中每一个独立数字（排除『第N』序数）都必须出现在某条事实的 numbers 里。这是整套判据里唯一能自动圈出『这句没人给它出过处』的腿——其余各条只保证台账自身自洽。"
 }

@@ -23712,6 +23712,8 @@ class RegressionTestRunner:
             test_box_overlap_glyph_coverage_adjudication,
             test_shared_scene_boundary_rounding,
             test_product_state_reason_matches_verdict,
+            test_content_facts_visual_bindings,
+            test_scene_overflow_wired_before_render,
             test_delivery_acceptance_mode_decoupling,
         ]
         self.results = []
@@ -31440,6 +31442,273 @@ def test_product_state_reason_matches_verdict() -> RegressionTestCase:
     except Exception as e:
         tc.mark_failed("product_state_reason_matches_verdict error: " + str(e)
                        + "\n" + traceback.format_exc())
+    return tc
+
+
+def test_content_facts_visual_bindings() -> RegressionTestCase:
+    """用例150：事实台账可选 visual_bindings 与 HTML 逐行对撞（2026-11-26 竖屏科普项目复盘）。
+
+    存在理由：首轮独立 Critic 抓出 Scene3 把 30 kg/m³ 错绑到 0.20、Scene9 丢失已确认
+    分镜的厚度列，而既有 content_facts 只核旁白数字出处，audit d4 只核 narration 指针，
+    都不读 HTML 绑定。本用例把“作者声明的画面绑定”变成可机算对撞，且不改变未声明项目。
+    """
+    import hashlib
+    import json as _json
+    import tempfile
+    from pathlib import Path as _P
+
+    tc = RegressionTestCase(
+        "content_facts_visual_bindings",
+        "事实台账 visual_bindings 与 HTML 逐行对撞：错绑/缺行/跨场/未声明/断链五态"
+    )
+    tmp = _P(tempfile.mkdtemp(prefix="case150_"))
+    try:
+        import content_facts_gate as g
+        import preflight_check as pc
+
+        rules = g.load_rules()
+        snap = tmp / "s.txt"
+        snap.write_text("q", encoding="utf-8")
+        sha = hashlib.sha256(snap.read_bytes()).hexdigest()
+        html = tmp / "index.html"
+        html.write_text(
+            '<html><body>'
+            '<div data-scene-id="s1"><div id="c">'
+            '<div class="row"><span>50</span><span>0.20</span></div>'
+            '<div class="row"><span>100</span><span>0.18</span></div>'
+            '</div></div>'
+            '<div data-scene-id="s2"><div id="t"><div>办公室</div><div>25–30 mm</div></div></div>'
+            '</body></html>', encoding="utf-8")
+
+        def ledger(bindings):
+            return {
+                "sources": [{"id": "S1", "kind": "standard", "tier": "T1",
+                             "title": "t", "snapshot": "s.txt", "sha256": sha}],
+                "facts": [{"id": "F1", "claim": "c", "type": "spec",
+                           "status": "verified", "source": "S1", "quote": "q",
+                           "numbers": [], "visual_bindings": bindings}],
+            }
+
+        def run(bindings, html_path=html):
+            fp = tmp / "facts.json"
+            fp.write_text(_json.dumps(ledger(bindings), ensure_ascii=False),
+                          encoding="utf-8")
+            return g.check(fp, [], rules, html_path=html_path)
+
+        clean = [{"scene_id": "s1", "rows": [
+            {"container_id": "c", "row_class": "row", "key": "50", "contains": ["0.20"]},
+            {"container_id": "c", "row_class": "row", "key": "100", "contains": ["0.18"]},
+        ]}, {"scene_id": "s2", "rows": [
+            {"id": "t", "key": "办公室", "contains": ["25–30 mm"]},
+        ]}]
+        res = run(clean)
+        tc.assert_equal(res["status"], g.gs.PASS, f"A1 干净绑定 PASS：{res['violations']}")
+        tc.assert_equal(res["counts"]["visual_rows_verified"], 3, "A1b 三行全部对撞通过")
+
+        wrong = _json.loads(_json.dumps(clean, ensure_ascii=False))
+        wrong[0]["rows"][0]["contains"] = ["0.19"]
+        res = run(wrong)
+        tc.assert_equal(res["status"], g.gs.FAIL, "A2 值错绑 FAIL")
+        tc.assert_true(any("0.19" in v for v in res["violations"]),
+                       f"A2b 点名缺失值：{res['violations']}")
+
+        missing = _json.loads(_json.dumps(clean, ensure_ascii=False))
+        missing[1]["rows"][0]["contains"] = ["厚度"]
+        res = run(missing)
+        tc.assert_true(any("厚度" in v for v in res["violations"]),
+                       f"A3 缺列 FAIL：{res['violations']}")
+
+        cross = _json.loads(_json.dumps(clean, ensure_ascii=False))
+        cross[0]["scene_id"] = "s3"
+        res = run(cross)
+        tc.assert_true(any("s3" in v and "0 个根" in v for v in res["violations"]),
+                       f"A4 跨场绑定点名：{res['violations']}")
+
+        res = run([])
+        tc.assert_equal(res["status"], g.gs.PASS, "A5 未声明绑定不受影响")
+        tc.assert_equal(res["counts"]["visual_bindings"], 0, "A5b 未声明计数 0")
+
+        res = run(clean, html_path=tmp / "missing.html")
+        tc.assert_equal(res["status"], g.gs.UNTESTED, "A6 声明后 HTML 读不回判未测")
+        tc.assert_true(any("画面绑定" in u for u in res["untested"]),
+                       f"A6b 未测点名：{res['untested']}")
+
+        # 与 A6 是两条不同出口：A6 走 OSError（给了路径但读不回），A6c 走
+        # html_path is None（调用方根本没给路径）。只测其一时，另一条的变异
+        # 无可观察后果即 SURVIVED（150-M3 曾如此）。
+        res = run(clean, html_path=None)
+        tc.assert_equal(res["status"], g.gs.UNTESTED, "A6c 未提供 HTML 路径判未测")
+        tc.assert_true(any("未提供 HTML 路径" in u for u in res["untested"]),
+                       f"A6d 未给路径的点名与读不回可区分：{res['untested']}")
+
+        proj = tmp / "proj"
+        proj.mkdir()
+        (proj / "s.txt").write_text("q", encoding="utf-8")
+        (proj / "index.html").write_text(html.read_text(encoding="utf-8"), encoding="utf-8")
+        (proj / "facts.json").write_text(
+            _json.dumps(ledger(clean), ensure_ascii=False), encoding="utf-8")
+        r = pc.PreflightResult(mode="render")
+        pc.check_content_facts(proj, {"scenes": []}, r)
+        tc.assert_equal(r.errors, [], f"A7 预检接线 PASS：{r.errors}")
+        tc.assert_true(any("画面绑定 3/3" in e["message"] for e in r._log_entries),
+                       f"A7b 预检透出绑定读数：{r._log_entries}")
+
+        broken = tmp / "rules.json"
+        doc = _json.loads(g.RULES_FILE.read_text(encoding="utf-8"))
+        doc.pop("visual_binding_field")
+        broken.write_text(_json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        try:
+            g.load_rules(broken)
+            tc.assert_true(False, "A8 规则缺 visual_binding_field 应 fail-closed")
+        except g.RulesBroken as e:
+            tc.assert_true("缺键" in str(e), f"A8b 点名缺键：{e}")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("content_facts_visual_bindings error: " + str(e) + "\n"
+                       + traceback.format_exc())
+    return tc
+
+
+def test_scene_overflow_wired_before_render() -> RegressionTestCase:
+    """用例151：容器裁切探针接入 preview 留痕（WARN 不阻断）。
+
+    存在理由：`scene_overflow_probe.py` 自 2026-11-05 常驻但从未接入流水线，
+    Scene3 HUD 被 `.sc{overflow:hidden}` 裁切 76px 时全链门禁全绿。本用例锁：
+    preview 步真调用、结果进 preview 指纹、字符串 scene_id 可取数、T 块可回退、
+    UNTESTED 也落盘、调用方不得把缺失 JSON 写成已取得证据。
+    """
+    import ast as _ast
+    import json as _json
+    import subprocess
+    import tempfile
+    from pathlib import Path as _P
+
+    tc = RegressionTestCase(
+        "scene_overflow_wired_before_render",
+        "容器裁切探针接入 preview：真调用/指纹登记/字符串 scene_id/T块回退/未测落盘"
+    )
+    try:
+        pr_src = (SUITE_SCRIPT_DIR / "pipeline_runner.py").read_text(encoding="utf-8")
+        tc.assert_true('"scene_overflow_probe": SCRIPTS / "scene_overflow_probe.py"' in pr_src,
+                       "B1 preview 指纹登记裁切探针（改量法不得静默命中缓存）")
+        fn = next(n for n in _ast.walk(_ast.parse(pr_src))
+                  if isinstance(n, _ast.FunctionDef) and n.name == "step_preview")
+        calls = [n for n in _ast.walk(fn)
+                 if isinstance(n, _ast.Call)
+                 and isinstance(n.func, _ast.Attribute)
+                 and n.func.attr == "_run_with_retry"
+                 and any(isinstance(a, _ast.List)
+                         and any(isinstance(e, _ast.Constant)
+                                 and e.value == "scene_overflow_probe.py" for e in a.elts)
+                         for a in n.args)]
+        tc.assert_equal(len(calls), 1, "B2 step_preview 内经 AST 锚定真调用裁切探针")
+        tc.assert_true('"scene_overflow_check"' in pr_src,
+                       "B3 裁切结果留痕 state.scene_overflow_check")
+
+        script = SUITE_SCRIPT_DIR / "scene_overflow_probe.py"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = _P(td)
+            ok = tmp / "ok.html"
+            ok_src = _OVF_FIXTURE.format(
+                inner='<div style="position:absolute;left:20px;right:20px;top:0px;'
+                      'height:1600px;background:#ddd;"></div>',
+                driver=_OVF_DRIVER_RESET).replace(
+                'scene_id:1,', 'scene_id:"s1",')
+            ok.write_text(ok_src, encoding="utf-8")
+            # 夹具改写自身必须留证：_OVF_FIXTURE 的 S-block 是无引号 JS 字面量
+            # （scene_id:1），按 JSON 形态 '{"scene_id":1,' 替换会静默空转，
+            # B4/B5 于是永远跑数字 id，字符串 id 取数面的变异照不出来（151-M3 曾 SURVIVED）。
+            tc.assert_true('scene_id:"s1"' in ok_src and 'scene_id:1,' not in ok_src,
+                           "B4a 夹具确已改写成字符串 scene_id（替换空转即断言恒真）")
+            env = dict(os.environ)
+            env["PYTHONUTF8"] = "1"
+
+            def run_json(html, out):
+                rr = subprocess.run(
+                    [sys.executable, str(script), str(html), "--json-out", str(out)],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", env=env, timeout=300)
+                return rr.returncode, (rr.stdout or "") + (rr.stderr or "")
+
+            r = subprocess.run([sys.executable, str(script), str(ok)],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=300)
+            tc.assert_equal(r.returncode, 0,
+                            f"B4 字符串 scene_id 能取数且无裁切：{r.stdout}{r.stderr}")
+
+            bad = tmp / "bad.html"
+            bad.write_text(_OVF_FIXTURE.format(
+                inner='<div style="position:absolute;left:20px;right:20px;top:0px;'
+                      'height:2400px;background:#ddd;"></div>',
+                driver=_OVF_DRIVER_RESET).replace(
+                'scene_id:1,', 'scene_id:"s1",'), encoding="utf-8")
+            r = subprocess.run([sys.executable, str(script), str(bad)],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=300)
+            tc.assert_equal(r.returncode, 1,
+                            f"B5 字符串 scene_id 下真实裁切仍 FAIL：{r.stdout}{r.stderr}")
+
+            tc.assert_true("ovf_json.is_file()" in pr_src,
+                           "B6 调用方核对裁切 JSON 是否真落盘")
+            tc.assert_true('"json_exists": ovf_json_exists' in pr_src,
+                           "B6b 留痕显式记录证据文件存在性")
+            tc.assert_true('ovf_rc = 2 if probe_rc == 0 and not ovf_json_exists else probe_rc'
+                           in pr_src,
+                           "B6c 退 0 但缺 JSON 时降为 UNTESTED，不得写 PASS")
+
+            t_html = tmp / "t_block.html"
+            t_src = _OVF_FIXTURE.format(
+                inner='<div style="position:absolute;left:20px;right:20px;top:0px;'
+                      'height:1600px;background:#ddd;"></div>',
+                driver=_OVF_DRIVER_RESET).replace(
+                'var S=[{scene_id:1,start:0,end:10,dur:10,type:"gsap",cover:false}];',
+                'var T={s1:0};').replace(
+                '<body>', '<body><div id="root" data-duration="10"></div>')
+            t_html.write_text(t_src, encoding="utf-8")
+            tc.assert_true('var T={s1:0};' in t_src and 'var S=' not in t_src,
+                           "B7a T 块夹具确已移除 S 块（替换空转即假覆盖）")
+            t_json = tmp / "t_block.json"
+            code_t, out_t = run_json(t_html, t_json)
+            tc.assert_equal(code_t, 0, f"B7 T 块项目可回退取数：{out_t}")
+            tc.assert_true(t_json.is_file(), "B7b T 块结果落盘")
+            tc.assert_equal(_json.loads(t_json.read_text(encoding="utf-8"))["verdict"],
+                            "PASS", "B7c T 块回退结果明确为 PASS")
+
+            u_html = tmp / "no_driver.html"
+            u_html.write_text(_OVF_FIXTURE.format(
+                inner='<div style="height:100px;"></div>',
+                driver=_OVF_DRIVER_NONE), encoding="utf-8")
+            u_json = tmp / "no_driver.json"
+            code_u, out_u = run_json(u_html, u_json)
+            tc.assert_equal(code_u, 2, f"B8 无驱动源仍判 UNTESTED：{out_u}")
+            tc.assert_true(u_json.is_file(), "B8b UNTESTED 也落盘，不留悬空路径")
+            u_doc = _json.loads(u_json.read_text(encoding="utf-8"))
+            tc.assert_equal(u_doc["verdict"], "UNTESTED", "B8c JSON 自报未测")
+            tc.assert_true("主时间轴驱动源" in u_doc.get("reason", ""),
+                           "B8d 未测原因点名缺驱动源")
+
+            n_html = tmp / "no_window.html"
+            n_src = _OVF_FIXTURE.format(
+                inner='<div style="height:100px;"></div>',
+                driver=_OVF_DRIVER_RESET).replace(
+                'var S=[{scene_id:1,start:0,end:10,dur:10,type:"gsap",cover:false}];', '')
+            n_html.write_text(n_src, encoding="utf-8")
+            n_json = tmp / "no_window.json"
+            code_n, out_n = run_json(n_html, n_json)
+            tc.assert_equal(code_n, 2, f"B9 无时间窗仍判 UNTESTED：{out_n}")
+            tc.assert_true(n_json.is_file(), "B9b 无时间窗未测也落盘")
+            n_doc = _json.loads(n_json.read_text(encoding="utf-8"))
+            tc.assert_equal(n_doc["verdict"], "UNTESTED", "B9c JSON 自报未测")
+            tc.assert_equal(n_doc["diagnostics"]["unseeked_scene_ids"], ["s1"],
+                            "B9d 未测逐场点名，不得静默当通过")
+
+        tc.mark_passed()
+    except Exception as e:
+        import traceback
+        tc.mark_failed("scene_overflow_wired_before_render error: " + str(e) + "\n"
+                       + traceback.format_exc())
     return tc
 
 

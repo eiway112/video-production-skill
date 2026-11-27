@@ -9,12 +9,12 @@
 借鉴自 vibe-knowledge（andyhuo520/vibe-knowledge）的 `engine/scripts/check.py`
 33 条内容判据中的**可机算**部分，逐条取舍：
 - 保留：来源快照哈希、引文逐字命中、来源等级充分性、弱来源不得标 T1、
-  旁白数字必须挂在事实上、非确定状态必须写说明。
+  旁白数字必须挂在事实上、非确定状态必须写说明；可选 visual_bindings 逐行对撞 HTML。
 - 不借：44 套风格库（与装配式讲解的画风需求错位）、时长偏差 >15%（本仓
   `duration_budget` 是更严的绝对秒数门禁）、概念先修图（本仓无系列课模型）。
 
-**边界（不得读宽）**：本件证明**记账合规**，不证明内容为真——"引文在快照里"
-不等于"引文支撑该结论"，那一层仍由人裁定（与 AGENTS.md『自述结论必须逐条可核』同向）。
+**边界（不得读宽）**：本件证明**记账与已声明画面绑定合规**，不证明内容为真——"引文在快照里"
+不等于"引文支撑该结论"；visual_bindings 只证作者声明的值/列确实落在对应 HTML 行，不证绑定关系本身正确。
 
 声明面：config 顶层 `content_facts`（相对项目目录的路径），或项目目录下的
 `facts.json`。两者都不在位 → NOT_APPLICABLE 并点名，**不得读成检查通过**。
@@ -48,7 +48,7 @@ def load_rules(path=None) -> dict:
     except Exception as e:
         raise RulesBroken(f"判据文件不可解析：{p} ({e})")
     for key in ("tiers", "source_kinds", "fact_types", "statuses",
-                "verified_min_sources", "number_claim_field"):
+                "verified_min_sources", "number_claim_field", "visual_binding_field"):
         if key not in rules:
             raise RulesBroken(f"判据缺键：{key}")
     for key in ("tiers", "source_kinds", "fact_types", "statuses"):
@@ -108,15 +108,180 @@ def _resolve_snapshot(facts_dir: Path, rel: str):
     return target, None
 
 
-def check(facts_path: Path, narration_scenes, rules: dict) -> dict:
-    """裁定入口。narration_scenes: [(scene_id, narration_text)]。
+def _binding_text_has(text: str, needle: str) -> bool:
+    """绑定文本命中：数字按完整 token，中文/带单位串按去空白子串。"""
+    spaced = re.sub(r"\s+", " ", str(text or "")).strip()
+    compact = re.sub(r"\s+", "", spaced)
+    want = re.sub(r"\s+", "", str(needle or ""))
+    if not want:
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)?", want):
+        return re.search(rf"(?<![\d.]){re.escape(want)}(?![\d.])", spaced) is not None
+    return want in compact
+
+
+def _check_visual_bindings(ledger: dict, html_path, field: str, counts: dict):
+    """把事实的可选 visual_bindings 与 HTML DOM 逐行对撞。
+
+    只证“作者声明的画面绑定确实落在对应场景”，不证事实为真。未声明绑定的旧项目
+    保持原行为；一旦声明而 HTML 取不回，则判 UNTESTED，不得按没有绑定放过。
+    """
+    bindings = []
+    for fact in ledger.get("facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        value = fact.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            return [f"事实 {fact.get('id', '?')} 的 {field} 必须是列表"], []
+        bindings.extend((str(fact.get("id") or "?"), b) for b in value)
+    counts["visual_bindings"] = len(bindings)
+    if not bindings:
+        return [], []
+
+    if html_path is None:
+        return [], [f"事实台账声明了 {field}，但预检未提供 HTML 路径，画面绑定无从核对"]
+    path = Path(html_path)
+    try:
+        html = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return [], [f"画面绑定取数断链：HTML 读不回 {path} ({e})"]
+
+    from html.parser import HTMLParser
+
+    class _Node:
+        __slots__ = ("tag", "attrs", "parent", "children", "text")
+
+        def __init__(self, tag, attrs, parent):
+            self.tag = tag
+            self.attrs = attrs
+            self.parent = parent
+            self.children = []
+            self.text = ""
+
+    class _Parser(HTMLParser):
+        VOID = {"img", "br", "hr", "input", "meta", "link", "source", "area",
+                "base", "col", "embed", "param", "track", "wbr"}
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root = _Node("#root", {}, None)
+            self.cur = self.root
+            self.nodes = []
+
+        def handle_starttag(self, tag, attrs):
+            node = _Node(tag, {k: (v or "") for k, v in attrs}, self.cur)
+            self.cur.children.append(node)
+            self.nodes.append(node)
+            if tag not in self.VOID:
+                self.cur = node
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            if tag not in self.VOID:
+                self.cur = self.cur.parent
+
+        def handle_endtag(self, tag):
+            node = self.cur
+            while node is not self.root:
+                if node.tag == tag:
+                    self.cur = node.parent
+                    return
+                node = node.parent
+
+        def handle_data(self, data):
+            if self.cur.tag not in ("script", "style"):
+                self.cur.text += data
+
+    parser = _Parser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as e:
+        return [], [f"画面绑定取数断链：HTML 解析失败 {path.name} ({e})"]
+
+    try:
+        from cue_resolve import normalize_scene_id
+    except ImportError as e:
+        return [], [f"画面绑定取数断链：场景 id 归一无单源 ({e})"]
+
+    def descendants(node):
+        for child in node.children:
+            yield child
+            yield from descendants(child)
+
+    def node_text(node):
+        parts = [node.text] + [node_text(child) for child in node.children]
+        return " ".join(p for p in parts if p)
+
+    violations = []
+    for fid, binding in bindings:
+        if not isinstance(binding, dict):
+            violations.append(f"事实 {fid} 的画面绑定不是对象")
+            continue
+        sid = str(binding.get("scene_id") or "").strip()
+        rows = binding.get("rows")
+        if not sid or not isinstance(rows, list) or not rows:
+            violations.append(f"事实 {fid} 的画面绑定缺 scene_id 或非空 rows")
+            continue
+        wanted = normalize_scene_id(sid)
+        roots = [n for n in parser.nodes
+                 if "data-scene-id" in n.attrs
+                 and normalize_scene_id(n.attrs.get("data-scene-id")) == wanted]
+        if len(roots) != 1:
+            violations.append(f"事实 {fid} 的画面绑定场景 {sid} 在 HTML 中命中 {len(roots)} 个根")
+            continue
+        scene = roots[0]
+        for row in rows:
+            counts["visual_rows"] += 1
+            if not isinstance(row, dict):
+                violations.append(f"事实 {fid} 的绑定行不是对象")
+                continue
+            key = str(row.get("key") or "").strip()
+            contains = row.get("contains")
+            if not key or not isinstance(contains, list) or not contains:
+                violations.append(f"事实 {fid} 的绑定行缺 key 或非空 contains")
+                continue
+            by_id = str(row.get("id") or "").strip()
+            container_id = str(row.get("container_id") or "").strip()
+            row_class = str(row.get("row_class") or "").strip()
+            if bool(by_id) + bool(container_id and row_class) != 1:
+                violations.append(f"事实 {fid} 的绑定行须且只须用 id 或 container_id+row_class 定位")
+                continue
+            if by_id:
+                candidates = [n for n in descendants(scene) if n.attrs.get("id") == by_id]
+            else:
+                containers = [n for n in descendants(scene) if n.attrs.get("id") == container_id]
+                candidates = [n for c in containers for n in descendants(c)
+                              if row_class in (n.attrs.get("class") or "").split()
+                              and _binding_text_has(node_text(n), key)]
+            if len(candidates) != 1:
+                violations.append(
+                    f"事实 {fid} 的绑定行 {key} 在场景 {sid} 中命中 {len(candidates)} 个元素"
+                    f"（定位 {by_id or container_id + '.' + row_class}）")
+                continue
+            text = node_text(candidates[0])
+            missing = [str(v) for v in contains if not _binding_text_has(text, str(v))]
+            if not _binding_text_has(text, key) or missing:
+                violations.append(
+                    f"事实 {fid} 的场景 {sid} 绑定行 {key} 与 HTML 不一致"
+                    f"（缺 key 或值 {missing or '—'}；实读 {re.sub(chr(10), ' ', text)[:120]}）")
+            else:
+                counts["visual_rows_verified"] += 1
+    return violations, []
+
+
+def check(facts_path: Path, narration_scenes, rules: dict, html_path=None) -> dict:
+    """裁定入口。narration_scenes: [(scene_id, narration_text)]；html_path 供视觉绑定核对。
 
     返回 {status, violations[], untested[], counts{}}；status 用 _gate_status 四态。
     """
     violations, untested = [], []
     counts = {"sources": 0, "facts": 0, "snapshots_verified": 0,
               "quotes_verified": 0, "numbers_in_narration": 0,
-              "numbers_sourced": 0}
+              "numbers_sourced": 0, "visual_bindings": 0,
+              "visual_rows": 0, "visual_rows_verified": 0}
     facts_path = Path(facts_path)
     if not facts_path.is_file():
         return {"status": gs.NOT_APPLICABLE, "violations": [],
@@ -243,6 +408,11 @@ def check(facts_path: Path, narration_scenes, rules: dict) -> dict:
 
         for n in (f.get(rules["number_claim_field"]) or []):
             numbers_sourced.add(_canon_number(n))
+
+    visual_violations, visual_untested = _check_visual_bindings(
+        ledger, html_path, rules.get("visual_binding_field") or "visual_bindings", counts)
+    violations.extend(visual_violations)
+    untested.extend(visual_untested)
 
     # —— 旁白数字必须挂事实（唯一能自动圈出"这句没人给出处"的腿）——
     prefixes = rules.get("ordinal_prefix_chars") or []

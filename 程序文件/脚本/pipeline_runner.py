@@ -1487,6 +1487,9 @@ class PipelineRunner:
                              # [CHOREO-PREVIEW]，判据与文案真身住 choreography_profile.py；
                              # 不登记即"改了编排口径而预览缓存照常命中"（A06 同族）。
                              "choreography_profile": SCRIPTS / "choreography_profile.py",
+                             # 2026-11-26 接入：preview 步新增容器裁切实测（scene_overflow_probe），
+                             # 判据真身住该脚本；不登记即"改了裁切量法而预览缓存照常命中"（A06 同族）。
+                             "scene_overflow_probe": SCRIPTS / "scene_overflow_probe.py",
                              "script": SCRIPTS / "instant_preview.py"},
             "render":       {"config": self._technical_config_input(), "html": self.html_path,
                              "render_rules": quality_dir / "render_rules.json"},
@@ -2960,6 +2963,34 @@ class PipelineRunner:
             desc="instant preview"
         )
         if rc == 0:
+            ovf_json = self.temp_dir / "_scene_overflow_check.json"
+            probe_rc = self._run_with_retry(
+                [str(VENV_PYTHON), "scene_overflow_probe.py", str(self.html_path),
+                 "--json-out", str(ovf_json)],
+                cwd=str(SCRIPTS),
+                env=self.env,
+                desc="scene overflow probe"
+            )
+            ovf_json_exists = ovf_json.is_file()
+            # 进程退 0 但证据文件不在盘＝取数链断裂，不得把 PASS 写进 state。
+            ovf_rc = 2 if probe_rc == 0 and not ovf_json_exists else probe_rc
+            self.state.data["scene_overflow_check"] = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "exit_code": ovf_rc,
+                "probe_exit_code": probe_rc,
+                "verdict": {0: "PASS", 1: "FAIL", 2: "UNTESTED"}.get(ovf_rc, "UNKNOWN"),
+                "json_path": str(ovf_json) if ovf_json_exists else None,
+                "json_exists": ovf_json_exists,
+            }
+            self.state.save()
+            if ovf_rc != 0:
+                # 2026-11-26 普查 85 个存量项目 17 个有裁切读数：会判红既有交付的
+                # 判据不得升阻断。此处只把"渲染前已看见"变成机器留痕，修复由作者按
+                # 预览报告处理；UNTESTED 同样点名，不得读成无裁切。
+                evidence = str(ovf_json) if ovf_json_exists else "结果 JSON 未落盘"
+                print(f"  [SCENE-OVERLAP-WARN] 容器裁切实测 exit={ovf_rc}"
+                      f"（{self.state.data['scene_overflow_check']['verdict']}）："
+                      f"渲染前须按 {evidence} 复核，本项不阻断既有存量形态")
             self.state.mark_completed("preview", self._fingerprint("preview"))
             return True
         # Preview failure is FATAL — visual issues must be resolved before render.

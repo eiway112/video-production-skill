@@ -14,6 +14,7 @@
 | 信息类型 | 权威源 | 消费者 |
 |---------|-------|--------|
 | 场景定义 | `narration.json` | 编译器 → `_compiled_scenes.json` |
+| 事实与出处（项目级） | `facts.json`（台账）＋各来源快照字节 | `content_facts_gate` → 预检 check 13c ｜`pipeline_runner._step_inputs` 预检步登记 |
 | 时间轴 | HTML `T-block` | GSAP代码 + `adjust_timeline.py` |
 | 字幕 | `.srt` 文件 | 字幕后处理 + 交付验收 |
 | 交付路径 | `config/delivery` | 交付脚本 + 完工报告 |
@@ -50,6 +51,8 @@
 **视觉边界采样**：`visual_boundary_check.py` 在每场景时长的 30%/50%/70% 三点采样，取最坏值（content_bottom 最大者）判定场景 PASS/FAIL；比旧两点采样更严，旧项目边缘内容可能由 PASS 变 FAIL，属预期质量增强。
 
 **代码位置**：`verify_tts_product.py` + `media_qa_gate.py` + `generate_completion_report.py`
+
+**内容溯源与画面绑定**：项目声明 `facts.json` 或 config 顶层 `content_facts` 后，预检 check 13c 核来源快照 SHA256、引文逐字命中、来源等级、旁白数字出处与状态说明；判据唯一住 `config/quality/content_facts_rules.json`。表格／对比行／参数 HUD 的值来自某条事实时，在该事实的可选 `visual_bindings` 中声明场景与行，预检按 HTML DOM 对撞 `key` 与 `contains`；未声明不硬判，声明后 HTML 取不回则判 UNTESTED。**边界**：台账只证记账与已声明绑定合规，不证内容为真，也不证“这一行语义上就该放这个值”；填写方式住 `AI视频制作工作流模板/分镜设计模板_AI导演模式.md`「画面绑定 `visual_bindings`」节。
 
 ### 4. 完整依赖链强制
 
@@ -142,12 +145,17 @@ preflight → tts → timeline → render
 
 **预览驱动迭代**：修订任务修改 HTML 后，必须先跑 `instant_preview.py`（秒级出图）确认画面生效且无溢出，确认后才进入渲染；**禁止把全量渲染当预览用**。场景级增量渲染由 render 步**自动尝试**（基线齐备即触发，不再需要开关）：仅场景 div 内容变化时走 PATCH，样式/脚本/时间轴/旁白有变则降级全量；显式退出用 `--no-scene-patch`（旧 `--scene-patch` 已降为兼容 no-op）。
 
+**修订轮改动落点**：改表格值、补一列、调几何时优先写在场内元素的内联 `style`，不动 `<style>` 类规则与场景外结构；后者会改变 `outside_scene_hash` 使增量渲染回退 FULL。判据与合法例外住 `AI视频制作工作流模板/新路径实施_踩坑清单与防范检查表.md` A5 样例注释，此处不复述。
+
+**容器裁切自查**：preview 步在 `instant_preview` 成功后另跑 `scene_overflow_probe.py`，量 `overflow:hidden/clip` 祖先对内容的裁切像素；读数落 `temp/_scene_overflow_check.json` 并留痕 `state.scene_overflow_check`。`[SCENE-OVERLAP-WARN]` 只告警不阻断，但新写 HTML 出现裁切须改布局，不得忽略。
+
 **观感类修订的取数顺序（2026-11-08 立；2026-11-11 补预览填充率；2026-11-22 补信息层覆盖、编排四榜与遮挡点名）**：节奏/动效类修订按 静态面（`choreography_profile.py`，零渲染，出**推进覆盖率**与**信息层覆盖**两榜＋各自的"最低三场/最长无变化段"，外加 cue 节拍中位与最大；同面的预检 7j 判"抬起态元素提前在场"与"覆盖盒左右同为负外扩"，WARN 不阻断）→ 预览（字幕安全区／文字塌陷／柱溢出／`[LAYOUT-FULLNESS]` 主体区填充率／`[CHOREO-PREVIEW]` 四榜带秒位／`Box Overlap` 绘制盒压他人字形点名——**这些榜全部只点名、不进退出码**，对照它改版面而不是等交付后投诉）→ **渲染产物**（`--step render` 只出 `temp/render_raw.mp4`，不落交付槽位、不进入交付态）→ 对 `render_raw.mp4` 跑 `generate_completion_report.py --project-name X --video-file <render_raw.mp4>` 读 `frame_occupancy`（在动占比与静止窗清单）决定是否继续 → 再走完整链。**三把尺方向互斥，不得用任一数字单独下结论**：推进覆盖率量"时间轴声明了什么"，像素在动占比量"产出里动了多少"（可被亚像素位移与常驻光斑循环刷分），信息层覆盖只统计归属为信息层的元素且是**下界**（辅助函数内按数据挂载的动效静态面归因不到）。**不要把 `--resume` 当"只跑到渲染看看"**：链跑到 postprocess 就会落交付槽位并进入交付态，那个中间构建即是一次交付。反过来说，观感迭代轮次一开头就按最终交付名命名。
 
 **错误恢复纪律**：
 1. 步骤失败后**先定点诊断，禁止直接 `--fresh`** 全量重置——优先 `--resume`（自动回退到最早失效步）或 `--quick-fix`；长视频（≥300s）或有渲染产物时，`--fresh` 必须显式追加 `--confirm-fresh` 并确认破坏清单
 2. 每个子步骤的完整输出落盘至 `过程产物/日志/{config}_{step}_*.log`，失败时 `pipeline_state.json` 记录 `log_path`，完工报告 issues 同步引用
 3. 全量渲染前自动备份基线（`render_raw.prev.mp4`），已交付成片在覆盖前自动备份并受交付态拦截保护；覆盖已交付成片须改用 `_修订NN` 后缀
+4. **长任务后台执行**：pipeline／render／postprocess 等超过前台命令时限的任务，一律用工具的后台执行入口并等待系统完成通知；禁止用相同参数轮询日志大小或进程状态。需要中途进度时看任务监控或使用一次持续事件监听，不得以重复 Bash 调用替代等待。
 
 **转场（场景切换）不得依赖交叉淡化**（2026-11-06 实测）：场景根是透明底（内容层之下有常驻不透明底衬）时，淡入淡出只能让两场内容以半透明状态压在同一位置——**α 之和恰为 1 也不等于看不见下层**。写法取**边界瞬间硬切**（`tl.set`），画面变化交给元素入场承担；封面退场可保留极短淡出以维持封面契约。自查用 `transition_overlap_census.py`（叠印峰值／双可见秒，描述面、不裁定）。
 

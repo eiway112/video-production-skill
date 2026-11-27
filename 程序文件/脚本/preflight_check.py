@@ -3410,7 +3410,8 @@ def check_content_facts(project_dir: Path, cfg: dict, r: PreflightResult):
     预算，就没有任何机算面能发现它无出处。
 
     判据本体住 `content_facts_gate`（借鉴 vibe-knowledge 的 check.py 33 条中
-    可机算的部分：快照哈希、引文逐字命中、来源等级、数字挂事实、状态有说明），
+    可机算的部分：快照哈希、引文逐字命中、来源等级、数字挂事实、状态有说明；
+    可选 visual_bindings 与项目 HTML 逐行对撞），
     本函数只做三件事：定位台账、把四态翻成预检面、把读数印出来——阈值一律不在
     此处重写（两处各写一套即 A06 同族）。
 
@@ -3444,7 +3445,7 @@ def check_content_facts(project_dir: Path, cfg: dict, r: PreflightResult):
 
     scenes = [(str(s.get("scene_id")), str(s.get("narration") or ""))
               for s in (cfg.get("scenes") or []) if isinstance(s, dict)]
-    res = _cf_gate.check(facts_path, scenes, rules)
+    res = _cf_gate.check(facts_path, scenes, rules, html_path=project_dir / "index.html")
     counts = res["counts"]
     gsmod = _cf_gate.gs
 
@@ -3459,9 +3460,11 @@ def check_content_facts(project_dir: Path, cfg: dict, r: PreflightResult):
     for v in res["violations"]:
         r.error(v, check_id="content_facts")
     if res["status"] == gsmod.PASS:
+        visual = (f"／画面绑定 {counts['visual_rows_verified']}/{counts['visual_rows']} 行"
+                  if counts.get("visual_bindings") else "")
         r.ok(f"事实台账自洽：来源 {counts['sources']}／事实 {counts['facts']}／"
              f"快照哈希 {counts['snapshots_verified']}／引文命中 {counts['quotes_verified']}／"
-             f"旁白数字 {counts['numbers_sourced']}/{counts['numbers_in_narration']} 有出处",
+             f"旁白数字 {counts['numbers_sourced']}/{counts['numbers_in_narration']} 有出处{visual}",
              check_id="content_facts")
 
 
