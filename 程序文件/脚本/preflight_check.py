@@ -67,8 +67,8 @@ RENDER_CRITICAL_CHECKS = {
     # 2026-10-13 复盘：6 处容器带 .rv 而入场的 tween 只打其子元素 → 父层 opacity
     # 恒 0、整块子树从未出现在成片里，终检 20 项与审计 6 维全绿未拦。
     "element_reveal",
-    # check 7c: 章级常驻条结构闭环（cl/cf 配对 · tag 自报归属 · 点亮锚）。手写
-    # HTML 三个环节各自独立书写，任一处漏改即成片观感与结构不符——实证
+    # check 7c: 章级常驻条结构闭环（cl/cf 配对 · tag 自报归属 · 点亮锚 · 选择器可解析）。
+    # 手写 HTML 四个环节各自独立书写，任一处漏改即成片观感与结构不符——实证
     # building-perf-craft 曾缺第 6 章刻度（tag 有 06 无 cf6）。
     "chapter_bar",
     # check 7d: 画面文本中文语境夹半角标点（半角引号为主要形态）。字幕侧有 SRT
@@ -1943,7 +1943,7 @@ def check_chapter_bar(html_path: Path, r: PreflightResult):
     实证 building-perf-craft 曾缺第 6 章刻度（tag 有 06 无 cf6）。
     与最接近的 check_element_reveal 的分工：那条管"整体不可见"，本条管"结构性错位"。
 
-    三腿判据（零渲染、零像素）：
+    四腿判据（零渲染、零像素）：
       L1 配对：id="clN" 集合 == id="cfN" 集合（两向差集各点名）
       L2 闭环：sN-tag 文本行首 `NN ·` → 存在 clNN；且 clNN 的全部点亮语句锚
                == 该章**首个**带 NN 场景的 T 键（craft 修复形态证明锚点是章首场，
@@ -1951,6 +1951,8 @@ def check_chapter_bar(html_path: Path, r: PreflightResult):
       L3 点亮：每个 clN/cfN 必须有含 opacity:1（或 autoAlpha:1）的语句，锚 `T.sX`
                须为 T 块已有键、第三参缺锚判错 —— "有 DOM 无语句" = 条上死格子，
                该章永不点亮
+      L4 选择器：脚本中 `#clN`／`#cfN` 若带后代标签，该后代必须真实存在于对应
+               DOM 子树；id 已在填充元素自身时再写 `#cfN i` 会空跑，必须点名
 
     取数纪律：
       · DOM 面 html.parser（注释与 script/style 内容不进元素树），tag 文本取子树拼接；
@@ -2060,7 +2062,18 @@ def check_chapter_bar(html_path: Path, r: PreflightResult):
         for kind, num in refs:
             lit.setdefault((kind, int(num)), []).append(anchor)
 
-    # ── 3. 三腿裁定 ──
+    selector_misses = set()
+    for stmt in scripts.split(";"):
+        for m in re.finditer(r'["\']#(cl|cf)(\d+)(?:\s+([A-Za-z][\w-]*))?["\']', stmt):
+            target = f"{m.group(1)}{m.group(2)}"
+            desc = m.group(3)
+            if not desc:
+                continue
+            node = next((n for n in p.nodes if n.id == target), None)
+            if node is None or not any(d.tag == desc for d in _descendants(node)):
+                selector_misses.add(f"#{target} {desc}")
+
+    # ── 3. 四腿裁定 ──
     viol = []
     for n in sorted(set(cl_ids) - set(cf_ids)):
         viol.append(f"L1 cl{n} 无配对 cf{n}（章名格有、刻度格缺）")
@@ -2088,6 +2101,9 @@ def check_chapter_bar(html_path: Path, r: PreflightResult):
                     viol.append(f"L3 {kind}{n} 点亮语句缺 T 锚点（第三参不是 T.sX）")
                 elif t_keys is not None and a not in t_keys:
                     viol.append(f"L3 {kind}{n} 锚 T.s{a} 不在 T 块（键：{sorted(t_keys)}）")
+
+    for selector in sorted(selector_misses):
+        viol.append(f"L4 章级条选择器 {selector} 无 DOM 目标（动画会空跑）")
 
     if t_keys is None:
         viol.append("T 块取不到（var T = {...} 形态未命中）"

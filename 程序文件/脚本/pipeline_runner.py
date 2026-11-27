@@ -1961,7 +1961,9 @@ class PipelineRunner:
             return True
         try:
             import narration_pause_precheck as npp
-            audit = npp.run_project_audit(self.html_project)
+            from cue_resolve import normalize_scene_id
+            audit = npp.run_project_audit(
+                self.html_project, manifest_path=self.temp_dir / "_timeline_manifest.json")
         except Exception as e:
             print(f"  [PAUSE-AUDIT] 无从审计：{e}")
             print("    这不等于「停顿已核过」——需该项目先跑过 TTS 对齐（timeline 步之前完成）")
@@ -1998,7 +2000,7 @@ class PipelineRunner:
                   f"｜插值/样本<2 未裁定 {_intra['unmeasurable']} 个")
             for q in (_intra.get("points") or [])[:5]:
                 _tag = {True: "真静音谷", False: "非谷", None: "未经能量确认"}[q["energy"]]
-                print(f"    · s{q['scene_id']} 无标点处实测 {q['gap']:.2f}s"
+                print(f"    · s{normalize_scene_id(q['scene_id'])} 无标点处实测 {q['gap']:.2f}s"
                       f"『…{q['ctx']}…』〔{_tag}〕")
             for b in (_intra.get("broken") or [])[:3]:
                 print(f"    · 第三桶取数断链：{b}")
@@ -2044,7 +2046,7 @@ class PipelineRunner:
                 for _q in sorted([r for r in _comp["rows"] if r["zero_silence"] > 0],
                                  key=lambda x: -x["zero_silence"])[:3]:
                     _who = "引擎break" if _q.get("declared") else "未声明"
-                    print(f"    · s{_q['scene_id']}『…{_q['ctx']}…』"
+                    print(f"    · s{normalize_scene_id(_q['scene_id'])}『…{_q['ctx']}…』"
                           f"交付 {_q['asr_gap']:.2f}s ＝ 带噪 {_q['signal_gap']:.2f}s "
                           f"＋ 精确零 {_q['zero_silence']:.2f}s〔{_who}〕")
             else:
@@ -2061,11 +2063,11 @@ class PipelineRunner:
         if _pro.get("summary_line"):
             print(f"  [PAUSE-AUDIT] 语义层级｜{_pro['summary_line']}")
             for _b in (_pro.get("beat_candidates") or [])[:3]:
-                print(f"    · s{_b['scene_id']}『…{_b['ctx']}…』分句逗号 "
+                print(f"    · s{normalize_scene_id(_b['scene_id'])}『…{_b['ctx']}…』分句逗号 "
                       f"{_b['gap']:.2f}s → 可声明 {_b['ms']}ms"
                       f"（SSML，实测约 +0.7s，引擎生成的真停顿）")
             for _e in (_pro.get("enum_slow") or [])[:2]:
-                print(f"    · s{_e['scene_id']}『…{_e['ctx']}…』顿号 "
+                print(f"    · s{normalize_scene_id(_e['scene_id'])}『…{_e['ctx']}…』顿号 "
                       f"{_e['gap']:.2f}s 偏长：列举被拉开，修法是改写（合并项/换逗号），"
                       f"不是剪波形")
         if audit["skipped"]:

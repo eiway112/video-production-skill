@@ -81,6 +81,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _script_env import ROOT, QUALITY_DIR, HTML_BASE, TEMP_BASE  # noqa: E402
+from cue_resolve import normalize_scene_id  # noqa: E402
 
 RULES_FILE = QUALITY_DIR / "narration_prosody_rules.json"
 SYNC_RULES_FILE = QUALITY_DIR / "audio_sync_rules.json"
@@ -773,13 +774,15 @@ def resolve_project(name: str):
     return narration, temp
 
 
-def run_project_audit(project: str) -> dict:
+def run_project_audit(project: str, manifest_path=None) -> dict:
     """流水线与命令行共用的单一入口（取数路径解析不得各写一份）。
 
     返回 {project, absolute, rushed, summary, skipped, absolute_rows}；取数断链一律抛 Broken，
     调用方（pipeline_runner）据此打印"无从审计"并点名断在哪条腿，不得读成 0 条。
+    `manifest_path` 供流水线传入其真实 temp；缺省仍按项目名解析，保持 CLI 旧行为。
     """
-    narration_path, manifest_path = resolve_project(project)
+    narration_path, resolved_manifest = resolve_project(project)
+    manifest_path = Path(manifest_path) if manifest_path is not None else resolved_manifest
     rules = load_rules()
     narration = load_narration(narration_path)
     if not manifest_path or not Path(manifest_path).exists():
@@ -1040,7 +1043,7 @@ def main(argv=None) -> int:
                 for r in _intra.get("points") or []:
                     tag = {True: "真静音谷", False: "非谷（ASR 词尾早收）",
                            None: "未经能量确认"}[r["energy"]]
-                    print(f"  · s{r['scene_id']} 无标点位点实测 {r['gap']:.2f}s"
+                    print(f"  · s{normalize_scene_id(r['scene_id'])} 无标点位点实测 {r['gap']:.2f}s"
                           f"（≥{_intra['threshold_seconds'] if _intra['threshold_seconds'] is not None else '?'}s）"
                           f"『…{r['ctx']}…』〔{tag}〕")
                 for b in _intra.get("broken") or []:

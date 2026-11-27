@@ -19309,11 +19309,11 @@ def test_chapter_bar_structure_consistency() -> RegressionTestCase:
     夹具段：A tag 自报而无对应 cl（craft 原形态）/ B 点亮锚落到收束场 / C 有 DOM 无
     点亮语句 / D 锚不在 T 块 / E L1 两向差集 / F 修好后 0 违规 + 计数自报 / G 无条
     不适用 / H T 块取不到 fail-closed / I 点亮语句缺锚 / J 真身接线 + audit 降档 /
-    K 存量真实项目只读冒烟 / L 注释里的语句字面不得凭空造点亮。
+    K 存量真实项目只读冒烟 / L 注释里的语句字面不得凭空造点亮 / M 章级条选择器须解析到真实 DOM。
     """
     tc = RegressionTestCase(
         "chapter_bar_structure_consistency",
-        "验证章级常驻条三腿判据：cl/cf 配对、tag 自报归属闭环、点亮语句锚点可核"
+        "验证章级常驻条四腿判据：cl/cf 配对、tag 自报归属闭环、点亮锚点可核、选择器可解析"
     )
     try:
         import ast
@@ -19498,6 +19498,23 @@ def test_chapter_bar_structure_consistency() -> RegressionTestCase:
         tc.assert_equal(_lit, 2,
                         "L3 实登记点亮 id 恰 2（cl1/cf1），注释不入；"
                         f"取数实得 {_lit}（取不到须点名而非炸整案）")
+
+        # M. 章级条动画选择器必须解析到真实 DOM（2026-11-27 Demo 实证）：
+        # id 已在内层 <i> 时写 #cfN i 会得到空集，旧三腿只验 id 配对与 opacity 锚，
+        # 因而结构全绿但填充线不动。正负两形态共用同一组点亮语句，只差 DOM 子树。
+        html_m1 = _mk({}, ["cl1", "cf1"],
+                      ['tl.set("#cl1", { opacity: 1 }, T.s1);',
+                       'tl.set("#cf1", { opacity: 1 }, T.s1);',
+                       'tl.to("#cf1 i", { width: "100%", duration: 1 }, T.s1);'], [1])
+        r_m1, _ = _run(html_m1)
+        tc.assert_true(any("L4" in e and "#cf1 i" in e and "无 DOM 目标" in e
+                           for e in r_m1.errors),
+                       f"M1 后代选择器无真实目标须判错并点名，实得 {r_m1.errors}")
+        tc.assert_equal(len(r_m1.errors), 1, "M2 该形态恰一条错，不得连带其它腿")
+        html_m2 = html_m1.replace('<span id="cf1">·</span>',
+                                  '<span id="cf1"><i></i></span>')
+        r_m2, _ = _run(html_m2)
+        tc.assert_equal(r_m2.errors, [], "M3 后代真实存在时同一选择器不得误杀")
 
         tc.mark_passed()
     except Exception as e:
@@ -27287,10 +27304,12 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
     try:
         import ast
         import hashlib
+        import io
         import re
         import sys
         import tempfile
         import wave
+        from contextlib import redirect_stdout
         from pathlib import Path
 
         import numpy as np
@@ -27621,6 +27640,74 @@ def test_intra_punctuation_pause_enforcement() -> RegressionTestCase:
         tc.assert_equal([ok8, _rec8["verdict"], _rec8["declined_scenes_without_record"]],
                         [False, "FAIL", 3],
                         f"H10 旧 manifest 无拒插记录：按无记录计数并仍判 FAIL，不按 0 条拒插读：{_rec8}")
+
+        # H11-H14 自定义 temp 的 manifest 必须走真实路径（2026-11-27 Demo 实证）：
+        # pipeline 支持 paths.temp_subdir，但 pause audit 旧入口只按 `<项目名>_audio` 找文件，
+        # 同一份 9/9 asr_forced manifest 因而被读成 8 场未走 asr_forced 并落 UNTESTED。
+        with tempfile.TemporaryDirectory() as td_custom:
+            custom = Path(td_custom)
+            narration_custom = custom / "narration.json"
+            narration_custom.write_text(_json.dumps({"scenes": [{
+                "scene_id": 1, "narration": "甲乙，丙丁。"}]}, ensure_ascii=False), encoding="utf-8")
+            wav_custom = custom / "tts_44k"
+            wav_custom.mkdir()
+            _make_wav(wav_custom / "tts_custom_hq.wav", 0.4)
+            manifest_custom = custom / "_timeline_manifest.json"
+            manifest_custom.write_text(_json.dumps({"scenes": [{
+                "scene_id": 1, "method": "asr_forced", "tts_file": "tts_custom_hq.wav",
+                "norm": "甲乙丙丁",
+                "chars": [[0.0, 0.5, 1], [0.5, 1.0, 1],
+                          [1.4, 1.9, 1], [1.9, 2.4, 1]],
+            }]}, ensure_ascii=False), encoding="utf-8")
+            old_resolve = npp.resolve_project
+            default_manifest_custom = custom / "default_manifest.json"
+            default_manifest_custom.write_text(_json.dumps({"scenes": [{
+                "scene_id": 1, "method": "punct_gap", "norm": "甲乙丙丁"
+            }]}, ensure_ascii=False), encoding="utf-8")
+            npp.resolve_project = lambda name: (narration_custom, default_manifest_custom)
+            audit_custom = None
+            custom_error = None
+            try:
+                audit_custom = npp.run_project_audit("custom-temp", manifest_path=manifest_custom)
+            except npp.Broken as e:
+                custom_error = str(e)
+            finally:
+                npp.resolve_project = old_resolve
+            tc.assert_true(audit_custom is not None
+                           and audit_custom["summary"]["punct_median"].get("，") == 0.4,
+                           f"H11 显式 manifest 必须胜过已存在的默认 manifest，不得回落并把已对齐场记成未测：{custom_error or audit_custom}")
+            tc.assert_equal(audit_custom["summary"]["punct_points_measured"] if audit_custom else None, 1,
+                            f"H12 显式路径须真的读到自定义 temp 的音频面：{audit_custom['summary'] if audit_custom else custom_error}")
+        npp_src = Path(npp.__file__).read_text(encoding="utf-8")
+        tc.assert_true("def run_project_audit(project: str, manifest_path=None)" in npp_src,
+                       "H13 审计入口必须接受显式 manifest 路径，否则自定义 temp 无接线")
+        pr_face_src = Path(pr.__file__).read_text(encoding="utf-8")
+        face_src = pr_face_src.split("def _pause_audit_face")[1].split("\n    def ")[0]
+        tc.assert_true('manifest_path=self.temp_dir / "_timeline_manifest.json"' in face_src,
+                       "H14 pipeline 必须把本轮真实 temp 的 manifest 传给审计入口")
+        captured_manifest = {}
+        old_run_audit = npp.run_project_audit
+
+        def _capture_manifest(project, manifest_path=None):
+            captured_manifest["project"] = project
+            captured_manifest["manifest_path"] = manifest_path
+            raise RuntimeError("capture-stop")
+
+        npp.run_project_audit = _capture_manifest
+        try:
+            runner = object.__new__(pr.PipelineRunner)
+            runner.tts_enabled = True
+            runner.html_project = "custom-temp"
+            runner.temp_dir = custom
+            runner.state = type("State", (), {"data": {}})()
+            runner._pause_gate_verdict = lambda *a, **k: True
+            with redirect_stdout(io.StringIO()):
+                runner._pause_audit_face()
+        finally:
+            npp.run_project_audit = old_run_audit
+        tc.assert_equal(captured_manifest.get("manifest_path"),
+                        custom / "_timeline_manifest.json",
+                        "H14b runner 行为测试必须实际传入本轮 temp 的 manifest，而非只靠源码接线见证")
 
         # ---------------- I 段：候选面与报告透传 ----------------------------------
         import pause_marks as pm

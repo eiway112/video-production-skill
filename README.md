@@ -54,13 +54,13 @@
 
 ## 效果预览
 
-下面这支展示片由本流水线**自己产出**：十步全过、六维审计全过、零放行开关。画面为矢量 / CSS / GSAP 动画，不含任何业务项目名与客户素材；片尾三计数是该片刻完工报告的实测读数。
+下面这支展示片由本流水线**自己产出**：十步全过、六维审计全过、零放行开关。画面为矢量 / CSS / GSAP 动画，不含任何业务项目名与客户素材；片尾三计数是该片刻完工报告的实测读数。本版新增词级联动实证：锚词触发关键词芯片、引线标注、参数 HUD 与图形同步变化。
 
-[![效果预览封面：四态门禁场](AI视频制作工作流模板/demo_poster.jpg)](https://github.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261112)
+[![效果预览封面：词级联动场](AI视频制作工作流模板/demo_poster.jpg)](https://github.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261127)
 
-- **完整视频（2 分 11 秒）**：[GitHub Release 附件](https://github.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261112) ｜ [Gitee 镜像附件](https://gitee.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261112)
+- **完整视频（2 分 57 秒）**：[GitHub Release 附件](https://github.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261127) ｜ [Gitee 镜像附件](https://gitee.com/eiway112/video-production-skill/releases/tag/demo-showcase-20261127)
 - 该 release **只承载展示片，不承载安装对象**；安装请回默认分支 `main`。
-- 片中依次展示：痛点 → 十步流水线 → 单一权威源 → 四态门禁 → 增量渲染 → 波形对齐 → 交付守卫 → 片尾自证。复核方式见[门禁与证据体系](#门禁与证据体系)。
+- 片中依次展示：痛点 → 十步流水线 → 单一权威源 → 四态门禁 → 词级联动 → 增量渲染 → 波形对齐 → 交付守卫 → 片尾自证。复核方式见[门禁与证据体系](#门禁与证据体系)。
 
 ## 能力地图
 
