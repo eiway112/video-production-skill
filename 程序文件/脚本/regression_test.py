@@ -31870,10 +31870,12 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
             def set_governance(status="PASS", warn=False, health_overrides=None,
                                review_overrides=None, checks_overrides=None):
                 health = {
-                    "scope": "workspace",
-                    "subject": str(_pr.ROOT.parent),
+                    "scope": "project",
+                    "subject": _pr.ROOT.name,
+                    "dependencies": [],
                     "overall_status": "OK" if status == "PASS" else status,
-                    "workspace_status": "OK" if status == "PASS" else status,
+                    "project_status": "OK" if status == "PASS" else status,
+                    "workspace_status": None,
                     "can_proceed": status != "FAIL",
                     "timestamp": "2026-11-25T16:48:04",
                 }
@@ -31902,7 +31904,7 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                     "governance_evidence_dir": governance,
                     "business_acceptance_file": business,
                     "root": _pr.ROOT,
-                    "workspace_root": _pr.ROOT.parent,
+                    "project_root": _pr.ROOT,
                 }
                 args.update(overrides)
                 return acceptance.build_acceptance_status(**args)
@@ -31993,10 +31995,10 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 set_governance()
                 (governance / "independent_review.json").unlink()
                 partial_status, satisfied, _ = make_runner("production", "partial")._project_acceptance()
-                tc.assert_equal(partial_status["governance_acceptance"]["status"], "WARN", "C 普通模式部分治理证据只能 WARN")
+                tc.assert_equal(partial_status["governance_acceptance"]["status"], "NOT_RUN", "C 普通模式不读取部分治理证据")
                 tc.assert_true(satisfied, "C 普通模式部分治理不阻断")
-                tc.assert_equal(len(partial_status["governance_acceptance"]["missing_evidence"]), 1, "C 缺失证据单列不重复记错误")
-                tc.assert_equal(partial_status["governance_acceptance"]["errors"], [], "C 文件缺席不冒充不可读错误")
+                tc.assert_equal(partial_status["governance_acceptance"]["missing_evidence"], [], "C 普通模式不列治理缺失")
+                tc.assert_equal(partial_status["governance_acceptance"]["errors"], [], "C 普通模式不读治理错误")
                 _, satisfied, _ = engineering._project_acceptance()
                 tc.assert_true(not satisfied, "C 工程模式缺独立复核即阻断")
                 set_governance("FAIL")
@@ -32361,28 +32363,31 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                     tc.assert_equal(any("六维技术审计未通过" in reason for reason in reasons), expected == "FAIL", "O 审计失败原因单源：" + label)
                 set_report()
 
-                set_governance(health_overrides={"scope": "project"})
+                set_governance(health_overrides={"scope": "workspace"})
                 bad_scope, ok, _ = make_runner("engineering", "scope")._project_acceptance()
-                tc.assert_equal(bad_scope["governance_acceptance"]["status"], "FAIL", "P scope=project 不得冒充工程工作区")
-                tc.assert_true(not ok, "P 工程工作区 scope 错误阻断")
+                tc.assert_equal(bad_scope["governance_acceptance"]["status"], "FAIL", "P scope=workspace 不得冒充项目域")
+                tc.assert_true(not ok, "P 项目域 scope 错误阻断")
                 production_bad_scope, production_ok, _ = make_runner("production", "production-scope")._project_acceptance()
-                tc.assert_equal(production_bad_scope["governance_acceptance"]["status"], "WARN", "P 普通模式非法体检 schema 不得显示 PASS")
-                tc.assert_true(production_ok, "P 普通模式非法体检 schema 不阻断技术交付")
+                tc.assert_equal(production_bad_scope["governance_acceptance"]["status"], "NOT_RUN", "P 普通模式不读取全局体检")
+                tc.assert_true(production_ok, "P 普通模式全局体检不阻断技术交付")
                 set_governance(health_overrides={"subject": str(root)})
                 bad_subject, ok, _ = make_runner("engineering", "subject")._project_acceptance()
-                tc.assert_equal(bad_subject["governance_acceptance"]["status"], "FAIL", "P 异域 subject 不得冒充当前工作区")
-                tc.assert_true(not ok, "P 工程工作区身份错误阻断")
-                set_governance(health_overrides={"workspace_status": "FAIL"})
+                tc.assert_equal(bad_subject["governance_acceptance"]["status"], "FAIL", "P 异域 subject 不得冒充当前项目")
+                tc.assert_true(not ok, "P 项目身份错误阻断")
+                set_governance(health_overrides={"dependencies": None})
+                bad_dependencies = make_runner("engineering", "dependencies")._project_acceptance()[0]
+                tc.assert_equal(bad_dependencies["governance_acceptance"]["status"], "FAIL", "P 项目体检依赖清单必须合法")
+                set_governance(health_overrides={"project_status": "FAIL"})
                 bad_health = make_runner("engineering", "health-status")._project_acceptance()[0]
-                tc.assert_equal(bad_health["governance_acceptance"]["status"], "FAIL", "P workspace_status 必须与 overall_status 一致")
+                tc.assert_equal(bad_health["governance_acceptance"]["status"], "FAIL", "P project_status 必须与 overall_status 一致")
                 set_governance(health_overrides={"can_proceed": False})
                 bad_proceed = make_runner("engineering", "health-proceed")._project_acceptance()[0]
                 tc.assert_equal(bad_proceed["governance_acceptance"]["status"], "FAIL", "P can_proceed 必须与总体状态一致")
                 production_bad_proceed = make_runner("production", "production-proceed")._project_acceptance()[0]
-                tc.assert_equal(production_bad_proceed["governance_acceptance"]["status"], "WARN", "P 普通模式 can_proceed 矛盾不得显示 PASS")
+                tc.assert_equal(production_bad_proceed["governance_acceptance"]["status"], "NOT_RUN", "P 普通模式不读取矛盾 can_proceed")
                 set_governance(health_overrides={"timestamp": "2026-11-25"})
                 bad_time = make_runner("engineering", "health-time")._project_acceptance()[0]
-                tc.assert_equal(bad_time["governance_acceptance"]["status"], "FAIL", "P 工程体检时间必须合法")
+                tc.assert_equal(bad_time["governance_acceptance"]["status"], "FAIL", "P 项目体检时间必须合法")
                 set_governance(review_overrides={"critic": {"status": "PASS", "evidence": "agents.md:99999"}})
                 bad_pointer = make_runner("engineering", "pointer")._project_acceptance()[0]
                 tc.assert_equal(bad_pointer["governance_acceptance"]["status"], "FAIL", "P 治理证据行号越界为失败")
@@ -32392,6 +32397,20 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 set_governance(review_overrides={"critic": {"status": "PASS", "evidence": "../agents.md:1"}})
                 traversal_pointer = make_runner("engineering", "traversal")._project_acceptance()[0]
                 tc.assert_equal(traversal_pointer["governance_acceptance"]["status"], "FAIL", "P 治理证据拒绝越界路径")
+                set_governance("FAIL")
+                with mock.patch.object(acceptance, "_file_sha256",
+                                       wraps=acceptance._file_sha256) as hash_probe:
+                    isolated = project_status(acceptance_mode="production")
+                hashed_names = {Path(call.args[0]).name
+                                for call in hash_probe.call_args_list}
+                tc.assert_true(hashed_names.isdisjoint(acceptance.GOVERNANCE_FILES.values()),
+                               "P production 不读取或哈希治理三件套")
+                tc.assert_equal(isolated["governance_acceptance"]["status"], "NOT_RUN",
+                                "P production 治理轴恒为未跑")
+                tc.assert_equal(isolated["evidence_binding"]["governance_evidence_sha256"], {},
+                                "P production 绑定不携带治理文件哈希")
+                tc.assert_true(acceptance.acceptance_satisfied(isolated)[0],
+                               "P production 不被治理 FAIL 连坐")
                 set_governance()
                 tc.assert_equal(project_status(governance_evidence_dir=None, config={"governance_evidence_dir": str(governance)}, acceptance_mode="engineering")["governance_acceptance"]["status"], "PASS", "P config-only 治理证据路径被消费")
 
@@ -32878,6 +32897,12 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 tc.assert_true(acceptance.acceptance_satisfied(rebaselined)[0],
                                "X rebaseline 后工程总门可通过")
                 dump(status_path, rebaselined)
+                production_from_engineering = project_status(acceptance_mode="production")
+                tc.assert_equal(production_from_engineering["evidence_binding"]["status"],
+                                acceptance.REUSABLE,
+                                "T production 切回不比较无关治理哈希")
+                tc.assert_true(acceptance.acceptance_satisfied(production_from_engineering)[0],
+                               "T production 切回仍只由交付与技术轴决定")
 
                 clear_governance()
                 missing_engineering, missing_ok, _ = make_runner(
@@ -32891,7 +32916,7 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 missing_production, production_ok, _ = make_runner(
                     "production", "missing-binding-production")._project_acceptance()
                 tc.assert_equal(missing_production["evidence_binding"]["status"],
-                                acceptance.EVIDENCE_MISSING, "T 普通制作缺治理证据仍标不可复用")
+                                acceptance.REUSABLE, "T 普通制作不把治理缺失当证据缺失")
                 tc.assert_true(production_ok, "T 普通制作四轴语义不因缺治理证据回归")
 
                 set_governance()

@@ -181,8 +181,8 @@ preflight → tts → timeline → render
 - **快速路径**：缺省 `production`。内容、HTML、素材变更且不改共享 Harness 时，只跑 pipeline 的 `completion_report` 六维技术审计，不触发独立 Critic/Evaluator 或安全 L3。
 - **工程路径**：修改共享脚本或配置才用 `engineering`；外部协议强制 L3 时，只在最终交付物和最终代码差异上跑一次。`acceptance_mode` 由配置或 `--acceptance-mode` 声明；验收强度 L0–L3、预检 `gate_mode` 均不是执行模式。
 - **冻结点**：共享代码审核在渲染前完成；渲染后冻结共享代码和配置，只有阻断交付的缺陷才修，并集中一次重渲。
-- **机器链**：pipeline 只负责 `preflight → tts → timeline → preview → render → verify → visual_check → postprocess → delivery → completion_report`。Critic/Evaluator、工作区体检、治理台账、provenance 与版本追溯是主智能体过程，不伪装成 pipeline step。
-- **状态与证据**：`delivery_acceptance.py` 是四轴投影唯一裁定源，输出 `temp/acceptance_status.json`。视频交付、技术验证、治理验收、业务验收分别裁定；技术 FAIL 阻断交付，治理 FAIL 不改写交付事实，业务验收只认用户明确证据。工程模式须提供工作区体检、独立复核、治理检查三件证据，并由 `evidence_binding` 绑定成片、完工报告和治理证据集合；缺证或身份失配不得判 PASS。
+- **机器链**：pipeline 只负责 `preflight → tts → timeline → preview → render → verify → visual_check → postprocess → delivery → completion_report`。Critic/Evaluator、项目域体检、治理台账、provenance 与版本追溯是主智能体过程，不伪装成 pipeline step。
+- **状态与证据**：`delivery_acceptance.py` 是四轴投影唯一裁定源，输出 `temp/acceptance_status.json`。视频交付、技术验证、治理验收、业务验收分别裁定；技术 FAIL 阻断交付，治理 FAIL 不改写交付事实，业务验收只认用户明确证据。工程模式须提供项目域体检、独立复核、治理检查三件证据，并由 `evidence_binding` 绑定成片、完工报告和治理证据集合；缺证或身份失配不得判 PASS。production 不读取、不哈希治理三件套。
 - **复用**：同一成片、同一报告、同一治理证据只投影复用，不重生成报告、不重复审计；任一输入变化即不可复用并点名变化来源。绑定只回答能否复用，不替代各轴有效性裁定；工程失配后先重审，再显式接受新基线，失败投影不得推进旧基线。治理/业务证据变化不使技术完工报告失效；缓存命中仍按当前模式重投影。验收专属字段不进入技术指纹，旧项目未声明这些字段时保持原输入表示。
 
 ### 参照文档

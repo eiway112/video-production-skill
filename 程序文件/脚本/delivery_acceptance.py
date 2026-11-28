@@ -164,19 +164,20 @@ def _file_sha256(path: Path) -> tuple[str | None, str | None]:
 
 def _build_evidence_binding(*, project: str, video_path: Path, report_path: Path,
                             governance_dir: Path, previous_status_file: Path,
-                            rebaseline: bool = False,
+                            mode: str, rebaseline: bool = False,
                             axes_ready: bool = True) -> dict[str, Any]:
     """绑定只判复用；输入变化须由上游重审后再建立新基线。"""
     video_sha, video_error = _file_sha256(video_path)
     report_sha, report_error = _file_sha256(report_path)
     governance_rows = []
     blockers = []
-    for name, filename in GOVERNANCE_FILES.items():
-        path = governance_dir / filename
-        sha256, error = _file_sha256(path)
-        governance_rows.append({"name": name, "path": str(path), "sha256": sha256})
-        if error:
-            blockers.append(f"治理证据缺失或不可读: {name}（{error}）")
+    if mode == ENGINEERING:
+        for name, filename in GOVERNANCE_FILES.items():
+            path = governance_dir / filename
+            sha256, error = _file_sha256(path)
+            governance_rows.append({"name": name, "path": str(path), "sha256": sha256})
+            if error:
+                blockers.append(f"治理证据缺失或不可读: {name}（{error}）")
     if video_error:
         blockers.append(f"成片缺失或不可读: {video_error}")
     if report_error:
@@ -299,6 +300,8 @@ def _build_evidence_binding(*, project: str, video_path: Path, report_path: Path
                 "governance_set_sha256": "治理证据集合 SHA256",
             }
             for field in BINDING_HASH_FIELDS:
+                if mode == PRODUCTION and field == "governance_set_sha256":
+                    continue
                 if accepted_baseline[field] != binding[field]:
                     blockers.append(f"{labels[field]} 已变化")
     binding.update({
@@ -548,20 +551,24 @@ def _normalize_governance_status(value: Any) -> str | None:
     return None
 
 
-def _health_verdict(data: dict[str, Any], workspace_root: Path,
-                    evidence_root: Path) -> tuple[str, list[str]]:
+def _health_verdict(data: dict[str, Any], project_root: Path) -> tuple[str, list[str]]:
     status = _normalize_governance_status(data.get("overall_status"))
     errors = []
     if status is None:
         errors.append("workspace_health.overall_status 非法")
-    if data.get("scope") != "workspace":
-        errors.append("workspace_health.scope 必须为 workspace")
+    if data.get("scope") != "project":
+        errors.append("workspace_health.scope 必须为 project")
     subject = data.get("subject")
     if (not isinstance(subject, str)
-            or _normalized_path(subject, evidence_root) != workspace_root):
-        errors.append("workspace_health.subject 不是当前工程工作区")
-    if _normalize_governance_status(data.get("workspace_status")) != status:
-        errors.append("workspace_status 与 overall_status 不一致")
+            or subject != project_root.name
+            or Path(subject).name != subject):
+        errors.append("workspace_health.subject 不是当前项目目录名")
+    if not isinstance(data.get("dependencies"), list):
+        errors.append("workspace_health.dependencies 缺失或非法")
+    if data.get("workspace_status") is not None:
+        errors.append("workspace_health.workspace_status 必须为 null")
+    if _normalize_governance_status(data.get("project_status")) != status:
+        errors.append("project_status 与 overall_status 不一致")
     if type(data.get("can_proceed")) is not bool:
         errors.append("workspace_health.can_proceed 缺失或非法")
     elif status is not None and data["can_proceed"] != (status != "FAIL"):
@@ -628,7 +635,18 @@ def _checks_verdict(data: dict[str, Any],
 
 
 def _project_governance(mode: str, evidence_dir: Path,
-                        evidence_root: Path, workspace_root: Path) -> dict[str, Any]:
+                        evidence_root: Path, project_root: Path) -> dict[str, Any]:
+    if mode == PRODUCTION:
+        return {
+            "status": NOT_RUN,
+            "can_proceed": True,
+            "source": "acceptance_mode",
+            "evidence": [],
+            "missing_required": [],
+            "missing_evidence": [],
+            "errors": [],
+            "evidence_status": {},
+        }
     paths = {name: evidence_dir / filename for name, filename in GOVERNANCE_FILES.items()}
     present = {name: path.exists() for name, path in paths.items()}
     base = {
@@ -651,8 +669,7 @@ def _project_governance(mode: str, evidence_dir: Path,
         if health_error:
             base["errors"].append(f"workspace_health: {health_error}")
         else:
-            verdict, errors = _health_verdict(
-                health, workspace_root, evidence_root)
+            verdict, errors = _health_verdict(health, project_root)
             verdicts["workspace_health"] = verdict
             base["errors"].extend(errors)
     if present["independent_review"]:
@@ -771,7 +788,7 @@ def build_acceptance_status(*, registry_file: str | Path,
                             governance_evidence_dir: str | Path | None = None,
                             business_acceptance_file: str | Path | None = None,
                             root: str | Path = EVIDENCE_ROOT,
-                            workspace_root: str | Path | None = None,
+                            project_root: str | Path | None = None,
                             previous_status_file: str | Path | None = None,
                             rebaseline: bool = False) -> dict[str, Any]:
     _validate_project(project)
@@ -779,8 +796,8 @@ def build_acceptance_status(*, registry_file: str | Path,
     if rebaseline and mode != ENGINEERING:
         raise AcceptanceInputError("--rebaseline 仅用于 engineering")
     root_path = Path(root)
-    workspace_path = _normalized_path(
-        workspace_root if workspace_root is not None else root_path.parent,
+    project_path = _normalized_path(
+        project_root if project_root is not None else root_path,
         root_path)
     registry_path = _required_path(registry_file, "registry_file", root_path)
     video_path = _required_path(video_file, "video_file", root_path)
@@ -797,7 +814,7 @@ def build_acceptance_status(*, registry_file: str | Path,
     delivery = _project_delivery(registry_path, video_path, project)
     technical = _project_technical(report_path, project, video_path, root_path)
     governance = _project_governance(
-        mode, governance_dir, root_path, workspace_path)
+        mode, governance_dir, root_path, project_path)
     business = _project_business(
         business_path, project, video_path, delivery, root_path)
     axes_ready = (
@@ -822,7 +839,7 @@ def build_acceptance_status(*, registry_file: str | Path,
         "evidence_binding": _build_evidence_binding(
             project=project, video_path=video_path, report_path=report_path,
             governance_dir=governance_dir, previous_status_file=previous_status,
-            rebaseline=rebaseline, axes_ready=axes_ready),
+            mode=mode, rebaseline=rebaseline, axes_ready=axes_ready),
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 

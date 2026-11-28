@@ -115,7 +115,7 @@ python config_manager.py
 ## 技术审计与验收出口
 
 - 六维技术审计只在 `completion_report` 步执行；定义与失败处置以完工报告工具和 `agents.md`「执行模式与四轴验收」为单源指针。
-- 工程验收的独立复核与治理证据由主智能体在 pipeline 外提供；治理 FAIL 不回写视频交付事实，技术 FAIL 不得登记交付。
+- 工程验收的独立复核与治理证据由主智能体在 pipeline 外提供；项目任务只消费 `scope=project` 的体检报告，production 不读取治理三件套。治理 FAIL 不回写视频交付事实，技术 FAIL 不得登记交付。
 - 同一证据只验收一次；变化、缺失和复用边界由 `delivery_acceptance.py` 的 `evidence_binding` 裁定。
 
 ## 常见陷阱

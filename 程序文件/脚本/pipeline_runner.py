@@ -4396,7 +4396,7 @@ Examples:
                         help="Execution mode: production keeps technical gates only; "
                              "engineering also requires governance evidence.")
     parser.add_argument("--governance-evidence-dir",
-                        help="Directory containing workspace_health.json, "
+                        help="Directory containing project-scoped workspace_health.json, "
                              "independent_review.json and governance_checks.json.")
     parser.add_argument("--business-acceptance-file",
                         help="Explicit user acceptance evidence JSON; absence stays "
