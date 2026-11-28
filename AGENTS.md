@@ -177,11 +177,13 @@ preflight → tts → timeline → render
 
 ### 执行模式与四轴验收
 
-- **模式**：缺省 `production`（普通制作）；修改共享工作流代码、用户明确要求 L3 或证明机制进化时用 `engineering`（工程验收）。由 `acceptance_mode` 声明，或传 `--acceptance-mode`。**验收强度 L0–L3 与预检 `gate_mode` 均不是执行模式**，不得另造别名。
-- **机器链**：pipeline 只负责 `preflight → tts → timeline → preview → render → verify → visual_check → postprocess → delivery → completion_report`。普通制作的本地六维技术审计由 pipeline 的 `completion_report` 步实际执行；Agent Critic/Evaluator、`workspace_health`、治理台账、provenance 与版本追溯是主智能体过程，不伪装成 pipeline step。
-- **状态**：`delivery_acceptance.py` 是四轴投影的唯一裁定源，输出 `temp/acceptance_status.json`。视频交付、技术验证、治理验收、业务验收分别裁定，不合并成第五个总状态；技术 FAIL 阻断交付，治理 FAIL 不改写交付登记与 `delivered_at`，业务验收只认用户明确证据。字段、优先级与模式出口以该脚本为准，报告、日志和本文件不另写判定副本。
-- **证据**：工程模式须在 `governance_evidence_dir` 提供工作区体检、独立复核与治理检查三件证据；业务确认走 `business_acceptance_file` 并绑定当前项目与视频。缺证据不得靠 AI 自评补成通过。
-- **缓存**：治理/业务证据变化只触发重投影，不使技术完工报告失效；缓存命中仍按当前模式重新验收。首次给旧 config 增加验收字段会改变技术配置指纹表示，可能触发一次上游重跑；未声明这些字段的旧项目保持原输入表示。
+- **任务单元**：一个用户授权目标只验收一次；代码提交、文档回填、Release 附件不各自重启 L3。最终交付物与最终代码差异构成唯一验收面。
+- **快速路径**：缺省 `production`。内容、HTML、素材变更且不改共享 Harness 时，只跑 pipeline 的 `completion_report` 六维技术审计，不触发独立 Critic/Evaluator 或安全 L3。
+- **工程路径**：修改共享脚本或配置才用 `engineering`；外部协议强制 L3 时，只在最终交付物和最终代码差异上跑一次。`acceptance_mode` 由配置或 `--acceptance-mode` 声明；验收强度 L0–L3、预检 `gate_mode` 均不是执行模式。
+- **冻结点**：共享代码审核在渲染前完成；渲染后冻结共享代码和配置，只有阻断交付的缺陷才修，并集中一次重渲。
+- **机器链**：pipeline 只负责 `preflight → tts → timeline → preview → render → verify → visual_check → postprocess → delivery → completion_report`。Critic/Evaluator、工作区体检、治理台账、provenance 与版本追溯是主智能体过程，不伪装成 pipeline step。
+- **状态与证据**：`delivery_acceptance.py` 是四轴投影唯一裁定源，输出 `temp/acceptance_status.json`。视频交付、技术验证、治理验收、业务验收分别裁定；技术 FAIL 阻断交付，治理 FAIL 不改写交付事实，业务验收只认用户明确证据。工程模式须提供工作区体检、独立复核、治理检查三件证据，并由 `evidence_binding` 绑定成片、完工报告和治理证据集合；缺证或身份失配不得判 PASS。
+- **复用**：同一成片、同一报告、同一治理证据只投影复用，不重生成报告、不重复审计；任一输入变化即不可复用并点名变化来源。绑定只回答能否复用，不替代各轴有效性裁定；工程失配后先重审，再显式接受新基线，失败投影不得推进旧基线。治理/业务证据变化不使技术完工报告失效；缓存命中仍按当前模式重投影。验收专属字段不进入技术指纹，旧项目未声明这些字段时保持原输入表示。
 
 ### 参照文档
 

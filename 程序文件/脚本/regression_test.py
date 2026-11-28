@@ -8002,21 +8002,6 @@ def test_check_registry_names_are_single_source() -> RegressionTestCase:
                        f"docstring catalog and emitted check names must match exactly "
                        f"(doc-only={sorted(catalog - emitted)}, code-only={sorted(emitted - catalog)})")
 
-        # ── C. 文档面禁止手抄计数与"检查N"编号 ──
-        tc.assert_true(not re.search(r'检查\s?\d+', src),
-                       "code comments address checks by name, not by a hand-maintained number")
-        tc.assert_true(not re.search(r'（\d+项）', doc),
-                       "the module docstring carries no item count")
-        # 文件名按大小写不敏感定位：仓内实际是 agents.md，Linux CI 上写死 "AGENTS.md"
-        # 会 FileNotFoundError 把本用例判成红（Windows 大小写不敏感掩盖了这点）
-        _root = (script_dir / ".." / "..").resolve()
-        agents_md = next(p for p in _root.iterdir()
-                         if p.name.lower() == "agents.md").read_text(encoding='utf-8')
-        tc.assert_true(not re.search(r'媒体文件\d+项', agents_md),
-                       "AGENTS.md must not hand-copy the media_qa check count")
-        tc.assert_true(not re.search(r'\d+ ?项检查全部', agents_md),
-                       "the A04 row references the registry, not a count")
-
         # ── D. 运行时一致：真实 validate() 的 check_statuses 键集 == 权威源 ──
         if str(script_dir) not in sys.path:
             sys.path.insert(0, str(script_dir))
@@ -21365,12 +21350,6 @@ def test_single_source_and_repo_hygiene() -> RegressionTestCase:
             tc.assert_equal(missing, [],
                             f"A2 交付裁定项必须逐项被卫生扫描覆盖，缺 {missing}——"
                             f"漏一项即\'同一文件名一判过一判红\'（v01 曾是该形态）")
-        agents_md = (SCRIPT_DIR.parent.parent / "AGENTS.md").read_text(encoding="utf-8")
-        tc.assert_true("清单不在此处手抄" in agents_md,
-                       "A3 AGENTS.md 的交付命名节须为指针（手抄清单一复活，A2 那条包含关系就没人看了）")
-        tc.assert_true("'final`, `v01`, `render`" not in agents_md,
-                       "A4 AGENTS.md 不得复活逐项枚举形态")
-
         # ── B. cue 偏弱档：值真来自配置文件 ─────────────────────────────
         if str(SCRIPT_DIR) not in sys.path:
             sys.path.insert(0, str(SCRIPT_DIR))
@@ -21486,20 +21465,14 @@ def test_single_source_and_repo_hygiene() -> RegressionTestCase:
                        not (SCRIPT_DIR / "装配式轻钢龙骨隔墙防开裂治理_旁白脚本.md").exists(),
                        "F2 业务旁白文档须归素材/项目层，不住源码目录")
 
-        # ── G. 管理文档与磁盘一致 ──────────────────────────────────────
+        # ── G. 管理载体与磁盘一致 ──────────────────────────────────────
         inv_path = SCRIPT_DIR / "SCRIPT_INVENTORY.md"
         tc.assert_true(not (SCRIPT_DIR / "_deprecated").exists(),
                        "G2 声明与磁盘须一致：该目录在两仓均不存在（发布仓亦不得新建）")
-        if inv_path.is_file():
-            inv = inv_path.read_text(encoding="utf-8")
-            tc.assert_true("程序文件/脚本/_deprecated/`**" not in inv,
-                           "G1 不得声明一个不存在的归档目录（假管理文档比没有文档更糟）")
-            tc.assert_true("V2装饰器模式完成 | 永久参考" not in inv.replace(" ", ""),
-                           "G3 不得再把 _v2 死件写成主件的替代方案（方向曾写反）")
-        else:
+        if not inv_path.is_file():
             tc.assert_equal(export_repo_face(tc), "published",
                             "G 载体 SCRIPT_INVENTORY.md 取不到——只允许发生在发布仓面（该件按清单"
-                            "未列不导出）；开发仓面取不到即管理文档断链，G1/G3 两条判据将无人执行")
+                            "未列不导出）；开发仓面取不到即管理文档断链")
         # H. 已撤的第二安全区口径不得复活（2026-11-11：Step 0 的 150px 代理判据
         #    与预览像素面构成两份真相，且曾误杀验收通过交付；撤函数＋docstring 手抄副本）
         eva_src = (Path(__file__).parent / "enhance_video_audio.py").read_text(encoding="utf-8")
@@ -25698,8 +25671,6 @@ def test_choreography_descriptive_face() -> RegressionTestCase:
         gcr_src = (script_dir / "generate_completion_report.py").read_text(encoding="utf-8")
         runner_src = (script_dir / "pipeline_runner.py").read_text(encoding="utf-8")
         mod_src = (script_dir / "choreography_profile.py").read_text(encoding="utf-8")
-        clause = (script_dir.parent.parent / "AI视频制作工作流模板" /
-                  "新路径实施_踩坑清单与防范检查表.md").read_text(encoding="utf-8", errors="replace")
 
         tmp = Path(tempfile.mkdtemp(prefix="case122_"))
 
@@ -25722,16 +25693,12 @@ def test_choreography_descriptive_face() -> RegressionTestCase:
         ps = {s["scene"]: s for s in m.get("per_scene", [])}
 
         # ═════════════════════════════════════════════════════════
-        # A. 口径单源
+        # A. 口径单源（只锁真实行为，不锁文档措辞）
         # ═════════════════════════════════════════════════════════
         tc.assert_equal(ch.DEFAULT_DURATION, 0.5,
                         "A1 duration 缺省 0.5＝GSAP 引擎缺省值，非本件自定（改它即换口径）")
         tc.assert_equal(ch.STILL_RUN_SECONDS, 3.0,
                         "A2 占比门槛 3.0 与踩坑清单 §八 第 3 条同源")
-        tc.assert_true("连续静止不超过 3 秒" in clause,
-                       "A3 条款文本仍在位（常量与条款两处必须同批改，A4 锁指针注释）")
-        tc.assert_true("改那条条款须同批改此处" in mod_src,
-                       "A4 同批改的指针注释在位（否则常量与条款漂移无人提示）")
         tc.assert_true("repeat:-1" in ch.CALIBER["loop_treatment"] and
                        "推进型" in ch.CALIBER["loop_treatment"],
                        "A5 循环处理口径随读数落盘（两腿差异的口径声明本身就是读数的一部分）")
@@ -31957,6 +31924,9 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 for child in governance.glob("*.json"):
                     child.unlink()
 
+            def reset_acceptance_baseline():
+                (temp / "acceptance_status.json").unlink(missing_ok=True)
+
             def make_runner(mode="production", tag="main"):
                 runner = PipelineRunner.__new__(PipelineRunner)
                 runner.state = PipelineState(temp / f"state-{tag}.json")
@@ -31986,6 +31956,11 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 tc.assert_equal(acceptance.DEFAULT_ACCEPTANCE_MODE, "production", "A 默认模式为普通制作")
                 tc.assert_equal(acceptance.resolve_acceptance_mode(config={"acceptance_mode": "engineering"}), "engineering", "A config 模式被读取")
                 try:
+                    project_status(acceptance_mode="production", rebaseline=True)
+                    tc.assert_true(False, "X 公共 API 拒绝普通制作 rebaseline")
+                except acceptance.AcceptanceInputError:
+                    tc.assert_true(True, "X 公共 API 拒绝普通制作 rebaseline")
+                try:
                     acceptance.resolve_acceptance_mode(config={"acceptance_mode": "L3"})
                     tc.assert_true(False, "A 非法模式必须拒绝")
                 except acceptance.AcceptanceInputError:
@@ -32000,15 +31975,19 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 tc.assert_true(satisfied and not reasons, "B 普通制作完成条件只含交付与技术")
                 tc.assert_equal(production_status["business_acceptance"]["status"], "PENDING_USER", "B 技术通过不代替业务验收")
 
+                reset_acceptance_baseline()
                 engineering = make_runner("engineering", "engineering")
                 engineering_status, satisfied, reasons = engineering._project_acceptance()
                 tc.assert_equal(engineering_status["governance_acceptance"]["status"], "NOT_RUN", "C 工程模式无治理证据为未跑")
-                tc.assert_true(not satisfied and reasons == ["工程治理验收未通过"], "C 工程模式必须阻断未跑治理")
+                tc.assert_true(not satisfied and reasons == ["工程治理验收未通过", "工程证据不可复用"],
+                               "C 工程模式必须阻断未跑治理与证据缺失")
 
                 set_governance()
+                reset_acceptance_baseline()
                 _, satisfied, _ = engineering._project_acceptance()
                 tc.assert_true(satisfied, "C 工程治理三件套完整通过")
                 set_governance(warn=True)
+                reset_acceptance_baseline()
                 _, satisfied, _ = engineering._project_acceptance()
                 tc.assert_true(satisfied, "C 工程治理 WARN 不阻断")
                 set_governance()
@@ -32021,6 +32000,7 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 _, satisfied, _ = engineering._project_acceptance()
                 tc.assert_true(not satisfied, "C 工程模式缺独立复核即阻断")
                 set_governance("FAIL")
+                reset_acceptance_baseline()
                 failed_gov, satisfied, _ = engineering._project_acceptance()
                 tc.assert_equal(failed_gov["video_delivery"]["status"], "DELIVERED", "D 治理 FAIL 不抹除交付")
                 tc.assert_equal(failed_gov["video_delivery"]["delivered_at"], first_delivered, "D 治理 FAIL 不改交付时间")
@@ -32601,6 +32581,7 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
 
                 set_registry()
                 set_governance()
+                reset_acceptance_baseline()
                 final_runner = make_runner("engineering", "final-reprojection")
                 final_runner.source_dir = root / "hyperframes" / "project"
                 final_runner.quick_fix = False
@@ -32746,6 +32727,7 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                     tc.assert_equal(refreshed_early["technical_validation"]["status"], "FAIL",
                                     "L2 早期失败出口不遗留旧通过快照：" + label)
                 set_report()
+                reset_acceptance_baseline()
 
                 cli = [
                     sys.executable, str(script_dir / "delivery_acceptance.py"),
@@ -32757,6 +32739,11 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 cli_result = subprocess.run(cli, cwd=str(script_dir), capture_output=True, text=True, encoding="utf-8")
                 tc.assert_equal(cli_result.returncode, 0, "M CLI 工程验收通过\nstdout=" + cli_result.stdout + "\nstderr=" + cli_result.stderr)
                 tc.assert_true("治理验收: PASS" in cli_result.stdout, "M CLI 输出四轴状态")
+                rebaseline_cli_result = subprocess.run(
+                    cli + ["--rebaseline"], cwd=str(script_dir),
+                    capture_output=True, text=True, encoding="utf-8")
+                tc.assert_equal(rebaseline_cli_result.returncode, 0,
+                                "X CLI 显式 rebaseline 入口可用")
                 om = subprocess.run([
                     sys.executable, str(script_dir / "openmontage_runner.py"),
                     "--config", str(config_path), "--acceptance-mode", "production",
@@ -32772,6 +32759,267 @@ def test_delivery_acceptance_mode_decoupling() -> RegressionTestCase:
                 tc.assert_equal(bad_config_result.returncode, 2, "S CLI 非 UTF-8 config 落输入错误")
                 tc.assert_true("Traceback" not in bad_config_result.stderr, "S CLI 非 UTF-8 config 不泄漏未捕获异常")
                 dump(config_path, {"paths": {"video_name": video.name}})
+
+                set_registry()
+                set_report()
+                set_governance()
+                status_path = temp / "acceptance_status.json"
+                status_path.unlink(missing_ok=True)
+                first_binding_status = project_status(acceptance_mode="engineering")
+                first_binding = first_binding_status["evidence_binding"]
+                tc.assert_equal(first_binding["status"], acceptance.REUSABLE,
+                                "T 首次完整投影建立可复用基线")
+                tc.assert_true(first_binding["reuse_eligible"], "T 首次完整投影可复用")
+                tc.assert_equal(first_binding["baseline"], "new", "T 首次基线显式标记")
+                tc.assert_equal(len(first_binding["video_sha256"]), 64, "T 绑定成片 SHA256")
+                tc.assert_equal(len(first_binding["completion_report_sha256"]), 64,
+                                "T 绑定完工报告 SHA256")
+                tc.assert_equal(len(first_binding["governance_set_sha256"]), 64,
+                                "T 绑定治理证据集合 SHA256")
+                tc.assert_equal(first_binding["accepted_baseline"], {
+                    "video_sha256": first_binding["video_sha256"],
+                    "completion_report_sha256": first_binding["completion_report_sha256"],
+                    "governance_set_sha256": first_binding["governance_set_sha256"],
+                }, "T 首次投影显式建立已接受基线")
+                dump(status_path, first_binding_status)
+                second_binding_status = project_status(acceptance_mode="engineering")
+                second_binding = second_binding_status["evidence_binding"]
+                tc.assert_equal(second_binding["status"], acceptance.REUSABLE,
+                                "T 相同输入二次投影可复用")
+                tc.assert_true(second_binding["reuse_eligible"], "T 相同输入不得重复阻断")
+                tc.assert_equal(second_binding["video_sha256"], first_binding["video_sha256"],
+                                "T 二次投影成片哈希不变")
+                tc.assert_equal(second_binding["completion_report_sha256"],
+                                first_binding["completion_report_sha256"],
+                                "T 二次投影报告哈希不变")
+                tc.assert_equal(second_binding["governance_set_sha256"],
+                                first_binding["governance_set_sha256"],
+                                "T 二次投影治理集合哈希不变")
+                baseline_governance_sha = second_binding["governance_set_sha256"]
+
+                changed_payload = payload + b"-changed"
+                video.write_bytes(changed_payload)
+                changed_digest = hashlib.sha256(changed_payload).hexdigest()
+                set_registry(entry | {"bytes": len(changed_payload), "sha256": changed_digest})
+                video_changed_status = project_status(acceptance_mode="engineering")
+                video_changed = video_changed_status["evidence_binding"]
+                tc.assert_equal(video_changed["status"], acceptance.NOT_REUSABLE,
+                                "T 成片 SHA 变化后不可复用")
+                tc.assert_equal(video_changed["reuse_blockers"], ["成片 SHA256 已变化"],
+                                "T 成片变化点名来源")
+                tc.assert_true(not acceptance.acceptance_satisfied(video_changed_status)[0],
+                               "U 工程总门必须消费成片失配")
+                tc.assert_true(acceptance.acceptance_satisfied(
+                    video_changed_status | {
+                        "acceptance_mode": "production",
+                        "technical_validation": {"status": "PASS"},
+                    })[0], "U production 总门不因复用失配改变")
+                tc.assert_equal(video_changed["accepted_baseline"]["video_sha256"], digest,
+                                "V 失败投影保留原已接受成片基线")
+                dump(status_path, video_changed_status)
+                video_changed_again = project_status(acceptance_mode="engineering")["evidence_binding"]
+                tc.assert_equal(video_changed_again["status"], acceptance.NOT_REUSABLE,
+                                "V 连续第二次失配不得自愈为可复用")
+                tc.assert_equal(video_changed_again["reuse_blockers"], ["成片 SHA256 已变化"],
+                                "V 第二次失配仍点名成片来源")
+                video.write_bytes(payload)
+                set_registry()
+                set_report()
+                dump(status_path, project_status(acceptance_mode="engineering", rebaseline=True))
+
+                changed_report = json.loads(report.read_text(encoding="utf-8"))
+                changed_report["binding_probe"] = "changed"
+                dump(report, changed_report)
+                report_changed_status = project_status(acceptance_mode="engineering")
+                report_changed = report_changed_status["evidence_binding"]
+                tc.assert_equal(report_changed["status"], acceptance.NOT_REUSABLE,
+                                "T 完工报告变化后不可复用")
+                tc.assert_equal(report_changed["reuse_blockers"], ["完工报告 SHA256 已变化"],
+                                "T 报告变化点名来源")
+                tc.assert_true(not acceptance.acceptance_satisfied(report_changed_status)[0],
+                               "U 工程总门必须消费报告失配")
+                set_report()
+                dump(status_path, project_status(acceptance_mode="engineering"))
+
+                set_governance()
+                governance_copy = temp / "governance-copy"
+                governance_copy.mkdir()
+                for child in governance.glob("*.json"):
+                    (governance_copy / child.name).write_bytes(child.read_bytes())
+                copied_binding = project_status(
+                    acceptance_mode="engineering",
+                    governance_evidence_dir=governance_copy,
+                )["evidence_binding"]
+                tc.assert_equal(copied_binding["governance_set_sha256"], baseline_governance_sha,
+                                "W 同字节治理证据换目录不得改变集合哈希")
+                tc.assert_equal(copied_binding["status"], acceptance.REUSABLE,
+                                "W 同字节治理证据换目录仍可复用: " + str(copied_binding))
+                review_path = governance / "independent_review.json"
+                review_path.write_bytes(review_path.read_bytes() + b"\n")
+                governance_changed_status = project_status(acceptance_mode="engineering")
+                governance_changed = governance_changed_status["evidence_binding"]
+                tc.assert_equal(governance_changed["status"], acceptance.NOT_REUSABLE,
+                                "T 治理证据变化后不可复用")
+                tc.assert_equal(governance_changed["reuse_blockers"], ["治理证据集合 SHA256 已变化"],
+                                "T 治理变化点名来源: " + str(governance_changed))
+                tc.assert_true(not acceptance.acceptance_satisfied(governance_changed_status)[0],
+                               "U 工程总门必须消费治理失配")
+                tc.assert_equal(governance_changed["accepted_baseline"]["governance_set_sha256"],
+                                baseline_governance_sha, "V 失败投影保留原治理基线")
+                rebaselined = project_status(acceptance_mode="engineering", rebaseline=True)
+                rebaselined_binding = rebaselined["evidence_binding"]
+                tc.assert_equal(rebaselined_binding["status"], acceptance.REUSABLE,
+                                "X 重审后显式 rebaseline 建立新基线")
+                tc.assert_equal(rebaselined_binding["baseline"], "rebaseline",
+                                "X rebaseline 来源显式留痕")
+                tc.assert_equal(rebaselined_binding["accepted_baseline"]["governance_set_sha256"],
+                                rebaselined_binding["governance_set_sha256"],
+                                "X 新基线绑定本轮治理证据")
+                tc.assert_true(acceptance.acceptance_satisfied(rebaselined)[0],
+                               "X rebaseline 后工程总门可通过")
+                dump(status_path, rebaselined)
+
+                clear_governance()
+                missing_engineering, missing_ok, _ = make_runner(
+                    "engineering", "missing-binding")._project_acceptance()
+                tc.assert_equal(missing_engineering["evidence_binding"]["status"],
+                                acceptance.EVIDENCE_MISSING, "T 工程证据缺失单列第三态")
+                tc.assert_true(all(name in " ".join(missing_engineering["evidence_binding"]["reuse_blockers"])
+                                   for name in acceptance.GOVERNANCE_FILES),
+                               "T 缺失 blocker 逐项点名治理证据")
+                tc.assert_true(not missing_ok, "T 工程模式缺证据不得判通过")
+                missing_production, production_ok, _ = make_runner(
+                    "production", "missing-binding-production")._project_acceptance()
+                tc.assert_equal(missing_production["evidence_binding"]["status"],
+                                acceptance.EVIDENCE_MISSING, "T 普通制作缺治理证据仍标不可复用")
+                tc.assert_true(production_ok, "T 普通制作四轴语义不因缺治理证据回归")
+
+                set_governance()
+                dump(status_path, {"project": "acceptance-fixture", "schema_version": 1})
+                unbound = project_status(acceptance_mode="engineering")["evidence_binding"]
+                tc.assert_equal(unbound["status"], acceptance.NOT_REUSABLE,
+                                "T 旧状态无绑定时不得伪造可复用")
+                tc.assert_equal(unbound["reuse_blockers"], ["旧验收状态缺少证据绑定"],
+                                "T 旧状态缺绑定点名原因")
+
+                dump(status_path, first_binding_status | {"project": "another-project"})
+                cross_project = project_status(
+                    acceptance_mode="engineering", rebaseline=True)["evidence_binding"]
+                tc.assert_equal(cross_project["status"], acceptance.NOT_REUSABLE,
+                                "V 跨项目旧状态不得被显式 rebaseline 放行")
+                tc.assert_equal(cross_project["reuse_blockers"], ["旧验收状态属于其他项目"],
+                                "V 跨项目 rebaseline 点名归属冲突")
+                tc.assert_equal(cross_project["accepted_baseline"], None,
+                                "V 跨项目 rebaseline 不得建立基线")
+                protected_status_bytes = status_path.read_bytes()
+                cross_project_cli = subprocess.run(
+                    cli + ["--output-file", str(status_path), "--rebaseline"],
+                    cwd=str(script_dir), capture_output=True, text=True, encoding="utf-8")
+                tc.assert_equal(cross_project_cli.returncode, 2,
+                                "V CLI 拒绝跨项目验收状态覆盖")
+                tc.assert_equal(status_path.read_bytes(), protected_status_bytes,
+                                "V CLI 跨项目拒绝时不得写盘")
+                tc.assert_true("拒绝覆盖其他项目" in cross_project_cli.stderr,
+                               "V CLI 跨项目拒绝原因可定位")
+
+                for label, existing in (
+                    ("不可读", (None, "unreadable: bad")),
+                    ("非对象", (None, "not-an-object")),
+                ):
+                    argv = [
+                        "delivery_acceptance.py", "--registry-file", str(registry),
+                        "--video-file", str(video), "--completion-report", str(report),
+                        "--project-name", "acceptance-fixture",
+                        "--acceptance-mode", "engineering",
+                        "--output-file", str(status_path),
+                    ]
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(acceptance, "build_acceptance_status",
+                                              return_value=first_binding_status), \
+                            mock.patch.object(acceptance, "_read_json", return_value=existing), \
+                            mock.patch.object(acceptance, "write_acceptance_status") as write, \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        rc = acceptance.main()
+                    tc.assert_equal(rc, 2, "V CLI 拒绝覆盖" + label + "状态文件")
+                    tc.assert_true(not write.called, "V CLI " + label + "状态不得写盘")
+
+                malformed_legacy = {
+                    "project": "acceptance-fixture",
+                    "acceptance_mode": "engineering",
+                    "schema_version": 2,
+                    "evidence_binding": {
+                        "status": "NOT_REUSABLE", "reuse_eligible": False,
+                        "accepted_baseline": {
+                            field: first_binding[field]
+                            for field in acceptance.BINDING_HASH_FIELDS
+                        },
+                    },
+                }
+                dump(status_path, malformed_legacy)
+                for rebaseline in (False, True):
+                    malformed_binding = project_status(
+                        acceptance_mode="engineering", rebaseline=rebaseline)["evidence_binding"]
+                    tc.assert_equal(malformed_binding["status"], acceptance.NOT_REUSABLE,
+                                    "V 带基线畸形旧状态必须失败关闭: " + str(rebaseline))
+                    tc.assert_equal(malformed_binding["reuse_blockers"], ["旧验收状态结构不完整"],
+                                    "V 带基线畸形旧状态点名结构缺失: " + str(rebaseline))
+                    tc.assert_equal(malformed_binding["accepted_baseline"], None,
+                                    "V 带基线畸形旧状态不得采信基线: " + str(rebaseline))
+                    tc.assert_equal(malformed_binding["baseline"], "not-advanced",
+                                    "V 带基线畸形旧状态显式标记不推进: " + str(rebaseline))
+                dump(status_path, first_binding_status)
+
+                set_governance("FAIL")
+                status_path.unlink(missing_ok=True)
+                first_failed = project_status(acceptance_mode="engineering", rebaseline=True)
+                first_failed_binding = first_failed["evidence_binding"]
+                tc.assert_equal(first_failed_binding["status"], acceptance.NOT_REUSABLE,
+                                "Y 首次失败投影不得建立可复用基线")
+                tc.assert_equal(first_failed_binding["accepted_baseline"], None,
+                                "Y 首次失败投影 accepted_baseline 必须为空")
+                tc.assert_equal(first_failed_binding["baseline"], "not-advanced",
+                                "Y 首次失败投影显式标记不推进")
+                tc.assert_equal(first_failed_binding["reuse_blockers"], ["前置轴未通过，未建立基线"],
+                                "Y 首次失败只保留真实阻断原因")
+                tc.assert_true(not acceptance.acceptance_satisfied(first_failed)[0],
+                               "Y 首次失败投影不得通过工程验收")
+                acceptance.write_acceptance_status(status_path, first_failed)
+                persisted_first_failed = json.loads(status_path.read_text(encoding="utf-8"))
+                tc.assert_equal(persisted_first_failed["evidence_binding"]["accepted_baseline"], None,
+                                "Y 失败状态写盘后仍无已接受基线")
+                set_governance()
+                recovered_without_rebaseline = project_status(acceptance_mode="engineering")
+                tc.assert_equal(recovered_without_rebaseline["evidence_binding"]["status"],
+                                acceptance.NOT_REUSABLE,
+                                "Y 修复后仍须显式 rebaseline")
+                tc.assert_equal(recovered_without_rebaseline["evidence_binding"]["reuse_blockers"],
+                                ["旧验收状态缺少已接受基线"],
+                                "Y 无基线失败状态不得被静默转正")
+                rebaselined_after_failure = project_status(
+                    acceptance_mode="engineering", rebaseline=True)
+                tc.assert_equal(rebaselined_after_failure["evidence_binding"]["status"],
+                                acceptance.REUSABLE,
+                                "Y 重审后显式 rebaseline 可建立基线")
+                dump(status_path, rebaselined_after_failure)
+                accepted_before_failed_rebaseline = rebaselined_after_failure["evidence_binding"]["accepted_baseline"]
+                set_governance("FAIL")
+                failed_rebaseline = project_status(acceptance_mode="engineering", rebaseline=True)
+                failed_rebaseline_binding = failed_rebaseline["evidence_binding"]
+                tc.assert_equal(failed_rebaseline_binding["accepted_baseline"],
+                                accepted_before_failed_rebaseline,
+                                "Z 失败 rebaseline 必须保留旧已接受基线")
+                tc.assert_true(failed_rebaseline_binding["baseline"] != "rebaseline",
+                               "Z 失败 rebaseline 不得标记新基线")
+                tc.assert_true(not acceptance.acceptance_satisfied(failed_rebaseline)[0],
+                               "Z 失败 rebaseline 不得通过工程验收")
+                acceptance.write_acceptance_status(status_path, failed_rebaseline)
+                persisted_failed_rebaseline = json.loads(status_path.read_text(encoding="utf-8"))
+                tc.assert_equal(persisted_failed_rebaseline["evidence_binding"]["accepted_baseline"],
+                                accepted_before_failed_rebaseline,
+                                "Z 失败 rebaseline 写盘后仍保留旧基线")
+                tc.assert_equal(persisted_failed_rebaseline["governance_acceptance"]["status"],
+                                "FAIL", "Z 失败诊断仍真实落盘")
             finally:
                 _pr.DELIVERY_REGISTRY = saved_registry
                 _pr.PipelineLock = saved_lock

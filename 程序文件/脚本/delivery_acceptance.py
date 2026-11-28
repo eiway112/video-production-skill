@@ -30,6 +30,13 @@ PENDING_USER = "PENDING_USER"
 USER_ACCEPTED = "USER_ACCEPTED"
 NOT_RUN = "NOT_RUN"
 
+REUSABLE = "REUSABLE"
+NOT_REUSABLE = "NOT_REUSABLE"
+EVIDENCE_MISSING = "EVIDENCE_MISSING"
+BINDING_HASH_FIELDS = (
+    "video_sha256", "completion_report_sha256", "governance_set_sha256",
+)
+
 GOVERNANCE_FILES = {
     "workspace_health": "workspace_health.json",
     "independent_review": "independent_review.json",
@@ -122,6 +129,187 @@ def _parse_timestamp(value: str) -> datetime | None:
 
 def _valid_sha256(value: Any) -> bool:
     return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
+def _acceptance_axes_complete(status: dict[str, Any]) -> bool:
+    return (
+        status.get("acceptance_mode") in ACCEPTANCE_MODES
+        and all(
+            isinstance(status.get(name), dict)
+            and isinstance(status[name].get("status"), str)
+            for name in (
+                "video_delivery", "technical_validation",
+                "governance_acceptance", "business_acceptance",
+            )
+        )
+    )
+
+
+def _file_sha256(path: Path) -> tuple[str | None, str | None]:
+    try:
+        before = path.stat()
+        if not path.is_file():
+            return None, "不是文件"
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+    except OSError as exc:
+        return None, f"不可读: {exc}"
+    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        return None, "读取期间发生变化"
+    return digest.hexdigest(), None
+
+
+def _build_evidence_binding(*, project: str, video_path: Path, report_path: Path,
+                            governance_dir: Path, previous_status_file: Path,
+                            rebaseline: bool = False,
+                            axes_ready: bool = True) -> dict[str, Any]:
+    """绑定只判复用；输入变化须由上游重审后再建立新基线。"""
+    video_sha, video_error = _file_sha256(video_path)
+    report_sha, report_error = _file_sha256(report_path)
+    governance_rows = []
+    blockers = []
+    for name, filename in GOVERNANCE_FILES.items():
+        path = governance_dir / filename
+        sha256, error = _file_sha256(path)
+        governance_rows.append({"name": name, "path": str(path), "sha256": sha256})
+        if error:
+            blockers.append(f"治理证据缺失或不可读: {name}（{error}）")
+    if video_error:
+        blockers.append(f"成片缺失或不可读: {video_error}")
+    if report_error:
+        blockers.append(f"完工报告缺失或不可读: {report_error}")
+    canonical = json.dumps(
+        [{"name": row["name"], "sha256": row["sha256"]}
+         for row in governance_rows],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    binding = {
+        "video_sha256": video_sha,
+        "completion_report_sha256": report_sha,
+        "governance_evidence_sha256": {
+            row["name"]: row["sha256"] for row in governance_rows
+        },
+        "governance_set_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+    previous, previous_error = _read_json(previous_status_file)
+    accepted_baseline = None
+    legacy_structure_incomplete = False
+    if not previous_error and previous.get("project") == project:
+        previous_binding = previous.get("evidence_binding")
+        schema = previous.get("schema_version")
+        if ((schema == 2 and (
+                not _acceptance_axes_complete(previous)
+                or not isinstance(previous_binding, dict)))
+                or (schema is not None and schema not in (1, 2))):
+            legacy_structure_incomplete = True
+        elif isinstance(previous_binding, dict):
+            candidate = previous_binding.get("accepted_baseline")
+            if (isinstance(candidate, dict)
+                    and all(_valid_sha256(candidate.get(field))
+                            for field in BINDING_HASH_FIELDS)):
+                accepted_baseline = {
+                    field: candidate[field] for field in BINDING_HASH_FIELDS
+                }
+            elif (previous.get("acceptance_mode") == ENGINEERING
+                  and previous_binding.get("status") == REUSABLE
+                  and previous_binding.get("reuse_eligible") is True):
+                if not _acceptance_axes_complete(previous):
+                    legacy_structure_incomplete = True
+                elif acceptance_satisfied(previous)[0]:
+                    candidate = {
+                        field: previous_binding.get(field)
+                        for field in BINDING_HASH_FIELDS
+                    }
+                    if all(_valid_sha256(candidate[field])
+                           for field in BINDING_HASH_FIELDS):
+                        accepted_baseline = candidate
+    if blockers:
+        binding.update({
+            "status": EVIDENCE_MISSING,
+            "reuse_eligible": False,
+            "reuse_blockers": blockers,
+            "previous_status": str(previous_status_file),
+            "accepted_baseline": accepted_baseline,
+            "baseline": "not-advanced",
+        })
+        return binding
+    if not previous_error and previous.get("project") != project:
+        binding.update({
+            "status": NOT_REUSABLE,
+            "reuse_eligible": False,
+            "reuse_blockers": ["旧验收状态属于其他项目"],
+            "previous_status": str(previous_status_file),
+            "accepted_baseline": None,
+            "baseline": "not-advanced",
+        })
+        return binding
+    if legacy_structure_incomplete:
+        binding.update({
+            "status": NOT_REUSABLE,
+            "reuse_eligible": False,
+            "reuse_blockers": ["旧验收状态结构不完整"],
+            "previous_status": str(previous_status_file),
+            "accepted_baseline": None,
+            "baseline": "not-advanced",
+        })
+        return binding
+    if rebaseline and axes_ready:
+        accepted_baseline = {
+            field: binding[field] for field in BINDING_HASH_FIELDS
+        }
+        binding.update({
+            "status": REUSABLE,
+            "reuse_eligible": True,
+            "reuse_blockers": [],
+            "previous_status": str(previous_status_file),
+            "accepted_baseline": accepted_baseline,
+            "baseline": "rebaseline",
+        })
+        return binding
+    if previous_error == "missing":
+        if axes_ready:
+            accepted_baseline = {
+                field: binding[field] for field in BINDING_HASH_FIELDS
+            }
+            binding.update({
+                "status": REUSABLE,
+                "reuse_eligible": True,
+                "reuse_blockers": [],
+                "previous_status": str(previous_status_file),
+                "accepted_baseline": accepted_baseline,
+                "baseline": "new",
+            })
+            return binding
+        blockers.append("前置轴未通过，未建立基线")
+    elif previous_error:
+        blockers.append(f"旧验收状态不可读: {previous_error}")
+    else:
+        previous_binding = previous.get("evidence_binding")
+        if not isinstance(previous_binding, dict):
+            blockers.append("旧验收状态缺少证据绑定")
+        elif accepted_baseline is None:
+            blockers.append("旧验收状态缺少已接受基线")
+        else:
+            labels = {
+                "video_sha256": "成片 SHA256",
+                "completion_report_sha256": "完工报告 SHA256",
+                "governance_set_sha256": "治理证据集合 SHA256",
+            }
+            for field in BINDING_HASH_FIELDS:
+                if accepted_baseline[field] != binding[field]:
+                    blockers.append(f"{labels[field]} 已变化")
+    binding.update({
+        "status": NOT_REUSABLE if blockers else REUSABLE,
+        "reuse_eligible": not blockers,
+        "reuse_blockers": blockers,
+        "previous_status": str(previous_status_file),
+        "accepted_baseline": accepted_baseline,
+        "baseline": "not-advanced" if blockers else "previous",
+    })
+    return binding
 
 
 def _evidence_pointer_error(pointer: Any, evidence_root: Path) -> str | None:
@@ -583,9 +771,13 @@ def build_acceptance_status(*, registry_file: str | Path,
                             governance_evidence_dir: str | Path | None = None,
                             business_acceptance_file: str | Path | None = None,
                             root: str | Path = EVIDENCE_ROOT,
-                            workspace_root: str | Path | None = None) -> dict[str, Any]:
+                            workspace_root: str | Path | None = None,
+                            previous_status_file: str | Path | None = None,
+                            rebaseline: bool = False) -> dict[str, Any]:
     _validate_project(project)
     mode = resolve_acceptance_mode(acceptance_mode, config)
+    if rebaseline and mode != ENGINEERING:
+        raise AcceptanceInputError("--rebaseline 仅用于 engineering")
     root_path = Path(root)
     workspace_path = _normalized_path(
         workspace_root if workspace_root is not None else root_path.parent,
@@ -603,17 +795,34 @@ def build_acceptance_status(*, registry_file: str | Path,
         or resolve_evidence_path((config or {}).get("business_acceptance_file"), root_path)
     )
     delivery = _project_delivery(registry_path, video_path, project)
+    technical = _project_technical(report_path, project, video_path, root_path)
+    governance = _project_governance(
+        mode, governance_dir, root_path, workspace_path)
+    business = _project_business(
+        business_path, project, video_path, delivery, root_path)
+    axes_ready = (
+        delivery["status"] == DELIVERED
+        and technical["status"] == gs.PASS
+        and (mode != ENGINEERING
+             or governance["status"] in ("PASS", "WARN"))
+    )
+    previous_status = (
+        _required_path(previous_status_file, "previous_status_file", root_path)
+        if previous_status_file is not None
+        else report_path.parent / "acceptance_status.json"
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "project": project,
         "acceptance_mode": mode,
         "video_delivery": delivery,
-        "technical_validation": _project_technical(
-            report_path, project, video_path, root_path),
-        "governance_acceptance": _project_governance(
-            mode, governance_dir, root_path, workspace_path),
-        "business_acceptance": _project_business(
-            business_path, project, video_path, delivery, root_path),
+        "technical_validation": technical,
+        "governance_acceptance": governance,
+        "business_acceptance": business,
+        "evidence_binding": _build_evidence_binding(
+            project=project, video_path=video_path, report_path=report_path,
+            governance_dir=governance_dir, previous_status_file=previous_status,
+            rebaseline=rebaseline, axes_ready=axes_ready),
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -627,6 +836,11 @@ def acceptance_satisfied(status: dict[str, Any]) -> tuple[bool, list[str]]:
     if status["acceptance_mode"] == ENGINEERING:
         if status["governance_acceptance"]["status"] not in ("PASS", "WARN"):
             reasons.append("工程治理验收未通过")
+        binding = status.get("evidence_binding")
+        if (not isinstance(binding, dict)
+                or binding.get("status") != REUSABLE
+                or binding.get("reuse_eligible") is not True):
+            reasons.append("工程证据不可复用")
     return not reasons, reasons
 
 
@@ -634,11 +848,13 @@ def format_status_lines(status: dict[str, Any]) -> list[str]:
     delivery = status["video_delivery"]
     delivered_at = f" delivered_at={delivery['delivered_at']}" if delivery["delivered_at"] else ""
     governance = status["governance_acceptance"]
+    binding = status["evidence_binding"]
     return [
         f"视频交付: {delivery['status']}{delivered_at}",
         f"技术验证: {status['technical_validation']['status']}",
         f"治理验收: {governance['status']} can_proceed={str(governance['can_proceed']).lower()}",
         f"业务验收: {status['business_acceptance']['status']}",
+        f"证据复用: {binding['status']}",
     ]
 
 
@@ -657,6 +873,8 @@ def main() -> int:
     parser.add_argument("--governance-evidence-dir")
     parser.add_argument("--business-acceptance-file")
     parser.add_argument("--output-file")
+    parser.add_argument("--rebaseline", action="store_true",
+                        help="工程重审后显式接受当前证据基线")
     parser.add_argument("--require-acceptance", action="store_true")
     args = parser.parse_args()
     try:
@@ -675,9 +893,19 @@ def main() -> int:
             config=config,
             governance_evidence_dir=args.governance_evidence_dir,
             business_acceptance_file=args.business_acceptance_file,
+            previous_status_file=(
+                str(Path(args.output_file).resolve()) if args.output_file else None
+            ),
+            rebaseline=args.rebaseline,
         )
         if args.output_file:
-            write_acceptance_status(args.output_file, status)
+            output_path = Path(args.output_file)
+            existing, existing_error = _read_json(output_path)
+            if output_path.exists() and existing_error:
+                raise AcceptanceInputError("既有验收状态不可读，拒绝覆盖")
+            if not existing_error and existing.get("project") != args.project_name:
+                raise AcceptanceInputError("拒绝覆盖其他项目的验收状态")
+            write_acceptance_status(output_path, status)
     except (AcceptanceInputError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         print(f"[ACCEPTANCE] ERROR: {exc}", file=sys.stderr)
         return 2
